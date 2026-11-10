@@ -59,12 +59,16 @@ scene() {
   pid=$!
   sleep 6
   shot "$1"
+  echo "$1: $(grep -E 'VmRSS|VmHWM' /proc/$pid/status | paste -sd ' ')" >> "$out/memory.txt"
   kill $pid; wait $pid 2>/dev/null
 }
 scene 06-chat-cozy chat-cozy c-general
 scene 07-chat-compact chat-compact c-general
 scene 08-chat-system chat-system c-system
 scene 09-chat-replies chat-replies c-replies
+scene 10-attachments attachments c-attachments
+scene 11-embed-all-types embed-all-types c-embeds
+scene 12-image-viewer image-viewer c-attachments
 
 tail -n 20 "$out/signin.log" "$out/demo.log" >&2
 cat "$out/memory.txt" >&2

@@ -218,6 +218,36 @@ pub fn separator_line() -> Hsla {
     h(rgba(0xc9c5d30b))
 }
 
+// ---- Media ------------------------------------------------------------------
+
+/// `--brand-primary-foreground` without an instance accent.
+pub const BRAND_FOREGROUND_DEFAULT: u32 = 0x413cdd;
+/// The left bar of an embed without a colour (`--brand-primary-foreground`). It follows
+/// the instance accent like the brand colour.
+pub fn brand_foreground() -> Hsla {
+    h(rgb(or_default(&BRAND, BRAND_FOREGROUND_DEFAULT)))
+}
+/// An image's box while it loads or when it cannot be shown.
+pub fn media_placeholder() -> Hsla {
+    h(rgb(0x2a2830))
+}
+/// The cover over a spoiler or explicit image.
+pub fn media_cover() -> Hsla {
+    h(rgb(0x141317))
+}
+/// Buttons and labels drawn over media (black at 60 %).
+pub fn media_overlay() -> Hsla {
+    h(rgba(0x00000099))
+}
+/// The same under the pointer.
+pub fn media_overlay_hover() -> Hsla {
+    h(rgba(0x000000cc))
+}
+/// Behind the image viewer (black at 85 %).
+pub fn viewer_backdrop() -> Hsla {
+    h(rgba(0x000000d9))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

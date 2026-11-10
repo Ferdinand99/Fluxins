@@ -21,6 +21,8 @@ path = "src/main.rs"
 inlet-protocol = { path = "../inlet-protocol" }
 # Per-account client state: the message windows the chat shows.
 inlet-state = { path = "../inlet-state" }
+# Images: fetched from the media proxy, decoded and cached with hard limits.
+inlet-media = { path = "../inlet-media" }
 
 gpui.workspace = true
 gpui_platform.workspace = true
@@ -28,6 +30,7 @@ gpui_platform.workspace = true
 fluxer_markdown_parser = { git = "https://github.com/fluxerapp/fluxer", rev = "f1cba64e64bda5f57ad3cf827c1d5a98ecdd80df" }
 
 anyhow = "1"
+bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 dirs = "6"
 env_logger = "0.11"
@@ -36,11 +39,14 @@ fluent-bundle = "0.16"
 futures = "0.3"
 keyring = { version = "3.6", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust", "vendored"] }
 log = "0.4"
+# The media proxy client (images, saved files): no cookies, no token, no redirects.
+# Same version and TLS stack as inlet-protocol.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # The system locale, for the date and time format in the chat.
 sys-locale = "0.3"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "fs", "io-util"] }
 unic-langid = "0.9"
 unicode-segmentation = "1"
 url = "2"

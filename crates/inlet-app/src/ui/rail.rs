@@ -94,10 +94,17 @@ impl Inlet {
             )
             .children(self.guilds.iter().map(|g| {
                 let id = g.id.clone();
+                let active = selected.as_deref() == Some(g.id.as_str());
+                // The guild's icon when it has one, rounded like the entry.
+                let icon = self.guild_icon_image(&g.id, 44., cx).map(|i| {
+                    i.rounded(px(if active { 13. } else { 22. }))
+                        .group_hover(format!("guild-{}-g", g.id), |s| s.rounded(px(13.)))
+                        .into_any_element()
+                });
                 item(
                     format!("guild-{}", g.id).into(),
-                    g.initials().into_any_element(),
-                    selected.as_deref() == Some(g.id.as_str()),
+                    icon.unwrap_or_else(|| g.initials().into_any_element()),
+                    active,
                 )
                 .on_click(
                     cx.listener(move |this, _, _, cx| this.select_guild(Some(id.clone()), cx)),

@@ -72,26 +72,84 @@ pub struct Names {
     pub user_order: std::collections::VecDeque<String>,
 }
 
-/// A rich embed (bots post these), drawn as a card.
+/// What kind of embed it is (`type`), which decides how it is drawn.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EmbedKind {
+    /// Sent by a bot or webhook; also anything Inlet does not know.
+    #[default]
+    Rich,
+    /// A link preview.
+    Link,
+    /// An article preview, with a large image.
+    Article,
+    /// A link that is an image: drawn as the image alone.
+    Image,
+    /// A link that is a looping video (GIF-like): drawn as the media alone.
+    Gifv,
+    /// A video page (YouTube and the like): a thumbnail with a play button.
+    Video,
+    /// A Bluesky post.
+    Bluesky,
+}
+
+/// An image, thumbnail or video of an embed. URLs are kept as sent; the media view
+/// only loads `proxy_url` after checking it is on the instance's media proxy.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EmbedMedia {
+    /// The original (third-party) URL. Never fetched; opened in the browser on click.
+    pub url: String,
+    /// The same media through the instance's media proxy.
+    pub proxy_url: Option<String>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub animated: bool,
+    /// Marked as explicit by the server's media inspection.
+    pub explicit: bool,
+}
+
+/// An embed (bots post these, and link previews), drawn as a card.
 #[derive(Clone, Debug, Default)]
 pub struct Embed {
+    pub kind: EmbedKind,
     /// Colour of the left bar, `0xRRGGBB`.
     pub color: Option<u32>,
     pub author: Option<String>,
+    /// Link of the author name (opened on click, http/https only).
+    pub author_url: Option<String>,
+    /// Author icon through the media proxy (checked before loading).
+    pub author_icon: Option<String>,
+    /// The site a link preview is from.
+    pub provider: Option<String>,
     pub title: Option<String>,
     /// Link of the title (http/https only when opened).
     pub url: Option<String>,
     pub description: Vec<Block>,
     pub fields: Vec<EmbedField>,
     pub footer: Option<String>,
-    /// Images, thumbnails and videos, shown as links in v0.
-    pub media: Vec<Attachment>,
+    /// Footer icon through the media proxy (checked before loading).
+    pub footer_icon: Option<String>,
+    /// The embed's time, milliseconds since the Unix epoch.
+    pub timestamp_ms: Option<i64>,
+    pub thumbnail: Option<EmbedMedia>,
+    pub image: Option<EmbedMedia>,
+    pub video: Option<EmbedMedia>,
+    /// The embed is marked as explicit.
+    pub nsfw: bool,
+}
+
+impl Embed {
+    /// Whether the embed shows an image or video below its text.
+    pub fn has_media(&self) -> bool {
+        self.image.is_some() || self.video.is_some()
+    }
 }
 
 #[derive(Clone, Debug)]
 pub struct EmbedField {
     pub name: String,
     pub value: Vec<Block>,
+    /// Shares a row with the inline fields next to it.
+    pub inline: bool,
 }
 
 /// The message a reply points to, for the line above the reply.
@@ -111,10 +169,52 @@ impl Channel {
     }
 }
 
-#[derive(Clone, Debug)]
+/// What an attachment is, by its content type.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AttachmentKind {
+    Image,
+    Video,
+    Audio,
+    #[default]
+    File,
+}
+
+/// A file attached to a message. URLs are kept as sent; the media view only loads or
+/// saves them after checking that they are on the instance's media proxy.
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Attachment {
+    pub id: String,
+    /// File name, cleaned.
     pub filename: String,
-    pub url: String,
+    /// The signed URL of the file; it expires (`expires_at_ms`).
+    pub url: Option<String>,
+    /// The file through the media proxy.
+    pub proxy_url: Option<String>,
+    pub content_type: Option<String>,
+    /// Size in bytes.
+    pub size: u64,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub kind: AttachmentKind,
+    pub spoiler: bool,
+    /// Marked as explicit by the server's media inspection.
+    pub explicit: bool,
+    pub animated: bool,
+    /// Length of audio or video, in seconds.
+    pub duration_secs: Option<u64>,
+    /// Alt text, cleaned.
+    pub alt: Option<String>,
+    /// When the signed URLs stop working, milliseconds since the Unix epoch.
+    pub expires_at_ms: Option<i64>,
+    /// The server says the URLs no longer work.
+    pub expired: bool,
+}
+
+/// A user's avatar: the user and the image hash (`a_` = animated).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UserAvatar {
+    pub user_id: String,
+    pub hash: String,
 }
 
 #[derive(Clone, Debug)]
@@ -127,6 +227,9 @@ pub struct Message {
     pub author_username: String,
     /// The author is a bot: show a BOT tag.
     pub author_bot: bool,
+    /// The author's avatar, when they have one (otherwise their initials show). Boxed:
+    /// most messages are converted and kept, and this keeps them small.
+    pub author_avatar: Option<Box<UserAvatar>>,
     /// Milliseconds since the Unix epoch.
     pub timestamp_ms: i64,
     /// Already formatted for display, in local time.
@@ -292,6 +395,7 @@ mod tests {
             author: author.into(),
             author_username: author.into(),
             author_bot: false,
+            author_avatar: None,
             timestamp_ms: t,
             timestamp: String::new(),
             content: String::new(),

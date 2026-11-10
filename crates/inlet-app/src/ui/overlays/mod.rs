@@ -20,6 +20,7 @@ impl Inlet {
     /// The overlays to draw over the current screen, bottom first.
     pub(crate) fn render_overlays(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let mut out = Vec::new();
+        out.extend(self.render_image_viewer(cx));
         if let Some(url) = self.overlays.pending_link.clone() {
             out.push(self.render_link_confirm(&url, cx));
         }
