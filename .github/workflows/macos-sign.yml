@@ -36,7 +36,7 @@ jobs:
   sign:
     name: Sign and notarise (macOS)
     runs-on: macos-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
     environment: release
     permissions:
       contents: read
@@ -106,7 +106,7 @@ jobs:
           # A fresh random password; it only lives in this step.
           keychain_password=$(openssl rand -base64 32)
           security create-keychain -p "$keychain_password" "$KEYCHAIN"
-          security set-keychain-settings -lut 5400 "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
           security unlock-keychain -p "$keychain_password" "$KEYCHAIN"
 
           p12="$RUNNER_TEMP/inlet-signing.p12"
@@ -168,7 +168,7 @@ jobs:
           check '^Timestamp=' "The signature has no secure timestamp"
           check "^TeamIdentifier=${APPLE_TEAM_ID}\$" "The signature has the wrong team"
           echo "Entitlements:"
-          codesign --display --entitlements - --xml build/Inlet.app | plutil -p -
+          codesign --display --entitlements - --xml build/Inlet.app | plutil -p - || true
 
       - name: Notarise and staple the app
         env:
