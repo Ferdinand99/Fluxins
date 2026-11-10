@@ -31,6 +31,7 @@ use serde_json::Value;
 
 use super::time;
 use crate::app::Inlet;
+use crate::backend::messages::outbox::is_own_copy;
 use crate::backend::messages::parse::{self, SharedNames};
 use crate::backend::messages::{Cmd, Ev, Pending};
 use crate::model::{self, Message, Names};
@@ -203,6 +204,8 @@ impl PartialEq for PendingRow {
 pub struct OutboxEntry {
     pub out: Pending,
     blocks: Rc<Vec<Block>>,
+    /// When the row was first shown, in Unix milliseconds (the send's time).
+    queued_ms: u64,
 }
 
 /// The request for older messages from the list: one at a time, at most one a second,
@@ -901,9 +904,29 @@ impl MessageView {
             Some(entry) => entry.out = out,
             None => {
                 let blocks = Rc::new(markdown::parse(&out.text));
-                self.outbox.push(OutboxEntry { out, blocks });
+                self.outbox.push(OutboxEntry {
+                    out,
+                    blocks,
+                    queued_ms: u64::try_from(now_ms()).unwrap_or(0),
+                });
             }
         }
+    }
+
+    /// Rows of `channel_id` whose message a page already has. Fluxer's lists carry no
+    /// nonce, so a row goes when the page has a message of `me` with the same wire text
+    /// that is not older than the row ([`is_own_copy`]). Each message clears at most
+    /// one row. Whether any went.
+    pub fn clear_arrived(&mut self, me: &str, channel_id: &str, messages: &[p::Message]) -> bool {
+        let before = self.outbox.len();
+        for m in messages {
+            if let Some(ix) = self.outbox.iter().position(|o| {
+                o.out.channel_id == channel_id && is_own_copy(m, me, &o.out.text, 0, o.queued_ms)
+            }) {
+                self.outbox.remove(ix);
+            }
+        }
+        self.outbox.len() != before
     }
 
     /// The server took the message with this nonce: its row goes. Whether one went.
@@ -1074,18 +1097,12 @@ impl Inlet {
             return;
         }
         if !older {
-            // Messages of this account that the page already has are no longer pending.
-            let nonces: HashSet<&str> = page
-                .messages
-                .iter()
-                .filter_map(|m| m.nonce.as_deref())
-                .collect();
-            if !nonces.is_empty() {
-                self.chat
-                    .view
-                    .outbox
-                    .retain(|o| !nonces.contains(o.out.nonce.as_str()));
-            }
+            // Messages of this account that the page already has are no longer pending
+            // (one that arrived although its send looked failed).
+            let me = account.read(cx).me_id().to_string();
+            self.chat
+                .view
+                .clear_arrived(&me, &channel_id, &page.messages);
         }
         let edits = edits_of(&page.messages);
         let mut changes = account.update(cx, |s, _| s.apply_messages(ch, page));

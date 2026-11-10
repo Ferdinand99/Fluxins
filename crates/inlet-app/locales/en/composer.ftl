@@ -28,6 +28,7 @@ composer-msg-sent = Direct message sent.
 composer-msg-failed = Could not send the direct message: { $error }
 composer-command-failed = The command failed: { $error }
 composer-bad-answer = the server gave an answer Inlet could not read
+composer-not-connected = not connected to the server
 composer-saved-not-yet = Saved media can not be picked here yet.
 
 ## Reply bar

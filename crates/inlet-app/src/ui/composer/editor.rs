@@ -1295,7 +1295,7 @@ mod tests {
         cx.simulate_keystrokes("escape");
         assert!(view.read_with(cx, |v, _| v.edit.is_some()));
         let id = (4u64 << 22).to_string();
-        view.update(cx, |v, cx| v.on_edit_failed(&id, "too fast".into(), cx));
+        view.update(cx, |v, cx| v.on_edit_failed(&id, "too fast", cx));
         let (open_edit, text, error) = view.read_with(cx, |v, cx| {
             (
                 v.edit.as_ref().is_some_and(|e| !e.saving),
@@ -1311,5 +1311,66 @@ mod tests {
         // Enter sends it again.
         cx.simulate_keystrokes("enter");
         assert_eq!(edits(&host, cx).len(), 2);
+    }
+
+    #[gpui::test]
+    fn text_typed_while_an_edit_saves_is_kept(cx: &mut TestAppContext) {
+        use super::super::edit_inline::tests::message;
+        let (host, view, cx) = host(cx);
+        open(&view, "301", cx);
+        let (account, ch) = account(serde_json::json!([message(4, "10", "typo")]), cx);
+        cx.update(|window, cx| crate::ui::composer::edit_last(&view, &account, ch, window, cx));
+        let editor = view
+            .read_with(cx, |v, _| v.edit.as_ref().map(|e| e.editor.clone()))
+            .expect("an edit is open");
+        editor.update_in(cx, |e, window, cx| {
+            e.replace_text_in_range(None, "s", window, cx)
+        });
+        cx.simulate_keystrokes("enter");
+        assert_eq!(edits(&host, cx).len(), 1);
+        // More text while the server has not answered yet.
+        editor.update_in(cx, |e, window, cx| {
+            e.replace_text_in_range(None, "!", window, cx)
+        });
+        let id = (4u64 << 22).to_string();
+        view.update_in(cx, |v, window, cx| v.on_edited(&id, window, cx));
+        let (open_edit, text) = view.read_with(cx, |v, cx| {
+            (
+                v.edit.as_ref().is_some_and(|e| !e.saving),
+                v.edit
+                    .as_ref()
+                    .map(|e| e.editor.read(cx).buffer().text().to_owned()),
+            )
+        });
+        assert!(open_edit, "the box stays open for the newer text");
+        assert_eq!(text.as_deref(), Some("typos!"));
+        cx.simulate_keystrokes("enter");
+        let sent = edits(&host, cx);
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[1].1, "typos!");
+        view.update_in(cx, |v, window, cx| v.on_edited(&id, window, cx));
+        assert!(view.read_with(cx, |v, _| v.edit.is_none()));
+    }
+
+    #[gpui::test]
+    fn a_refused_edit_of_a_closed_box_is_not_shown_in_another_channel(cx: &mut TestAppContext) {
+        use super::super::edit_inline::tests::message;
+        let (_host, view, cx) = host(cx);
+        open(&view, "301", cx);
+        let (account, ch) = account(serde_json::json!([message(4, "10", "typo")]), cx);
+        cx.update(|window, cx| crate::ui::composer::edit_last(&view, &account, ch, window, cx));
+        let editor = view
+            .read_with(cx, |v, _| v.edit.as_ref().map(|e| e.editor.clone()))
+            .expect("an edit is open");
+        editor.update_in(cx, |e, window, cx| {
+            e.replace_text_in_range(None, "s", window, cx)
+        });
+        cx.simulate_keystrokes("enter");
+        // The person moves on to another channel; the edit box closes there.
+        open(&view, "302", cx);
+        let id = (4u64 << 22).to_string();
+        let shown = view.update(cx, |v, cx| v.on_edit_failed(&id, "too fast", cx));
+        assert!(!shown, "the app says it in the notice bar instead");
+        assert!(view.read_with(cx, |v, _| v.error.is_none()));
     }
 }

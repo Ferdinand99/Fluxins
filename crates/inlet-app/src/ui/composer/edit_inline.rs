@@ -26,6 +26,8 @@ pub struct InlineEdit {
     replied_user: Option<bool>,
     /// Saved; waiting for the server.
     pub saving: bool,
+    /// The text last sent to the server.
+    sent: Option<String>,
     _events: Subscription,
 }
 
@@ -122,6 +124,7 @@ impl ComposerView {
             original,
             replied_user,
             saving: false,
+            sent: None,
             _events: events,
         });
         cx.notify();
@@ -158,13 +161,14 @@ impl ComposerView {
         cx.emit(ComposerEvent::Edit {
             channel_id: edit.channel_id.clone(),
             message_id: edit.message_id.clone(),
-            content,
+            content: content.clone(),
             // Keep what the original did for its reply's author; when that is not
             // known, never let the edit add that author as a mention.
             mentions: Mentions::from_editor(&allowed, Some(edit.replied_user.unwrap_or(false))),
         });
         if let Some(edit) = &mut self.edit {
             edit.saving = true;
+            edit.sent = Some(content);
         }
         self.error = None;
         cx.notify();
@@ -176,24 +180,42 @@ impl ComposerView {
         cx.notify();
     }
 
-    /// The server took the edit: the box closes.
+    /// The server took the edit: the box closes, unless the person typed more while it
+    /// was saving; then it stays open with that text, to be saved again.
     pub fn on_edited(&mut self, message_id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if self
-            .edit
-            .as_ref()
-            .is_some_and(|e| e.message_id == message_id)
-        {
+        let Some(edit) = self.edit.as_mut().filter(|e| e.message_id == message_id) else {
+            return;
+        };
+        let now = edit.editor.read(cx).buffer().to_wire().trim().to_owned();
+        let sent = edit.sent.take();
+        if sent.as_deref() == Some(now.as_str()) {
             self.cancel_edit(window, cx);
+        } else {
+            edit.saving = false;
+            if let Some(sent) = sent {
+                // What the server has now; saving the same again sends nothing.
+                edit.original = sent;
+            }
+            cx.notify();
         }
     }
 
     /// The server refused the edit: the box stays open with its text and says why.
-    pub fn on_edit_failed(&mut self, message_id: &str, reason: String, cx: &mut Context<Self>) {
+    /// `false` when that edit is no longer open (the caller says it elsewhere).
+    pub fn on_edit_failed(
+        &mut self,
+        message_id: &str,
+        reason: &str,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(edit) = self.edit.as_mut().filter(|e| e.message_id == message_id) else {
+            return false;
+        };
+        edit.saving = false;
+        edit.sent = None;
         self.error = Some(t!("composer-edit-failed", error = reason));
-        if let Some(edit) = self.edit.as_mut().filter(|e| e.message_id == message_id) {
-            edit.saving = false;
-        }
         cx.notify();
+        true
     }
 
     /// The edit box: the editor and a hint line.
@@ -258,13 +280,13 @@ impl ComposerView {
 }
 
 #[cfg(test)]
-pub(super) mod tests {
+pub(crate) mod tests {
     use super::*;
     use inlet_state::MessagesPage;
     use serde_json::{json, Value};
 
     /// An account `10` in guild `100` with text channel `301` holding `messages`.
-    pub(in crate::ui::composer) fn state_with(messages: Value) -> (AccountState, ChannelId) {
+    pub(crate) fn state_with(messages: Value) -> (AccountState, ChannelId) {
         let everyone = (1u64 << 10) | (1 << 11) | (1 << 16);
         let ready: p::Ready = serde_json::from_value(json!({
             "session_id": "s",

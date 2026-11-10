@@ -27,6 +27,7 @@ use inlet_state::{AccountState, ChannelId};
 use crate::app::Inlet;
 use crate::backend::composer::{Cmd, Ev, Outgoing};
 use crate::backend::messages;
+use crate::ui::chat::messages::MessageView;
 use crate::ui::sidebar::channel_list::channel_label;
 pub use editor::{bind_keys, ChannelContext, ComposerEvent, ComposerView, Shared};
 
@@ -85,6 +86,13 @@ impl ComposerState {
         self.shared.borrow_mut().sign_out();
         self.reset_session();
     }
+}
+
+/// A send from the composer: the message list shows its pending row first, then the
+/// returned command sends it, so no answer can come before the row exists.
+pub fn begin_send(view: &mut MessageView, message: Outgoing) -> Cmd {
+    view.upsert_pending(pending_of(&message));
+    Cmd::Send(message)
 }
 
 /// The pending row a send shows in the message list until the server took it.
@@ -162,8 +170,9 @@ impl Inlet {
         match event {
             ComposerEvent::Send(message) => {
                 // The row shows "sending" at once; the backend reports the outcome to it.
-                self.on_messages_event(messages::Ev::Pending(pending_of(&message)), window, cx);
-                self.backend.send(Cmd::Send(message));
+                let cmd = begin_send(&mut self.chat.view, message);
+                self.refresh_rows(cx);
+                self.backend.send(cmd);
             }
             ComposerEvent::Edit {
                 channel_id,
@@ -253,7 +262,11 @@ impl Inlet {
                 view.update(cx, |v, cx| v.on_edited(&message_id, window, cx))
             }
             Ev::EditFailed { message_id, reason } => {
-                view.update(cx, |v, cx| v.on_edit_failed(&message_id, reason, cx))
+                let shown = view.update(cx, |v, cx| v.on_edit_failed(&message_id, &reason, cx));
+                if !shown {
+                    // The edit box is gone (another channel): say it in the notice bar.
+                    self.chat.notice = Some(t!("composer-edit-failed", error = reason));
+                }
             }
             Ev::Members { guild_id, members } => {
                 view.update(cx, |v, cx| v.on_members(guild_id, members, cx))
@@ -331,5 +344,29 @@ mod tests {
         }
         assert_eq!(pending_rows(&mut view, &state), [("777".to_owned(), None)]);
         assert!(view.retry("777").is_none(), "only a failed row retries");
+    }
+
+    #[test]
+    fn a_page_clears_a_row_by_its_own_text_not_by_nonce() {
+        use crate::backend::messages::outbox::tests::listed;
+        let (state, _) = edit_inline::tests::state_with(serde_json::json!([]));
+        let mut view = MessageView::new();
+        let mut failed = pending_of(&outgoing());
+        failed.failed = Some("timed out".into());
+        view.upsert_pending(failed);
+        let t = chrono::Utc::now().timestamp_millis() as u64;
+        // Lists carry no nonce. Someone else's message, other text, or an own message
+        // from before the send do not clear the row.
+        let page = [
+            listed(t + 1_000, "20", "hello", 0),
+            listed(t + 1_000, "10", "hello again", 0),
+            listed(t - 60_000, "10", "hello", 0),
+        ];
+        assert!(!view.clear_arrived("10", "301", &page));
+        assert!(!view.clear_arrived("10", "302", &[listed(t + 1_000, "10", "hello", 0)]));
+        assert_eq!(pending_rows(&mut view, &state).len(), 1);
+        // The own copy, sent after the row was shown, does.
+        assert!(view.clear_arrived("10", "301", &[listed(t + 1_000, "10", "hello", 0)]));
+        assert!(pending_rows(&mut view, &state).is_empty());
     }
 }

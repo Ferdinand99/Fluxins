@@ -9,8 +9,9 @@
 //!   `/nick` is one `PATCH`;
 //! - typing: at most one request per channel every 8 s (the protocol's debounce), and the
 //!   UI asks at most once a second;
-//! - a Retry more than five minutes after an unclear failure first reads the channel's 50
-//!   newest messages (one `GET`) and sends only if the nonce is not among them;
+//! - a Retry more than five minutes after an unclear failure first reads up to 100 of the
+//!   channel's messages since the first send (one `GET`) and sends only if none of them
+//!   is an own message with the same text (lists carry no nonce);
 //! - autocomplete reads roles, channels, emoji and rights from the account state (no
 //!   request); member search goes over the gateway (op 8), which the protocol caps at 10
 //!   per 10 s.

@@ -13,7 +13,7 @@ mod ack;
 mod actions;
 mod fetch;
 mod inbox;
-mod outbox;
+pub(crate) mod outbox;
 pub mod parse;
 mod pins;
 mod threads;

@@ -8,20 +8,26 @@
 //! mention that is not on the list, and `@everyone`/`@here` unless one was picked.
 //! Sends and edits go through the protocol's `send` and `edit_message_with`.
 
+use std::future::Future;
+use std::time::Instant;
+
 use inlet_protocol as p;
 use reqwest::Method;
 use serde_json::{json, Value};
 
+use super::directory::RetryPlan;
 use super::Ev;
 use super::State;
 use crate::backend::messages;
+use crate::backend::messages::outbox::{is_own_copy, CLOCK_SLACK_MS};
 use crate::backend::session::{Failure, FailureKind};
 use crate::backend::{Active, Backend, Internal, Ui};
 
 /// The longest nickname Fluxer takes.
 const MAX_NICK_CHARS: usize = 32;
-/// Recent messages read to find out whether a send went through after all.
-const NONCE_LOOKBACK: u8 = 50;
+/// Messages read to find out whether a send went through after all (the most one
+/// request gives).
+const COPY_LOOKBACK: u8 = 100;
 
 /// Who a message may notify: the mentions picked in the editor.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -186,7 +192,7 @@ fn report_failure(events: &Ui, message: &Outgoing, e: SendError) {
 /// The session's parts a send task needs.
 #[derive(Clone)]
 struct Ctx {
-    session: p::Session,
+    client: p::Client,
     events: Ui,
     internal: tokio::sync::mpsc::UnboundedSender<Internal>,
     gen: u64,
@@ -198,7 +204,7 @@ impl Ctx {
     /// ended.
     async fn post(&self, message: &Outgoing) -> Result<(), Option<SendError>> {
         let result = match message.to_message() {
-            Ok(m) => self.session.client().send(&message.channel_id, &m).await,
+            Ok(m) => self.client.send(&message.channel_id, &m).await,
             Err(e) => Err(e.into()),
         };
         match result {
@@ -229,33 +235,104 @@ impl Ctx {
         }
     }
 
-    /// Whether a message with this nonce is among the channel's newest messages.
-    async fn already_sent(&self, message: &Outgoing) -> Result<bool, Option<SendError>> {
-        match self
-            .session
-            .client()
-            .messages(&message.channel_id, None, NONCE_LOOKBACK)
-            .await
-        {
-            Ok(list) => Ok(list
-                .iter()
-                .any(|m| m.nonce.as_deref() == Some(message.nonce.as_str()))),
-            Err(err) => Err(failed(&self.internal, self.gen, err)),
+    /// A send from the composer: kept for Retry, then posted.
+    fn send(self, message: Outgoing) -> impl Future<Output = ()> + Send {
+        self.state.remember_send(self.gen, &message);
+        async move { self.post_and_report(message).await }
+    }
+
+    /// How a Retry at `now` goes out: as the composer first sent it, or, for a message
+    /// it did not send, with no mentions allowed.
+    fn retry_plan(
+        &self,
+        channel_id: String,
+        nonce: String,
+        text: String,
+        now: Instant,
+    ) -> RetryPlan {
+        self.state
+            .retry_of(self.gen, &nonce, now)
+            .unwrap_or_else(|| RetryPlan {
+                // Not sent from this session's composer: nothing it says may notify
+                // anyone.
+                message: Outgoing {
+                    channel_id,
+                    nonce,
+                    content: text,
+                    mentions: Mentions::default(),
+                    reply_to: None,
+                    silent: false,
+                },
+                look_since_ms: None,
+            })
+    }
+
+    /// Sends a Retry with its first nonce. A late one after an unclear failure first
+    /// looks whether the message arrived.
+    fn resend(self, plan: RetryPlan) -> impl Future<Output = ()> + Send {
+        self.state.remember_send(self.gen, &plan.message);
+        async move {
+            match plan.look_since_ms {
+                Some(since) => self.send_unless_sent(plan.message, since).await,
+                None => self.post_and_report(plan.message).await,
+            }
         }
     }
 
+    /// Whether a copy of `message`, first sent at `since_ms`, is among the channel's
+    /// messages since then. Lists carry no nonce, so it is matched on the author, the
+    /// wire text, the reply and the time ([`is_own_copy`]).
+    async fn already_sent(&self, message: &Outgoing, since_ms: u64) -> Result<bool, p::Error> {
+        let me = match self.state.session(self.gen) {
+            Some((id, _)) => id,
+            None => self.client.me().await?.id.clone(),
+        };
+        let after = p::models::snowflake_at_ms(since_ms.saturating_sub(CLOCK_SLACK_MS));
+        let list = self
+            .client
+            .messages_after(&message.channel_id, &after, COPY_LOOKBACK)
+            .await?;
+        Ok(list.iter().any(|m| {
+            is_own_copy(m, &me, &message.content, 0, since_ms)
+                && message
+                    .reply_to
+                    .as_deref()
+                    .is_none_or(|r| replied_to(m) == Some(r))
+        }))
+    }
+
     /// A retry long after an unclear failure: the server only recognises a nonce for a
-    /// few minutes, so first look whether the message arrived; send it only if not.
-    async fn send_unless_sent(&self, message: Outgoing) {
-        match self.already_sent(&message).await {
+    /// few minutes, so first look whether the message arrived; send it (same nonce)
+    /// only if not.
+    async fn send_unless_sent(&self, message: Outgoing, since_ms: u64) {
+        match self.already_sent(&message, since_ms).await {
             Ok(true) => self.sent(message.nonce),
             Ok(false) => self.post_and_report(message).await,
-            Err(Some(mut e)) => {
-                e.ambiguous = true;
-                self.failed(&message, e);
+            Err(err) => {
+                if let Some(mut e) = failed(&self.internal, self.gen, err) {
+                    // Still not known whether the first attempt arrived.
+                    e.ambiguous = true;
+                    self.failed(&message, e);
+                }
             }
-            Err(None) => {}
         }
+    }
+}
+
+/// The message a listed message replies to.
+fn replied_to(m: &p::Message) -> Option<&str> {
+    m.extra
+        .get("message_reference")?
+        .get("message_id")?
+        .as_str()
+}
+
+/// Why a send, a Retry or an edit could not even start.
+fn not_connected() -> SendError {
+    SendError {
+        reason: t!("composer-not-connected"),
+        retry_after_secs: None,
+        ambiguous: false,
     }
 }
 
@@ -263,7 +340,7 @@ impl Backend {
     fn send_ctx(&self) -> Option<Ctx> {
         match &self.active {
             Some(Active::Real(r)) => Some(Ctx {
-                session: r.session.clone(),
+                client: r.session.client().clone(),
                 events: self.events.clone(),
                 internal: self.internal.clone(),
                 gen: r.gen,
@@ -333,13 +410,11 @@ impl Backend {
             m.resend(message.channel_id, message.nonce, message.content);
             return;
         }
-        if let Some(ctx) = self.send_ctx() {
-            ctx.state.remember_send(ctx.gen, &message);
-            self.spawn_guarded(
-                "send",
-                None,
-                async move { ctx.post_and_report(message).await },
-            );
+        match self.send_ctx() {
+            Some(ctx) => {
+                self.spawn_guarded("send", None, ctx.send(message));
+            }
+            None => report_failure(&self.events, &message, not_connected()),
         }
     }
 
@@ -358,10 +433,6 @@ impl Backend {
             return;
         }
         let Some(ctx) = self.send_ctx() else {
-            return;
-        };
-        let (message, unclear) = ctx.state.retry_of(ctx.gen, &nonce).unwrap_or_else(|| {
-            // Not sent from this session's composer: nothing it says may notify anyone.
             let message = Outgoing {
                 channel_id,
                 nonce,
@@ -370,16 +441,11 @@ impl Backend {
                 reply_to: None,
                 silent: false,
             };
-            (message, false)
-        });
-        ctx.state.remember_send(ctx.gen, &message);
-        self.spawn_guarded("resend", None, async move {
-            if unclear {
-                ctx.send_unless_sent(message).await
-            } else {
-                ctx.post_and_report(message).await
-            }
-        });
+            report_failure(&self.events, &message, not_connected());
+            return;
+        };
+        let plan = ctx.retry_plan(channel_id, nonce, text, Instant::now());
+        self.spawn_guarded("resend", None, ctx.resend(plan));
     }
 
     pub(super) fn edit(
@@ -396,13 +462,16 @@ impl Backend {
             return;
         }
         let Some(ctx) = self.send_ctx() else {
+            self.emit(Ev::EditFailed {
+                message_id,
+                reason: not_connected().reason,
+            });
             return;
         };
         self.spawn_guarded("edit", None, async move {
             let result = match edit_of(&content, &mentions) {
                 Ok(edit) => {
-                    ctx.session
-                        .client()
+                    ctx.client
                         .edit_message_with(&channel_id, &message_id, &edit)
                         .await
                 }
@@ -457,8 +526,7 @@ impl Backend {
             let body = json!({ "nick": nick });
             let path = format!("/guilds/{guild}/members/@me");
             match ctx
-                .session
-                .client()
+                .client
                 .request_json(Method::PATCH, &path, Some(&body))
                 .await
             {
@@ -506,8 +574,7 @@ impl Backend {
             // The protocol has no method for this route yet.
             let body = json!({ "recipient_id": user });
             let channel = ctx
-                .session
-                .client()
+                .client
                 .request_json(Method::POST, "/users/@me/channels", Some(&body))
                 .await;
             let channel_id = match channel {
@@ -653,6 +720,276 @@ mod tests {
             "@me",
         ] {
             assert_eq!(snowflake(bad), None, "{bad:?}");
+        }
+    }
+
+    /// The send path against a mock Fluxer: the app's wiring for a send and a Retry,
+    /// and the look for a copy before a late Retry.
+    mod wire {
+        use std::time::{Duration, Instant};
+
+        use futures::channel::mpsc::{unbounded, UnboundedReceiver};
+        use serde_json::{json, Value};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        use super::super::super::directory::unix_ms;
+        use super::super::*;
+        use crate::backend::composer::Cmd;
+        use crate::backend::{Event, Ui};
+        use crate::ui::chat::messages::{MessageView, Row};
+        use crate::ui::composer::begin_send;
+        use crate::ui::composer::edit_inline::tests::state_with;
+
+        const POSTS: &str = "/api/v1/channels/301/messages";
+
+        fn discovery(base: &str) -> Value {
+            json!({
+                "api_code_version": 1,
+                "endpoints": {
+                    "api": format!("{base}/api"), "api_client": format!("{base}/api"),
+                    "api_public": format!("{base}/api"), "gateway": "ws://127.0.0.1:1/gateway",
+                    "media": format!("{base}/media"), "webapp": base,
+                    "invite": format!("{base}/invite")
+                },
+                "captcha": {"provider": "altcha"},
+                "features": {"account_identity": "email", "voice_enabled": true},
+                "limits": {"version": 2, "rules": [{"id": "default", "overrides": {}}]},
+                "app_public": {"branding": {"product_name": "Mock"}},
+                "sso": {"enabled": false},
+                "domain_migration": {"enabled": false}
+            })
+        }
+
+        /// A mock instance and a send context for account `10` on it.
+        async fn fixture() -> (MockServer, Ctx, UnboundedReceiver<Event>) {
+            static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/.well-known/fluxer"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(discovery(&server.uri())))
+                .mount(&server)
+                .await;
+            let info = p::ClientInfo {
+                installation_id: "00000000-0000-4000-a000-000000000000".into(),
+                ..p::ClientInfo::default()
+            };
+            let instance = p::Instance::discover_with(&server.uri(), info)
+                .await
+                .expect("discovery");
+            // One token per fixture: clients of one token share their rate state.
+            let token = format!(
+                "tok-composer-{}",
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            );
+            let (tx, rx) = unbounded();
+            let (internal, _) = tokio::sync::mpsc::unbounded_channel();
+            let state = State::default();
+            state.set_session(1, "10".into(), 2000);
+            let ctx = Ctx {
+                client: p::Client::new(instance, p::Token::new(token)),
+                events: Ui::new(tx),
+                internal,
+                gen: 1,
+                state,
+            };
+            (server, ctx, rx)
+        }
+
+        fn created(content: &str, nonce: &str) -> Value {
+            json!({
+                "id": p::models::snowflake_at_ms(unix_ms()), "channel_id": "301",
+                "author": {"id": "10", "username": "me"}, "content": content, "nonce": nonce
+            })
+        }
+
+        fn outgoing() -> Outgoing {
+            Outgoing {
+                channel_id: "301".into(),
+                nonce: "777".into(),
+                content: "hi <@7>".into(),
+                mentions: Mentions {
+                    users: vec![7],
+                    ..Default::default()
+                },
+                reply_to: None,
+                silent: false,
+            }
+        }
+
+        async fn posts(server: &MockServer) -> Vec<Value> {
+            server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|r: &Request| r.method.as_str() == "POST" && r.url.path() == POSTS)
+                .map(|r| serde_json::from_slice(&r.body).unwrap())
+                .collect()
+        }
+
+        /// What the app does with the backend's events for the message list.
+        fn apply(view: &mut MessageView, rx: &mut UnboundedReceiver<Event>) {
+            while let Ok(event) = rx.try_recv() {
+                match event {
+                    Event::Messages(messages::Ev::Pending(p)) => view.upsert_pending(p),
+                    Event::Messages(messages::Ev::Sent { nonce }) => {
+                        view.sent(&nonce);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        fn rows(view: &mut MessageView) -> Vec<(String, bool)> {
+            let (state, ch) = state_with(json!([]));
+            view.build_rows(&state, ch)
+                .into_iter()
+                .filter_map(|r| match r {
+                    Row::Pending(p) => Some((p.nonce.clone(), p.failed.is_some())),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// A message whose first send failed unclearly more than five minutes ago.
+        fn late_unclear(ctx: &Ctx) -> RetryPlan {
+            ctx.state.remember_send(ctx.gen, &outgoing());
+            ctx.state.mark_failed(ctx.gen, "777", true);
+            let later = Instant::now() + Duration::from_secs(6 * 60);
+            let plan = ctx.retry_plan("301".into(), "777".into(), "hi <@7>".into(), later);
+            assert!(plan.look_since_ms.is_some(), "a late retry looks first");
+            plan
+        }
+
+        /// A message list with the message's failed row.
+        fn failed_row() -> MessageView {
+            let mut view = MessageView::new();
+            let mut failed = crate::ui::composer::pending_of(&outgoing());
+            failed.failed = Some("timed out".into());
+            view.upsert_pending(failed);
+            view
+        }
+
+        #[tokio::test]
+        async fn send_and_retry_go_through_the_app_wiring() {
+            let (server, ctx, mut rx) = fixture().await;
+            Mock::given(method("POST"))
+                .and(path(POSTS))
+                .respond_with(ResponseTemplate::new(503))
+                .up_to_n_times(1)
+                .with_priority(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path(POSTS))
+                .respond_with(ResponseTemplate::new(200).set_body_json(created("hi <@7>", "777")))
+                .mount(&server)
+                .await;
+
+            // The composer's send: the row is in the list before the command goes out.
+            let mut view = MessageView::new();
+            let Cmd::Send(message) = begin_send(&mut view, outgoing()) else {
+                panic!("a send");
+            };
+            assert_eq!(rows(&mut view), [("777".to_owned(), false)]);
+            // What `Backend::send` runs. The server fails: the row shows Retry.
+            ctx.clone().send(message).await;
+            apply(&mut view, &mut rx);
+            assert_eq!(rows(&mut view), [("777".to_owned(), true)]);
+
+            // Retry in the row: the message list's command, then the backend's resend.
+            let Some(messages::Cmd::Resend {
+                channel_id,
+                nonce,
+                text,
+            }) = view.retry("777")
+            else {
+                panic!("a failed row retries");
+            };
+            assert_eq!(rows(&mut view), [("777".to_owned(), false)]);
+            let plan = ctx.retry_plan(channel_id, nonce, text, Instant::now());
+            assert!(plan.look_since_ms.is_none(), "within the nonce window");
+            ctx.clone().resend(plan).await;
+            apply(&mut view, &mut rx);
+            assert!(rows(&mut view).is_empty(), "the server took it");
+
+            let sent = posts(&server).await;
+            assert_eq!(sent.len(), 2);
+            for body in &sent {
+                assert_eq!(body["nonce"], "777", "the same nonce both times");
+                assert_eq!(body["allowed_mentions"]["users"], json!(["7"]));
+                assert_eq!(body["allowed_mentions"]["parse"], json!([]));
+            }
+        }
+
+        #[tokio::test]
+        async fn a_late_retry_finds_the_message_by_its_text_and_does_not_send_it_again() {
+            let (server, ctx, mut rx) = fixture().await;
+            let plan = late_unclear(&ctx);
+            // The first attempt did arrive. A list has no nonce.
+            let copy = json!({
+                "id": p::models::snowflake_at_ms(unix_ms() + 500), "channel_id": "301",
+                "author": {"id": "10", "username": "me"}, "content": "hi <@7>"
+            });
+            Mock::given(method("GET"))
+                .and(path(POSTS))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!([copy])))
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path(POSTS))
+                .respond_with(ResponseTemplate::new(200).set_body_json(created("hi <@7>", "777")))
+                .mount(&server)
+                .await;
+            let mut view = failed_row();
+            ctx.clone().resend(plan).await;
+            apply(&mut view, &mut rx);
+            assert!(posts(&server).await.is_empty(), "not posted twice");
+            assert!(rows(&mut view).is_empty(), "the row counts as sent");
+        }
+
+        #[tokio::test]
+        async fn a_late_retry_without_a_copy_sends_with_the_same_nonce() {
+            let (server, ctx, mut rx) = fixture().await;
+            let plan = late_unclear(&ctx);
+            let at = p::models::snowflake_at_ms(unix_ms() + 500);
+            // Someone else wrote the same; this account wrote something else.
+            let list = json!([
+                {"id": at, "channel_id": "301", "author": {"id": "20", "username": "ada"},
+                 "content": "hi <@7>"},
+                {"id": at, "channel_id": "301", "author": {"id": "10", "username": "me"},
+                 "content": "hi"}
+            ]);
+            Mock::given(method("GET"))
+                .and(path(POSTS))
+                .respond_with(ResponseTemplate::new(200).set_body_json(list))
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path(POSTS))
+                .respond_with(ResponseTemplate::new(200).set_body_json(created("hi <@7>", "777")))
+                .mount(&server)
+                .await;
+
+            let mut view = failed_row();
+            ctx.clone().resend(plan).await;
+            let sent = posts(&server).await;
+            assert_eq!(sent.len(), 1, "sent again");
+            assert_eq!(sent[0]["nonce"], "777");
+            assert_eq!(sent[0]["allowed_mentions"]["users"], json!(["7"]));
+            apply(&mut view, &mut rx);
+            assert!(rows(&mut view).is_empty(), "the server took it");
+            // The look asked only for messages since the first send.
+            let lookups: Vec<_> = server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|r| r.method.as_str() == "GET" && r.url.path() == POSTS)
+                .collect();
+            assert_eq!(lookups.len(), 1);
+            assert!(lookups[0].url.query().is_some_and(|q| q.contains("after=")));
         }
     }
 }

@@ -101,8 +101,20 @@ pub struct State(Arc<Mutex<Inner>>);
 struct SentMessage {
     message: Outgoing,
     first: Instant,
-    /// The last failure may have reached the server.
+    /// The first send's wall-clock time, in Unix milliseconds: copies are looked for
+    /// from there on.
+    first_ms: u64,
+    /// Some failure may have reached the server. Once set, it stays: a later clear
+    /// refusal does not prove that the first attempt did not arrive.
     ambiguous: bool,
+}
+
+/// How a Retry goes out.
+pub struct RetryPlan {
+    pub message: Outgoing,
+    /// Look for a copy that arrived after all before sending, from this Unix time in
+    /// milliseconds on (the first send's time).
+    pub look_since_ms: Option<u64>,
 }
 
 #[derive(Default)]
@@ -121,24 +133,31 @@ pub fn look_before_retry(ambiguous: bool, since_first: Duration) -> bool {
 }
 
 impl State {
-    /// The state of session `gen`; anything from another session is dropped first.
-    fn of(&self, gen: u64) -> MutexGuard<'_, Inner> {
+    /// The state of session `gen`. A newer session drops what an older one left; a
+    /// late task of an older session gets `None` and changes nothing (generations only
+    /// grow).
+    fn of(&self, gen: u64) -> Option<MutexGuard<'_, Inner>> {
         let mut inner = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        if inner.gen != gen {
+        if gen < inner.gen {
+            return None;
+        }
+        if gen > inner.gen {
             *inner = Inner {
                 gen,
                 ..Inner::default()
             };
         }
-        inner
+        Some(inner)
     }
 
     pub fn session(&self, gen: u64) -> Option<(String, usize)> {
-        self.of(gen).session.clone()
+        self.of(gen)?.session.clone()
     }
 
     pub fn set_session(&self, gen: u64, user_id: String, max_len: usize) {
-        self.of(gen).session = Some((user_id, max_len));
+        if let Some(mut inner) = self.of(gen) {
+            inner.session = Some((user_id, max_len));
+        }
     }
 
     /// Takes the guild of an open search with this nonce.
@@ -150,7 +169,9 @@ impl State {
 
     /// Keeps a message being sent, once (a retry keeps its first time).
     pub fn remember_send(&self, gen: u64, message: &Outgoing) {
-        let mut inner = self.of(gen);
+        let Some(mut inner) = self.of(gen) else {
+            return;
+        };
         if inner
             .outbox
             .iter()
@@ -164,34 +185,44 @@ impl State {
         inner.outbox.push_back(SentMessage {
             message: message.clone(),
             first: Instant::now(),
+            first_ms: unix_ms(),
             ambiguous: false,
         });
     }
 
     pub fn mark_failed(&self, gen: u64, nonce: &str, ambiguous: bool) {
-        if let Some(s) = self
-            .of(gen)
-            .outbox
-            .iter_mut()
-            .find(|s| s.message.nonce == nonce)
-        {
-            s.ambiguous = ambiguous;
+        let Some(mut inner) = self.of(gen) else {
+            return;
+        };
+        if let Some(s) = inner.outbox.iter_mut().find(|s| s.message.nonce == nonce) {
+            s.ambiguous |= ambiguous;
         }
     }
 
     pub fn forget_send(&self, gen: u64, nonce: &str) {
-        self.of(gen).outbox.retain(|s| s.message.nonce != nonce);
+        if let Some(mut inner) = self.of(gen) {
+            inner.outbox.retain(|s| s.message.nonce != nonce);
+        }
     }
 
-    /// The message to send again for a Retry, and whether to look for it first.
-    pub fn retry_of(&self, gen: u64, nonce: &str) -> Option<(Outgoing, bool)> {
-        let inner = self.of(gen);
+    /// The message to send again for a Retry at `now`, and whether to look for it
+    /// first. `None` for a message this session's composer did not send.
+    pub fn retry_of(&self, gen: u64, nonce: &str, now: Instant) -> Option<RetryPlan> {
+        let inner = self.of(gen)?;
         let s = inner.outbox.iter().find(|s| s.message.nonce == nonce)?;
-        Some((
-            s.message.clone(),
-            look_before_retry(s.ambiguous, s.first.elapsed()),
-        ))
+        let late = look_before_retry(s.ambiguous, now.saturating_duration_since(s.first));
+        Some(RetryPlan {
+            message: s.message.clone(),
+            look_since_ms: late.then_some(s.first_ms),
+        })
     }
+}
+
+/// The wall clock in Unix milliseconds.
+pub fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
 }
 
 pub fn members_chunk(state: &State, events: &Ui, chunk: &p::models::GuildMembersChunk) {
@@ -250,7 +281,9 @@ impl Backend {
                     Some(&nonce),
                 );
                 if sent {
-                    let mut inner = self.composer.of(r.gen);
+                    let Some(mut inner) = self.composer.of(r.gen) else {
+                        return;
+                    };
                     if inner.searches.len() >= MAX_SEARCHES {
                         inner.searches.pop_front();
                     }
@@ -285,18 +318,48 @@ mod tests {
     fn a_retry_sends_the_message_as_it_was_first_sent() {
         let state = State::default();
         state.remember_send(1, &outgoing("n1"));
-        let (again, look) = state.retry_of(1, "n1").unwrap();
+        let plan = state.retry_of(1, "n1", Instant::now()).unwrap();
         assert_eq!(
-            again,
+            plan.message,
             outgoing("n1"),
             "mentions, reply and @silent are kept"
         );
-        assert!(!look);
+        assert!(plan.look_since_ms.is_none());
         state.forget_send(1, "n1");
-        assert!(state.retry_of(1, "n1").is_none());
-        // Another session forgets everything.
+        assert!(state.retry_of(1, "n1", Instant::now()).is_none());
+        // A newer session forgets everything.
         state.remember_send(1, &outgoing("n2"));
-        assert!(state.retry_of(2, "n2").is_none());
+        assert!(state.retry_of(2, "n2", Instant::now()).is_none());
+    }
+
+    #[test]
+    fn an_unclear_failure_stays_unclear() {
+        let state = State::default();
+        state.remember_send(1, &outgoing("n1"));
+        state.mark_failed(1, "n1", true);
+        // A Retry within the nonce window got a clear refusal (a rate limit).
+        state.mark_failed(1, "n1", false);
+        let late = Instant::now() + Duration::from_secs(6 * 60);
+        let plan = state.retry_of(1, "n1", late).unwrap();
+        assert!(
+            plan.look_since_ms.is_some(),
+            "the first attempt may still have arrived"
+        );
+    }
+
+    #[test]
+    fn a_late_task_of_an_older_session_changes_nothing() {
+        let state = State::default();
+        state.set_session(2, "42".into(), 4000);
+        state.remember_send(2, &outgoing("n2"));
+        // A send of session 1 finishes after session 2 started.
+        state.forget_send(1, "n2");
+        state.mark_failed(1, "n2", true);
+        state.set_session(1, "7".into(), 2000);
+        assert_eq!(state.session(2), Some(("42".to_owned(), 4000)));
+        assert!(state.session(1).is_none());
+        let plan = state.retry_of(2, "n2", Instant::now()).unwrap();
+        assert_eq!(plan.message, outgoing("n2"));
     }
 
     #[test]
