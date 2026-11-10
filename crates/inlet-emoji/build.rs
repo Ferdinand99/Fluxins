@@ -51,8 +51,9 @@ fn str_list(values: &[Value]) -> String {
 fn main() {
     println!("cargo:rerun-if-changed=data/emojis.json");
     println!("cargo:rerun-if-changed=build.rs");
+    let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let root: Value = serde_json::from_str(
-        &fs::read_to_string("data/emojis.json").expect("read data/emojis.json"),
+        &fs::read_to_string(manifest.join("data/emojis.json")).expect("read data/emojis.json"),
     )
     .expect("parse data/emojis.json");
     let categories = root["categories"].as_object().expect("categories object");
@@ -68,14 +69,30 @@ fn main() {
     let mut skins: Vec<(String, [String; 5])> = Vec::new();
     let mut extra: Vec<String> = Vec::new();
     let mut total = 0usize;
+    let mut seen_names = std::collections::HashSet::new();
 
     for (key, variant) in CATEGORIES {
-        let list = categories[key].as_array().expect("category array");
+        let list = categories
+            .get(key)
+            .and_then(Value::as_array)
+            .unwrap_or_else(|| panic!("category {key} missing from data/emojis.json"));
         let start = total;
         for entry in list {
             let glyph = entry["surrogates"].as_str().expect("surrogates");
             let names = entry["names"].as_array().expect("names");
             assert!(!names.is_empty(), "emoji without a name: {glyph}");
+            for name in names {
+                let name = name.as_str().expect("name");
+                // search.rs compares names as they are.
+                assert!(
+                    name.to_lowercase() == name,
+                    "name {name:?} is not lower case"
+                );
+                assert!(
+                    seen_names.insert(name.to_owned()),
+                    "duplicate name {name:?}"
+                );
+            }
             let skin_list = entry.get("skins").and_then(Value::as_array);
             let has_skins = skin_list.is_some_and(|s| !s.is_empty());
             let _ = writeln!(
@@ -84,10 +101,17 @@ fn main() {
                 lit(glyph),
                 str_list(names),
             );
-            let kw = entry
-                .get("keywords")
-                .and_then(Value::as_array)
-                .map_or_else(|| "&[]".to_owned(), |k| str_list(k));
+            let kw = entry.get("keywords").and_then(Value::as_array).map_or_else(
+                || "&[]".to_owned(),
+                |k| {
+                    // Lower case here, so that search does not copy them at run time.
+                    let lowered: Vec<Value> = k
+                        .iter()
+                        .map(|v| Value::from(v.as_str().expect("keyword").to_lowercase()))
+                        .collect();
+                    str_list(&lowered)
+                },
+            );
             let _ = writeln!(keywords, "    {kw},");
             if let Some(list) = skin_list.filter(|s| !s.is_empty()) {
                 assert!(

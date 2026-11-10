@@ -202,7 +202,9 @@ pub(crate) fn strip_fe0f(glyph: &str) -> Cow<'_, str> {
     }
 }
 
-/// The emoji for a glyph, ignoring `U+FE0F`. Skin tone variants give the base emoji.
+/// The emoji for a glyph, ignoring `U+FE0F`. The five single-tone variants give the base
+/// emoji; the mixed-tone couples are not mapped (they are only known to [`glyphs`],
+/// [`crate::emoji_only`] and [`crate::twemoji_svg`]).
 #[must_use]
 pub fn by_glyph(glyph: &str) -> Option<&'static Emoji> {
     static BY_GLYPH: OnceLock<HashMap<String, usize>> = OnceLock::new();
@@ -258,6 +260,7 @@ pub fn with_skin_tone(emoji: &Emoji, tone: SkinTone) -> Cow<'static, str> {
     }
 }
 
+/// Search keywords of the emoji at `index`, lower case.
 pub(crate) fn keywords(index: usize) -> &'static [&'static str] {
     KEYWORDS[index]
 }

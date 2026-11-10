@@ -5,3 +5,4 @@
 *.ttf binary
 *.otf binary
 *.woff2 binary
+*.pack binary

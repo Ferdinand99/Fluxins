@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Shortcode search. The tiers and the order inside a tier follow Fluxer's emoji search
 //! (`EmojiSearchIndex.ts`), without the frecency boost: Inlet has no usage history yet.
+//!
+//! `build.rs` guarantees that every name and keyword is lower case, so the data is
+//! compared as it is.
 
 use std::sync::OnceLock;
 
-use crate::data::{all, Emoji};
+use crate::data::{all, keywords, Emoji};
 
 /// How well a query matches, best first.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -17,99 +20,86 @@ enum Tier {
     KeywordSubstring,
 }
 
-struct Meta {
-    lower_names: Vec<String>,
-    /// Names without `_` and `-`, so that `thumbsup` finds `thumbs_up`.
-    compact_names: Vec<String>,
-    lower_keywords: Vec<String>,
+fn is_compact_char(c: char) -> bool {
+    !matches!(c, '_' | '-')
 }
 
+/// A name without `_` and `-`, so that `thumbsup` finds `thumbs_up`.
 fn compact(text: &str) -> String {
-    text.chars().filter(|c| !matches!(c, '_' | '-')).collect()
+    text.chars().filter(|&c| is_compact_char(c)).collect()
 }
 
-fn metas() -> &'static [Meta] {
-    static METAS: OnceLock<Vec<Meta>> = OnceLock::new();
-    METAS.get_or_init(|| {
+/// Per emoji and name, the compact form, kept only where it differs from the name.
+fn compact_names() -> &'static [Vec<Option<String>>] {
+    static COMPACT: OnceLock<Vec<Vec<Option<String>>>> = OnceLock::new();
+    COMPACT.get_or_init(|| {
         all()
             .iter()
-            .enumerate()
-            .map(|(index, emoji)| {
-                let lower_names: Vec<String> =
-                    emoji.names.iter().map(|n| n.to_lowercase()).collect();
-                Meta {
-                    compact_names: lower_names.iter().map(|n| compact(n)).collect(),
-                    lower_names,
-                    lower_keywords: crate::data::keywords(index)
-                        .iter()
-                        .map(|k| k.to_lowercase())
-                        .collect(),
-                }
+            .map(|emoji| {
+                emoji
+                    .names
+                    .iter()
+                    .map(|name| name.contains(['_', '-']).then(|| compact(name)))
+                    .collect()
             })
             .collect()
     })
 }
 
 fn is_boundary(byte: Option<u8>) -> bool {
-    byte.is_none_or(|b| b == b'_' || b.is_ascii_uppercase())
+    byte.is_none_or(|b| b == b'_')
 }
 
-/// `query` found in `name` between word boundaries (`_` or a capital), allowing a plural
-/// `s` after it.
-fn has_word_match(name: &str, lower_name: &str, query: &str) -> bool {
-    if name.len() != lower_name.len() {
-        return false;
-    }
+/// `query` found in `name` between word boundaries (`_`), allowing a plural `s` after it.
+fn has_word_match(name: &str, query: &str) -> bool {
     let bytes = name.as_bytes();
-    let lower = lower_name.as_bytes();
     let mut from = 0;
-    while let Some(found) = lower_name[from..].find(query) {
+    while let Some(found) = name[from..].find(query) {
         let start = from + found;
         let end = start + query.len();
         if is_boundary(start.checked_sub(1).map(|i| bytes[i])) {
             if is_boundary(bytes.get(end).copied()) {
                 return true;
             }
-            if lower.get(end) == Some(&b's') && is_boundary(bytes.get(end + 1).copied()) {
+            if bytes.get(end) == Some(&b's') && is_boundary(bytes.get(end + 1).copied()) {
                 return true;
             }
         }
         from = start + 1;
-        while !lower_name.is_char_boundary(from) {
+        while !name.is_char_boundary(from) {
             from += 1;
         }
     }
     false
 }
 
-fn tier(emoji: &Emoji, meta: &Meta, query: &str, compact_query: &str) -> Option<Tier> {
-    if meta.lower_names.iter().any(|n| n == query) {
+fn tier(index: usize, emoji: &Emoji, query: &str, compact_query: &str) -> Option<Tier> {
+    if emoji.names.contains(&query) {
         return Some(Tier::ExactName);
     }
-    let prefix = |i: usize| {
-        meta.lower_names[i].starts_with(query)
-            || (!compact_query.is_empty() && meta.compact_names[i].starts_with(compact_query))
+    let compact_of = |i: usize| -> &str {
+        compact_names()[index][i]
+            .as_deref()
+            .unwrap_or(emoji.names[i])
     };
-    if (0..meta.lower_names.len()).any(prefix) {
+    let compact_ok = !compact_query.is_empty();
+    let mut names = 0..emoji.names.len();
+    if names.clone().any(|i| {
+        emoji.names[i].starts_with(query)
+            || (compact_ok && compact_of(i).starts_with(compact_query))
+    }) {
         return Some(Tier::NamePrefix);
     }
-    if emoji
-        .names
-        .iter()
-        .zip(&meta.lower_names)
-        .any(|(name, lower)| has_word_match(name, lower, query))
-    {
+    if emoji.names.iter().any(|name| has_word_match(name, query)) {
         return Some(Tier::NameWord);
     }
-    let contains = |i: usize| {
-        meta.lower_names[i].contains(query)
-            || (!compact_query.is_empty() && meta.compact_names[i].contains(compact_query))
-    };
-    if (0..meta.lower_names.len()).any(contains) {
+    if names.any(|i| {
+        emoji.names[i].contains(query) || (compact_ok && compact_of(i).contains(compact_query))
+    }) {
         return Some(Tier::NameSubstring);
     }
     let mut keyword_substring = false;
-    for keyword in &meta.lower_keywords {
+    for keyword in keywords(index) {
         if keyword.starts_with(query) {
             return Some(Tier::KeywordPrefix);
         }
@@ -137,9 +127,9 @@ pub fn search(query: &str, limit: usize) -> Vec<&'static Emoji> {
     }
     let compact_query = compact(&query);
     let mut hits: Vec<(Tier, &str, usize)> = Vec::new();
-    for (index, (emoji, meta)) in all().iter().zip(metas()).enumerate() {
-        if let Some(tier) = tier(emoji, meta, &query, &compact_query) {
-            hits.push((tier, &meta.lower_names[0], index));
+    for (index, emoji) in all().iter().enumerate() {
+        if let Some(tier) = tier(index, emoji, &query, &compact_query) {
+            hits.push((tier, emoji.names[0], index));
         }
     }
     hits.sort_unstable();

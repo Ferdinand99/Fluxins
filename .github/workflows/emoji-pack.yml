@@ -1,0 +1,74 @@
+name: Emoji pack
+
+# The Twemoji drawings in crates/inlet-emoji/assets/twemoji.pack must be exactly what
+# examples/pack_twemoji.rs makes from the pinned upstream files.
+
+on:
+  push:
+    branches: [v0, main]
+    paths:
+      - "crates/inlet-emoji/**"
+      - "rust-toolchain.toml"
+      - ".github/workflows/emoji-pack.yml"
+  pull_request:
+    branches: [v0, main]
+    paths:
+      - "crates/inlet-emoji/**"
+      - "rust-toolchain.toml"
+      - ".github/workflows/emoji-pack.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: emoji-pack-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  RUSTUP_MAX_RETRIES: 10
+  # jdecked/twemoji v17.0.2, see crates/inlet-emoji/SOURCES.md.
+  TWEMOJI_COMMIT: 388f518b756404152f128a3539f5e7f9a6f1ebd6
+  TWEMOJI_ARCHIVE_SHA256: 097e9b665da40c8bda2730bf1fe6b1efa71316adc3b6bffceabe7d24eaa49d03
+
+jobs:
+  pack:
+    name: Twemoji pack matches the pinned drawings
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned Rust toolchain
+        run: |
+          rustup toolchain install
+          rustc --version
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          prefix-key: v0-emoji-pack
+
+      - name: Download the pinned Twemoji archive
+        run: |
+          mkdir -p "$RUNNER_TEMP/twemoji"
+          curl -fsSL -o "$RUNNER_TEMP/twemoji.tar.gz" \
+            "https://github.com/jdecked/twemoji/archive/${TWEMOJI_COMMIT}.tar.gz"
+          echo "${TWEMOJI_ARCHIVE_SHA256}  $RUNNER_TEMP/twemoji.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/twemoji.tar.gz" -C "$RUNNER_TEMP/twemoji" \
+            --strip-components=3 "twemoji-${TWEMOJI_COMMIT}/assets/svg"
+          ls "$RUNNER_TEMP/twemoji" | wc -l
+
+      - name: Rebuild the pack
+        run: |
+          cargo run --release --locked -p inlet-emoji --example pack_twemoji -- \
+            "$RUNNER_TEMP/twemoji" "$RUNNER_TEMP/twemoji.pack"
+
+      - name: Compare with the committed pack
+        run: |
+          sha256sum "$RUNNER_TEMP/twemoji.pack" crates/inlet-emoji/assets/twemoji.pack
+          cmp "$RUNNER_TEMP/twemoji.pack" crates/inlet-emoji/assets/twemoji.pack
