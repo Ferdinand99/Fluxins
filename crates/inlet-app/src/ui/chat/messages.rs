@@ -45,7 +45,10 @@ pub enum Row {
     /// The start of the channel ("Welcome to #general!").
     Welcome(WelcomeRow),
     /// A date separator; `new` when the first unread message is also the first of the day.
-    Day { day: NaiveDate, new: bool },
+    Day {
+        day: NaiveDate,
+        new: bool,
+    },
     /// The unread line with "NEW".
     Unread,
     Message(Box<MessageRow>),
@@ -114,7 +117,10 @@ pub struct MessageRow {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReplyState {
-    Loaded { author: String, snippet: String },
+    Loaded {
+        author: String,
+        snippet: String,
+    },
     /// The message replied to was deleted.
     Deleted,
     /// The server did not send it.
@@ -218,12 +224,15 @@ impl OlderPager {
     }
 }
 
+/// Converted messages of one channel, with the edit time each was converted from.
+type Conversions = HashMap<MessageId, (Option<String>, Rc<Message>)>;
+
 /// The message list's view state.
 #[derive(Default)]
 pub struct MessageView {
     pub rows: Vec<Row>,
     /// Converted messages per channel, with the edit time they were converted from.
-    rendered: HashMap<ChannelId, HashMap<MessageId, (Option<String>, Rc<Message>)>>,
+    rendered: HashMap<ChannelId, Conversions>,
     outbox: Vec<OutboxEntry>,
     /// The account's read position when the channel was opened: the "NEW" line goes
     /// above the first message after it.
@@ -330,11 +339,11 @@ fn name_color(state: &AccountState, guild: Option<GuildId>, m: &p::Message) -> O
         .map(|r| (r.color & 0xFF_FF_FF) as u32)
 }
 
-fn tag(channel: Option<&p::Channel>, m: &p::Message) -> Option<Tag> {
+fn tag(channel: Option<&p::Channel>, m: &p::Message, shown: &Message) -> Option<Tag> {
     if m.author.system {
         return Some(Tag::System);
     }
-    if m.author.bot || m.webhook_id().is_some() {
+    if shown.author_bot || m.webhook_id().is_some() {
         return Some(Tag::Bot);
     }
     let thread = channel.filter(|c| {
@@ -646,8 +655,8 @@ impl MessageView {
                     prev = Some((m, ms, day));
                     continue;
                 }
-                let grouped = !first_unread
-                    && prev.is_some_and(|(pm, pms, _)| groups_with(pm, pms, m, ms));
+                let grouped =
+                    !first_unread && prev.is_some_and(|(pm, pms, _)| groups_with(pm, pms, m, ms));
                 rows.push(Row::Message(Box::new(MessageRow {
                     id,
                     grouped,
@@ -655,7 +664,7 @@ impl MessageView {
                     jumped: self.jumped.is_some_and(|(j, _)| j == id),
                     revealed: self.revealed.contains(&id),
                     name_color: name_color(state, guild, m),
-                    tag: tag(channel, m),
+                    tag: tag(channel, m, &shown),
                     reply: reply_of(m, &shown),
                     clock: time::clock(ms),
                     message: Shown(shown),
@@ -961,9 +970,7 @@ impl Inlet {
     /// Ticks the account state about once a second (typing, timeouts, load timeouts).
     fn start_ticker(&mut self, cx: &mut Context<Self>) {
         self.chat.view.ticker = Some(cx.spawn(async move |this, cx| loop {
-            cx.background_executor()
-                .timer(Duration::from_secs(1))
-                .await;
+            cx.background_executor().timer(Duration::from_secs(1)).await;
             let alive = this.update(cx, |this, cx| this.tick_account(cx));
             if alive.is_err() {
                 break;
@@ -1113,12 +1120,7 @@ mod tests {
         assert!(groups_with(&a, t0, &same, t0 + 60_000));
         assert!(groups_with(&a, t0, &same, t0 + model::GROUP_WINDOW_MS));
         // Seven minutes is the edge.
-        assert!(!groups_with(
-            &a,
-            t0,
-            &same,
-            t0 + model::GROUP_WINDOW_MS + 1
-        ));
+        assert!(!groups_with(&a, t0, &same, t0 + model::GROUP_WINDOW_MS + 1));
         // Another account with the same display name.
         let other = raw(3, "8", json!({}));
         assert!(!groups_with(&a, t0, &other, t0 + 1_000));
@@ -1178,7 +1180,11 @@ mod tests {
         let mut state = state_with_roles(&["30"], json!([]));
         let role_ping = raw(1, "7", json!({"mention_roles": ["30"]}));
         let other_role = raw(2, "7", json!({"mention_roles": ["31"]}));
-        let me = raw(3, "7", json!({"mentions": [{"id": "10", "username": "me"}]}));
+        let me = raw(
+            3,
+            "7",
+            json!({"mentions": [{"id": "10", "username": "me"}]}),
+        );
         let everyone = raw(4, "7", json!({"mention_everyone": true}));
         let plain = raw(5, "7", json!({}));
         assert!(mentions_me(&state, ch, &role_ping));
@@ -1278,9 +1284,15 @@ mod tests {
             day: NaiveDate::from_ymd_opt(2026, 10, d).unwrap(),
             new: false,
         };
-        assert_eq!(splice_range(&[day(1), a.clone()], &[day(1), a.clone()]), None);
+        assert_eq!(
+            splice_range(&[day(1), a.clone()], &[day(1), a.clone()]),
+            None
+        );
         // Appended at the end.
-        assert_eq!(splice_range(&[day(1)], &[day(1), a.clone()]), Some((1..1, 1)));
+        assert_eq!(
+            splice_range(&[day(1)], &[day(1), a.clone()]),
+            Some((1..1, 1))
+        );
         // Prepended (an older page).
         assert_eq!(splice_range(&[day(2)], &[day(1), day(2)]), Some((0..0, 1)));
         // One changed in the middle.
@@ -1289,7 +1301,10 @@ mod tests {
             Some((1..2, 1))
         );
         // Removed.
-        assert_eq!(splice_range(&[day(1), a.clone()], &[day(1)]), Some((1..2, 0)));
+        assert_eq!(
+            splice_range(&[day(1), a.clone()], &[day(1)]),
+            Some((1..2, 0))
+        );
         assert_eq!(splice_range(&[], &[a]), Some((0..0, 1)));
     }
 
@@ -1313,15 +1328,21 @@ mod tests {
         // A slow server: one request at a time.
         let mut pager = OlderPager::default();
         assert!(pager.request(0, true, false, Some(MessageId(5))).is_some());
-        assert!(pager.request(5_000, true, false, Some(MessageId(5))).is_none());
+        assert!(pager
+            .request(5_000, true, false, Some(MessageId(5)))
+            .is_none());
         pager.done();
-        assert!(pager.request(5_000, true, false, Some(MessageId(5))).is_some());
+        assert!(pager
+            .request(5_000, true, false, Some(MessageId(5)))
+            .is_some());
 
         // At the start of the channel, or while the newest page loads: never.
         let mut pager = OlderPager::default();
         for i in 0..1_000i64 {
             let now = i * 1_000;
-            assert!(pager.request(now, false, false, Some(MessageId(5))).is_none());
+            assert!(pager
+                .request(now, false, false, Some(MessageId(5)))
+                .is_none());
             assert!(pager.request(now, true, true, Some(MessageId(5))).is_none());
         }
     }

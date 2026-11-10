@@ -126,7 +126,8 @@ pub(crate) fn demo_names(channels: &HashMap<Option<String>, Vec<Channel>>) -> Na
         n.users.insert(user_id(name), name.to_string());
     }
     n.roles.insert(ROLE_MODERATORS.into(), "Moderators".into());
-    n.roles.insert(ROLE_CONTRIBUTORS.into(), "Contributors".into());
+    n.roles
+        .insert(ROLE_CONTRIBUTORS.into(), "Contributors".into());
     n
 }
 
@@ -212,7 +213,13 @@ pub(crate) fn message_at(
 }
 
 /// A message at `HH:MM` on the demo day.
-pub(crate) fn msg(seq: u64, channel_id: &str, author: &str, time: &str, content: &str) -> p::Message {
+pub(crate) fn msg(
+    seq: u64,
+    channel_id: &str,
+    author: &str,
+    time: &str,
+    content: &str,
+) -> p::Message {
     message_at(seq, channel_id, author, at(time), content, json!({}))
 }
 
@@ -248,9 +255,7 @@ fn live(seq: u64, channel_id: &str, author: &str, content: &str, extra: Value) -
 fn page_of(list: &[p::Message], before: Option<MessageId>) -> Vec<p::Message> {
     let mut older: Vec<&p::Message> = list
         .iter()
-        .filter(|m| {
-            before.is_none_or(|b| MessageId::parse(&m.id).is_some_and(|id| id < b))
-        })
+        .filter(|m| before.is_none_or(|b| MessageId::parse(&m.id).is_some_and(|id| id < b)))
         .collect();
     older.sort_by_key(|m| std::cmp::Reverse(MessageId::parse(&m.id)));
     older

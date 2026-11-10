@@ -27,7 +27,9 @@ impl Inlet {
         if self.chat.message_list.item_is_above_viewport(divider) != Some(true) {
             return None;
         }
-        let text = if view.unread_count > MAX_COUNTED {
+        let text = if view.unread_count == 1 {
+            t!("chat-new-message", since = time::full(view.unread_since_ms))
+        } else if view.unread_count > MAX_COUNTED {
             t!(
                 "chat-new-messages-many",
                 count = MAX_COUNTED,

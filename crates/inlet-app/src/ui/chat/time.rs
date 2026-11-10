@@ -60,9 +60,9 @@ impl LocaleFormat {
             ("ko" | "hu", _) => (YearMonthDay, '.'),
             ("nl", _) => (DayMonthYear, '-'),
             (
-                "de" | "nb" | "nn" | "no" | "da" | "fi" | "ru" | "uk" | "pl" | "cs" | "sk"
-                | "tr" | "ro" | "hr" | "sl" | "sr" | "bg" | "et" | "lv" | "is" | "be" | "kk"
-                | "az" | "mk" | "sq",
+                "de" | "nb" | "nn" | "no" | "da" | "fi" | "ru" | "uk" | "pl" | "cs" | "sk" | "tr"
+                | "ro" | "hr" | "sl" | "sr" | "bg" | "et" | "lv" | "is" | "be" | "kk" | "az" | "mk"
+                | "sq",
                 _,
             ) => (DayMonthYear, '.'),
             _ => (DayMonthYear, '/'),
@@ -138,7 +138,9 @@ pub fn full(ms: i64) -> String {
 
 /// The time alone, as beside grouped messages and in compact mode.
 pub fn clock(ms: i64) -> String {
-    local(ms).map(|t| system().time(t.time())).unwrap_or_default()
+    local(ms)
+        .map(|t| system().time(t.time()))
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -166,7 +168,13 @@ mod tests {
         assert_eq!(fmt(""), "10/01/2026, 11:52 PM");
         assert_eq!(fmt("zh-Hant-TW"), "2026/10/01, 11:52 PM");
         let f = LocaleFormat::for_locale("en-US");
-        assert_eq!(f.time(NaiveTime::from_hms_opt(0, 5, 0).unwrap()), "12:05 AM");
-        assert_eq!(f.time(NaiveTime::from_hms_opt(12, 0, 0).unwrap()), "12:00 PM");
+        assert_eq!(
+            f.time(NaiveTime::from_hms_opt(0, 5, 0).unwrap()),
+            "12:05 AM"
+        );
+        assert_eq!(
+            f.time(NaiveTime::from_hms_opt(12, 0, 0).unwrap()),
+            "12:00 PM"
+        );
     }
 }

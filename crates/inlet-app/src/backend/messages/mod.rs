@@ -30,20 +30,13 @@ pub const PAGE_SIZE: u8 = 50;
 
 pub enum Cmd {
     /// Load channels for a guild, or DMs when `guild_id` is `None`.
-    OpenGuild {
-        guild_id: Option<String>,
-    },
+    OpenGuild { guild_id: Option<String> },
     /// Load the newest page of a channel. The UI opens the channel's window with
     /// `AccountState::begin_load` first.
-    OpenChannel {
-        channel_id: String,
-    },
+    OpenChannel { channel_id: String },
     /// Load the page before `before` (the person scrolled to the top). At most one runs
     /// at a time, and the backend drops requests that come within a second of the last.
-    LoadOlder {
-        channel_id: String,
-        before: String,
-    },
+    LoadOlder { channel_id: String, before: String },
 }
 
 /// A message being sent, or one that could not be sent.
@@ -75,7 +68,10 @@ pub enum Ev {
         rendered: Vec<Message>,
     },
     /// Loading a page failed; the reason was reported as an error.
-    PageFailed { channel_id: String, older: bool },
+    PageFailed {
+        channel_id: String,
+        older: bool,
+    },
     /// A message this account sent, converted from the REST answer. The gateway's
     /// MESSAGE_CREATE brings it into the account state.
     MessageCreated(Message),

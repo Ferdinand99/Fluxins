@@ -171,34 +171,50 @@ fn joins() -> Vec<p::Message> {
 
 /// Every system message type, and one Inlet does not know.
 fn system() -> Vec<p::Message> {
-    let with = |seq: u64,
-                author: &str,
-                time: &str,
-                kind: i64,
-                content: &str,
-                extra: serde_json::Value| {
-        let mut fields = json!({ "type": kind });
-        if let (Some(obj), Some(more)) = (fields.as_object_mut(), extra.as_object()) {
-            for (k, v) in more {
-                obj.insert(k.clone(), v.clone());
+    let with =
+        |seq: u64, author: &str, time: &str, kind: i64, content: &str, extra: serde_json::Value| {
+            let mut fields = json!({ "type": kind });
+            if let (Some(obj), Some(more)) = (fields.as_object_mut(), extra.as_object()) {
+                for (k, v) in more {
+                    obj.insert(k.clone(), v.clone());
+                }
             }
-        }
-        msg_with(seq, "c-system", author, time, content, fields)
-    };
+            msg_with(seq, "c-system", author, time, content, fields)
+        };
     let grace = super::user("grace");
     vec![
         with(40, "linus", "10:00", 7, "", json!({})),
         with(41, "ada", "10:02", 6, "", json!({})),
-        msg(42, "c-system", "ada", "10:03", "Pinned the release notes above."),
+        msg(
+            42,
+            "c-system",
+            "ada",
+            "10:03",
+            "Pinned the release notes above.",
+        ),
         with(43, "ada", "10:05", 1, "", json!({ "mentions": [grace] })),
         with(44, "grace", "10:06", 2, "", json!({})),
         with(45, "linus", "10:08", 3, "", json!({})),
         with(46, "ada", "10:10", 4, "release-planning", json!({})),
         with(47, "ada", "10:11", 5, "", json!({})),
-        with(48, "Inlet", "10:12", 12, "Fluxer News #announcements", json!({})),
+        with(
+            48,
+            "Inlet",
+            "10:12",
+            12,
+            "Fluxer News #announcements",
+            json!({}),
+        ),
         with(49, "grace", "10:14", 18, "Release planning", json!({})),
         with(50, "grace", "10:15", 21, "", json!({})),
-        with(51, "linus", "10:16", 4242, "Whatever a newer server sends", json!({})),
+        with(
+            51,
+            "linus",
+            "10:16",
+            4242,
+            "Whatever a newer server sends",
+            json!({}),
+        ),
     ]
 }
 

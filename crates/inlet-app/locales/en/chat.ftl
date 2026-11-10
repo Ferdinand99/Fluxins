@@ -14,10 +14,8 @@ message-send-failed = Could not send: { $reason }
 message-retry = Retry
 chat-reply-not-loaded = The original message is not loaded.
 chat-new-mark = NEW
-chat-new-messages = { $count ->
-    [one] 1 new message
-   *[other] { $count } new messages
-} since { $since }
+chat-new-message = 1 new message since { $since }
+chat-new-messages = { $count } new messages since { $since }
 chat-new-messages-many = { $count }+ new messages since { $since }
 chat-mark-as-read = Mark as read
 chat-jump-to-present = Jump to present

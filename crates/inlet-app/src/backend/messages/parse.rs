@@ -223,11 +223,6 @@ pub fn to_embed(v: &serde_json::Value, names: &Names) -> Option<Embed> {
     (!empty).then_some(embed)
 }
 
-/// Snowflakes compare as numbers; a shorter string is older.
-pub fn snowflake_key(id: &str) -> (usize, &str) {
-    (id.len(), id)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

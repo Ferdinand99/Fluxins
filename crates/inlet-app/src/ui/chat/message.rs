@@ -64,11 +64,12 @@ impl Inlet {
     fn message_body(&self, row: &MessageRow, cx: &mut Context<Self>) -> gpui::Div {
         let m = &row.message;
         let ctx = self.render_ctx(row, cx);
-        let mut body = div().flex().flex_col().gap_1().min_w_0().child(markdown::render(
-            &format!("m{}", m.id),
-            &m.blocks,
-            &ctx,
-        ));
+        let mut body = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .min_w_0()
+            .child(markdown::render(&format!("m{}", m.id), &m.blocks, &ctx));
         if m.truncated {
             let id = row.id;
             body = body.child(
@@ -331,6 +332,11 @@ impl Inlet {
         } else {
             div().w(px(AVATAR_COLUMN)).flex_none()
         };
+        let name = div()
+            .flex_none()
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(theme::text_strong())
+            .child(row.author.clone());
         div()
             .w_full()
             .pl_4()
@@ -348,6 +354,7 @@ impl Inlet {
                     .min_w_0()
                     .flex()
                     .flex_col()
+                    .child(name)
                     .child(text)
                     .children(failed),
             )
