@@ -12,6 +12,9 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
+# Only fail on unmaintained crates we depend on directly; gpui pulls in several
+# unmaintained transitive crates that are not ours to fix.
+unmaintained = "workspace"
 
 [licenses]
 version = 2
