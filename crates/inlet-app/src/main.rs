@@ -1062,12 +1062,12 @@ impl Inlet {
                                 .flex_row()
                                 .gap_1()
                                 .cursor_pointer()
-                                .text_size(px(12.))
+                                .text_size(px(14.))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(theme::text_muted())
                                 .hover(|s| s.text_color(theme::text()))
                                 .child(if folded { "\u{25B8}" } else { "\u{25BE}" })
-                                .child(c.name.to_uppercase())
+                                .child(c.name.clone())
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     if !this.collapsed.remove(&cat) {
                                         this.collapsed.insert(cat.clone());
@@ -1243,12 +1243,13 @@ impl Inlet {
                 .when(m.author_bot, |d| {
                     d.child(
                         div()
-                            .px_1()
-                            .rounded_sm()
-                            .bg(theme::accent())
+                            .px(px(5.6))
+                            .py(px(2.))
+                            .rounded(px(4.))
+                            .bg(theme::brand())
                             .text_size(px(10.))
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(theme::text_strong())
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(gpui::white())
                             .child("BOT"),
                     )
                 })
@@ -1292,15 +1293,15 @@ impl Inlet {
                 .gap_2()
                 .px_4()
                 .pt_4()
-                .child(div().flex_1().h(px(1.)).bg(theme::quote_bar()))
+                .child(div().flex_1().h(px(2.)).bg(theme::divider()))
                 .child(
                     div()
                         .text_size(px(12.))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(theme::text_muted())
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(theme::text_tertiary())
                         .child(model::day_label(day)),
                 )
-                .child(div().flex_1().h(px(1.)).bg(theme::quote_bar()))
+                .child(div().flex_1().h(px(2.)).bg(theme::divider()))
         });
         div()
             .flex()
@@ -1576,8 +1577,16 @@ fn channel_label(c: &Channel) -> String {
 
 /// Draws an embed: colour bar, author, title, description, fields, footer, media links.
 fn render_embed(id: &str, e: &model::Embed, ctx: &RenderCtx, cx: &mut Context<Inlet>) -> AnyElement {
-    let bar = e.color.map(|c| gpui::rgb(c).into()).unwrap_or(theme::quote_bar());
-    let mut content = div().flex().flex_col().gap_1().p_3().flex_1().min_w_0();
+    let bar = e.color.map(|c| gpui::rgb(c).into()).unwrap_or(theme::brand());
+    let mut content = div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .pt_3()
+        .px_3()
+        .pb(px(14.))
+        .flex_1()
+        .min_w_0();
     if let Some(author) = &e.author {
         content = content.child(div().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).child(author.clone()));
     }
@@ -1624,12 +1633,14 @@ fn render_embed(id: &str, e: &model::Embed, ctx: &RenderCtx, cx: &mut Context<In
     }
     div()
         .mt_1()
-        .max_w(px(560.))
+        .max_w(px(516.))
         .flex()
         .flex_row()
-        .rounded_md()
+        .rounded(px(8.))
         .overflow_hidden()
-        .bg(theme::code_bg())
+        .border_1()
+        .border_color(theme::embed_border())
+        .bg(theme::embed_bg())
         .child(div().w(px(4.)).flex_none().bg(bar))
         .child(content)
         .into_any_element()

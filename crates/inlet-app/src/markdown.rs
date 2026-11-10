@@ -465,8 +465,8 @@ fn highlight(style: Style, revealed: bool) -> HighlightStyle {
             ..Default::default()
         },
         Style::Mention => HighlightStyle {
-            background_color: Some(theme::mention_bg()),
-            color: Some(theme::text_strong()),
+            background_color: Some(theme::mention_fill()),
+            color: Some(theme::mention_text()),
             ..Default::default()
         },
     }
