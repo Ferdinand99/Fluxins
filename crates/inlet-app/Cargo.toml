@@ -38,3 +38,11 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"
 unicode-segmentation = "1"
 url = "2"
 zeroize = "1"
+
+# Decodes the built-in window icon (X11). gpui already depends on image 0.25.
+[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+# Embeds the app icon and version info in inlet.exe.
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
