@@ -42,10 +42,10 @@ jobs:
           prefix-key: v0-windows-x86_64
 
       - name: Build
-        run: cargo build --release -p inlet
+        run: cargo build --release --locked -p inlet
 
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -83,10 +83,10 @@ jobs:
           prefix-key: v0-macos-aarch64
 
       - name: Build
-        run: cargo build --release -p inlet
+        run: cargo build --release --locked -p inlet
 
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
       # The binary is not signed or notarised yet. On the first start Gatekeeper
       # blocks it: right-click the file and choose Open, or run
@@ -142,24 +142,14 @@ jobs:
         with:
           prefix-key: v0-linux-x86_64
 
-      # libc 0.2.190 removed the deprecated ENOATTR on Linux, which xattr 0.2.3
-      # (pulled in by gpui through zed-async-tar) still uses. Hold libc back to
-      # 0.2.189 while that combination is in the dependency tree.
-      - name: Hold libc back for xattr 0.2.3
-        run: |
-          [ -f Cargo.lock ] || cargo generate-lockfile
-          if cargo tree -i xattr@0.2.3 --target x86_64-unknown-linux-gnu >/dev/null 2>&1; then
-            cargo update -p libc --precise 0.2.189
-          fi
-
       - name: Build
-        run: cargo build --release -p inlet
+        run: cargo build --release --locked -p inlet
 
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Package
         run: |
@@ -189,4 +179,4 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check
-          arguments: --all-features
+          arguments: --all-features --locked
