@@ -19,10 +19,18 @@ pub mod message_flags {
     pub const SUPPRESS_EMBEDS: u64 = 1 << 2;
     /// The source of a crosspost was deleted.
     pub const SOURCE_MESSAGE_DELETED: u64 = 1 << 3;
+    /// A thread was started from this message.
+    pub const HAS_THREAD: u64 = 1 << 5;
+    /// Some members of a mentioned role were not added to the thread.
+    pub const FAILED_TO_MENTION_SOME_ROLES_IN_THREAD: u64 = 1 << 8;
     /// Sent without a notification.
     pub const SUPPRESS_NOTIFICATIONS: u64 = 1 << 12;
     /// A voice message.
     pub const VOICE_MESSAGE: u64 = 1 << 13;
+    /// The bits a client may set when it sends or edits a message (Fluxer's
+    /// `SENDABLE_MESSAGE_FLAGS`). The server keeps every other bit as it is
+    /// and ignores them in a request.
+    pub const CLIENT_SETTABLE: u64 = SUPPRESS_EMBEDS | SUPPRESS_NOTIFICATIONS | VOICE_MESSAGE;
 }
 
 /// Message types (`type` on a message).
@@ -517,6 +525,39 @@ impl Message {
         self.flags.as_ref().and_then(value_u64).unwrap_or(0)
     }
 
+    /// Whether the message was sent without notifications (`SUPPRESS_NOTIFICATIONS`, "@silent").
+    pub fn is_silent(&self) -> bool {
+        self.flag_bits() & message_flags::SUPPRESS_NOTIFICATIONS != 0
+    }
+
+    /// Whether its embeds are hidden (`SUPPRESS_EMBEDS`).
+    pub fn embeds_suppressed(&self) -> bool {
+        self.flag_bits() & message_flags::SUPPRESS_EMBEDS != 0
+    }
+
+    /// Whether this is a forward (a `FORWARD` reference; the content is in
+    /// [`Message::message_snapshots`]).
+    pub fn is_forward(&self) -> bool {
+        self.message_reference()
+            .is_some_and(|r| r.kind == message_reference_type::FORWARD)
+    }
+
+    /// Copies of a forwarded message. Snapshots that do not parse are skipped.
+    pub fn message_snapshots(&self) -> Vec<MessageSnapshot> {
+        extra_list(&self.extra, "message_snapshots")
+    }
+
+    /// Whether a thread was started from this message (`HAS_THREAD`).
+    pub fn has_thread(&self) -> bool {
+        self.flag_bits() & message_flags::HAS_THREAD != 0
+            || self.extra.get("thread").is_some_and(Value::is_object)
+    }
+
+    /// The thread started from this message, when the server sent it.
+    pub fn thread(&self) -> Option<super::Channel> {
+        extra_field(&self.extra, "thread")
+    }
+
     /// Whether the account could edit this message by its kind: only its own
     /// `DEFAULT` and `REPLY` messages, and not forwards. In a guild use
     /// [`crate::PermissionContext::can_edit_message`], which also checks
@@ -625,8 +666,212 @@ pub struct OutgoingMessage {
     pub flags: Option<u64>,
     /// Text-to-speech (needs `SEND_TTS_MESSAGES`).
     pub tts: bool,
-    /// Suppress every mention (sends `allowed_mentions: {}`).
+    /// Suppress every mention (sends `allowed_mentions: {}`). Wins over
+    /// [`OutgoingMessage::allowed_mentions`].
     pub suppress_mentions: bool,
+    /// Which mentions in the text notify anyone. `None` leaves it to the
+    /// server (every mention notifies). The composer sets it from the
+    /// mentions the person picked.
+    pub allowed_mentions: Option<AllowedMentions>,
+}
+
+/// `allowed_mentions` of a message ([`OutgoingMessage::allowed_mentions`],
+/// [`MessageEdit::allowed_mentions`]).
+///
+/// Fluxer's rules (`MessageMentionService.applyAllowedMentions`):
+/// - a missing `parse` with no `users` or `roles` parses every kind of
+///   mention, so `parse` is always sent, also as `[]`;
+/// - `parse: []` with `users` or `roles` allows only the listed IDs, and
+///   `parse: []` alone allows nothing (a reply still notifies its author
+///   unless `replied_user` is false);
+/// - a non-empty `parse` together with a non-empty `users` or `roles` is
+///   refused with 400 `PARSE_AND_USERS_OR_ROLES_CANNOT_BE_USED_TOGETHER`.
+///   "These users and roles plus `@everyone`" therefore has no encoding:
+///   [`AllowedMentions::only`] refuses it, and the caller chooses between
+///   the lists without `@everyone` and [`AllowedMentions::all`].
+///
+/// At most 100 IDs per list are sent. The fields are public; a value that
+/// breaks the rules makes the send or edit fail with
+/// [`crate::Error::InvalidInput`] before any request.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AllowedMentions {
+    /// [`allowed_mention_parse`] values.
+    pub parse: Vec<String>,
+    /// Users who may be notified.
+    pub users: Vec<Snowflake>,
+    /// Roles that may be notified.
+    pub roles: Vec<Snowflake>,
+    /// Whether a reply notifies the author of the message it replies to.
+    /// `None`: from [`ReplyTo::mention_author`] (default true).
+    pub replied_user: Option<bool>,
+}
+
+/// Values for [`AllowedMentions::parse`].
+pub mod allowed_mention_parse {
+    /// User mentions.
+    pub const USERS: &str = "users";
+    /// Role mentions.
+    pub const ROLES: &str = "roles";
+    /// `@everyone` and `@here`.
+    pub const EVERYONE: &str = "everyone";
+}
+
+/// Why an [`AllowedMentions`] cannot be sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AllowedMentionsError {
+    /// A non-empty `parse` (for example `@everyone`) together with users or
+    /// roles. Fluxer answers 400; send the lists without `@everyone`, or
+    /// [`AllowedMentions::all`].
+    ParseWithUsersOrRoles,
+    /// A user or role ID is not a snowflake.
+    NotASnowflake,
+    /// A `parse` value that is not in [`allowed_mention_parse`].
+    UnknownParse,
+}
+
+impl std::fmt::Display for AllowedMentionsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            AllowedMentionsError::ParseWithUsersOrRoles => {
+                "allowed_mentions: parse cannot be used together with users or roles"
+            }
+            AllowedMentionsError::NotASnowflake => {
+                "allowed_mentions: a user or role ID is not a snowflake"
+            }
+            AllowedMentionsError::UnknownParse => "allowed_mentions: unknown parse value",
+        })
+    }
+}
+
+impl std::error::Error for AllowedMentionsError {}
+
+impl From<AllowedMentionsError> for crate::Error {
+    fn from(e: AllowedMentionsError) -> Self {
+        crate::Error::InvalidInput(e.to_string())
+    }
+}
+
+/// Most IDs per list Fluxer takes.
+const MAX_ALLOWED_MENTION_IDS: usize = 100;
+
+impl AllowedMentions {
+    /// Allows exactly the listed users and roles, and `@everyone`/`@here`
+    /// when `everyone` is set (at most 100 IDs per list are sent). With no
+    /// IDs and `everyone` false, nothing notifies (a reply still notifies
+    /// its author unless [`ReplyTo::mention_author`] is false).
+    ///
+    /// # Errors
+    /// [`AllowedMentionsError::ParseWithUsersOrRoles`] when `everyone` is set
+    /// together with users or roles (Fluxer cannot express it), and
+    /// [`AllowedMentionsError::NotASnowflake`] for an ID that is not a
+    /// snowflake.
+    pub fn only(
+        users: &[Snowflake],
+        roles: &[Snowflake],
+        everyone: bool,
+    ) -> Result<Self, AllowedMentionsError> {
+        let allowed = AllowedMentions {
+            parse: if everyone {
+                vec![allowed_mention_parse::EVERYONE.to_owned()]
+            } else {
+                Vec::new()
+            },
+            users: users
+                .iter()
+                .take(MAX_ALLOWED_MENTION_IDS)
+                .cloned()
+                .collect(),
+            roles: roles
+                .iter()
+                .take(MAX_ALLOWED_MENTION_IDS)
+                .cloned()
+                .collect(),
+            replied_user: None,
+        };
+        allowed.validate()?;
+        Ok(allowed)
+    }
+
+    /// Parses every kind of mention in the text: users, roles and
+    /// `@everyone`/`@here` (as far as the account's permissions allow).
+    pub fn all() -> Self {
+        AllowedMentions {
+            parse: vec![
+                allowed_mention_parse::USERS.to_owned(),
+                allowed_mention_parse::ROLES.to_owned(),
+                allowed_mention_parse::EVERYONE.to_owned(),
+            ],
+            ..AllowedMentions::default()
+        }
+    }
+
+    /// Checks Fluxer's rules (see [`AllowedMentions`]) without a request.
+    pub fn validate(&self) -> Result<(), AllowedMentionsError> {
+        let known = [
+            allowed_mention_parse::USERS,
+            allowed_mention_parse::ROLES,
+            allowed_mention_parse::EVERYONE,
+        ];
+        if self.parse.iter().any(|p| !known.contains(&p.as_str())) {
+            return Err(AllowedMentionsError::UnknownParse);
+        }
+        if !self.parse.is_empty() && (!self.users.is_empty() || !self.roles.is_empty()) {
+            return Err(AllowedMentionsError::ParseWithUsersOrRoles);
+        }
+        let users = self.users.iter().take(MAX_ALLOWED_MENTION_IDS);
+        let roles = self.roles.iter().take(MAX_ALLOWED_MENTION_IDS);
+        if users.chain(roles).any(|i| !crate::media::is_snowflake(i)) {
+            return Err(AllowedMentionsError::NotASnowflake);
+        }
+        Ok(())
+    }
+
+    /// The JSON object. `parse` is always written, also as `[]`: Fluxer
+    /// reads a missing `parse` without lists as "parse everything".
+    pub(crate) fn to_json(
+        &self,
+        reply_mentions_author: Option<bool>,
+    ) -> Result<Value, AllowedMentionsError> {
+        self.validate()?;
+        let mut m = Map::new();
+        let mut parse: Vec<&str> = Vec::new();
+        for p in &self.parse {
+            if !parse.contains(&p.as_str()) {
+                parse.push(p);
+            }
+        }
+        m.insert("parse".into(), json!(parse));
+        if !self.users.is_empty() {
+            m.insert(
+                "users".into(),
+                json!(self.users.iter().take(100).collect::<Vec<_>>()),
+            );
+        }
+        if !self.roles.is_empty() {
+            m.insert(
+                "roles".into(),
+                json!(self.roles.iter().take(100).collect::<Vec<_>>()),
+            );
+        }
+        if let Some(r) = self.replied_user.or(reply_mentions_author) {
+            m.insert("replied_user".into(), json!(r));
+        }
+        Ok(Value::Object(m))
+    }
+}
+
+/// Removes Fluxer's `@silent` prefix from composer text: `Some(rest)` when
+/// the text starts with it (after spaces), `None` otherwise. Send the rest
+/// with [`OutgoingMessage::silent`], as Fluxer's client does.
+pub fn strip_silent_prefix(content: &str) -> Option<&str> {
+    let trimmed = content.trim_start();
+    let rest = trimmed.strip_prefix("@silent")?;
+    match rest.chars().next() {
+        None => Some(rest),
+        Some(c) if c.is_whitespace() => Some(&rest[c.len_utf8()..]),
+        Some(_) => None,
+    }
 }
 
 impl OutgoingMessage {
@@ -636,6 +881,18 @@ impl OutgoingMessage {
             content: Some(content.into()),
             ..Default::default()
         }
+    }
+
+    /// Sends it without notifications (`SUPPRESS_NOTIFICATIONS`, "@silent").
+    pub fn silent(mut self) -> Self {
+        self.flags = Some(self.flags.unwrap_or(0) | message_flags::SUPPRESS_NOTIFICATIONS);
+        self
+    }
+
+    /// Sets which mentions notify anyone.
+    pub fn with_allowed_mentions(mut self, allowed: AllowedMentions) -> Self {
+        self.allowed_mentions = Some(allowed);
+        self
     }
 
     /// Sets the nonce.
@@ -654,8 +911,12 @@ impl OutgoingMessage {
     }
 
     /// The JSON body of Create message. `attachments` is the metadata of
-    /// uploaded files (see [`crate::Client::send_with_files`]).
-    pub(crate) fn to_json(&self, attachments: Option<Value>) -> Value {
+    /// uploaded files (see [`crate::Client::send_with_files`]). Fails when
+    /// [`OutgoingMessage::allowed_mentions`] breaks Fluxer's rules.
+    pub(crate) fn to_json(
+        &self,
+        attachments: Option<Value>,
+    ) -> Result<Value, AllowedMentionsError> {
         let mut body = Map::new();
         if let Some(c) = &self.content {
             body.insert("content".into(), json!(c));
@@ -671,6 +932,11 @@ impl OutgoingMessage {
         }
         if self.suppress_mentions {
             body.insert("allowed_mentions".into(), json!({}));
+        } else if let Some(a) = &self.allowed_mentions {
+            body.insert(
+                "allowed_mentions".into(),
+                a.to_json(self.reply_to.as_ref().map(|r| r.mention_author))?,
+            );
         } else if self.reply_to.as_ref().is_some_and(|r| !r.mention_author) {
             body.insert(
                 "allowed_mentions".into(),
@@ -689,7 +955,7 @@ impl OutgoingMessage {
         if let Some(a) = attachments {
             body.insert("attachments".into(), a);
         }
-        Value::Object(body)
+        Ok(Value::Object(body))
     }
 }
 
@@ -701,10 +967,14 @@ pub struct MessageEdit {
     pub content: Option<String>,
     /// New [`message_flags`] (for example to set or clear `SUPPRESS_EMBEDS`).
     pub flags: Option<u64>,
+    /// Which mentions in the new text notify anyone.
+    pub allowed_mentions: Option<AllowedMentions>,
 }
 
 impl MessageEdit {
-    pub(crate) fn to_json(&self) -> Value {
+    /// The JSON body of Edit message. Fails when
+    /// [`MessageEdit::allowed_mentions`] breaks Fluxer's rules.
+    pub(crate) fn to_json(&self) -> Result<Value, AllowedMentionsError> {
         let mut body = Map::new();
         if let Some(c) = &self.content {
             body.insert("content".into(), json!(c));
@@ -712,7 +982,56 @@ impl MessageEdit {
         if let Some(f) = self.flags {
             body.insert("flags".into(), json!(f));
         }
-        Value::Object(body)
+        if let Some(a) = &self.allowed_mentions {
+            body.insert("allowed_mentions".into(), a.to_json(None)?);
+        }
+        Ok(Value::Object(body))
+    }
+}
+
+/// A copy of a forwarded message ([`Message::message_snapshots`]). It does
+/// not change when the source is edited or deleted.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MessageSnapshot {
+    /// Text.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub content: String,
+    /// When the source was created.
+    #[serde(default)]
+    pub timestamp: Option<String>,
+    /// When the source was last edited.
+    #[serde(default)]
+    pub edited_timestamp: Option<String>,
+    /// IDs of mentioned users (resolve them against the message's `mentions`).
+    #[serde(default, deserialize_with = "sf_list")]
+    pub mentions: Vec<Snowflake>,
+    /// IDs of mentioned roles.
+    #[serde(default, deserialize_with = "sf_list")]
+    pub mention_roles: Vec<Snowflake>,
+    /// Raw embeds; parse them like [`Message::parsed_embeds`] via [`MessageSnapshot::parsed_embeds`].
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub embeds: Vec<Value>,
+    /// Attachments.
+    #[serde(default, deserialize_with = "lenient_vec")]
+    pub attachments: Vec<Attachment>,
+    /// Stickers.
+    #[serde(default, deserialize_with = "lenient_vec")]
+    pub stickers: Vec<StickerItem>,
+    /// The source's message type.
+    #[serde(rename = "type", default, deserialize_with = "null_as_default")]
+    pub kind: i64,
+    /// The source's [`message_flags`].
+    #[serde(default, deserialize_with = "opt_u64")]
+    pub flags: Option<u64>,
+    /// Every other field.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+impl MessageSnapshot {
+    /// The embeds, typed. Embeds that do not parse are skipped.
+    pub fn parsed_embeds(&self) -> Vec<Embed> {
+        super::parse_values(&self.embeds, "embed")
     }
 }
 
@@ -819,17 +1138,188 @@ mod tests {
         let m = OutgoingMessage::text("hi")
             .with_nonce("42")
             .reply_to("100", false);
-        let v = m.to_json(None);
+        let v = m.to_json(None).unwrap();
         assert_eq!(v["content"], "hi");
         assert_eq!(v["nonce"], "42");
         assert_eq!(v["message_reference"]["message_id"], "100");
         assert_eq!(v["allowed_mentions"]["replied_user"], false);
-        let plain = OutgoingMessage::text("x").reply_to("1", true).to_json(None);
+        let plain = OutgoingMessage::text("x")
+            .reply_to("1", true)
+            .to_json(None)
+            .unwrap();
         assert!(plain.get("allowed_mentions").is_none());
         let edit = MessageEdit {
             content: Some("new".into()),
-            flags: None,
+            ..MessageEdit::default()
         };
-        assert_eq!(edit.to_json(), json!({"content": "new"}));
+        assert_eq!(edit.to_json().unwrap(), json!({"content": "new"}));
+    }
+
+    #[test]
+    fn silent_messages_and_allowed_mentions() {
+        assert_eq!(strip_silent_prefix("@silent hi"), Some("hi"));
+        assert_eq!(strip_silent_prefix("  @silent"), Some(""));
+        assert_eq!(strip_silent_prefix("@silently"), None);
+        assert_eq!(strip_silent_prefix("hi @silent"), None);
+        let v = OutgoingMessage::text("hi").silent().to_json(None).unwrap();
+        assert_eq!(v["flags"], json!(message_flags::SUPPRESS_NOTIFICATIONS));
+        let picked = AllowedMentions::only(&["5".into()], &["6".into()], false).unwrap();
+        let v = OutgoingMessage::text("<@5> <@&6>")
+            .reply_to("1", false)
+            .with_allowed_mentions(picked)
+            .to_json(None)
+            .unwrap();
+        assert_eq!(
+            v["allowed_mentions"],
+            json!({"parse": [], "users": ["5"], "roles": ["6"], "replied_user": false})
+        );
+        let edit = MessageEdit {
+            content: Some("x".into()),
+            allowed_mentions: Some(AllowedMentions::default()),
+            ..MessageEdit::default()
+        };
+        assert_eq!(
+            edit.to_json().unwrap()["allowed_mentions"],
+            json!({"parse": []})
+        );
+    }
+
+    /// Fluxer's three branches: `{}` parses nothing, an explicit `parse: []`
+    /// parses nothing (lists still allow their IDs), and a missing `parse`
+    /// parses everything unless lists are sent. "No pings" must never reach
+    /// the third branch.
+    #[test]
+    fn no_pings_always_sends_an_empty_parse() {
+        let none = AllowedMentions::only(&[], &[], false).unwrap();
+        let reply = OutgoingMessage::text("@everyone <@5>")
+            .reply_to("1", false)
+            .with_allowed_mentions(none.clone())
+            .to_json(None)
+            .unwrap();
+        assert_eq!(
+            reply["allowed_mentions"],
+            json!({"parse": [], "replied_user": false})
+        );
+        let reply = OutgoingMessage::text("hi")
+            .reply_to("1", true)
+            .with_allowed_mentions(none.clone())
+            .to_json(None)
+            .unwrap();
+        assert_eq!(
+            reply["allowed_mentions"],
+            json!({"parse": [], "replied_user": true})
+        );
+        let send = OutgoingMessage::text("@everyone")
+            .with_allowed_mentions(none.clone())
+            .to_json(None)
+            .unwrap();
+        assert_eq!(send["allowed_mentions"], json!({"parse": []}));
+        let edit = MessageEdit {
+            content: Some("@everyone".into()),
+            allowed_mentions: Some(AllowedMentions {
+                replied_user: Some(false),
+                ..none
+            }),
+            ..MessageEdit::default()
+        };
+        assert_eq!(
+            edit.to_json().unwrap()["allowed_mentions"],
+            json!({"parse": [], "replied_user": false})
+        );
+        let suppressed = OutgoingMessage {
+            suppress_mentions: true,
+            ..OutgoingMessage::text("@everyone")
+        };
+        assert_eq!(
+            suppressed.to_json(None).unwrap()["allowed_mentions"],
+            json!({})
+        );
+        let everyone = AllowedMentions::only(&[], &[], true).unwrap();
+        assert_eq!(
+            everyone.to_json(None).unwrap(),
+            json!({"parse": ["everyone"]})
+        );
+        assert_eq!(
+            AllowedMentions::all().to_json(None).unwrap(),
+            json!({"parse": ["users", "roles", "everyone"]})
+        );
+    }
+
+    /// Fluxer refuses a non-empty `parse` with `users` or `roles` (400
+    /// `PARSE_AND_USERS_OR_ROLES_CANNOT_BE_USED_TOGETHER`), so it is caught
+    /// before any request; IDs must be snowflakes.
+    #[test]
+    fn parse_with_lists_and_bad_ids_are_refused() {
+        assert_eq!(
+            AllowedMentions::only(&["5".into()], &[], true),
+            Err(AllowedMentionsError::ParseWithUsersOrRoles)
+        );
+        assert_eq!(
+            AllowedMentions::only(&[], &["6".into()], true),
+            Err(AllowedMentionsError::ParseWithUsersOrRoles)
+        );
+        assert_eq!(
+            AllowedMentions::only(&["@me".into()], &[], false),
+            Err(AllowedMentionsError::NotASnowflake)
+        );
+        assert_eq!(
+            AllowedMentions::only(&[], &["1,2".into()], false),
+            Err(AllowedMentionsError::NotASnowflake)
+        );
+        let hand_built = AllowedMentions {
+            parse: vec![allowed_mention_parse::USERS.into()],
+            users: vec!["5".into()],
+            ..AllowedMentions::default()
+        };
+        let send = OutgoingMessage::text("x").with_allowed_mentions(hand_built.clone());
+        assert_eq!(
+            send.to_json(None),
+            Err(AllowedMentionsError::ParseWithUsersOrRoles)
+        );
+        let edit = MessageEdit {
+            allowed_mentions: Some(hand_built),
+            ..MessageEdit::default()
+        };
+        assert_eq!(
+            edit.to_json(),
+            Err(AllowedMentionsError::ParseWithUsersOrRoles)
+        );
+        let unknown = AllowedMentions {
+            parse: vec!["channels".into()],
+            ..AllowedMentions::default()
+        };
+        assert_eq!(unknown.validate(), Err(AllowedMentionsError::UnknownParse));
+        let many: Vec<Snowflake> = (1..=150).map(|i| i.to_string()).collect();
+        let capped = AllowedMentions::only(&many, &[], false).unwrap();
+        assert_eq!(capped.users.len(), 100);
+        assert!(matches!(
+            crate::Error::from(AllowedMentionsError::NotASnowflake),
+            crate::Error::InvalidInput(_)
+        ));
+    }
+
+    #[test]
+    fn forwards_and_threads_on_a_message() {
+        let mut v = base();
+        v["flags"] = json!(message_flags::HAS_THREAD | message_flags::SUPPRESS_NOTIFICATIONS);
+        v["message_reference"] = json!({"channel_id": "2", "message_id": "0", "type": 1});
+        v["message_snapshots"] = json!([
+            {"content": "orig", "timestamp": "2026-01-01T00:00:00Z", "type": 0, "flags": null,
+             "mentions": ["4", 5], "attachments": [{"id": "9", "filename": "a.png", "size": 1}, {"bad": 1}],
+             "embeds": [{"type": "image"}], "future_field": {"x": 1}},
+            "not a snapshot"
+        ]);
+        v["thread"] = json!({"id": "1", "type": 11, "guild_id": "3", "parent_id": "2", "name": "t",
+                             "thread_metadata": {"archived": false, "locked": false}});
+        let m: Message = serde_json::from_value(v).unwrap();
+        assert!(m.is_forward() && m.is_silent() && m.has_thread());
+        assert!(!m.embeds_suppressed());
+        let snaps = m.message_snapshots();
+        assert_eq!(snaps.len(), 1);
+        assert_eq!(snaps[0].content, "orig");
+        assert_eq!(snaps[0].mentions, vec!["4".to_string(), "5".to_string()]);
+        assert_eq!(snaps[0].attachments.len(), 1);
+        assert_eq!(snaps[0].parsed_embeds().len(), 1);
+        assert_eq!(m.thread().unwrap().name.as_deref(), Some("t"));
     }
 }

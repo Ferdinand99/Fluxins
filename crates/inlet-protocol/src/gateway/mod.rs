@@ -26,6 +26,7 @@
 //! sent while disconnected are kept (up to 64) and sent once connected.
 
 pub mod codec;
+pub mod events;
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -41,6 +42,7 @@ use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, WebSocketConfig};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
+use crate::api::threads::ThreadMember;
 use crate::instance::{require_scheme, Instance};
 use crate::models::{
     Channel, ChannelPinsUpdate, ChannelUpdateBulk, CurrentUser, Guild, GuildDelete,
@@ -52,6 +54,10 @@ use crate::models::{
 };
 use crate::token::Token;
 use codec::ZstdStream;
+use events::{
+    ForumUnreadRequest, ForumUnreads, RecentMentionDelete, SavedMessageDelete, ThreadDelete,
+    ThreadListSync, ThreadMemberListUpdate, ThreadMembersUpdate,
+};
 
 /// Identify session flag: merge DM reaction bursts.
 pub const FLAG_DEBOUNCE_MESSAGE_REACTIONS: u32 = 1 << 1;
@@ -95,6 +101,18 @@ const BOUNDED_WINDOW: Duration = Duration::from_secs(1);
 /// Fluxer accepts 5 Presence Updates per 20 s and drops the rest.
 const PRESENCE_PER_WINDOW: usize = 5;
 const PRESENCE_WINDOW: Duration = Duration::from_secs(20);
+/// Request Forum Unreads (op 28): Fluxer drops more than 5 per 5 s per
+/// connection; send 4, like Fluxer's client.
+const FORUM_UNREADS_PER_WINDOW: usize = 4;
+const FORUM_UNREADS_WINDOW: Duration = Duration::from_secs(5);
+/// Forum unread requests waiting for their window; older ones are dropped.
+const MAX_WAITING_FORUM_UNREADS: usize = 4;
+/// Posts per Request Forum Unreads.
+pub const MAX_FORUM_UNREAD_THREADS: usize = 40;
+/// Thread member lists per guild Fluxer keeps.
+pub const MAX_THREAD_MEMBER_LISTS: usize = 10;
+/// Guilds whose thread subscription is remembered for replay.
+const MAX_THREAD_SUBSCRIPTIONS: usize = 5;
 /// Allowed `heartbeat_interval` range.
 const HEARTBEAT_MIN: Duration = Duration::from_secs(1);
 const HEARTBEAT_MAX: Duration = Duration::from_secs(120);
@@ -288,6 +306,33 @@ pub enum Dispatch {
     SessionsReplace(Vec<SessionPresence>),
     /// A voice state changed (`channel_id` `None` means the participant left).
     VoiceStateUpdate(Box<VoiceState>),
+    /// A thread was created, or the account was added to one. `member` (the
+    /// account's membership) and `newly_created` are in `extra`
+    /// ([`Channel::thread_member`], [`Channel::newly_created`]).
+    ThreadCreate(Box<Channel>),
+    /// A thread changed. It never carries the account's membership: merge
+    /// it with [`Channel::merge_thread_update`] (only for this event; store
+    /// threads from READY, GUILD_CREATE, THREAD_CREATE and THREAD_LIST_SYNC
+    /// with [`Channel::replace_thread`]).
+    ThreadUpdate(Box<Channel>),
+    /// A thread was deleted.
+    ThreadDelete(Box<ThreadDelete>),
+    /// The account's active threads in a guild (or some channels) are replaced.
+    ThreadListSync(Box<ThreadListSync>),
+    /// The account's own membership in a thread changed (`id`, `guild_id` set).
+    ThreadMemberUpdate(Box<ThreadMember>),
+    /// Users joined or left a thread ([`ThreadMembersUpdate::membership_change`]).
+    ThreadMembersUpdate(Box<ThreadMembersUpdate>),
+    /// The member list of a subscribed thread.
+    ThreadMemberListUpdate(Box<ThreadMemberListUpdate>),
+    /// Unread counts of forum posts (answer to op 28).
+    ForumUnreads(Box<ForumUnreads>),
+    /// The account saved a message (the message).
+    SavedMessageCreate(Box<Message>),
+    /// The account unsaved a message.
+    SavedMessageDelete(SavedMessageDelete),
+    /// The account removed a message from its recent mentions.
+    RecentMentionDelete(RecentMentionDelete),
     /// Any other event, or a known one whose payload did not parse.
     Other {
         /// Event name, for example `PRESENCE_UPDATE`.
@@ -391,6 +436,25 @@ impl Dispatch {
             }
             "SESSIONS_REPLACE" => typed(name, data, Dispatch::SessionsReplace),
             "VOICE_STATE_UPDATE" => typed(name, data, |v| Dispatch::VoiceStateUpdate(Box::new(v))),
+            "THREAD_CREATE" => typed(name, data, |v| Dispatch::ThreadCreate(Box::new(v))),
+            "THREAD_UPDATE" => typed(name, data, |v| Dispatch::ThreadUpdate(Box::new(v))),
+            "THREAD_DELETE" => typed(name, data, |v| Dispatch::ThreadDelete(Box::new(v))),
+            "THREAD_LIST_SYNC" => typed(name, data, |v| Dispatch::ThreadListSync(Box::new(v))),
+            "THREAD_MEMBER_UPDATE" => {
+                typed(name, data, |v| Dispatch::ThreadMemberUpdate(Box::new(v)))
+            }
+            "THREAD_MEMBERS_UPDATE" => {
+                typed(name, data, |v| Dispatch::ThreadMembersUpdate(Box::new(v)))
+            }
+            "THREAD_MEMBER_LIST_UPDATE" => typed(name, data, |v| {
+                Dispatch::ThreadMemberListUpdate(Box::new(v))
+            }),
+            "FORUM_UNREADS" => typed(name, data, |v| Dispatch::ForumUnreads(Box::new(v))),
+            "SAVED_MESSAGE_CREATE" => {
+                typed(name, data, |v| Dispatch::SavedMessageCreate(Box::new(v)))
+            }
+            "SAVED_MESSAGE_DELETE" => typed(name, data, Dispatch::SavedMessageDelete),
+            "RECENT_MENTION_DELETE" => typed(name, data, Dispatch::RecentMentionDelete),
             _ => Dispatch::Other {
                 name: name.to_owned(),
                 data,
@@ -421,6 +485,11 @@ enum Command {
     MemberList(String, String, Vec<[u32; 2]>),
     /// Request Guild Members: sent only while connected, never replayed.
     Search(Value),
+    /// Lazy Request thread options of a guild: thread member lists, or
+    /// `None` to unsubscribe.
+    Threads(String, Option<Vec<String>>),
+    /// Request Forum Unreads (op 28): sent only while connected, never replayed.
+    ForumUnreads(Value),
 }
 
 impl std::fmt::Debug for Command {
@@ -431,6 +500,8 @@ impl std::fmt::Debug for Command {
             Command::Status(s) => write!(f, "Status({s})"),
             Command::MemberList(g, c, r) => write!(f, "MemberList({g}, {c}, {r:?})"),
             Command::Search(_) => write!(f, "Search"),
+            Command::Threads(g, l) => write!(f, "Threads({g}, {l:?})"),
+            Command::ForumUnreads(_) => write!(f, "ForumUnreads"),
         }
     }
 }
@@ -440,6 +511,8 @@ impl std::fmt::Debug for Command {
 pub struct GatewayHandle {
     tx: mpsc::Sender<Command>,
     close: Arc<watch::Sender<bool>>,
+    /// The Identify session flags ([`GatewayOptions::flags`]).
+    flags: u32,
 }
 
 impl GatewayHandle {
@@ -541,6 +614,96 @@ impl GatewayHandle {
         true
     }
 
+    /// Lazy Request (op 14) thread options for a guild: thread events and
+    /// messages for every thread the account can view there (`threads:
+    /// true`), and the member lists of up to 10 threads (`thread_member_lists`;
+    /// THREAD_MEMBER_LIST_UPDATE follows). Call it for the guild on screen,
+    /// with the threads whose member list is shown; an empty list is fine.
+    /// Pass no member lists for a guild the account only visits (Fluxer's
+    /// client does the same). Remembered (the 5 most recently used guilds)
+    /// and sent again after a reconnect. Invalid thread IDs are dropped.
+    ///
+    /// Returns `false` and sends nothing when `guild_id` is not a snowflake
+    /// (Fluxer would close the session with 4002) or the session was opened
+    /// without [`FLAG_CHANNEL_THREADS`] (Fluxer ignores the options then).
+    pub fn subscribe_threads(&self, guild_id: &str, member_lists: &[&str]) -> bool {
+        if !self.threads_enabled() || !crate::media::is_snowflake(guild_id) {
+            return false;
+        }
+        let lists: Vec<String> = member_lists
+            .iter()
+            .filter(|t| crate::media::is_snowflake(t))
+            .take(MAX_THREAD_MEMBER_LISTS)
+            .map(|t| (*t).to_owned())
+            .collect();
+        self.push(Command::Threads(guild_id.to_owned(), Some(lists)));
+        true
+    }
+
+    /// Stops the thread options of a guild (`threads: false` and no member
+    /// lists) and forgets them for reconnects. Returns `false` and sends
+    /// nothing under the same conditions as [`GatewayHandle::subscribe_threads`].
+    pub fn unsubscribe_threads(&self, guild_id: &str) -> bool {
+        if !self.threads_enabled() || !crate::media::is_snowflake(guild_id) {
+            return false;
+        }
+        self.push(Command::Threads(guild_id.to_owned(), None));
+        true
+    }
+
+    /// Whether the session was opened with [`FLAG_CHANNEL_THREADS`].
+    fn threads_enabled(&self) -> bool {
+        self.flags & FLAG_CHANNEL_THREADS != 0
+    }
+
+    /// Request Forum Unreads (op 28): unread counts for up to 40 posts of a
+    /// forum or media channel; FORUM_UNREADS answers. Returns `false` and
+    /// sends nothing when `guild_id` or `channel_id` is not a snowflake
+    /// (Fluxer would close the session with 4002), when no post ID is one,
+    /// or when the session was opened without [`FLAG_CHANNEL_THREADS`]
+    /// (Fluxer closes such a session with 4001); posts past 40 are left
+    /// out. Paced like Fluxer's client: at most 4 per 5 s (Fluxer drops more
+    /// than 5), within the shared limit of 4 bounded commands per second;
+    /// when more wait, only the newest 4 are kept. Made while the gateway is
+    /// not connected, it is dropped.
+    pub fn request_forum_unreads(
+        &self,
+        guild_id: &str,
+        channel_id: &str,
+        threads: &[ForumUnreadRequest],
+    ) -> bool {
+        if !self.threads_enabled()
+            || !crate::media::is_snowflake(guild_id)
+            || !crate::media::is_snowflake(channel_id)
+        {
+            return false;
+        }
+        let threads: Vec<Value> = threads
+            .iter()
+            .filter(|t| crate::media::is_snowflake(&t.thread_id))
+            .take(MAX_FORUM_UNREAD_THREADS)
+            .map(|t| {
+                let mut v = json!({ "thread_id": t.thread_id });
+                if let Some(a) = t
+                    .ack_message_id
+                    .as_deref()
+                    .filter(|a| crate::media::is_snowflake(a))
+                {
+                    v["ack_message_id"] = json!(a);
+                }
+                v
+            })
+            .collect();
+        if threads.is_empty() {
+            return false;
+        }
+        self.push(Command::ForumUnreads(json!({
+            "op": 28,
+            "d": { "guild_id": guild_id, "channel_id": channel_id, "threads": threads }
+        })));
+        true
+    }
+
     /// Closes the connection and ends the session (no resume).
     pub fn close(&self) {
         let _ = self.close.send(true);
@@ -563,6 +726,7 @@ impl Gateway {
         let (event_tx, event_rx) = mpsc::channel(options.event_buffer.max(1));
         let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_BUFFER);
         let (close_tx, close_rx) = watch::channel(false);
+        let flags = options.flags;
         let task = Task {
             url: instance.gateway_url().to_owned(),
             user_agent: instance.client_info().user_agent.clone(),
@@ -576,6 +740,7 @@ impl Gateway {
             last_identify: None,
             active_guilds: Recent::new(MAX_ACTIVE_GUILDS),
             member_lists: Recent::new(MAX_MEMBER_LISTS),
+            thread_subs: Recent::new(MAX_THREAD_SUBSCRIPTIONS),
             status: None,
             queued: VecDeque::new(),
             pending: VecDeque::new(),
@@ -585,6 +750,7 @@ impl Gateway {
             GatewayHandle {
                 tx: cmd_tx,
                 close: Arc::new(close_tx),
+                flags,
             },
             event_rx,
         )
@@ -635,6 +801,8 @@ struct Task {
     active_guilds: Recent<bool>,
     /// Member list subscriptions per guild: channel and ranges.
     member_lists: Recent<(String, Vec<[u32; 2]>)>,
+    /// Thread subscriptions per guild: the thread member lists.
+    thread_subs: Recent<Vec<String>>,
     /// Last status the UI set; replayed after Identify and Resume.
     status: Option<String>,
     /// Raw commands sent while disconnected.
@@ -806,6 +974,11 @@ impl Task {
             Command::Search(_) => {
                 tracing::debug!("member search while disconnected; dropped");
             }
+            Command::ForumUnreads(_) => {
+                tracing::debug!("forum unread request while disconnected; dropped");
+            }
+            Command::Threads(g, None) => self.thread_subs.remove(&g),
+            Command::Threads(g, Some(lists)) => self.thread_subs.insert(g, lists),
             Command::Raw(v) => {
                 if self.queued.len() >= MAX_QUEUED {
                     tracing::warn!("gateway command queue full; dropping the oldest");
@@ -819,7 +992,17 @@ impl Task {
     /// Payloads for a command while connected (and records the wanted state).
     fn live(&mut self, cmd: Command) -> Option<Value> {
         match cmd {
-            Command::Raw(v) | Command::Search(v) => Some(v),
+            Command::Raw(v) | Command::Search(v) | Command::ForumUnreads(v) => Some(v),
+            Command::Threads(g, lists) => {
+                let unsubscribe = lists.is_none();
+                self.remember(Command::Threads(g.clone(), lists));
+                let mut sub = self.subscription(&g);
+                if unsubscribe {
+                    sub.insert("threads".into(), json!(false));
+                    sub.insert("thread_member_lists".into(), json!([]));
+                }
+                Some(lazy_request_subs(vec![(g, sub)]))
+            }
             Command::Status(s) => {
                 let payload = presence(&s);
                 self.remember(Command::Status(s));
@@ -857,6 +1040,10 @@ impl Task {
                 one_entry(c.clone(), json!(ranges)),
             );
         }
+        if let Some(lists) = self.thread_subs.get(guild_id) {
+            sub.insert("threads".into(), json!(true));
+            sub.insert("thread_member_lists".into(), json!(lists));
+        }
         sub
     }
 
@@ -867,6 +1054,7 @@ impl Task {
             .active_guilds
             .keys()
             .chain(self.member_lists.keys())
+            .chain(self.thread_subs.keys())
             .map(str::to_owned)
             .collect();
         if !guilds.is_empty() {
@@ -1207,6 +1395,9 @@ struct Pacer {
     /// Member searches waiting for their window.
     searches: VecDeque<Value>,
     search_sent: VecDeque<Instant>,
+    /// Forum unread requests (op 28) waiting for their window.
+    forums: VecDeque<Value>,
+    forum_sent: VecDeque<Instant>,
 }
 
 fn is_bounded(payload: &Value) -> bool {
@@ -1239,6 +1430,13 @@ impl Pacer {
             self.searches.push_back(payload);
             return;
         }
+        if payload.get("op").and_then(Value::as_u64) == Some(28) {
+            if self.forums.len() >= MAX_WAITING_FORUM_UNREADS {
+                self.forums.pop_front();
+            }
+            self.forums.push_back(payload);
+            return;
+        }
         if self.outbox.len() >= MAX_QUEUED {
             tracing::warn!("gateway outbox full; dropping the oldest command");
             self.outbox.pop_front();
@@ -1252,6 +1450,7 @@ impl Pacer {
         prune(&mut self.bounded_sent, BOUNDED_WINDOW, now);
         prune(&mut self.presence_sent, PRESENCE_WINDOW, now);
         prune(&mut self.search_sent, SEARCH_WINDOW, now);
+        prune(&mut self.forum_sent, FORUM_UNREADS_WINDOW, now);
         let mut out = Vec::new();
         while let Some(front) = self.outbox.front() {
             if is_bounded(front) {
@@ -1269,6 +1468,14 @@ impl Pacer {
             self.search_sent.push_back(now);
             self.bounded_sent.push_back(now);
             out.extend(self.searches.pop_front());
+        }
+        while !self.forums.is_empty()
+            && self.forum_sent.len() < FORUM_UNREADS_PER_WINDOW
+            && self.bounded_sent.len() < BOUNDED_PER_WINDOW
+        {
+            self.forum_sent.push_back(now);
+            self.bounded_sent.push_back(now);
+            out.extend(self.forums.pop_front());
         }
         if self.presence_due && self.presence_sent.len() < PRESENCE_PER_WINDOW {
             if let Some(s) = status {
@@ -1300,7 +1507,19 @@ impl Pacer {
         } else {
             None
         };
-        [bounded, presence, search].into_iter().flatten().min()
+        let forum = if self.forums.is_empty() {
+            None
+        } else if self.forum_sent.len() >= FORUM_UNREADS_PER_WINDOW {
+            self.forum_sent.front().map(|t| *t + FORUM_UNREADS_WINDOW)
+        } else if self.bounded_sent.len() >= BOUNDED_PER_WINDOW {
+            self.bounded_sent.front().map(|t| *t + BOUNDED_WINDOW)
+        } else {
+            None
+        };
+        [bounded, presence, search, forum]
+            .into_iter()
+            .flatten()
+            .min()
     }
 }
 
@@ -1599,5 +1818,101 @@ mod tests {
         let wake = pacer.next_wakeup().expect("presence waiting");
         tokio::time::advance(wake - Instant::now()).await;
         assert_eq!(pacer.take_ready(Some("dnd")).len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn op28_is_paced_with_other_bounded_commands() {
+        let mut pacer = Pacer::default();
+        let forum = |i: u64| json!({"op": 28, "d": {"guild_id": "1", "channel_id": "2", "n": i}});
+        for i in 0..3 {
+            pacer.push(lazy_request(std::iter::once((
+                format!("{i}").as_str(),
+                true,
+            ))));
+        }
+        for i in 0..6 {
+            pacer.push(forum(i));
+        }
+        // 3 lazy requests and 1 op 28 fill the 4 bounded commands per second;
+        // only the newest 4 op 28 wait (2 and 3 of them were dropped first).
+        let first = pacer.take_ready(None);
+        assert_eq!(first.iter().filter(|p| p["op"] == 14).count(), 3);
+        let op28: Vec<_> = first.iter().filter(|p| p["op"] == 28).collect();
+        assert_eq!(op28.len(), 1);
+        assert_eq!(op28[0]["d"]["n"], 2);
+        let wake = pacer.next_wakeup().expect("op 28 waiting");
+        assert_eq!(wake - Instant::now(), BOUNDED_WINDOW);
+
+        // Over 40 s of steady pressure from both: op 28 never more than 4 in
+        // 5 s, and no more than 4 bounded commands of any kind in 1 s.
+        let mut op28_sent: Vec<Instant> = vec![Instant::now()];
+        let mut bounded_sent: Vec<Instant> = vec![Instant::now(); 4];
+        for step in 0..400u64 {
+            if step % 2 == 0 {
+                pacer.push(forum(100 + step));
+            }
+            if step % 5 == 0 {
+                pacer.push(lazy_request(std::iter::once(("9", true))));
+            }
+            for p in pacer.take_ready(None) {
+                bounded_sent.push(Instant::now());
+                if p["op"] == 28 {
+                    op28_sent.push(Instant::now());
+                }
+            }
+            tokio::time::advance(Duration::from_millis(100)).await;
+        }
+        let max_in = |sent: &[Instant], window: Duration| {
+            (0..sent.len())
+                .map(|i| {
+                    sent[i..]
+                        .iter()
+                        .take_while(|t| **t - sent[i] < window)
+                        .count()
+                })
+                .max()
+                .unwrap_or(0)
+        };
+        assert!(max_in(&op28_sent, FORUM_UNREADS_WINDOW) <= FORUM_UNREADS_PER_WINDOW);
+        assert!(max_in(&bounded_sent, BOUNDED_WINDOW) <= BOUNDED_PER_WINDOW);
+        // Forum requests still get through (about 4 per 5 s).
+        assert!(op28_sent.len() >= 25, "{}", op28_sent.len());
+    }
+
+    #[test]
+    fn thread_events_parse_typed() {
+        let d = Dispatch::parse(
+            "THREAD_MEMBERS_UPDATE",
+            json!({"id": "5", "guild_id": "1", "member_count": "3",
+                   "added_members": [{"id": "5", "user_id": "10", "join_timestamp": null, "flags": 1},
+                                     {"broken": true}],
+                   "removed_member_ids": ["11", null]}),
+        );
+        let u = match d {
+            Dispatch::ThreadMembersUpdate(u) => u,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(u.member_count, Some(3));
+        assert!(matches!(u.membership_change("10"), Some(Some(_))));
+        assert_eq!(u.membership_change("11"), Some(None));
+        assert_eq!(u.membership_change("12"), None);
+        assert!(matches!(
+            Dispatch::parse("SAVED_MESSAGE_DELETE", json!({"message_id": 9})),
+            Dispatch::SavedMessageDelete(s) if s.message_id == "9"
+        ));
+        assert!(matches!(
+            Dispatch::parse("RECENT_MENTION_DELETE", json!({"message_id": "8"})),
+            Dispatch::RecentMentionDelete(s) if s.message_id == "8"
+        ));
+        assert!(matches!(
+            Dispatch::parse("FORUM_UNREADS", json!({"guild_id": "1", "channel_id": "2",
+                "threads": [{"thread_id": "3", "count": 25}, {"thread_id": "4", "missing": true}, {}]})),
+            Dispatch::ForumUnreads(f) if f.threads.len() == 2 && f.threads[1].missing
+        ));
+        // A broken payload falls back to Other.
+        assert!(matches!(
+            Dispatch::parse("THREAD_DELETE", json!({"guild_id": "1"})),
+            Dispatch::Other { .. }
+        ));
     }
 }
