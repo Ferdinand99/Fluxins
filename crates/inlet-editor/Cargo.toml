@@ -1,0 +1,16 @@
+[package]
+name = "inlet-editor"
+description = "The message composer's text model and gpui element for Inlet"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+gpui.workspace = true
+unicode-segmentation = "1"
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
