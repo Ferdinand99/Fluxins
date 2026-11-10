@@ -20,6 +20,9 @@ env:
   CARGO_INCREMENTAL: 0
   CARGO_NET_RETRY: 10
   RUSTUP_MAX_RETRIES: 10
+  # The About view links to the exact commit the binary was built from.
+  # Release builds never enable the `demo` feature of the app.
+  INLET_SOURCE_REV: ${{ github.sha }}
 
 jobs:
   windows:
@@ -48,10 +51,17 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked
 
+      - name: Package
+        shell: bash
+        run: |
+          mkdir dist
+          cp target/release/inlet.exe dist/inlet.exe
+          cp THIRD-PARTY-NOTICES dist/THIRD-PARTY-NOTICES
+
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: inlet-windows-x86_64
-          path: target/release/inlet.exe
+          path: dist/
           if-no-files-found: error
           retention-days: 7
 
@@ -96,8 +106,9 @@ jobs:
         run: |
           mkdir dist
           cp target/release/inlet dist/inlet
+          cp THIRD-PARTY-NOTICES dist/THIRD-PARTY-NOTICES
           cd dist
-          zip inlet-macos-aarch64.zip inlet
+          zip inlet-macos-aarch64.zip inlet THIRD-PARTY-NOTICES
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -155,7 +166,10 @@ jobs:
       - name: Package
         run: |
           mkdir dist
-          tar -czf dist/inlet-linux-x86_64.tar.gz -C target/release inlet
+          cp target/release/inlet dist/inlet
+          cp THIRD-PARTY-NOTICES dist/THIRD-PARTY-NOTICES
+          tar -czf inlet-linux-x86_64.tar.gz -C dist inlet THIRD-PARTY-NOTICES
+          mv inlet-linux-x86_64.tar.gz dist/
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -163,6 +177,37 @@ jobs:
           path: dist/inlet-linux-x86_64.tar.gz
           if-no-files-found: error
           retention-days: 7
+
+  notices:
+    name: Third-party notices are up to date
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned Rust toolchain
+        run: |
+          rustup toolchain install
+          rustc --version
+
+      - name: Cache cargo-about
+        id: cargo-about
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/bin/cargo-about
+          key: cargo-about-0.9.3-${{ runner.os }}-rust-1.99.1
+
+      - name: Install cargo-about
+        if: steps.cargo-about.outputs.cache-hit != 'true'
+        run: cargo install cargo-about --locked --version 0.9.3 --features cli
+
+      - name: Regenerate THIRD-PARTY-NOTICES
+        run: scripts/third-party-notices.sh
+
+      - name: Check that the committed file is current
+        run: git diff --exit-code THIRD-PARTY-NOTICES
 
   deny:
     name: cargo-deny
