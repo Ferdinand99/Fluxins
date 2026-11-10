@@ -1,0 +1,167 @@
+name: macOS packaging checks
+
+# Lints the macOS packaging files and the signing workflows. On v0 it also
+# checks that these files are the same as on main: the manual signing check
+# runs from main (GitHub only dispatches workflows from the default branch),
+# so main carries its own copy of them.
+#
+# Files that must be the same on v0 and main:
+#   packaging/macos/
+#   .github/workflows/macos-sign.yml
+#   .github/workflows/macos-sign-check.yml
+#   .github/workflows/macos-packaging.yml
+
+on:
+  push:
+    branches: [v0, main]
+    paths:
+      - "packaging/macos/**"
+      - ".github/workflows/macos-*.yml"
+      - ".github/workflows/release.yml"
+  pull_request:
+    branches: [v0, main]
+    paths:
+      - "packaging/macos/**"
+      - ".github/workflows/macos-*.yml"
+      - ".github/workflows/release.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-packaging-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      ACTIONLINT_VERSION: 1.7.12
+      ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install actionlint
+        run: |
+          archive="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$archive" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/$archive"
+          echo "$ACTIONLINT_SHA256  $RUNNER_TEMP/$archive" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP" actionlint
+
+      # shellcheck is preinstalled on the runner; actionlint uses it for run: blocks.
+      - name: actionlint
+        run: |
+          files=(.github/workflows/macos-*.yml)
+          if [ -f .github/workflows/release.yml ]; then files+=(.github/workflows/release.yml); fi
+          "$RUNNER_TEMP/actionlint" -color "${files[@]}"
+
+      - name: shellcheck
+        run: shellcheck --version && shellcheck packaging/macos/*.sh
+
+      - name: Scripts are executable
+        run: |
+          for f in packaging/macos/*.sh; do
+            mode=$(git ls-files -s -- "$f" | cut -d' ' -f1)
+            if [ "$mode" != "100755" ]; then
+              echo "::error file=$f::$f is not executable in git (mode $mode)"
+              exit 1
+            fi
+          done
+
+      - name: Property lists parse
+        run: |
+          python3 - <<'PY'
+          import plistlib
+          for path in ("packaging/macos/Info.plist", "packaging/macos/entitlements.plist"):
+              with open(path, "rb") as f:
+                  plistlib.load(f)
+              print(f"{path}: OK")
+          ents = plistlib.load(open("packaging/macos/entitlements.plist", "rb"))
+          # Hardened-runtime exceptions stay off unless this list changes on purpose.
+          forbidden = {
+              "com.apple.security.cs.allow-jit",
+              "com.apple.security.cs.allow-unsigned-executable-memory",
+              "com.apple.security.cs.disable-library-validation",
+              "com.apple.security.cs.allow-dyld-environment-variables",
+              "com.apple.security.cs.disable-executable-page-protection",
+              "com.apple.security.get-task-allow",
+          }
+          bad = forbidden & set(ents)
+          if bad:
+              raise SystemExit(f"entitlements.plist enables {sorted(bad)}")
+          PY
+
+  same-as-main:
+    name: Same as main
+    if: github.base_ref == 'v0' || github.ref == 'refs/heads/v0'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          path: main-copy
+          persist-credentials: false
+
+      - name: Compare with main
+        run: |
+          shared=(packaging/macos .github/workflows/macos-sign.yml \
+                  .github/workflows/macos-sign-check.yml .github/workflows/macos-packaging.yml)
+          if [ ! -d main-copy/packaging/macos ]; then
+            echo "::warning::main has no packaging/macos yet; nothing to compare"
+            exit 0
+          fi
+          status=0
+          for p in "${shared[@]}"; do
+            if ! diff -r "$p" "main-copy/$p"; then
+              echo "::error::$p differs between this branch and main"
+              status=1
+            fi
+          done
+          exit "$status"
+
+  bundle-layout:
+    name: Bundle layout (no macOS tools)
+    if: github.base_ref == 'v0' || github.ref == 'refs/heads/v0'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Assemble with a stand-in binary
+        run: |
+          printf '#!/bin/sh\n' > "$RUNNER_TEMP/inlet"
+          packaging/macos/build-app.sh "$RUNNER_TEMP/inlet" "$RUNNER_TEMP/out"
+          app="$RUNNER_TEMP/out/Inlet.app"
+          for f in Contents/MacOS/inlet Contents/Info.plist Contents/PkgInfo \
+                   Contents/Resources/inlet.icns Contents/Resources/LICENSE \
+                   Contents/Resources/THIRD-PARTY-NOTICES; do
+            test -f "$app/$f" || { echo "::error::missing $f"; exit 1; }
+          done
+          test -x "$app/Contents/MacOS/inlet"
+          APP="$app" python3 - <<'PY'
+          import os, plistlib, re
+          info = plistlib.load(open(os.path.join(os.environ["APP"], "Contents/Info.plist"), "rb"))
+          cargo = open("Cargo.toml", encoding="utf-8").read()
+          section = cargo.split("[workspace.package]", 1)[1]
+          version = re.search(r'^version\s*=\s*"([^"]+)"', section, re.M).group(1)
+          numeric = re.split(r"[-+]", version, maxsplit=1)[0]
+          assert info["CFBundleIdentifier"] == "no.opland.inlet", info["CFBundleIdentifier"]
+          assert info["CFBundleExecutable"] == "inlet"
+          assert info["CFBundleShortVersionString"] == numeric, info["CFBundleShortVersionString"]
+          assert info["CFBundleVersion"] == numeric
+          assert info["NSHighResolutionCapable"] is True
+          print(f"Info.plist OK, version {numeric}")
+          PY
