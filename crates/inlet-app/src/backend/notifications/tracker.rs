@@ -17,12 +17,12 @@
 
 use std::collections::HashMap;
 use std::hash::Hash;
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use inlet_protocol as p;
 use inlet_state::{AccountState, AckKind, Changes, ChannelId, GuildId, MessageId, UserId};
-use reqwest::Method;
 
 use super::settings::{self, Change, SettingsBatch, Target};
 use super::{Badge, BadgeUpdate, Ev};
@@ -66,8 +66,32 @@ pub struct ReadTracker {
     /// The channel `Opened` was last sent for.
     last_opened: Option<ChannelId>,
     settings: SettingsBatch,
+    /// Answers of settings writes (a started request reports here; `tick` reads it).
+    done_tx: Sender<Done>,
+    done_rx: Receiver<Done>,
     /// The guild and channel the settings window shows.
     settings_view: Option<(Option<GuildId>, Option<ChannelId>)>,
+}
+
+/// How a settings write ended.
+struct Done {
+    guild: Option<GuildId>,
+    /// The settings the server answered with, or the reason it failed.
+    result: Result<serde_json::Value, String>,
+}
+
+/// The guild and `version` of a settings update (an echo, or a write's answer).
+fn settings_key(data: &serde_json::Value) -> Option<(Option<GuildId>, Option<i64>)> {
+    let guild = match data.get("guild_id") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(s)) => Some(GuildId::parse(s)?),
+        Some(serde_json::Value::Number(n)) => Some(GuildId(n.as_u64()?)),
+        Some(_) => return None,
+    };
+    Some((
+        guild,
+        data.get("version").and_then(serde_json::Value::as_i64),
+    ))
 }
 
 /// Whether the tracker needs this event. Typing, presences, reactions, member lists and
@@ -199,7 +223,10 @@ fn unread_targets(state: &AccountState, guild: Option<GuildId>) -> Vec<(ChannelI
 
 impl ReadTracker {
     pub fn new(client: p::Client, events: Ui) -> Self {
+        let (done_tx, done_rx) = channel();
         ReadTracker {
+            done_tx,
+            done_rx,
             client,
             events,
             state: None,
@@ -219,6 +246,18 @@ impl ReadTracker {
         if !relevant(d, me) {
             return;
         }
+        // A settings update older than one already seen (a late echo of an earlier write).
+        let settings_update = match d {
+            p::Dispatch::Other { name, data } if name == "USER_GUILD_SETTINGS_UPDATE" => {
+                settings_key(data)
+            }
+            _ => None,
+        };
+        if let Some((guild, version)) = settings_update {
+            if self.settings.is_stale(guild, version) {
+                return;
+            }
+        }
         let mut changes = if let Some(state) = self.state.as_mut() {
             state.apply(d)
         } else if let p::Dispatch::Ready(r) = d {
@@ -229,6 +268,13 @@ impl ReadTracker {
         } else {
             return;
         };
+        // What the server holds is now the confirmed settings; what is asked for and not
+        // confirmed yet goes back on top of it.
+        if let Some((guild, version)) = settings_update {
+            self.confirm_settings(guild, version, &mut changes);
+        } else if matches!(d, p::Dispatch::Ready(_)) {
+            self.reconfirm_settings(&mut changes);
+        }
         // A message in the channel being read is read at once.
         if let p::Dispatch::MessageCreate(m) = d {
             if let (Some(ch), Some(id)) = (ChannelId::parse(&m.channel_id), MessageId::parse(&m.id))
@@ -246,6 +292,10 @@ impl ReadTracker {
 
     /// About once a second: the mute clock, due acknowledgements, due settings writes.
     pub fn tick(&mut self, now: Now) {
+        // Answers of settings writes first, so a write that waited for one can start.
+        while let Ok(done) = self.done_rx.try_recv() {
+            self.settings_done(done, now);
+        }
         if let Some(state) = self.state.as_mut() {
             let changes = state.tick(now.ms);
             self.refresh(&changes, false);
@@ -256,7 +306,7 @@ impl ReadTracker {
         for (ch, message) in self.gate.due(now.at) {
             self.client.ack(&ch.to_string(), &message.to_string());
         }
-        for (guild, body) in self.settings.due(now.at) {
+        for (guild, body) in self.settings.start_due(now.at) {
             self.send_settings(guild, body);
         }
     }
@@ -375,24 +425,119 @@ impl ReadTracker {
             },
             None => None,
         };
-        let Some(patch) =
-            settings::build_patch(state.guild_settings(), guild, channel, change, now.ms)
-        else {
+        let Some(intent) = settings::build_intent(guild, channel, change, now.ms) else {
             return;
         };
-        // The same object, as the server will echo it, so the sidebar answers the click.
-        let mut data = patch.clone();
-        data.insert(
-            "guild_id".into(),
-            guild.map_or(serde_json::Value::Null, |g| g.to_string().into()),
-        );
-        let changes = state.apply(&p::Dispatch::Other {
-            name: "USER_GUILD_SETTINGS_UPDATE".into(),
-            data: serde_json::Value::Object(data),
-        });
-        self.settings.add(guild, patch, now.at);
+        // A channel change replaces the server's whole override map, so it is only safe
+        // when the local map is that whole map (see `GuildSettings::can_write_overrides`).
+        if channel.is_some() && !state.guild_settings().can_write_overrides(guild) {
+            self.emit_error(t!("error-notification-too-many"));
+            return;
+        }
+        self.settings
+            .add(guild, state.guild_settings().get(guild), intent, now.at);
+        let changes = self.reapply_settings(guild);
         self.refresh(&changes, false);
         self.push_settings_view();
+    }
+
+    /// Puts the unconfirmed changes of a guild on top of the confirmed settings in the
+    /// state, so the sidebar shows what was asked for.
+    fn reapply_settings(&mut self, guild: Option<GuildId>) -> Changes {
+        let (Some(state), Some(data)) = (self.state.as_mut(), self.settings.effective(guild))
+        else {
+            return Changes::default();
+        };
+        state.apply(&p::Dispatch::Other {
+            name: "USER_GUILD_SETTINGS_UPDATE".into(),
+            data,
+        })
+    }
+
+    /// The server's word on a guild's settings was just applied to the state (an echo or
+    /// the answer of a write): remember it as the confirmed settings, and put what is
+    /// still unconfirmed back on top.
+    fn confirm_settings(
+        &mut self,
+        guild: Option<GuildId>,
+        version: Option<i64>,
+        changes: &mut Changes,
+    ) {
+        let Some(state) = &self.state else { return };
+        self.settings
+            .confirm(guild, state.guild_settings().get(guild), version);
+        if self.settings.is_busy(guild) {
+            changes.merge(self.reapply_settings(guild));
+        }
+    }
+
+    /// READY came: the server's settings replace the confirmed ones.
+    fn reconfirm_settings(&mut self, changes: &mut Changes) {
+        let Some(state) = &self.state else { return };
+        let busy = self
+            .settings
+            .reset(|g| state.guild_settings().get(g).clone());
+        for guild in busy {
+            changes.merge(self.reapply_settings(guild));
+        }
+    }
+
+    /// A settings write ended: on success the server's answer counts as its echo; on
+    /// failure the change is dropped, which shows the confirmed settings again, and the
+    /// error is shown.
+    fn settings_done(&mut self, done: Done, now: Now) {
+        let guild = done.guild;
+        // What the server holds if it took the write: the confirmed settings with the
+        // write on top. Its own answer, when it gives one, wins field by field.
+        let assumed = self.settings.finish(guild, done.result.is_ok());
+        match done.result {
+            Ok(answer) => {
+                let mut obj = match assumed {
+                    Some(serde_json::Value::Object(o)) => o,
+                    _ => serde_json::Map::new(),
+                };
+                if let serde_json::Value::Object(a) = answer {
+                    obj.extend(a);
+                }
+                if !obj.is_empty() {
+                    obj.insert(
+                        "guild_id".into(),
+                        guild.map_or(serde_json::Value::Null, |g| g.to_string().into()),
+                    );
+                    let update = p::Dispatch::Other {
+                        name: "USER_GUILD_SETTINGS_UPDATE".into(),
+                        data: serde_json::Value::Object(obj),
+                    };
+                    self.on_dispatch(&update, now);
+                }
+            }
+            Err(reason) => {
+                self.emit_error(t!("error-notification-settings", error = reason));
+                let changes = self.reapply_settings_back(guild);
+                self.refresh(&changes, false);
+                self.push_settings_view();
+            }
+        }
+    }
+
+    /// After a failed write: the confirmed settings, with what is still waiting on top.
+    fn reapply_settings_back(&mut self, guild: Option<GuildId>) -> Changes {
+        // The state holds the failed change; the confirmed settings replace it, then the
+        // changes made since go back on top.
+        let (Some(state), Some(confirmed)) = (self.state.as_mut(), self.settings.confirmed(guild))
+        else {
+            return Changes::default();
+        };
+        let mut changes = state.apply(&p::Dispatch::Other {
+            name: "USER_GUILD_SETTINGS_UPDATE".into(),
+            data: settings::compose(&confirmed, guild, &[]),
+        });
+        changes.merge(self.reapply_settings(guild));
+        changes
+    }
+
+    fn emit_error(&self, text: String) {
+        let _ = self.events.unbounded_send(accounts::Ev::Error(text));
     }
 
     pub fn show_settings(&mut self, guild: Option<GuildId>, channel: Option<ChannelId>) {
@@ -412,19 +557,17 @@ impl ReadTracker {
         self.emit(Ev::Settings(view));
     }
 
+    /// Starts one settings request. Its answer is sent to `tick`, not to the UI, so a
+    /// late answer never reaches another session and the next write waits for it.
     fn send_settings(&self, guild: Option<GuildId>, body: serde_json::Value) {
         let client = self.client.clone();
-        let events = self.events.clone();
+        let done = self.done_tx.clone();
         tokio::spawn(async move {
-            if let Err(err) = client
-                .request_json(Method::PATCH, &settings::route(guild), Some(&body))
+            let result = client
+                .request_json(p::Method::PATCH, &settings::route(guild), Some(&body))
                 .await
-            {
-                let _ = events.unbounded_send(accounts::Ev::Error(t!(
-                    "error-notification-settings",
-                    error = Failure::from(err).message
-                )));
-            }
+                .map_err(|err| Failure::from(err).message);
+            let _ = done.send(Done { guild, result });
         });
     }
 

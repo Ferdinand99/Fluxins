@@ -4,6 +4,7 @@ count-thousands = { $count }K
 count-millions = { $count }M
 
 error-notification-settings = Could not save the notification settings. { $error }
+error-notification-too-many = This server has more channel settings than Inlet can change safely. Change them in another client.
 
 ## The notification settings window
 

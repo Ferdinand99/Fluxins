@@ -2,17 +2,25 @@
 //! Writing notification settings (mutes, levels, suppressions) and reading them back
 //! for the settings window.
 //!
-//! Every change is applied to the local state at once, so the sidebar answers the
-//! click, and queued as a partial settings object. Changes to one guild's settings
-//! within [`QUIET`] merge into one `PATCH`, and at most [`MAX_PER_TICK`] go out per
-//! tick, so clicking through every option cannot get near Fluxer's limit (30 per 10 s).
-//! The channel override map is sent whole, as the server replaces it, built from the
-//! settings the account already has (see `GuildNotificationSettings::overrides_with`).
+//! A click becomes an [`Intent`]: what the person asked for, not a copy of the server's
+//! settings. For each guild the intents that the server has not confirmed yet are kept
+//! apart from the last settings the server confirmed, and what the UI shows is always
+//! the confirmed settings with those intents on top. That makes the display independent
+//! of the order echoes arrive in, and a failed write falls back to the confirmed
+//! settings by dropping its intent.
+//!
+//! Writes: at most one `PATCH` per guild is in flight; changes made meanwhile wait, and
+//! their body is built when they are sent, from the settings the server has confirmed by
+//! then. Changes to one guild within [`QUIET`] merge into one request, and at most
+//! [`MAX_PER_TICK`] start per tick, far below Fluxer's limit (30 per 10 s). The channel
+//! override map is sent whole, as the server replaces it.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use inlet_state::guild_settings::{notifications, GuildSettings, Mute};
+use inlet_state::guild_settings::{
+    notifications, ChannelOverride, GuildNotificationSettings, Mute,
+};
 use inlet_state::{AccountState, ChannelId, GuildId};
 use serde_json::{json, Map, Value};
 
@@ -51,16 +59,46 @@ pub enum Change {
     SuppressRoles(bool),
 }
 
-/// The partial settings object a change writes, or `None` when it makes no sense (a bad
-/// level, a suppression on a channel, a mute that is zero or absurdly long, a channel
-/// ID that is not one). `now_ms` is the time a timed mute counts from.
-pub fn build_patch(
-    settings: &GuildSettings,
+/// What the person asked for in one channel or category.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ChannelIntent {
+    pub mute: Option<Mute>,
+    pub level: Option<i64>,
+}
+
+/// What the person asked for in one guild: settings fields of the guild itself (as a
+/// partial settings object) and per-channel changes.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Intent {
+    pub fields: Map<String, Value>,
+    pub channels: BTreeMap<ChannelId, ChannelIntent>,
+}
+
+impl Intent {
+    /// Adds a later intent: its choices win where both set the same thing.
+    fn merge(&mut self, later: Intent) {
+        self.fields.extend(later.fields);
+        for (ch, c) in later.channels {
+            let e = self.channels.entry(ch).or_default();
+            if c.mute.is_some() {
+                e.mute = c.mute;
+            }
+            if c.level.is_some() {
+                e.level = c.level;
+            }
+        }
+    }
+}
+
+/// The intent of a change, or `None` when it makes no sense (a bad level, a suppression
+/// on a channel, a mute that is zero or absurdly long). `now_ms` is the time a timed
+/// mute counts from.
+pub fn build_intent(
     guild: Option<GuildId>,
     channel: Option<ChannelId>,
     change: Change,
     now_ms: i64,
-) -> Option<Map<String, Value>> {
+) -> Option<Intent> {
     let mute = |for_ms: Option<i64>| -> Option<Mute> {
         if let Some(ms) = for_ms {
             if ms <= 0 || ms > MAX_MUTE_MS {
@@ -74,52 +112,124 @@ pub fn build_patch(
         })
     };
     let level_ok = |l: i64| (notifications::ALL_MESSAGES..=notifications::INHERIT).contains(&l);
-    let mut patch = Map::new();
+    let mut intent = Intent::default();
     match (channel, change) {
         (None, Change::Mute { for_ms }) => {
             let m = mute(for_ms)?;
-            patch.insert("muted".into(), json!(true));
-            patch.insert("mute_config".into(), m.config_json());
+            intent.fields.insert("muted".into(), json!(true));
+            intent.fields.insert("mute_config".into(), m.config_json());
         }
         (None, Change::Unmute) => {
-            patch.insert("muted".into(), json!(false));
-            patch.insert("mute_config".into(), Value::Null);
+            intent.fields.insert("muted".into(), json!(false));
+            intent.fields.insert("mute_config".into(), Value::Null);
         }
         (None, Change::Level(l)) if level_ok(l) => {
-            patch.insert("message_notifications".into(), json!(l));
+            intent
+                .fields
+                .insert("message_notifications".into(), json!(l));
         }
         (None, Change::SuppressEveryone(on)) if guild.is_some() => {
-            patch.insert("suppress_everyone".into(), json!(on));
+            intent.fields.insert("suppress_everyone".into(), json!(on));
         }
         (None, Change::SuppressRoles(on)) if guild.is_some() => {
-            patch.insert("suppress_roles".into(), json!(on));
+            intent.fields.insert("suppress_roles".into(), json!(on));
         }
         (Some(ch), Change::Mute { for_ms }) => {
             let m = mute(for_ms)?;
-            patch.insert(
-                "channel_overrides".into(),
-                settings.get(guild).overrides_with(ch, |o| o.mute = m),
+            intent.channels.insert(
+                ch,
+                ChannelIntent {
+                    mute: Some(m),
+                    level: None,
+                },
             );
         }
         (Some(ch), Change::Unmute) => {
-            patch.insert(
-                "channel_overrides".into(),
-                settings
-                    .get(guild)
-                    .overrides_with(ch, |o| o.mute = Mute::default()),
+            intent.channels.insert(
+                ch,
+                ChannelIntent {
+                    mute: Some(Mute::default()),
+                    level: None,
+                },
             );
         }
         (Some(ch), Change::Level(l)) if level_ok(l) => {
-            patch.insert(
-                "channel_overrides".into(),
-                settings
-                    .get(guild)
-                    .overrides_with(ch, |o| o.message_notifications = l),
+            intent.channels.insert(
+                ch,
+                ChannelIntent {
+                    mute: None,
+                    level: Some(l),
+                },
             );
         }
         _ => return None,
     }
-    Some(patch)
+    Some(intent)
+}
+
+/// The complete `channel_overrides` map: the settings' own, with the intents applied.
+/// An override that ends up as the defaults is left out.
+fn overrides_json(base: &GuildNotificationSettings, intents: &[&Intent]) -> Value {
+    let mut all = base.channel_overrides.clone();
+    for intent in intents {
+        for (ch, c) in &intent.channels {
+            let mut o = all.get(ch).copied().unwrap_or_default();
+            if let Some(m) = c.mute {
+                o.mute = m;
+            }
+            if let Some(l) = c.level {
+                o.message_notifications = l;
+            }
+            if o == ChannelOverride::default() {
+                all.remove(ch);
+            } else {
+                all.insert(*ch, o);
+            }
+        }
+    }
+    Value::Object(
+        all.iter()
+            .map(|(id, o)| (id.to_string(), o.input_json()))
+            .collect(),
+    )
+}
+
+/// The whole settings object of a guild with the intents applied, in the shape of a
+/// `USER_GUILD_SETTINGS_UPDATE`: what the UI shows while the intents are unconfirmed.
+pub fn compose(
+    base: &GuildNotificationSettings,
+    guild: Option<GuildId>,
+    intents: &[&Intent],
+) -> Value {
+    let mut obj = Map::new();
+    obj.insert(
+        "guild_id".into(),
+        guild.map_or(Value::Null, |g| g.to_string().into()),
+    );
+    obj.insert("muted".into(), json!(base.mute.muted));
+    obj.insert("mute_config".into(), base.mute.config_json());
+    obj.insert(
+        "message_notifications".into(),
+        json!(base.message_notifications),
+    );
+    obj.insert("suppress_everyone".into(), json!(base.suppress_everyone));
+    obj.insert("suppress_roles".into(), json!(base.suppress_roles));
+    for intent in intents {
+        obj.extend(intent.fields.clone());
+    }
+    obj.insert("channel_overrides".into(), overrides_json(base, intents));
+    Value::Object(obj)
+}
+
+/// The body of the `PATCH` for an intent: its guild fields, and the whole override map
+/// when it changes a channel (the server replaces the map; without a channel change the
+/// map is left out and the server keeps its own).
+fn body(base: &GuildNotificationSettings, intent: &Intent) -> Value {
+    let mut obj = intent.fields.clone();
+    if !intent.channels.is_empty() {
+        obj.insert("channel_overrides".into(), overrides_json(base, &[intent]));
+    }
+    Value::Object(obj)
 }
 
 /// The route of a guild's (or the direct messages') settings.
@@ -130,55 +240,157 @@ pub fn route(guild: Option<GuildId>) -> String {
     }
 }
 
-struct Entry {
-    patch: Map<String, Value>,
-    first_at: Instant,
+/// One guild's write state.
+struct GuildWrite {
+    /// The settings as the server last confirmed them (an echo, a write's answer, READY).
+    confirmed: GuildNotificationSettings,
+    /// The newest `version` seen; an update with a lower one is old news.
+    version: Option<i64>,
+    /// Sent, not answered yet. At most one request per guild is in flight.
+    in_flight: Option<Intent>,
+    /// Asked for since, not sent yet, with when the first of it was asked for.
+    pending: Option<(Intent, Instant)>,
 }
 
-/// Settings changes waiting to be sent, merged per guild.
+impl GuildWrite {
+    fn has_intents(&self) -> bool {
+        self.in_flight.is_some() || self.pending.is_some()
+    }
+}
+
+/// Settings writes of every guild.
 #[derive(Default)]
 pub struct SettingsBatch {
-    pending: BTreeMap<Option<GuildId>, Entry>,
+    guilds: BTreeMap<Option<GuildId>, GuildWrite>,
 }
 
 impl SettingsBatch {
-    /// Queues `patch` for a guild. Fields of an earlier patch that this one repeats are
-    /// replaced (a channel override map already contains the earlier changes).
-    pub fn add(&mut self, guild: Option<GuildId>, patch: Map<String, Value>, now: Instant) {
-        match self.pending.get_mut(&guild) {
-            Some(e) => e.patch.extend(patch),
-            None => {
-                self.pending.insert(
-                    guild,
-                    Entry {
-                        patch,
-                        first_at: now,
-                    },
-                );
-            }
+    /// Queues an intent. `current` is the guild's settings as the state has them now; it
+    /// is taken as the confirmed settings the first time (nothing was unconfirmed then).
+    pub fn add(
+        &mut self,
+        guild: Option<GuildId>,
+        current: &GuildNotificationSettings,
+        intent: Intent,
+        now: Instant,
+    ) {
+        let w = self.guilds.entry(guild).or_insert_with(|| GuildWrite {
+            confirmed: current.clone(),
+            version: None,
+            in_flight: None,
+            pending: None,
+        });
+        match &mut w.pending {
+            Some((p, _)) => p.merge(intent),
+            None => w.pending = Some((intent, now)),
         }
     }
 
-    /// The requests to start now: guilds whose first change is at least [`QUIET`] old,
-    /// the oldest first, at most [`MAX_PER_TICK`].
-    pub fn due(&mut self, now: Instant) -> Vec<(Option<GuildId>, Value)> {
-        let mut ready: Vec<(Option<GuildId>, Instant)> = self
-            .pending
+    /// The settings object the UI should show for a guild: the confirmed settings with
+    /// the unconfirmed intents on top. `None` for a guild with no unconfirmed intent.
+    pub fn effective(&self, guild: Option<GuildId>) -> Option<Value> {
+        let w = self.guilds.get(&guild)?;
+        if !w.has_intents() {
+            return None;
+        }
+        let intents: Vec<&Intent> = w
+            .in_flight
             .iter()
-            .filter(|(_, e)| now.saturating_duration_since(e.first_at) >= QUIET)
-            .map(|(g, e)| (*g, e.first_at))
+            .chain(w.pending.as_ref().map(|(p, _)| p))
+            .collect();
+        Some(compose(&w.confirmed, guild, &intents))
+    }
+
+    /// Whether an update with this `version` is older than one already seen.
+    pub fn is_stale(&self, guild: Option<GuildId>, version: Option<i64>) -> bool {
+        match (self.guilds.get(&guild).and_then(|w| w.version), version) {
+            (Some(known), Some(v)) => v < known,
+            _ => false,
+        }
+    }
+
+    /// The settings the server last confirmed for a guild, if it has a write going on or had one.
+    pub fn confirmed(&self, guild: Option<GuildId>) -> Option<GuildNotificationSettings> {
+        self.guilds.get(&guild).map(|w| w.confirmed.clone())
+    }
+
+    /// Whether a guild has a write that is not confirmed yet.
+    pub fn is_busy(&self, guild: Option<GuildId>) -> bool {
+        self.guilds.get(&guild).is_some_and(GuildWrite::has_intents)
+    }
+
+    /// The server confirmed these settings (an echo or the answer to a write).
+    pub fn confirm(
+        &mut self,
+        guild: Option<GuildId>,
+        settings: &GuildNotificationSettings,
+        version: Option<i64>,
+    ) {
+        if let Some(w) = self.guilds.get_mut(&guild) {
+            w.confirmed = settings.clone();
+            w.version = w.version.max(version);
+        }
+    }
+
+    /// A new READY: what the server holds now is the confirmed settings of every guild
+    /// that has a write going on, and versions start over. Returns those guilds.
+    pub fn reset(
+        &mut self,
+        settings: impl Fn(Option<GuildId>) -> GuildNotificationSettings,
+    ) -> Vec<Option<GuildId>> {
+        for (g, w) in &mut self.guilds {
+            w.confirmed = settings(*g);
+            w.version = None;
+        }
+        self.guilds
+            .iter()
+            .filter(|(_, w)| w.has_intents())
+            .map(|(g, _)| *g)
+            .collect()
+    }
+
+    /// The requests to start now: guilds with nothing in flight whose first waiting
+    /// change is at least [`QUIET`] old, the oldest first, at most [`MAX_PER_TICK`].
+    /// What they carry moves to "in flight"; the body is built here, from the settings
+    /// the server has confirmed by now.
+    pub fn start_due(&mut self, now: Instant) -> Vec<(Option<GuildId>, Value)> {
+        let mut ready: Vec<(Option<GuildId>, Instant)> = self
+            .guilds
+            .iter()
+            .filter(|(_, w)| w.in_flight.is_none())
+            .filter_map(|(g, w)| {
+                let (_, first) = w.pending.as_ref()?;
+                (now.saturating_duration_since(*first) >= QUIET).then_some((*g, *first))
+            })
             .collect();
         ready.sort_by_key(|(_, at)| *at);
         ready.truncate(MAX_PER_TICK);
         ready
             .into_iter()
-            .filter_map(|(g, _)| self.pending.remove(&g).map(|e| (g, Value::Object(e.patch))))
+            .filter_map(|(g, _)| {
+                let w = self.guilds.get_mut(&g)?;
+                let (intent, _) = w.pending.take()?;
+                let b = body(&w.confirmed, &intent);
+                w.in_flight = Some(intent);
+                Some((g, b))
+            })
             .collect()
     }
 
+    /// The write in flight for a guild ended. When the server took it (`ok`), returns
+    /// the settings it holds then as far as the answer did not say (the confirmed
+    /// settings with the intent applied).
+    pub fn finish(&mut self, guild: Option<GuildId>, ok: bool) -> Option<Value> {
+        let w = self.guilds.get_mut(&guild)?;
+        let intent = w.in_flight.take()?;
+        ok.then(|| compose(&w.confirmed, guild, &[&intent]))
+    }
+
     #[cfg(test)]
-    pub fn is_idle(&self) -> bool {
-        self.pending.is_empty()
+    pub fn in_flight(&self, guild: Option<GuildId>) -> bool {
+        self.guilds
+            .get(&guild)
+            .is_some_and(|w| w.in_flight.is_some())
     }
 }
 
@@ -260,105 +472,213 @@ pub fn view(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use inlet_state::guild_settings::GuildSettings;
 
-    fn settings(v: Value) -> GuildSettings {
+    fn settings(v: Value) -> GuildNotificationSettings {
         GuildSettings::from_ready(&[v])
+            .get(Some(GuildId(1)))
+            .clone()
+    }
+
+    fn intent(g: Option<GuildId>, ch: Option<ChannelId>, c: Change) -> Intent {
+        build_intent(g, ch, c, 1_000).unwrap()
     }
 
     #[test]
-    fn changes_become_partial_objects() {
-        let s = settings(json!({"guild_id": "1", "channel_overrides": {
-            "5": {"collapsed": true, "message_notifications": 3, "muted": false, "mute_config": null}}}));
+    fn changes_become_intents() {
         let g = Some(GuildId(1));
-
-        let p = build_patch(
-            &s,
+        let i = intent(
             g,
             None,
             Change::Mute {
                 for_ms: Some(900_000),
             },
-            1_000,
-        )
-        .unwrap();
-        assert_eq!(p["muted"], json!(true));
+        );
+        assert_eq!(i.fields["muted"], json!(true));
         assert_eq!(
-            p["mute_config"],
+            i.fields["mute_config"],
             json!({"end_time": 901_000, "selected_time_window": 900_000})
         );
         // Until turned off: muted, no config.
-        let p = build_patch(&s, g, None, Change::Mute { for_ms: None }, 1_000).unwrap();
-        assert_eq!(p["mute_config"], Value::Null);
-        let p = build_patch(&s, g, None, Change::Unmute, 0).unwrap();
+        let i = intent(g, None, Change::Mute { for_ms: None });
+        assert_eq!(i.fields["mute_config"], Value::Null);
+        let i = intent(g, None, Change::Unmute);
         assert_eq!(
-            (p["muted"].clone(), p["mute_config"].clone()),
+            (i.fields["muted"].clone(), i.fields["mute_config"].clone()),
             (json!(false), Value::Null)
         );
-        let p = build_patch(&s, g, None, Change::Level(1), 0).unwrap();
-        assert_eq!(p.len(), 1);
-        assert_eq!(p["message_notifications"], json!(1));
-        let p = build_patch(&s, g, None, Change::SuppressEveryone(true), 0).unwrap();
-        assert_eq!(p["suppress_everyone"], json!(true));
-
-        // A channel change carries the other overrides whole.
-        let p = build_patch(&s, g, Some(ChannelId(6)), Change::Level(2), 0).unwrap();
-        assert_eq!(p["channel_overrides"]["5"]["collapsed"], json!(true));
-        assert_eq!(
-            p["channel_overrides"]["6"]["message_notifications"],
-            json!(2)
-        );
+        let i = intent(g, None, Change::Level(1));
+        assert_eq!(i.fields.len(), 1);
+        assert_eq!(i.fields["message_notifications"], json!(1));
+        let i = intent(g, None, Change::SuppressEveryone(true));
+        assert_eq!(i.fields["suppress_everyone"], json!(true));
+        let i = intent(g, Some(ChannelId(6)), Change::Level(2));
+        assert!(i.fields.is_empty());
+        assert_eq!(i.channels[&ChannelId(6)].level, Some(2));
 
         // Nonsense is refused.
-        assert!(build_patch(&s, g, None, Change::Level(9), 0).is_none());
-        assert!(build_patch(&s, g, None, Change::Level(-1), 0).is_none());
-        assert!(build_patch(&s, g, None, Change::Mute { for_ms: Some(0) }, 0).is_none());
-        assert!(build_patch(
-            &s,
+        let no = |g, ch, c| build_intent(g, ch, c, 0).is_none();
+        assert!(no(g, None, Change::Level(9)));
+        assert!(no(g, None, Change::Level(-1)));
+        assert!(no(g, None, Change::Mute { for_ms: Some(0) }));
+        assert!(no(
             g,
             None,
             Change::Mute {
                 for_ms: Some(i64::MAX)
-            },
-            0
-        )
-        .is_none());
-        assert!(build_patch(&s, g, Some(ChannelId(6)), Change::SuppressRoles(true), 0).is_none());
-        assert!(build_patch(&s, None, None, Change::SuppressRoles(true), 0).is_none());
+            }
+        ));
+        assert!(no(g, Some(ChannelId(6)), Change::SuppressRoles(true)));
+        assert!(no(None, None, Change::SuppressRoles(true)));
     }
 
     #[test]
-    fn a_burst_of_changes_is_one_request_per_guild() {
-        let base = Instant::now();
+    fn what_the_ui_shows_is_the_confirmed_settings_with_the_intents_on_top() {
+        let base = settings(json!({"guild_id": "1", "channel_overrides": {
+            "5": {"collapsed": true, "message_notifications": 3, "muted": false}}}));
+        let g = Some(GuildId(1));
         let mut b = SettingsBatch::default();
-        for i in 0..50u64 {
-            let mut p = Map::new();
-            p.insert("message_notifications".into(), json!(i % 3));
-            b.add(Some(GuildId(1)), p, base + Duration::from_millis(i));
-        }
-        let mut p = Map::new();
-        p.insert("suppress_roles".into(), json!(true));
-        b.add(Some(GuildId(1)), p, base + Duration::from_millis(60));
-        assert!(b.due(base + Duration::from_millis(400)).is_empty());
-        let due = b.due(base + Duration::from_millis(600));
-        assert_eq!(due.len(), 1);
+        let t = Instant::now();
+        assert!(b.effective(g).is_none());
+        b.add(g, &base, intent(g, Some(ChannelId(6)), Change::Level(2)), t);
+        b.add(
+            g,
+            &base,
+            intent(g, Some(ChannelId(7)), Change::Mute { for_ms: None }),
+            t,
+        );
+        let v = b.effective(g).unwrap();
+        // The other override travels whole, the two changes are both in it.
+        assert_eq!(v["channel_overrides"]["5"]["collapsed"], json!(true));
         assert_eq!(
-            due[0].1,
+            v["channel_overrides"]["6"]["message_notifications"],
+            json!(2)
+        );
+        assert_eq!(v["channel_overrides"]["7"]["muted"], json!(true));
+
+        // The server confirms {5, 6}: channel 7 is still on top.
+        let confirmed = settings(json!({"guild_id": "1", "channel_overrides": {
+            "5": {"collapsed": true},
+            "6": {"message_notifications": 2}}}));
+        b.confirm(g, &confirmed, Some(4));
+        let v = b.effective(g).unwrap();
+        assert_eq!(
+            v["channel_overrides"]["6"]["message_notifications"],
+            json!(2)
+        );
+        assert_eq!(v["channel_overrides"]["7"]["muted"], json!(true));
+    }
+
+    #[test]
+    fn two_writes_for_one_guild_are_never_in_flight_together() {
+        let base = settings(json!({"guild_id": "1"}));
+        let g = Some(GuildId(1));
+        let t = Instant::now();
+        let at = |ms: u64| t + Duration::from_millis(ms);
+        let mut b = SettingsBatch::default();
+
+        for i in 0..50i64 {
+            b.add(
+                g,
+                &base,
+                intent(g, None, Change::Level(i % 3)),
+                at(i as u64),
+            );
+        }
+        b.add(
+            g,
+            &base,
+            intent(g, None, Change::SuppressRoles(true)),
+            at(60),
+        );
+        assert!(b.start_due(at(400)).is_empty(), "merging");
+        let sent = b.start_due(at(600));
+        assert_eq!(sent.len(), 1, "one request for 51 changes");
+        assert_eq!(
+            sent[0].1,
             json!({"message_notifications": 1, "suppress_roles": true})
         );
-        assert!(b.is_idle());
+        assert!(b.in_flight(g));
 
-        // Many guilds at once: two per tick, the oldest first.
+        // More changes while it is out wait, however long.
+        b.add(
+            g,
+            &base,
+            intent(g, None, Change::SuppressEveryone(true)),
+            at(700),
+        );
+        assert!(b.start_due(at(60_000)).is_empty());
+        assert!(b.in_flight(g));
+
+        // The answer comes: the waiting change goes out, built from what is confirmed.
+        b.finish(g, true);
+        let sent = b.start_due(at(60_000));
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].1, json!({"suppress_everyone": true}));
+    }
+
+    #[test]
+    fn many_guilds_start_two_per_tick_oldest_first() {
+        let base = settings(json!({"guild_id": "1"}));
+        let t = Instant::now();
+        let mut b = SettingsBatch::default();
         for g in 0..5u64 {
-            let mut p = Map::new();
-            p.insert("muted".into(), json!(true));
-            b.add(Some(GuildId(g)), p, base + Duration::from_millis(g));
+            let g = Some(GuildId(g));
+            b.add(
+                g,
+                &base,
+                intent(g, None, Change::Mute { for_ms: None }),
+                t + Duration::from_millis(g.map_or(0, |g| g.0)),
+            );
         }
-        let t = base + Duration::from_secs(5);
-        let first: Vec<_> = b.due(t).into_iter().map(|(g, _)| g).collect();
+        let now = t + Duration::from_secs(5);
+        let first: Vec<_> = b.start_due(now).into_iter().map(|(g, _)| g).collect();
         assert_eq!(first, vec![Some(GuildId(0)), Some(GuildId(1))]);
-        assert_eq!(b.due(t).len(), 2);
-        assert_eq!(b.due(t).len(), 1);
-        assert!(b.is_idle());
+        assert_eq!(b.start_due(now).len(), 2);
+        assert_eq!(b.start_due(now).len(), 1);
+        assert!(b.start_due(now).is_empty());
+    }
+
+    #[test]
+    fn a_failed_write_drops_back_to_the_confirmed_settings() {
+        let base = settings(json!({"guild_id": "1"}));
+        let g = Some(GuildId(1));
+        let t = Instant::now();
+        let mut b = SettingsBatch::default();
+        b.add(g, &base, intent(g, None, Change::Level(2)), t);
+        b.start_due(t + QUIET);
+        b.add(
+            g,
+            &base,
+            intent(g, None, Change::SuppressRoles(true)),
+            t + QUIET,
+        );
+        assert_eq!(b.effective(g).unwrap()["message_notifications"], json!(2));
+
+        // The write fails: its change is gone, the one made since stays.
+        assert!(b.finish(g, false).is_none());
+        let v = b.effective(g).unwrap();
+        assert_eq!(v["message_notifications"], json!(3));
+        assert_eq!(v["suppress_roles"], json!(true));
+        // Nothing waits any more once that one is sent and done.
+        b.start_due(t + QUIET * 3);
+        b.finish(g, true);
+        assert!(b.effective(g).is_none());
+    }
+
+    #[test]
+    fn old_news_is_recognised_by_version() {
+        let base = settings(json!({"guild_id": "1"}));
+        let g = Some(GuildId(1));
+        let mut b = SettingsBatch::default();
+        // No entry yet: nothing to be old against.
+        assert!(!b.is_stale(g, Some(1)));
+        b.add(g, &base, intent(g, None, Change::Level(1)), Instant::now());
+        assert!(!b.is_stale(g, Some(1)));
+        b.confirm(g, &base, Some(5));
+        assert!(b.is_stale(g, Some(4)));
+        assert!(!b.is_stale(g, Some(5)));
+        assert!(!b.is_stale(g, None));
     }
 
     #[test]

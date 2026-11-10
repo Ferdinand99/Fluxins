@@ -23,6 +23,9 @@ pub struct RowMarks {
 }
 
 impl RowMarks {
+    // Deviation: Fluxer lets a person set an "unread badges" level per channel and turn
+    // the faded unread pill on muted channels off. Inlet has neither setting: customisation
+    // is off and the faded pill is always shown.
     /// Fluxer's `getChannelUnreadState` with the unread-badge customisation off, plus the
     /// rules of `ChannelItem`: no count on the open channel, faded unread on muted ones.
     pub fn of(b: Badge, selected: bool) -> RowMarks {

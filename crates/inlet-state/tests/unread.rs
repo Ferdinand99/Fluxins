@@ -73,6 +73,24 @@ fn read_state_from_ready_matches_server() {
     // The channel list only needs to refresh what READY named: all of it.
     let c = s.apply(&d("READY", ready_json_for_apply()));
     assert!(c.reset);
+    // The same server data gives the same answers.
+    assert_eq!(
+        s.unread(ch(GENERAL)),
+        Unread {
+            unread: true,
+            mentions: 3,
+            muted: false
+        }
+    );
+    assert_eq!(s.unread(ch(RANDOM)), Unread::default());
+    assert_eq!(
+        s.guild_unread(g()),
+        Unread {
+            unread: true,
+            mentions: 3,
+            muted: false
+        }
+    );
 
     // Reading the channel does what the server will say back: ack at the
     // newest message, mentions to zero.

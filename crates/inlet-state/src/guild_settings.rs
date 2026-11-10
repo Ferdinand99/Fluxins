@@ -148,6 +148,11 @@ pub struct GuildNotificationSettings {
     pub message_notifications: i64,
     /// Channel and category overrides.
     pub channel_overrides: BTreeMap<ChannelId, ChannelOverride>,
+    /// Some overrides of the payload were not kept (more than
+    /// [`MAX_CHANNEL_OVERRIDES`], or entries that could not be read). The map
+    /// is then not the server's whole map, and a write that replaces the map
+    /// would delete what is missing: see [`GuildSettings::can_write_overrides`].
+    pub lossy: bool,
 }
 
 impl Default for GuildNotificationSettings {
@@ -160,6 +165,7 @@ impl Default for GuildNotificationSettings {
             // guild's own default (`effectiveMessageNotifications`).
             message_notifications: notifications::INHERIT,
             channel_overrides: BTreeMap::new(),
+            lossy: false,
         }
     }
 }
@@ -203,24 +209,33 @@ impl GuildNotificationSettings {
             self.message_notifications = v.as_i64().unwrap_or(notifications::INHERIT);
         }
         if let Some(v) = obj.get("channel_overrides") {
-            self.channel_overrides = read_overrides(v);
+            (self.channel_overrides, self.lossy) = read_overrides(v);
         }
     }
 }
 
-fn read_overrides(v: &Value) -> BTreeMap<ChannelId, ChannelOverride> {
+/// The overrides of a payload, and whether any entry was left out.
+fn read_overrides(v: &Value) -> (BTreeMap<ChannelId, ChannelOverride>, bool) {
     let mut out = BTreeMap::new();
+    let mut lossy = false;
     let mut add = |key: Option<&str>, item: &Value| {
         if out.len() >= MAX_CHANNEL_OVERRIDES {
+            lossy = true;
             return;
         }
-        let Some(obj) = item.as_object() else { return };
+        let Some(obj) = item.as_object() else {
+            lossy = true;
+            return;
+        };
         let id = obj
             .get("channel_id")
             .and_then(Value::as_str)
             .or(key)
             .and_then(ChannelId::parse);
-        let Some(id) = id else { return };
+        let Some(id) = id else {
+            lossy = true;
+            return;
+        };
         let mut o = ChannelOverride {
             mute: Mute::read(obj, Mute::default()),
             collapsed: obj
@@ -239,9 +254,10 @@ fn read_overrides(v: &Value) -> BTreeMap<ChannelId, ChannelOverride> {
     match v {
         Value::Array(items) => items.iter().for_each(|i| add(None, i)),
         Value::Object(map) => map.iter().for_each(|(k, i)| add(Some(k), i)),
+        // Neither a list nor a map holds no overrides, as `null` does.
         _ => {}
     }
-    out
+    (out, lossy)
 }
 
 /// Every guild's settings; the key `None` is direct messages.
@@ -279,6 +295,17 @@ impl GuildSettings {
         }
         self.by_guild.entry(guild).or_default().merge(obj);
         Some(guild)
+    }
+
+    /// Whether a write may replace this guild's whole override map. The server
+    /// replaces the map, so a write is only safe when the local map is the
+    /// server's whole map: not cut at the cap, no entry that could not be
+    /// read, and an entry that was not refused for lack of room.
+    pub fn can_write_overrides(&self, guild: Option<GuildId>) -> bool {
+        match self.by_guild.get(&guild) {
+            Some(s) => !s.lossy,
+            None => self.by_guild.len() < MAX_GUILD_SETTINGS,
+        }
     }
 
     /// The settings of a guild (`None` = direct messages), or Fluxer's defaults.
@@ -446,5 +473,45 @@ mod tests {
         });
         assert_eq!(body["8"]["mute_config"], Value::Null);
         assert_eq!(body["8"]["muted"], json!(true));
+    }
+
+    #[test]
+    fn a_map_that_was_cut_or_not_fully_read_is_not_safe_to_replace() {
+        // Whole and readable: safe.
+        let s = GuildSettings::from_ready(&[json!({"guild_id": "1",
+            "channel_overrides": {"5": {"muted": true}}})]);
+        assert!(s.can_write_overrides(Some(GuildId(1))));
+        // No entry at all is safe too: there is nothing to lose.
+        assert!(s.can_write_overrides(Some(GuildId(2))));
+
+        // An entry that cannot be read.
+        let s = GuildSettings::from_ready(&[json!({"guild_id": "1",
+            "channel_overrides": {"5": {"muted": true}, "not-an-id": {"muted": true}}})]);
+        assert!(s.get(Some(GuildId(1))).lossy);
+        assert!(!s.can_write_overrides(Some(GuildId(1))));
+        let s = GuildSettings::from_ready(&[json!({"guild_id": "1",
+            "channel_overrides": {"5": 7}})]);
+        assert!(!s.can_write_overrides(Some(GuildId(1))));
+
+        // Fluxer's own limit of 10 000 fits; one more does not.
+        let many = |n: u64| -> Value {
+            Value::Object(
+                (1..=n)
+                    .map(|i| (i.to_string(), json!({"muted": true})))
+                    .collect(),
+            )
+        };
+        let s = GuildSettings::from_ready(&[json!({"guild_id": "1",
+            "channel_overrides": many(10_000)})]);
+        assert_eq!(s.get(Some(GuildId(1))).channel_overrides.len(), 10_000);
+        assert!(s.can_write_overrides(Some(GuildId(1))));
+        let s = GuildSettings::from_ready(&[json!({"guild_id": "1",
+            "channel_overrides": many(10_001)})]);
+        assert!(!s.can_write_overrides(Some(GuildId(1))));
+
+        // A later full payload that fits makes it safe again.
+        let mut s = s;
+        s.update(&json!({"guild_id": "1", "channel_overrides": {"5": {"muted": true}}}));
+        assert!(s.can_write_overrides(Some(GuildId(1))));
     }
 }

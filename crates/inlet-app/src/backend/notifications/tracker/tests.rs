@@ -8,6 +8,7 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 use super::*;
+use crate::backend::notifications::SettingsView;
 use crate::backend::Event;
 
 const ME: &str = "10";
@@ -87,6 +88,8 @@ struct Fixture {
     client: p::Client,
     tracker: ReadTracker,
     events: UnboundedReceiver<Event>,
+    /// Errors shown to the person, collected by `drain`.
+    errors: Vec<String>,
     base: Instant,
 }
 
@@ -126,7 +129,14 @@ impl Fixture {
         let instance = p::Instance::discover_with(&server.uri(), info)
             .await
             .expect("discovery");
-        let client = p::Client::new(instance, p::Token::new("tok-read"));
+        // One token per fixture: the protocol shares its ack and rate state between clients of
+        // one token, and tests run side by side.
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let token = format!(
+            "tok-read-{}",
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        );
+        let client = p::Client::new(instance, p::Token::new(token));
         let (tx, events) = unbounded();
         let mut tracker = ReadTracker::new(client.clone(), Ui::new(tx));
         let base = Instant::now();
@@ -140,6 +150,7 @@ impl Fixture {
             client,
             tracker,
             events,
+            errors: Vec::new(),
             base,
         }
     }
@@ -159,8 +170,10 @@ impl Fixture {
     fn drain(&mut self) -> Vec<Ev> {
         let mut out = Vec::new();
         while let Ok(ev) = self.events.try_recv() {
-            if let Event::Notifications(ev) = ev {
-                out.push(ev);
+            match ev {
+                Event::Notifications(ev) => out.push(ev),
+                Event::Accounts(crate::backend::accounts::Ev::Error(e)) => self.errors.push(e),
+                _ => {}
             }
         }
         out
@@ -566,4 +579,240 @@ async fn the_settings_window_gets_the_values_and_every_change() {
         f.at(20),
     );
     assert!(!f.drain().iter().any(|e| matches!(e, Ev::Settings(_))));
+}
+
+// ---- settings writes: echoes, queued writes and failures ----
+
+/// The server's answer to a settings write: the whole object, as the real one is.
+fn settings_answer(version: i64, body: &Value) -> Value {
+    let mut answer = json!({"guild_id": GUILD, "version": version});
+    if let (Value::Object(a), Value::Object(b)) = (&mut answer, body) {
+        a.extend(b.clone());
+    }
+    answer
+}
+
+/// Mounts the settings route: answers like the server, after `delay`.
+async fn mount_settings_route(server: &MockServer, delay: Duration) {
+    let version = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
+    Mock::given(method("PATCH"))
+        .and(path(format!("/api/v1/users/@me/guilds/{GUILD}/settings")))
+        .respond_with(move |req: &Request| {
+            let body: Value = serde_json::from_slice(&req.body).unwrap();
+            let v = version.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            ResponseTemplate::new(200)
+                .set_body_json(settings_answer(v, &body))
+                .set_delay(delay)
+        })
+        .mount(server)
+        .await;
+}
+
+fn settings_path() -> String {
+    format!("/api/v1/users/@me/guilds/{GUILD}/settings")
+}
+
+async fn wait_for_patches(f: &Fixture, n: usize) -> Vec<Value> {
+    for _ in 0..80 {
+        if f.requests("PATCH", &settings_path()).await.len() >= n {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    f.requests("PATCH", &settings_path())
+        .await
+        .iter()
+        .map(|r| serde_json::from_slice(&r.body).unwrap())
+        .collect()
+}
+
+fn channel_target(id: &str) -> Target {
+    Target::Channel {
+        guild_id: Some(GUILD.to_string()),
+        channel_id: id.to_string(),
+    }
+}
+
+/// What the settings window would show for a channel now.
+fn settings_view_of(f: &mut Fixture, channel: &str) -> SettingsView {
+    f.drain();
+    f.tracker
+        .show_settings(GuildId::parse(GUILD), ChannelId::parse(channel));
+    let events = f.drain();
+    let Some(Ev::Settings(v)) = events.into_iter().find(|e| matches!(e, Ev::Settings(_))) else {
+        panic!("no settings view");
+    };
+    v
+}
+
+#[tokio::test]
+async fn an_echo_between_two_clicks_does_not_undo_the_second() {
+    let mut f = Fixture::new(json!([]), json!([])).await;
+    mount_settings_route(&f.server, Duration::ZERO).await;
+    f.drain();
+
+    // A: mute general. The request goes out.
+    f.tracker.change(
+        channel_target(GENERAL),
+        Change::Mute {
+            for_ms: Some(900_000),
+        },
+        f.at(100),
+    );
+    f.tracker.tick(f.at(700));
+    assert_eq!(wait_for_patches(&f, 1).await.len(), 1);
+
+    // B: a level on random, while that request is out.
+    f.tracker
+        .change(channel_target(RANDOM), Change::Level(1), f.at(800));
+    // The echo of A comes between the two clicks: it only knows A.
+    f.tracker.on_dispatch(
+        &p::Dispatch::parse(
+            "USER_GUILD_SETTINGS_UPDATE",
+            json!({"guild_id": GUILD, "version": 1, "channel_overrides": {
+                GENERAL: {"muted": true, "message_notifications": 3, "collapsed": false,
+                          "mute_config": {"end_time": JOINED_MS as i64 + 3_600_000 + 900_100,
+                                          "selected_time_window": 900_000}}}}),
+        ),
+        f.at(850),
+    );
+    // B did not blink back, and A is still there.
+    assert_eq!(settings_view_of(&mut f, RANDOM).channel_level, 1);
+    assert!(settings_view_of(&mut f, GENERAL).channel_muted);
+
+    // C: another change to general. Then the first request is answered.
+    f.tracker
+        .change(channel_target(GENERAL), Change::Level(2), f.at(900));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    f.tracker.tick(f.at(1_500));
+
+    // The second request carries A, B and C: nothing was lost.
+    let bodies = wait_for_patches(&f, 2).await;
+    assert_eq!(bodies.len(), 2);
+    let overrides = &bodies[1]["channel_overrides"];
+    assert_eq!(overrides[GENERAL]["muted"], json!(true), "A");
+    assert_eq!(overrides[GENERAL]["message_notifications"], json!(2), "C");
+    assert_eq!(overrides[RANDOM]["message_notifications"], json!(1), "B");
+}
+
+#[tokio::test]
+async fn two_writes_for_one_guild_are_not_in_flight_together() {
+    let mut f = Fixture::new(json!([]), json!([])).await;
+    // Every answer takes 600 ms.
+    mount_settings_route(&f.server, Duration::from_millis(600)).await;
+    f.drain();
+
+    f.tracker.change(
+        channel_target(GENERAL),
+        Change::Mute { for_ms: None },
+        f.at(100),
+    );
+    f.tracker.tick(f.at(700));
+    assert_eq!(wait_for_patches(&f, 1).await.len(), 1);
+
+    // B is asked for while the first request is out; ticks, however late, start nothing.
+    f.tracker
+        .change(channel_target(RANDOM), Change::Level(2), f.at(800));
+    f.tracker.tick(f.at(5_000));
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    f.tracker.tick(f.at(6_000));
+    assert_eq!(
+        f.requests("PATCH", &settings_path()).await.len(),
+        1,
+        "the second waits for the first"
+    );
+
+    // Once the first is answered, the second goes, built from what the server now holds.
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    f.tracker.tick(f.at(7_000));
+    let bodies = wait_for_patches(&f, 2).await;
+    assert_eq!(bodies.len(), 2);
+    let overrides = &bodies[1]["channel_overrides"];
+    assert_eq!(overrides[GENERAL]["muted"], json!(true));
+    assert_eq!(overrides[RANDOM]["message_notifications"], json!(2));
+}
+
+#[tokio::test]
+async fn a_failed_write_rolls_back_and_is_not_sent_again() {
+    let mut f = Fixture::new(json!([]), json!([])).await;
+    // The first write fails, later ones work.
+    Mock::given(method("PATCH"))
+        .and(path(settings_path()))
+        .respond_with(ResponseTemplate::new(500).set_body_json(json!({"code": "UNKNOWN"})))
+        .up_to_n_times(1)
+        .mount(&f.server)
+        .await;
+    mount_settings_route(&f.server, Duration::ZERO).await;
+    f.drain();
+
+    f.tracker.change(
+        channel_target(GENERAL),
+        Change::Mute { for_ms: None },
+        f.at(100),
+    );
+    assert!(
+        settings_view_of(&mut f, GENERAL).channel_muted,
+        "shown at once"
+    );
+    f.drain();
+    f.tracker.tick(f.at(700));
+    assert_eq!(wait_for_patches(&f, 1).await.len(), 1);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    f.tracker.tick(f.at(1_500));
+
+    // Rolled back to what the server confirmed, with the reason shown.
+    let events = f.drain();
+    let update = badges(&events)[0];
+    assert_eq!(
+        channel_badge_of(update, GENERAL),
+        Some(&Badge {
+            unread: true,
+            mentions: 0,
+            muted: false,
+            dimmed: false
+        })
+    );
+    assert!(!settings_view_of(&mut f, GENERAL).channel_muted);
+    assert_eq!(f.errors.len(), 1, "{:?}", f.errors);
+
+    // The next, unrelated change does not carry the failed mute along.
+    f.tracker
+        .change(channel_target(RANDOM), Change::Level(1), f.at(2_000));
+    f.tracker.tick(f.at(3_000));
+    let bodies = wait_for_patches(&f, 2).await;
+    assert_eq!(bodies.len(), 2);
+    let overrides = &bodies[1]["channel_overrides"];
+    assert!(overrides.get(GENERAL).is_none(), "{overrides}");
+    assert_eq!(overrides[RANDOM]["message_notifications"], json!(1));
+}
+
+#[tokio::test]
+async fn a_channel_change_is_refused_when_the_server_map_was_not_read_whole() {
+    // One of the overrides cannot be read: replacing the map would delete it.
+    let mut f = Fixture::new(
+        json!([]),
+        json!([{"guild_id": GUILD, "channel_overrides": {
+            RANDOM: {"muted": true}, "not-an-id": {"muted": true}}}]),
+    )
+    .await;
+    mount_settings_route(&f.server, Duration::ZERO).await;
+    f.drain();
+
+    f.tracker
+        .change(channel_target(GENERAL), Change::Level(1), f.at(100));
+    f.tracker.tick(f.at(1_000));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    f.drain();
+    assert_eq!(f.errors.len(), 1);
+    assert!(f.requests("PATCH", &settings_path()).await.is_empty());
+
+    // A change to the guild's own settings sends no override map and is fine.
+    f.tracker.change(
+        Target::Guild(Some(GUILD.to_string())),
+        Change::SuppressRoles(true),
+        f.at(1_100),
+    );
+    f.tracker.tick(f.at(2_000));
+    let bodies = wait_for_patches(&f, 1).await;
+    assert_eq!(bodies, vec![json!({"suppress_roles": true})]);
 }

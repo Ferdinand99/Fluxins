@@ -2977,7 +2977,6 @@ dependencies = [
  "inlet-state",
  "keyring",
  "log",
- "reqwest",
  "serde",
  "serde_json",
  "tokio",

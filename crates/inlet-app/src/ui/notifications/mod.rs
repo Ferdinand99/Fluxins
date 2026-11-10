@@ -70,6 +70,48 @@ pub struct State {
     pub settings: Option<SettingsWindow>,
 }
 
+/// The channel that is being read: the open one, while the chat is on screen, the window
+/// is in front and the message list is at the bottom. Nothing otherwise, so nothing is
+/// acknowledged for a channel nobody can see.
+pub fn watch_target(
+    chat_visible: bool,
+    window_active: bool,
+    scrolled_up: bool,
+    selected: Option<&str>,
+) -> Option<String> {
+    (chat_visible && window_active && !scrolled_up)
+        .then(|| selected.map(str::to_string))
+        .flatten()
+}
+
+/// What Escape and Shift+Escape do.
+#[derive(Debug, PartialEq, Eq)]
+enum EscapeAction {
+    CloseSettings,
+    MarkChannel,
+    MarkGuild,
+    Nothing,
+}
+
+/// A window over the app takes the key first (the settings window closes, a link
+/// confirmation is left alone); with the chat out of sight nothing is marked as read.
+fn escape_action(
+    settings_open: bool,
+    chat_visible: bool,
+    link_confirm_open: bool,
+    shift: bool,
+) -> EscapeAction {
+    if settings_open {
+        EscapeAction::CloseSettings
+    } else if !chat_visible || link_confirm_open {
+        EscapeAction::Nothing
+    } else if shift {
+        EscapeAction::MarkGuild
+    } else {
+        EscapeAction::MarkChannel
+    }
+}
+
 impl State {
     /// Applies what the backend says changed.
     pub fn apply(&mut self, update: BadgeUpdate) {
@@ -183,11 +225,12 @@ impl Inlet {
     /// front and the message list is at the bottom. Called every frame; it only sends when
     /// the answer changes.
     pub(crate) fn sync_watching(&mut self, window: &Window) {
-        let want = (self.screen == Screen::Main
-            && window.is_window_active()
-            && !self.notifications.scrolled_up)
-            .then(|| self.selected_channel.clone())
-            .flatten();
+        let want = watch_target(
+            self.chat_is_visible(),
+            window.is_window_active(),
+            self.notifications.scrolled_up,
+            self.selected_channel.as_deref(),
+        );
         if want != self.notifications.watching {
             self.notifications.watching = want.clone();
             self.backend.send(backend::Cmd::Watch { channel_id: want });
@@ -226,18 +269,25 @@ impl Inlet {
 
     /// Escape (`shift` false) or Shift+Escape. A window over the app takes the key first.
     fn on_escape(&mut self, shift: bool, cx: &mut Context<Self>) {
-        if self.notifications.settings.is_some() {
-            self.close_notification_settings(cx);
-            return;
+        let action = escape_action(
+            self.notifications.settings.is_some(),
+            self.chat_is_visible(),
+            self.overlays.pending_link.is_some(),
+            shift,
+        );
+        match action {
+            EscapeAction::CloseSettings => self.close_notification_settings(cx),
+            EscapeAction::MarkChannel => self.mark_channel_read(),
+            EscapeAction::MarkGuild => self.mark_guild_read(),
+            EscapeAction::Nothing => {}
         }
-        if self.screen != Screen::Main || self.overlays.pending_link.is_some() {
-            return;
-        }
-        if shift {
-            self.mark_guild_read();
-        } else {
-            self.mark_channel_read();
-        }
+    }
+
+    /// Whether the chat is on screen: signed in, and not under the About view. A view
+    /// that replaces the chat (the settings view when it exists) must be added here, so
+    /// nothing is read or marked as read behind it.
+    fn chat_is_visible(&self) -> bool {
+        self.screen == Screen::Main && !self.show_about
     }
 
     /// Adds the Escape handlers to the window's root element.
@@ -252,7 +302,18 @@ impl Inlet {
 
     /// Opens the settings window for the open channel and its server.
     pub(crate) fn open_notification_settings(&mut self, cx: &mut Context<Self>) {
-        let (guild_id, channel_id) = (self.selected_guild.clone(), self.selected_channel.clone());
+        let channel_id = self.selected_channel.clone();
+        self.open_notification_settings_for(channel_id, cx);
+    }
+
+    /// Opens the settings window for a channel or category of the open server (or a
+    /// direct message), and for the server itself.
+    pub(crate) fn open_notification_settings_for(
+        &mut self,
+        channel_id: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let guild_id = self.selected_guild.clone();
         self.notifications.settings = Some(SettingsWindow {
             guild_id: guild_id.clone(),
             channel_id: channel_id.clone(),
@@ -320,6 +381,36 @@ mod tests {
         });
         assert_eq!(s.channels.len(), 1);
         assert!(s.channels.contains_key("3"));
+    }
+
+    #[test]
+    fn nothing_is_read_while_the_chat_is_out_of_sight() {
+        // Open, in front, at the bottom: read.
+        assert_eq!(
+            watch_target(true, true, false, Some("7")),
+            Some("7".to_string())
+        );
+        // The About view (or any view that hides the chat) is not the chat.
+        assert_eq!(watch_target(false, true, false, Some("7")), None);
+        // Another window in front, or the list scrolled up, or no channel.
+        assert_eq!(watch_target(true, false, false, Some("7")), None);
+        assert_eq!(watch_target(true, true, true, Some("7")), None);
+        assert_eq!(watch_target(true, true, false, None), None);
+    }
+
+    #[test]
+    fn escape_marks_read_only_where_the_chat_is_seen() {
+        use EscapeAction::*;
+        assert_eq!(escape_action(false, true, false, false), MarkChannel);
+        assert_eq!(escape_action(false, true, false, true), MarkGuild);
+        // Under the About view: nothing, not the channel behind it.
+        assert_eq!(escape_action(false, false, false, false), Nothing);
+        assert_eq!(escape_action(false, false, false, true), Nothing);
+        // A link confirmation keeps the key for itself.
+        assert_eq!(escape_action(false, true, true, false), Nothing);
+        // The settings window closes first, with or without Shift.
+        assert_eq!(escape_action(true, true, false, false), CloseSettings);
+        assert_eq!(escape_action(true, true, false, true), CloseSettings);
     }
 
     #[test]
