@@ -15,8 +15,9 @@
 //! - It stops for good on close codes a retry cannot fix (4004 bad token,
 //!   4010/4011 shard, 4012 version), on [`GatewayHandle::close`], when every
 //!   handle is dropped, or when the event receiver is dropped.
-//! - Heartbeats keep running when the event channel is full: the task stops
-//!   reading the socket until the receiver catches up.
+//! - Heartbeats keep running when the event channel is full: events wait in
+//!   a buffer of up to 4,096; past that the task drops the socket and resumes
+//!   once the receiver has caught up.
 //!
 //! Large guilds (over 250 members) are passive until you call
 //! [`GatewayHandle::set_guild_active`]: a passive session gets no
@@ -60,6 +61,9 @@ const STABLE_AFTER: Duration = Duration::from_secs(60);
 const LONG_BACKOFF: Duration = Duration::from_secs(30);
 /// How long to wait for READY/RESUMED after Identify/Resume.
 const READY_TIMEOUT: Duration = Duration::from_secs(90);
+/// Events kept while the receiver is behind. Past this the connection is
+/// dropped and resumed later (the server replays what was missed).
+const MAX_PENDING: usize = 4_096;
 /// Commands kept while disconnected.
 const MAX_QUEUED: usize = 64;
 /// Capacity of the command channel.
@@ -717,7 +721,6 @@ impl Task {
                 stable,
                 min_delay,
             };
-            let can_read = self.pending.is_empty();
             tokio::select! {
                 _ = &mut heartbeat => {
                     if !acked {
@@ -764,7 +767,7 @@ impl Task {
                         return Outcome::Stop(CloseReason::ClientClosed);
                     }
                 },
-                read = read_payload(&mut ws, &mut codec), if can_read => {
+                read = read_payload(&mut ws, &mut codec) => {
                     let payload = match read {
                         Ok(Some(p)) => p,
                         Ok(None) => return reconnect("connection closed".into(), false, Duration::ZERO),
@@ -796,6 +799,10 @@ impl Task {
                             }
                             let event = Dispatch::parse(&name, data);
                             self.pending.push_back(GatewayEvent::Dispatch { seq: seq.unwrap_or(0), event });
+                            if self.pending.len() > MAX_PENDING {
+                                let _ = close(&mut ws, 4000).await;
+                                return reconnect("the event receiver is too slow".into(), false, Duration::ZERO);
+                            }
                             if ready_now {
                                 for p in self.replay() {
                                     if let Err(e) = send_payload(&mut ws, &mut codec, &p).await {
