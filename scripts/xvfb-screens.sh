@@ -59,12 +59,18 @@ scene() {
   pid=$!
   sleep 6
   shot "$1"
+  echo "$1: $(grep -E 'VmRSS' /proc/$pid/status)" >> "$out/memory.txt"
   kill $pid; wait $pid 2>/dev/null
 }
 scene 06-chat-cozy chat-cozy c-general
 scene 07-chat-compact chat-compact c-general
 scene 08-chat-system chat-system c-system
 scene 09-chat-replies chat-replies c-replies
+
+# 6. Several accounts: the account switcher (two more accounts in the background, one
+#    on another instance) and the sign-in screen when adding one.
+scene 10-accounts accounts c-general
+scene 11-accounts-add accounts-add c-general
 
 tail -n 20 "$out/signin.log" "$out/demo.log" >&2
 cat "$out/memory.txt" >&2

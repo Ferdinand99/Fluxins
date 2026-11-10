@@ -54,6 +54,12 @@ impl Inlet {
                 self.chat.notice = Some(t!("sidebar-channel-deleted"));
                 self.selected_channel = None;
             }
+            // Back to an account: the channel it had open.
+            if let Some(wanted) = self.switcher.take_wanted_channel() {
+                if self.channels.iter().any(|c| c.id == wanted) {
+                    self.select_channel(wanted, window, cx);
+                }
+            }
             #[cfg(feature = "demo")]
             if let Some(wanted) = self.demo_channel.take() {
                 if self.channels.iter().any(|c| c.id == wanted) {

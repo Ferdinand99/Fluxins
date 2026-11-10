@@ -150,7 +150,13 @@ impl Inlet {
                     self.screen = Screen::SignIn;
                 }
             }
-            Ev::Notice(message) => self.sign_in.notice = Some(message),
+            Ev::Notice(message) => {
+                if self.screen == Screen::Main {
+                    self.chat.notice = Some(message);
+                } else {
+                    self.sign_in.notice = Some(message);
+                }
+            }
             Ev::ConfirmAccount {
                 display_name,
                 account,
@@ -167,7 +173,11 @@ impl Inlet {
                 };
             }
             Ev::GatewayDown(message) => self.chat.gateway_down = Some(message),
-            Ev::SignedIn { username, instance } => {
+            Ev::SignedIn {
+                key,
+                username,
+                instance,
+            } => {
                 self.sign_in.busy = false;
                 self.sign_in.handoff = None;
                 self.sign_in.error = None;
@@ -182,10 +192,28 @@ impl Inlet {
                         cx.write_to_clipboard(ClipboardItem::new_string(String::new()));
                     }
                 }
+                // Back from a sign-in or a start-up screen to the account already shown
+                // (signed in again, or connected after a switch): load its place again.
+                let reopen = self.switcher.is_active(&key) && self.screen != Screen::Main;
+                self.switch_ui_to(key, cx);
+                self.switcher.adding = false;
                 self.username = username;
                 self.instance = instance;
                 self.screen = Screen::Main;
-                self.select_guild(None, cx);
+                if reopen {
+                    self.reopen_place(cx);
+                }
+                // Demo screenshots (CI): the account switcher scenes.
+                #[cfg(feature = "demo")]
+                if std::env::var_os("INLET_DEMO").is_some() {
+                    match crate::demo::scenes::current() {
+                        crate::demo::scenes::Scene::Accounts => self.switcher.open = true,
+                        crate::demo::scenes::Scene::AccountsAdd => {
+                            return self.begin_add_account(window, cx);
+                        }
+                        _ => {}
+                    }
+                }
                 // Demo screenshots (CI): open a guild and channel straight away.
                 #[cfg(feature = "demo")]
                 if let Ok(guild) = std::env::var("INLET_DEMO_GUILD") {
@@ -200,6 +228,8 @@ impl Inlet {
                 self.sign_in.error = Some(message);
             }
             Ev::SignedOut => self.reset_main(),
+            Ev::Accounts(list) => self.on_account_list(list),
+            Ev::AccountRemoved { key, message } => self.on_account_removed(key, message),
             // The messages domain loads the open channel again on every READY.
             Ev::Reconnected => {}
             Ev::Status(status) => {

@@ -85,6 +85,8 @@ pub struct Inlet {
     pub notifications: ui::notifications::State,
     #[allow(dead_code)] // filled by the task that builds the domain
     pub settings: ui::settings::State,
+    /// The signed-in accounts and the account switcher.
+    pub switcher: ui::overlays::account_switcher::Switcher,
 
     /// Demo screenshots: the channel to open once the guild's channels arrive.
     #[cfg(feature = "demo")]
@@ -144,6 +146,7 @@ impl Inlet {
             voice: Default::default(),
             notifications,
             settings: Default::default(),
+            switcher: Default::default(),
             #[cfg(feature = "demo")]
             demo_channel: None,
             _subscriptions: subscriptions,
@@ -197,7 +200,12 @@ impl Inlet {
     }
 
     /// Hands a backend event to the domain it belongs to.
-    fn handle_event(&mut self, event: Event, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn handle_event(
+        &mut self,
+        event: Event,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         match event {
             Event::Accounts(ev) => self.on_accounts_event(ev, window, cx),
             Event::Messages(ev) => self.on_messages_event(ev, window, cx),
@@ -209,6 +217,7 @@ impl Inlet {
             Event::Notifications(ev) => self.on_notifications_event(ev, window, cx),
             Event::Voice(ev) => self.on_voice_event(ev, window, cx),
             Event::Platform(ev) => self.on_platform_event(ev, window, cx),
+            Event::Tagged { account, event } => self.on_tagged_event(account, *event, window, cx),
         }
         cx.notify();
     }
@@ -235,6 +244,7 @@ impl Inlet {
         self.selected_channel = None;
         self.reset_messages();
         self.notifications.clear();
+        self.switcher.signed_out();
         self.chat.status.clear();
         self.chat.error = None;
         self.chat.notice = None;

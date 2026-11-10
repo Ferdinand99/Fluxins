@@ -2996,6 +2996,7 @@ dependencies = [
  "serde_json",
  "sys-locale",
  "tokio",
+ "tokio-tungstenite",
  "unic-langid",
  "unicode-segmentation",
  "url",

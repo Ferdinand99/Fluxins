@@ -11,6 +11,9 @@
 //! - `chat-compact`: `chat-cozy` in compact mode.
 //! - `chat-system`: for `#system-messages`, every system message type.
 //! - `chat-replies`: for `#replies`, replies with loaded, deleted and missing originals.
+//! - `accounts`: as `default`, with two more accounts in the background (one on the same
+//!   instance with mentions, one on another instance) and the account switcher open.
+//! - `accounts-add`: the same accounts, on the sign-in screen to add one more.
 
 use std::collections::HashMap;
 
@@ -32,6 +35,8 @@ pub enum Scene {
     ChatCompact,
     ChatSystem,
     ChatReplies,
+    Accounts,
+    AccountsAdd,
 }
 
 impl Scene {
@@ -42,6 +47,8 @@ impl Scene {
             "chat-compact" => Scene::ChatCompact,
             "chat-system" => Scene::ChatSystem,
             "chat-replies" => Scene::ChatReplies,
+            "accounts" => Scene::Accounts,
+            "accounts-add" => Scene::AccountsAdd,
             _ => return None,
         })
     }
@@ -238,7 +245,7 @@ pub fn data(scene: Scene) -> Data {
         });
     }
     let mut guild_settings = Vec::new();
-    let unread_demo = scene == Scene::Default;
+    let unread_demo = matches!(scene, Scene::Default | Scene::Accounts | Scene::AccountsAdd);
     if unread_demo {
         // Unread messages, mentions and mutes in the sidebar and the rail.
         read_states.extend(unread::read_states());
@@ -273,6 +280,8 @@ mod tests {
             "chat-compact",
             "chat-system",
             "chat-replies",
+            "accounts",
+            "accounts-add",
         ] {
             let scene = Scene::from_name(name).expect(name);
             let data = data(scene);

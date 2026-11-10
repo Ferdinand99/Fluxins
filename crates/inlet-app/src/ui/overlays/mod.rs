@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Everything drawn on top of the window content: modals, context menus, tooltips.
 
+pub mod account_switcher;
 mod context_menu;
 mod link_confirm;
 pub mod modal;
@@ -26,6 +27,9 @@ impl Inlet {
         }
         if self.notifications.settings.is_some() {
             out.push(self.render_notification_settings(cx));
+        }
+        if self.switcher.open && self.screen == crate::app::Screen::Main {
+            out.push(self.render_account_switcher(cx));
         }
         out
     }
