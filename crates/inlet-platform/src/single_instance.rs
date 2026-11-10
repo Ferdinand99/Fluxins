@@ -478,14 +478,19 @@ mod imp {
                 Some(&attrs),
             )
         };
+        // Read the error before anything else can overwrite the thread's last error.
+        let create_error = pipe.is_invalid().then(windows::core::Error::from_thread);
         // SAFETY: allocated by ConvertStringSecurityDescriptorToSecurityDescriptorW.
         unsafe {
             let _ = LocalFree(Some(HLOCAL(sd.0)));
         }
-        if pipe.is_invalid() {
-            let err = windows::core::Error::from_thread();
-            if err.code() == ERROR_ACCESS_DENIED.to_hresult() {
-                // The pipe exists: another instance (or a squatter, checked next).
+        if let Some(err) = create_error {
+            // With FILE_FLAG_FIRST_PIPE_INSTANCE and one allowed instance, an existing
+            // pipe gives ACCESS_DENIED or PIPE_BUSY: another instance is running (or a
+            // squatter, which `secondary` refuses after checking the owner).
+            if err.code() == ERROR_ACCESS_DENIED.to_hresult()
+                || err.code() == ERROR_PIPE_BUSY.to_hresult()
+            {
                 return secondary(&name, &user, message);
             }
             return Err(err.into());
