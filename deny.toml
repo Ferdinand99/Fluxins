@@ -1,5 +1,5 @@
 # cargo-deny configuration: licences, advisories and sources.
-# Fluxins is AGPL-3.0-or-later, so every dependency licence must be compatible with it.
+# Inlet is AGPL-3.0-or-later, so every dependency licence must be compatible with it.
 
 [graph]
 targets = [

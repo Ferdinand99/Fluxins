@@ -42,15 +42,15 @@ jobs:
           prefix-key: v0-windows-x86_64
 
       - name: Build
-        run: cargo build --release -p fluxins
+        run: cargo build --release -p inlet
 
       - name: Test
         run: cargo test --workspace
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: fluxins-windows-x86_64
-          path: target/release/fluxins.exe
+          name: inlet-windows-x86_64
+          path: target/release/inlet.exe
           if-no-files-found: error
           retention-days: 7
 
@@ -83,25 +83,25 @@ jobs:
           prefix-key: v0-macos-aarch64
 
       - name: Build
-        run: cargo build --release -p fluxins
+        run: cargo build --release -p inlet
 
       - name: Test
         run: cargo test --workspace
 
       # The binary is not signed or notarised yet. On the first start Gatekeeper
       # blocks it: right-click the file and choose Open, or run
-      # `xattr -d com.apple.quarantine fluxins` after unzipping.
+      # `xattr -d com.apple.quarantine inlet` after unzipping.
       - name: Package
         run: |
           mkdir dist
-          cp target/release/fluxins dist/fluxins
+          cp target/release/inlet dist/inlet
           cd dist
-          zip fluxins-macos-aarch64.zip fluxins
+          zip inlet-macos-aarch64.zip inlet
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: fluxins-macos-aarch64
-          path: dist/fluxins-macos-aarch64.zip
+          name: inlet-macos-aarch64
+          path: dist/inlet-macos-aarch64.zip
           if-no-files-found: error
           retention-days: 7
 
@@ -143,7 +143,7 @@ jobs:
           prefix-key: v0-linux-x86_64
 
       - name: Build
-        run: cargo build --release -p fluxins
+        run: cargo build --release -p inlet
 
       - name: Test
         run: cargo test --workspace
@@ -154,12 +154,12 @@ jobs:
       - name: Package
         run: |
           mkdir dist
-          tar -czf dist/fluxins-linux-x86_64.tar.gz -C target/release fluxins
+          tar -czf dist/inlet-linux-x86_64.tar.gz -C target/release inlet
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: fluxins-linux-x86_64
-          path: dist/fluxins-linux-x86_64.tar.gz
+          name: inlet-linux-x86_64
+          path: dist/inlet-linux-x86_64.tar.gz
           if-no-files-found: error
           retention-days: 7
 
