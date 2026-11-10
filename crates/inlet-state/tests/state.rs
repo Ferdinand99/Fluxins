@@ -1305,7 +1305,9 @@ fn loads_are_never_refused_and_end_by_page_timeout_or_ready() {
     for i in 0..=MAX_MESSAGE_WINDOWS {
         s.begin_load(id(i));
     }
-    let w = s.messages(id(MAX_MESSAGE_WINDOWS)).expect("the newest load works");
+    let w = s
+        .messages(id(MAX_MESSAGE_WINDOWS))
+        .expect("the newest load works");
     assert!(w.is_loading());
     assert!(s.messages(id(0)).is_none());
     // An idle window goes before a loading one.
@@ -1334,18 +1336,27 @@ fn loads_are_never_refused_and_end_by_page_timeout_or_ready() {
 #[test]
 fn a_window_scrolled_back_applies_reactions_at_once() {
     let mut s = state();
-    let page: Vec<_> = (0..50).rev().map(|i| message(mid(100 + i, 0), GENERAL, OTHER)).collect();
+    let page: Vec<_> = (0..50)
+        .rev()
+        .map(|i| message(mid(100 + i, 0), GENERAL, OTHER))
+        .collect();
     s.apply_messages(ch(GENERAL), MessagesPage::latest(page, 50));
     for i in 0..(MAX_MESSAGES_PER_CHANNEL as u64 - 50) {
         s.apply(&create(mid(200 + i, 0), GENERAL, OTHER, json!({})));
     }
     // An older page pushes the newest messages out: scrolled back, not stale.
-    let older: Vec<_> = (0..50).rev().map(|i| message(mid(10 + i, 0), GENERAL, OTHER)).collect();
+    let older: Vec<_> = (0..50)
+        .rev()
+        .map(|i| message(mid(10 + i, 0), GENERAL, OTHER))
+        .collect();
     s.apply_messages(ch(GENERAL), MessagesPage::before(mid(100, 0), older, 50));
     let w = s.messages(ch(GENERAL)).unwrap();
     assert!(!w.has_newest() && !w.is_loading());
-    let c = s.apply(&d("MESSAGE_REACTION_ADD", json!({"user_id": OTHER, "channel_id": GENERAL,
-        "message_id": mid(10, 0).to_string(), "emoji": {"name": "🦔"}})));
+    let c = s.apply(&d(
+        "MESSAGE_REACTION_ADD",
+        json!({"user_id": OTHER, "channel_id": GENERAL,
+        "message_id": mid(10, 0).to_string(), "emoji": {"name": "🦔"}}),
+    ));
     assert!(c.messages.contains(&ch(GENERAL)));
     let m = s.messages(ch(GENERAL)).unwrap().get(mid(10, 0)).unwrap();
     assert_eq!(m.reactions()[0].count, 1);
