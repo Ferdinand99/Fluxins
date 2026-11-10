@@ -1,69 +1,17 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! The composer's demo data: who "you" are, autocomplete data with the demo's snowflake
-//! IDs (pills need real snowflakes), and edits of the demo's own messages.
+//! The composer's demo data: who "you" are, members for `@` search (with the demo's
+//! snowflake IDs), and edits of the demo's own messages. Roles, channels and emoji come
+//! from the demo's READY through the account state.
 
 use inlet_protocol as p;
 
-use super::{snowflake, user_id, MockSession, ME};
-use crate::backend::composer::{ChannelEntry, CustomEmoji, Directory, Person, Rights, RoleEntry};
+use super::{user_id, MockSession, ME};
+use crate::backend::composer::Person;
 use crate::backend::messages::{self as msgs, parse};
-
-/// Text channels of the demo guilds that autocomplete offers.
-const CHANNELS: [(&str, &str); 4] = [
-    ("c-welcome", "welcome"),
-    ("c-general", "general"),
-    ("c-dev", "development"),
-    ("c-replies", "replies"),
-];
 
 /// The demo account's ID: the author ID of the demo's own messages.
 pub fn demo_user_id() -> String {
     user_id(ME)
-}
-
-/// Roles, channels and emoji of every demo guild.
-pub fn directory(_guild_id: &str) -> Directory {
-    Directory {
-        roles: vec![
-            RoleEntry {
-                id: 3001,
-                name: "Moderators".into(),
-                mentionable: true,
-            },
-            RoleEntry {
-                id: 3002,
-                name: "Helpers".into(),
-                mentionable: false,
-            },
-        ],
-        channels: CHANNELS
-            .iter()
-            .filter_map(|(id, name)| {
-                Some(ChannelEntry {
-                    id: snowflake(id).parse().ok()?,
-                    name: (*name).into(),
-                })
-            })
-            .collect(),
-        emojis: vec![CustomEmoji {
-            id: 4001,
-            name: "inlet_wave".into(),
-            animated: false,
-        }],
-        // The demo account may mention everyone in its text channels.
-        rights: CHANNELS
-            .iter()
-            .map(|(id, _)| {
-                (
-                    snowflake(id),
-                    Rights {
-                        mention_everyone: true,
-                        bypass_slowmode: false,
-                    },
-                )
-            })
-            .collect(),
-    }
 }
 
 /// Members whose name or account name starts with `query`.

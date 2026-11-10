@@ -965,15 +965,6 @@ impl Inlet {
                 request,
                 older,
             } => self.on_page_failed(channel_id, request, older, cx),
-            Ev::MessageCreated(message) => {
-                if let Some(account) = self.account.clone() {
-                    self.chat.view.conversions.remember(
-                        account.read(cx),
-                        &Edits::new(),
-                        vec![message],
-                    );
-                }
-            }
             Ev::Pending(out) => {
                 self.chat.view.upsert_pending(out);
                 self.refresh_rows(cx);

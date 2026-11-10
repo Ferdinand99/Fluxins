@@ -178,7 +178,11 @@ impl ComposerView {
 
     /// The server took the edit: the box closes.
     pub fn on_edited(&mut self, message_id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if self.edit.as_ref().is_some_and(|e| e.message_id == message_id) {
+        if self
+            .edit
+            .as_ref()
+            .is_some_and(|e| e.message_id == message_id)
+        {
             self.cancel_edit(window, cx);
         }
     }
@@ -252,7 +256,6 @@ impl ComposerView {
         )
     }
 }
-
 
 #[cfg(test)]
 pub(super) mod tests {

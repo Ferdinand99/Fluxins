@@ -87,7 +87,6 @@ impl ComposerState {
     }
 }
 
-
 /// The pending row a send shows in the message list until the server took it.
 pub fn pending_of(message: &Outgoing) -> messages::Pending {
     messages::Pending {
@@ -323,7 +322,10 @@ mod tests {
                 channel_id, nonce, ..
             }) => {
                 assert_eq!(channel_id, "301");
-                assert_eq!(nonce, "777", "the first nonce, so the server can drop a copy");
+                assert_eq!(
+                    nonce, "777",
+                    "the first nonce, so the server can drop a copy"
+                );
             }
             _ => panic!("Retry sends the message again"),
         }

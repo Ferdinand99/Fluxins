@@ -16,7 +16,6 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use inlet_protocol as p;
-use p::permissions::{BYPASS_SLOWMODE, MENTION_EVERYONE};
 
 use super::send::{snowflake, Outgoing};
 use super::Ev;
@@ -58,16 +57,6 @@ pub struct Rights {
     pub mention_everyone: bool,
     /// Ignores slowmode.
     pub bypass_slowmode: bool,
-}
-
-impl Rights {
-    /// From permission bits of a channel.
-    pub fn from_bits(bits: u64) -> Rights {
-        Rights {
-            mention_everyone: bits & MENTION_EVERYONE != 0,
-            bypass_slowmode: bits & BYPASS_SLOWMODE != 0,
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -162,7 +151,11 @@ impl State {
     /// Keeps a message being sent, once (a retry keeps its first time).
     pub fn remember_send(&self, gen: u64, message: &Outgoing) {
         let mut inner = self.of(gen);
-        if inner.outbox.iter().any(|s| s.message.nonce == message.nonce) {
+        if inner
+            .outbox
+            .iter()
+            .any(|s| s.message.nonce == message.nonce)
+        {
             return;
         }
         if inner.outbox.len() >= MAX_OUTBOX {
@@ -231,9 +224,7 @@ fn person(m: &p::GuildMember) -> Option<Person> {
     })
 }
 
-
 impl Backend {
-
     /// Asks the gateway for members whose name starts with `query`.
     pub(super) fn search_members(&mut self, guild_id: String, query: String, nonce: String) {
         let query: String = query.trim().chars().take(32).collect();
@@ -271,7 +262,6 @@ impl Backend {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,7 +286,11 @@ mod tests {
         let state = State::default();
         state.remember_send(1, &outgoing("n1"));
         let (again, look) = state.retry_of(1, "n1").unwrap();
-        assert_eq!(again, outgoing("n1"), "mentions, reply and @silent are kept");
+        assert_eq!(
+            again,
+            outgoing("n1"),
+            "mentions, reply and @silent are kept"
+        );
         assert!(!look);
         state.forget_send(1, "n1");
         assert!(state.retry_of(1, "n1").is_none());
@@ -309,7 +303,13 @@ mod tests {
     fn only_a_late_retry_after_an_unclear_failure_looks_first() {
         let six = Duration::from_secs(6 * 60);
         assert!(look_before_retry(true, six));
-        assert!(!look_before_retry(false, six), "a clear refusal is sent again");
-        assert!(!look_before_retry(true, Duration::from_secs(60)), "the server still knows the nonce");
+        assert!(
+            !look_before_retry(false, six),
+            "a clear refusal is sent again"
+        );
+        assert!(
+            !look_before_retry(true, Duration::from_secs(60)),
+            "the server still knows the nonce"
+        );
     }
 }

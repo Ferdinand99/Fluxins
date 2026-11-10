@@ -266,7 +266,11 @@ impl ComposerView {
     }
 
     /// The account state to read roles, channels, emoji and rights from.
-    pub fn set_account(&mut self, account: Option<WeakEntity<AccountState>>, cx: &mut Context<Self>) {
+    pub fn set_account(
+        &mut self,
+        account: Option<WeakEntity<AccountState>>,
+        cx: &mut Context<Self>,
+    ) {
         self.account = account;
         self.refresh_directory(cx);
     }
@@ -845,8 +849,6 @@ impl ComposerView {
         }
         cx.notify();
     }
-
-
 }
 
 impl Render for ComposerView {
@@ -1066,13 +1068,20 @@ mod tests {
         assert_eq!(edits.len(), 1);
         assert_eq!(edits[0].0, mine);
         assert_eq!(edits[0].1, "old <@5> new");
-        assert_eq!(edits[0].2.users, [5], "the edit carries allowed_mentions too");
+        assert_eq!(
+            edits[0].2.users,
+            [5],
+            "the edit carries allowed_mentions too"
+        );
         assert_eq!(
             edits[0].2.replied_user,
             Some(false),
             "an edit never adds the replied author"
         );
-        assert!(sends(&host, cx).is_empty(), "saving an edit sends no message");
+        assert!(
+            sends(&host, cx).is_empty(),
+            "saving an edit sends no message"
+        );
         // The box stays until the server took the edit.
         assert!(view.read_with(cx, |v, _| v.edit.as_ref().is_some_and(|e| e.saving)));
         view.update_in(cx, |v, window, cx| v.on_edited(&mine, window, cx));
@@ -1277,7 +1286,9 @@ mod tests {
         let editor = view
             .read_with(cx, |v, _| v.edit.as_ref().map(|e| e.editor.clone()))
             .expect("an edit is open");
-        editor.update_in(cx, |e, window, cx| e.replace_text_in_range(None, "s", window, cx));
+        editor.update_in(cx, |e, window, cx| {
+            e.replace_text_in_range(None, "s", window, cx)
+        });
         cx.simulate_keystrokes("enter");
         assert_eq!(edits(&host, cx).len(), 1);
         // Escape while the server has not answered keeps the text.

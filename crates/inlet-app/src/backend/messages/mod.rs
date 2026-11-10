@@ -89,9 +89,6 @@ pub enum Ev {
         request: u64,
         older: bool,
     },
-    /// A message this account sent, converted from the REST answer. The gateway's
-    /// MESSAGE_CREATE brings it into the account state.
-    MessageCreated(Message),
     /// A message is being sent, or could not be sent.
     Pending(Pending),
     /// The server took the message with this nonce: its pending row goes.
