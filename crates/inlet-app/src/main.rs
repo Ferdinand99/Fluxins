@@ -1,8 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Inlet: a native desktop client that works with Fluxer.
+// Release builds on Windows are GUI apps: no console window next to Inlet.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod about;
+mod assets;
 mod backend;
+mod brand_icon;
 mod markdown;
 #[cfg(feature = "demo")]
 mod mock;
@@ -23,6 +27,7 @@ use gpui::{
     SharedString, Subscription, TitlebarOptions, Window, WindowBounds, WindowOptions,
 };
 
+use assets::Icon;
 use backend::{BackendHandle, Command, Event, DEFAULT_INSTANCE};
 use markdown::RenderCtx;
 use model::{Channel, ChannelKind, Guild, Message};
@@ -149,7 +154,7 @@ impl Inlet {
                 .masked()
                 .max_chars(512)
         });
-        let composer = cx.new(|cx| TextInput::new("Message", cx).max_chars(4_000));
+        let composer = cx.new(|cx| TextInput::new("Message", cx).composer().max_chars(4_000));
 
         let mut subscriptions = Vec::new();
         for input in [&instance_input, &token_input] {
@@ -648,13 +653,13 @@ impl Inlet {
             .flex()
             .items_center()
             .justify_center()
-            .bg(theme::rail_bg())
+            .bg(theme::bg_app())
             .child(
                 div()
                     .w(px(480.))
                     .p_8()
                     .rounded_lg()
-                    .bg(theme::chat_bg())
+                    .bg(theme::bg_chat())
                     .flex()
                     .flex_col()
                     .gap_4()
@@ -790,7 +795,7 @@ impl Inlet {
                                 .size(px(48.))
                                 .flex_none()
                                 .rounded(px(24.))
-                                .bg(theme::accent())
+                                .bg(theme::brand())
                                 .flex()
                                 .items_center()
                                 .justify_center()
@@ -953,47 +958,90 @@ impl Inlet {
 
     fn render_guild_rail(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let selected = self.selected_guild.clone();
-        let pill = |id: SharedString, label: String, active: bool| {
+        // One rail entry: a 4 px pill on the left (8 px at rest, 20 on hover, 40 when
+        // selected) and a 44 px icon, a circle that becomes a rounded square.
+        let item = |id: SharedString, content: AnyElement, active: bool| {
+            let group = SharedString::from(format!("{id}-g"));
             div()
                 .id(id)
-                .size(px(48.))
-                .flex()
+                .group(group.clone())
+                .relative()
+                .w(px(RAIL_WIDTH))
+                .h(px(48.))
                 .flex_none()
+                .flex()
                 .items_center()
                 .justify_center()
-                .rounded(if active { px(16.) } else { px(24.) })
-                .bg(if active {
-                    theme::accent()
-                } else {
-                    theme::chat_bg()
-                })
-                .text_color(theme::text_strong())
-                .font_weight(FontWeight::SEMIBOLD)
                 .cursor_pointer()
-                .hover(|s| s.rounded(px(16.)).bg(theme::accent()))
-                .child(label)
+                .child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .top(px(if active { 4. } else { 20. }))
+                        .w(px(4.))
+                        .h(px(if active { 40. } else { 8. }))
+                        .rounded_r(px(4.))
+                        .bg(theme::text_strong())
+                        .when(!active, |d| {
+                            d.opacity(0.).group_hover(group.clone(), |s| {
+                                s.opacity(1.).top(px(14.)).h(px(20.))
+                            })
+                        }),
+                )
+                .child(
+                    div()
+                        .size(px(44.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(if active { 13. } else { 22. }))
+                        .bg(if active {
+                            theme::brand()
+                        } else {
+                            theme::guild_item()
+                        })
+                        .text_color(theme::text_strong())
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_size(px(15.))
+                        .group_hover(group, |s| s.rounded(px(13.)).bg(theme::brand()))
+                        .child(content),
+                )
         };
         div()
             .id("guild-rail")
-            .w(px(72.))
+            .w(px(RAIL_WIDTH))
             .h_full()
+            .flex_none()
             .flex()
             .flex_col()
             .items_center()
-            .gap_2()
-            .py_3()
-            .bg(theme::rail_bg())
+            .gap(px(6.))
+            .pt_2()
+            .bg(theme::bg_app())
             .overflow_y_scroll()
             .child(
-                pill("home".into(), "DM".into(), selected.is_none())
-                    .on_click(cx.listener(|this, _, _, cx| this.select_guild(None, cx))),
+                item(
+                    "home".into(),
+                    Icon::ChatCircle
+                        .el(px(22.), theme::text_strong())
+                        .into_any_element(),
+                    selected.is_none(),
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.select_guild(None, cx))),
             )
-            .child(div().w(px(32.)).h(px(2.)).flex_none().bg(theme::chat_bg()))
+            .child(
+                div()
+                    .w(px(32.))
+                    .h(px(2.))
+                    .flex_none()
+                    .rounded_full()
+                    .bg(theme::guild_item()),
+            )
             .children(self.guilds.iter().map(|g| {
                 let id = g.id.clone();
-                pill(
+                item(
                     format!("guild-{}", g.id).into(),
-                    g.initials(),
+                    g.initials().into_any_element(),
                     selected.as_deref() == Some(g.id.as_str()),
                 )
                 .on_click(
@@ -1013,21 +1061,127 @@ impl Inlet {
                 .unwrap_or_default(),
         };
         let selected = self.selected_channel.clone();
+        let mut previous_was_channel = false;
+        let rows: Vec<AnyElement> = self
+            .channels
+            .iter()
+            .filter(|c| {
+                // Folded categories hide their channels, except the open one.
+                c.kind == ChannelKind::Category
+                    || c.parent_id
+                        .as_ref()
+                        .is_none_or(|p| !self.collapsed.contains(p))
+                    || selected.as_deref() == Some(c.id.as_str())
+            })
+            .map(|c| {
+                if c.kind == ChannelKind::Category {
+                    let folded = self.collapsed.contains(&c.id);
+                    let cat = c.id.clone();
+                    let spaced = std::mem::replace(&mut previous_was_channel, false);
+                    return div()
+                        .id(SharedString::from(format!("ch-{}", c.id)))
+                        .flex_none()
+                        .when(spaced, |d| d.mt_4())
+                        .h(px(32.))
+                        .ml_2()
+                        .px_2()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
+                        .cursor_pointer()
+                        .text_size(px(14.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme::text_channel())
+                        .hover(|s| s.text_color(theme::text_strong()))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .child(c.name.clone()),
+                        )
+                        .child(
+                            if folded {
+                                Icon::CaretRight
+                            } else {
+                                Icon::CaretDown
+                            }
+                            .el(px(12.), theme::text_channel()),
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if !this.collapsed.remove(&cat) {
+                                this.collapsed.insert(cat.clone());
+                            }
+                            cx.notify();
+                        }))
+                        .into_any_element();
+                }
+                previous_was_channel = true;
+                let active = selected.as_deref() == Some(c.id.as_str());
+                let messageable = c.is_messageable();
+                let id = c.id.clone();
+                let color = if active {
+                    theme::text_strong()
+                } else {
+                    theme::text_channel()
+                };
+                div()
+                    .id(SharedString::from(format!("ch-{}", c.id)))
+                    // Rows must not shrink: a scrolling flex column shrinks its children
+                    // when the list is taller than the view, and `overflow_hidden` lets
+                    // a row shrink to nothing.
+                    .flex_none()
+                    .h(px(32.))
+                    .ml_2()
+                    .px_2()
+                    .rounded(px(6.))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.))
+                    .whitespace_nowrap()
+                    .overflow_hidden()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(color)
+                    .when(active, |d| d.bg(theme::selected_bg()))
+                    .when(messageable, |d| {
+                        d.cursor_pointer()
+                            .hover(|s| s.bg(theme::hover_bg()).text_color(theme::text()))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.select_channel(id.clone(), window, cx)
+                            }))
+                    })
+                    .child(channel_icon(c.kind).el(px(20.), color))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .child(c.name.clone()),
+                    )
+                    .into_any_element()
+            })
+            .collect();
         div()
-            .w(px(240.))
+            .w(px(SIDEBAR_WIDTH))
             .h_full()
+            .flex_none()
             .flex()
             .flex_col()
-            .bg(theme::sidebar_bg())
+            .bg(theme::bg_app())
             .child(
                 div()
-                    .h(px(48.))
+                    .h(px(HEADER_HEIGHT))
                     .flex_none()
                     .px_4()
                     .flex()
                     .items_center()
                     .border_b_1()
-                    .border_color(theme::header_border())
+                    .border_color(theme::divider())
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(theme::text_strong())
                     .whitespace_nowrap()
@@ -1040,131 +1194,99 @@ impl Inlet {
                     .id("channels")
                     .flex_1()
                     .overflow_y_scroll()
-                    .p_2()
+                    .pt_2()
+                    .pr_2()
+                    .pb_2()
                     .flex()
                     .flex_col()
-                    .gap(px(2.))
-                    .children(
-                        self.channels
-                            .iter()
-                            .filter(|c| {
-                                // Folded categories hide their channels, except the open one.
-                                c.kind == ChannelKind::Category
-                                    || c.parent_id
-                                        .as_ref()
-                                        .is_none_or(|p| !self.collapsed.contains(p))
-                                    || selected.as_deref() == Some(c.id.as_str())
-                            })
-                            .map(|c| {
-                                if c.kind == ChannelKind::Category {
-                                    let folded = self.collapsed.contains(&c.id);
-                                    let cat = c.id.clone();
-                                    return div()
-                                        .id(SharedString::from(format!("ch-{}", c.id)))
-                                        .flex_none()
-                                        .pt_4()
-                                        .px_1()
-                                        .flex()
-                                        .flex_row()
-                                        .gap_1()
-                                        .cursor_pointer()
-                                        .text_size(px(14.))
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(theme::text_muted())
-                                        .hover(|s| s.text_color(theme::text()))
-                                        .child(if folded { "\u{25B8}" } else { "\u{25BE}" })
-                                        .child(c.name.clone())
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            if !this.collapsed.remove(&cat) {
-                                                this.collapsed.insert(cat.clone());
-                                            }
-                                            cx.notify();
-                                        }));
-                                }
-                                let active = selected.as_deref() == Some(c.id.as_str());
-                                let messageable = c.is_messageable();
-                                let id = c.id.clone();
-                                div()
-                                    .id(SharedString::from(format!("ch-{}", c.id)))
-                                    // Rows must not shrink: a scrolling flex column shrinks its
-                                    // children when the list is taller than the view, and
-                                    // `overflow_hidden` lets a row shrink to nothing.
-                                    .flex_none()
-                                    .px_2()
-                                    .py(px(5.))
-                                    .rounded_md()
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .gap_2()
-                                    .whitespace_nowrap()
-                                    .overflow_hidden()
-                                    .text_color(if active {
-                                        theme::text_strong()
-                                    } else {
-                                        theme::text_muted()
-                                    })
-                                    .when(active, |d| d.bg(theme::selected_bg()))
-                                    .when(messageable, |d| {
-                                        d.cursor_pointer()
-                                            .hover(|s| {
-                                                s.bg(theme::hover_bg()).text_color(theme::text())
-                                            })
-                                            .on_click(cx.listener(move |this, _, window, cx| {
-                                                this.select_channel(id.clone(), window, cx)
-                                            }))
-                                    })
-                                    .child(
-                                        div()
-                                            .flex_none()
-                                            .w(px(18.))
-                                            .text_color(theme::text_muted())
-                                            .child(channel_icon(c.kind)),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .overflow_hidden()
-                                            .text_ellipsis()
-                                            .child(c.name.clone()),
-                                    )
-                            }),
-                    ),
+                    .gap(px(1.))
+                    .children(rows),
             )
-            .child(
-                div()
-                    .h(px(56.))
-                    .flex_none()
-                    .px_3()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_between()
-                    .bg(theme::rail_bg())
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .overflow_hidden()
-                            .child(
-                                div()
-                                    .text_color(theme::text_strong())
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child(self.username.clone()),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(11.))
-                                    .text_color(theme::text_muted())
-                                    .child(self.instance.clone()),
-                            )
-                            .child(Self::about_link("About", cx)),
-                    )
-                    .child(
-                        button("sign-out", "Sign out", false).on_click(cx.listener(Self::sign_out)),
-                    ),
-            )
+    }
+
+    /// The floating user panel under the rail and channel list.
+    fn render_user_panel(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let initials = Guild {
+            id: String::new(),
+            name: self.username.clone(),
+        }
+        .initials();
+        let icon_button = |id: &'static str, icon: Icon| {
+            div()
+                .id(id)
+                .size(px(32.))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(6.))
+                .cursor_pointer()
+                .hover(|s| s.bg(theme::hover_bg()))
+                .child(icon.el(px(20.), theme::text_muted()))
+        };
+        div().flex_none().p(px(6.)).bg(theme::bg_app()).child(
+            div()
+                .h(px(58.))
+                .px_3()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .rounded(px(8.))
+                .bg(theme::panel_bg())
+                .border_1()
+                .border_color(theme::ring())
+                .child(
+                    div()
+                        .size(px(32.))
+                        .flex_none()
+                        .rounded_full()
+                        .bg(theme::brand())
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_size(px(12.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme::text_strong())
+                        .child(initials),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .child(
+                            div()
+                                .text_size(px(14.))
+                                .line_height(px(18.))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(theme::text_strong())
+                                .text_ellipsis()
+                                .child(self.username.clone()),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.))
+                                .line_height(px(14.))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(theme::text_muted())
+                                .text_ellipsis()
+                                .child(self.instance.clone()),
+                        ),
+                )
+                .child(
+                    icon_button("about", Icon::Info).on_click(cx.listener(|this, _, _, cx| {
+                        this.show_about = true;
+                        cx.notify();
+                    })),
+                )
+                .child(
+                    icon_button("sign-out", Icon::SignOut).on_click(cx.listener(Self::sign_out)),
+                ),
+        )
     }
 
     fn render_message(&mut self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
@@ -1263,7 +1385,8 @@ impl Inlet {
                 .gap_2()
                 .child(
                     div()
-                        .font_weight(FontWeight::SEMIBOLD)
+                        .font_weight(FontWeight::MEDIUM)
+                        .line_height(px(22.))
                         .text_color(theme::text_strong())
                         .child(m.author.clone()),
                 )
@@ -1291,7 +1414,7 @@ impl Inlet {
                 .child(
                     div()
                         .text_size(px(12.))
-                        .text_color(theme::text_muted())
+                        .text_color(theme::timestamp())
                         .child(m.timestamp.clone()),
                 )
         });
@@ -1326,7 +1449,7 @@ impl Inlet {
                 .gap_2()
                 .px_4()
                 .pt_4()
-                .child(div().flex_1().h(px(2.)).bg(theme::divider()))
+                .child(div().flex_1().h(px(2.)).bg(theme::separator_line()))
                 .child(
                     div()
                         .text_size(px(12.))
@@ -1334,23 +1457,52 @@ impl Inlet {
                         .text_color(theme::text_tertiary())
                         .child(model::day_label(day)),
                 )
-                .child(div().flex_1().h(px(2.)).bg(theme::divider()))
+                .child(div().flex_1().h(px(2.)).bg(theme::separator_line()))
+        });
+        // Avatar slot: initials until avatars arrive (next milestone).
+        let avatar = (!shown.grouped).then(|| {
+            div()
+                .size(px(AVATAR_COLUMN))
+                .rounded_full()
+                .bg(theme::guild_item())
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(14.))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(theme::text_muted())
+                .child(
+                    Guild {
+                        id: String::new(),
+                        name: m.author.clone(),
+                    }
+                    .initials(),
+                )
         });
         div()
+            .w_full()
             .flex()
             .flex_col()
             .children(separator)
             .child(
                 div()
-                    .px_4()
-                    .when(!shown.grouped, |d| d.pt_3())
-                    .pb(px(2.))
+                    .w_full()
+                    .when(!shown.grouped, |d| d.mt_4())
+                    .pl_4()
+                    .pr_4()
+                    .py(px(2.))
                     .flex()
                     .flex_row()
                     .gap_3()
                     .text_color(theme::text())
-                    // Room for the avatar column (avatars come in the next milestone).
-                    .child(div().w(px(AVATAR_COLUMN)).flex_none())
+                    .line_height(px(22.))
+                    .when(m.mentions_me, |d| {
+                        d.bg(theme::mention_me_bg())
+                            .border_l_2()
+                            .border_color(theme::mention_me_bar())
+                    })
+                    .when(!m.mentions_me, |d| d.hover(|s| s.bg(theme::hover_bg())))
+                    .child(div().w(px(AVATAR_COLUMN)).flex_none().children(avatar))
                     .child(
                         div()
                             .flex_1()
@@ -1366,12 +1518,12 @@ impl Inlet {
     }
 
     fn render_chat(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let title = self
+        let open = self
             .selected_channel
             .as_ref()
-            .and_then(|id| self.channels.iter().find(|c| &c.id == id))
-            .map(channel_label)
-            .unwrap_or_default();
+            .and_then(|id| self.channels.iter().find(|c| &c.id == id));
+        let title = open.map(|c| c.name.clone()).unwrap_or_default();
+        let title_icon = open.map(|c| channel_icon(c.kind));
         let topic = self
             .selected_channel
             .as_ref()
@@ -1393,10 +1545,10 @@ impl Inlet {
             .h_full()
             .flex()
             .flex_col()
-            .bg(theme::chat_bg())
+            .bg(theme::bg_chat())
             .child(
                 div()
-                    .h(px(48.))
+                    .h(px(HEADER_HEIGHT))
                     .flex_none()
                     .px_4()
                     .flex()
@@ -1404,32 +1556,50 @@ impl Inlet {
                     .items_center()
                     .justify_between()
                     .border_b_1()
-                    .border_color(theme::header_border())
+                    .border_color(theme::divider())
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
                             .flex()
                             .flex_row()
-                            .items_baseline()
-                            .gap_3()
+                            .items_center()
+                            .gap_2()
                             .whitespace_nowrap()
                             .overflow_hidden()
+                            .children(title_icon.map(|i| i.el(px(24.), theme::text_muted())))
                             .child(
                                 div()
                                     .flex_none()
-                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .line_height(px(24.))
                                     .text_color(theme::text_strong())
                                     .child(title),
                             )
                             .children(topic.map(|t| {
                                 div()
                                     .min_w_0()
-                                    .overflow_hidden()
-                                    .text_ellipsis()
-                                    .text_size(px(14.))
-                                    .text_color(theme::text_muted())
-                                    .child(t)
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .w(px(1.))
+                                            .h(px(20.))
+                                            .flex_none()
+                                            .bg(theme::accent_border()),
+                                    )
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .overflow_hidden()
+                                            .text_ellipsis()
+                                            .text_size(px(13.))
+                                            .line_height(px(18.))
+                                            .text_color(theme::text_tertiary())
+                                            .child(t),
+                                    )
                             })),
                     )
                     .child(
@@ -1486,8 +1656,8 @@ impl Inlet {
                 d.child(
                     div()
                         .flex_none()
-                        .px_4()
-                        .pb_4()
+                        .px(px(6.))
+                        .pb(px(6.))
                         .pt_1()
                         .child(self.composer.clone()),
                 )
@@ -1519,7 +1689,7 @@ impl Inlet {
                     .w(px(520.))
                     .p_6()
                     .rounded_lg()
-                    .bg(theme::chat_bg())
+                    .bg(theme::bg_chat())
                     .flex()
                     .flex_col()
                     .gap_3()
@@ -1592,20 +1762,31 @@ fn wrap_url(url: &str, width: usize, max_lines: usize) -> Vec<String> {
 struct CurrentBackend(BackendHandle);
 impl gpui::Global for CurrentBackend {}
 
-/// Width kept free left of every message for avatars (next milestone).
+/// Avatar column of the message grid (16 | 40 | 12 | text).
 const AVATAR_COLUMN: f32 = 40.;
+/// Guild rail width.
+const RAIL_WIDTH: f32 = 72.;
+/// Channel list / DM list width.
+const SIDEBAR_WIDTH: f32 = 320.;
+/// Height of the guild header and the channel header.
+const HEADER_HEIGHT: f32 = 56.;
 
-fn channel_icon(kind: ChannelKind) -> &'static str {
+fn channel_icon(kind: ChannelKind) -> Icon {
     match kind {
-        ChannelKind::Text => "#",
-        ChannelKind::Voice => "\u{1F50A}",
-        ChannelKind::Dm | ChannelKind::GroupDm => "@",
-        _ => "\u{2022}",
+        ChannelKind::Text => Icon::Hash,
+        ChannelKind::Announcement => Icon::Megaphone,
+        ChannelKind::Voice => Icon::Speaker,
+        ChannelKind::Dm | ChannelKind::GroupDm => Icon::At,
+        _ => Icon::Chats,
     }
 }
 
 fn channel_label(c: &Channel) -> String {
-    format!("{} {}", channel_icon(c.kind), c.name)
+    match c.kind {
+        ChannelKind::Dm | ChannelKind::GroupDm => format!("@{}", c.name),
+        ChannelKind::Text | ChannelKind::Announcement => format!("#{}", c.name),
+        _ => c.name.clone(),
+    }
 }
 
 /// Draws an embed: colour bar, author, title, description, fields, footer, media links.
@@ -1710,7 +1891,7 @@ fn render_embed(
         .rounded(px(8.))
         .overflow_hidden()
         .border_1()
-        .border_color(theme::embed_border())
+        .border_color(theme::accent_border())
         .bg(theme::embed_bg())
         .child(div().w(px(4.)).flex_none().bg(bar))
         .child(content)
@@ -1743,9 +1924,9 @@ pub fn button(id: &'static str, label: &'static str, primary: bool) -> gpui::Sta
         .cursor_pointer()
         .text_color(theme::text_strong())
         .bg(if primary {
-            theme::accent()
+            theme::brand()
         } else {
-            theme::input_bg()
+            theme::bg_textarea()
         })
         .hover(|s| s.opacity(0.85))
         .child(label)
@@ -1810,8 +1991,23 @@ impl Render for Inlet {
                 .size_full()
                 .flex()
                 .flex_row()
-                .child(self.render_guild_rail(cx))
-                .child(self.render_channel_list(cx))
+                .child(
+                    div()
+                        .h_full()
+                        .flex_none()
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_h_0()
+                                .flex()
+                                .flex_row()
+                                .child(self.render_guild_rail(cx))
+                                .child(self.render_channel_list(cx)),
+                        )
+                        .child(self.render_user_panel(cx)),
+                )
                 .child(self.render_chat(cx))
                 .into_any_element(),
         };
@@ -1824,13 +2020,7 @@ impl Render for Inlet {
 }
 
 fn ui_font() -> &'static str {
-    if cfg!(target_os = "macos") {
-        ".SystemUIFont"
-    } else if cfg!(target_os = "windows") {
-        "Segoe UI"
-    } else {
-        "DejaVu Sans"
-    }
+    assets::ui_font()
 }
 
 fn main() {
@@ -1846,6 +2036,7 @@ fn main() {
         .init();
     gpui_platform::application().run(|cx: &mut App| {
         text_input::bind_keys(cx);
+        assets::load_fonts(cx);
         // Fit small screens (CI runners have 1024x768): at most 90 % of the display.
         let (mut w, mut h) = (1200.0_f32, 780.0_f32);
         if let Some(display) = cx.primary_display() {
@@ -1862,6 +2053,9 @@ fn main() {
                     ..Default::default()
                 }),
                 app_id: Some("no.opland.inlet".into()),
+                // X11 only; Windows takes the icon from the .exe resource (build.rs).
+                #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+                icon: brand_icon::window_icon(),
                 ..Default::default()
             },
             |window, cx| cx.new(|cx| Inlet::new(window, cx)),

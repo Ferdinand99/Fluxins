@@ -361,7 +361,7 @@ fn push_inline(node: &Node, inline: &mut Inline) {
                 .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
                 .map(|t| {
                     t.with_timezone(&chrono::Local)
-                        .format("%Y-%m-%d %H:%M")
+                        .format("%d/%m/%Y, %H:%M")
                         .to_string()
                 })
                 .unwrap_or_else(|| timestamp.to_string());
@@ -393,13 +393,7 @@ fn push_inline(node: &Node, inline: &mut Inline) {
 }
 
 pub fn mono_font() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "Menlo"
-    } else if cfg!(target_os = "windows") {
-        "Consolas"
-    } else {
-        "DejaVu Sans Mono"
-    }
+    crate::assets::mono_font()
 }
 
 /// Called when a link is clicked: the URL and whether its text hides the target.
@@ -443,16 +437,17 @@ fn highlight(style: Style, revealed: bool) -> HighlightStyle {
             ..Default::default()
         },
         Style::Code => HighlightStyle {
-            background_color: Some(theme::code_bg()),
+            background_color: Some(theme::code_inline_bg()),
+            color: Some(theme::code_text()),
             ..Default::default()
         },
         Style::Spoiler if revealed => HighlightStyle {
-            background_color: Some(theme::code_bg()),
+            background_color: Some(theme::code_inline_bg()),
             ..Default::default()
         },
         Style::Spoiler => HighlightStyle {
-            background_color: Some(theme::rail_bg()),
-            color: Some(theme::rail_bg()),
+            background_color: Some(theme::guild_item()),
+            color: Some(theme::guild_item()),
             underline: None,
             ..Default::default()
         },
@@ -612,9 +607,9 @@ fn render_block(id: &str, block: &Block, ctx: &RenderCtx) -> AnyElement {
         Block::Code { content } => div()
             .bg(theme::code_bg())
             .border_1()
-            .border_color(theme::rail_bg())
-            .rounded_md()
-            .p_2()
+            .border_color(theme::accent_border())
+            .rounded(px(6.))
+            .p(px(14.))
             .font_family(mono_font())
             .text_size(px(13.))
             .child(content.clone())
@@ -630,7 +625,7 @@ fn render_block(id: &str, block: &Block, ctx: &RenderCtx) -> AnyElement {
             .flex()
             .flex_row()
             .gap_2()
-            .child(div().w(px(4.)).rounded_sm().bg(theme::accent()))
+            .child(div().w(px(4.)).rounded_sm().bg(theme::brand()))
             .child(
                 div()
                     .flex_1()

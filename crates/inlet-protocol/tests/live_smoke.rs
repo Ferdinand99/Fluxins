@@ -86,6 +86,55 @@ async fn live_discovery_openapi_and_gateway_hello() {
     ] {
         assert!(doc["paths"].get(path).is_some(), "openapi lacks {path}");
     }
+    // Routes the chat features use. Path parameter names follow the document.
+    let mut missing = Vec::new();
+    for (method, path) in [
+        ("patch", "/channels/{channel_id}/messages/{message_id}"),
+        ("delete", "/channels/{channel_id}/messages/{message_id}"),
+        (
+            "put",
+            "/channels/{channel_id}/messages/{message_id}/reactions/{emoji}/@me",
+        ),
+        (
+            "get",
+            "/channels/{channel_id}/messages/{message_id}/reactions/{emoji}/users",
+        ),
+        ("get", "/channels/{channel_id}/messages/pins"),
+        ("put", "/channels/{channel_id}/pins/{message_id}"),
+        ("post", "/channels/{channel_id}/pins/ack"),
+        ("post", "/channels/{channel_id}/typing"),
+        ("post", "/read-states/ack"),
+        ("get", "/users/@me/settings"),
+        ("patch", "/users/@me/settings"),
+        ("get", "/users/{target_id}/profile"),
+        ("get", "/guilds/{guild_id}/members/{user_id}"),
+        ("get", "/guilds/{guild_id}/members"),
+        ("get", "/guilds/{guild_id}/roles"),
+        ("get", "/guilds/{guild_id}/emojis"),
+        ("get", "/guilds/{guild_id}/stickers"),
+    ] {
+        if doc["paths"].get(path).and_then(|p| p.get(method)).is_none() {
+            missing.push(format!("{method} {path}"));
+        }
+    }
+    assert!(missing.is_empty(), "openapi lacks {missing:?}");
+
+    // Limits, brand colour and media endpoint from the same document (no requests).
+    let traits: Vec<String> = Vec::new();
+    println!(
+        "limits       file {} B, {} files, message {:?} chars",
+        d.max_attachment_file_size(&traits),
+        d.max_attachments_per_message(&traits),
+        d.resolve_limit("max_message_length", &traits)
+    );
+    println!(
+        "brand colour {:?}",
+        d.theme_color().map(|c| format!("#{c:06x}"))
+    );
+    println!("presigned    {}", d.presigned_attachment_uploads());
+    let media = instance.media().expect("an https media endpoint");
+    println!("media        {}", media.base());
+    println!("emoji url    {:?}", media.emoji("1", true, 48));
 
     let url = gateway_url(&d.endpoints.gateway, true).unwrap();
     println!("gateway url  {url}");
