@@ -57,6 +57,7 @@ jobs:
           mkdir dist
           cp target/release/inlet.exe dist/inlet.exe
           cp THIRD-PARTY-NOTICES dist/THIRD-PARTY-NOTICES
+          cp LICENSE dist/LICENSE
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -107,8 +108,9 @@ jobs:
           mkdir dist
           cp target/release/inlet dist/inlet
           cp THIRD-PARTY-NOTICES dist/THIRD-PARTY-NOTICES
+          cp LICENSE dist/LICENSE
           cd dist
-          zip inlet-macos-aarch64.zip inlet THIRD-PARTY-NOTICES
+          zip inlet-macos-aarch64.zip inlet THIRD-PARTY-NOTICES LICENSE
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -168,7 +170,8 @@ jobs:
           mkdir dist
           cp target/release/inlet dist/inlet
           cp THIRD-PARTY-NOTICES dist/THIRD-PARTY-NOTICES
-          tar -czf inlet-linux-x86_64.tar.gz -C dist inlet THIRD-PARTY-NOTICES
+          cp LICENSE dist/LICENSE
+          tar -czf inlet-linux-x86_64.tar.gz -C dist inlet THIRD-PARTY-NOTICES LICENSE
           mv inlet-linux-x86_64.tar.gz dist/
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
