@@ -1,0 +1,477 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+//! The bridge between the UI and the network.
+//!
+//! The UI runs on gpui's main thread. Everything that talks to a Fluxer instance runs
+//! on a background thread with its own tokio runtime. The UI sends [`Command`]s, the
+//! backend answers with [`Event`]s. Both are split by domain: every domain module owns
+//! its `Cmd` and `Ev` types and a `handle` function for its commands, so tasks that work
+//! on different domains do not edit the same file. A domain that has nothing yet has
+//! empty enums.
+//!
+//! The backend loop only holds state and starts tasks; it never waits on the network
+//! itself. Each REST call runs in its own task with a clone of the session, so a slow
+//! request never holds up sign-out, channel switches or the end of a session. Opening a
+//! channel or guild aborts the previous open. Task panics are caught and reported.
+//!
+//! The token never travels to the UI. It goes from the browser handoff (or the paste
+//! field) to the keychain and the protocol session, nowhere else.
+
+pub mod accounts;
+pub mod composer;
+mod gateway;
+pub mod media;
+pub mod messages;
+pub mod notifications;
+pub mod platform;
+pub mod search;
+mod session;
+pub mod settings;
+pub mod social;
+pub mod voice;
+
+use std::future::Future;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use futures::channel::mpsc::UnboundedSender;
+use inlet_protocol as p;
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender as TokioSender};
+use tokio::task::AbortHandle;
+
+use crate::model::Guild;
+use crate::reconnect::ReconnectPolicy;
+use gateway::GatewayEnd;
+use messages::parse::{ChannelCache, SharedNames};
+use session::{Credential, Failure, FailureKind};
+
+/// What the UI asks of the backend, by domain.
+// Domains without commands yet have uninhabited `Cmd` types.
+#[allow(dead_code)]
+pub enum Command {
+    Accounts(accounts::Cmd),
+    Messages(messages::Cmd),
+    Composer(composer::Cmd),
+    Media(media::Cmd),
+    Social(social::Cmd),
+    Settings(settings::Cmd),
+    Search(search::Cmd),
+    Notifications(notifications::Cmd),
+    Voice(voice::Cmd),
+    Platform(platform::Cmd),
+}
+
+/// What the backend tells the UI, by domain.
+// Domains without events yet have uninhabited `Ev` types. Events are moved once through
+// a channel, so the size of the largest domain's event does not matter.
+#[allow(dead_code, clippy::large_enum_variant)]
+pub enum Event {
+    Accounts(accounts::Ev),
+    Messages(messages::Ev),
+    Composer(composer::Ev),
+    Media(media::Ev),
+    Social(social::Ev),
+    Settings(settings::Ev),
+    Search(search::Ev),
+    Notifications(notifications::Ev),
+    Voice(voice::Ev),
+    Platform(platform::Ev),
+}
+
+/// `From` for each domain's `Cmd` and `Ev`, so callers write `send(accounts::Cmd::SignOut)`.
+macro_rules! domains {
+    ($($variant:ident => $module:ident),* $(,)?) => {
+        $(
+            impl From<$module::Cmd> for Command {
+                fn from(cmd: $module::Cmd) -> Self {
+                    Command::$variant(cmd)
+                }
+            }
+            impl From<$module::Ev> for Event {
+                fn from(ev: $module::Ev) -> Self {
+                    Event::$variant(ev)
+                }
+            }
+        )*
+    };
+}
+
+domains! {
+    Accounts => accounts,
+    Messages => messages,
+    Composer => composer,
+    Media => media,
+    Social => social,
+    Settings => settings,
+    Search => search,
+    Notifications => notifications,
+    Voice => voice,
+    Platform => platform,
+}
+
+/// The sender for UI events. Errors and status lines are coalesced: the same text again
+/// within a few seconds is dropped, and at most a handful of errors pass per window, so
+/// no loop can flood the UI.
+#[derive(Clone)]
+pub struct Ui {
+    tx: UnboundedSender<Event>,
+    throttle: Arc<Mutex<Throttle>>,
+}
+
+#[derive(Default)]
+struct Throttle {
+    last_error: Option<(String, Instant)>,
+    last_status: Option<String>,
+    window_start: Option<Instant>,
+    errors_in_window: u32,
+}
+
+const ERROR_REPEAT: Duration = Duration::from_secs(5);
+const ERROR_WINDOW: Duration = Duration::from_secs(10);
+const ERRORS_PER_WINDOW: u32 = 5;
+
+impl Ui {
+    pub fn new(tx: UnboundedSender<Event>) -> Self {
+        Self {
+            tx,
+            throttle: Arc::default(),
+        }
+    }
+
+    /// Sends an event unless it is a repeated or excess error or an unchanged status.
+    pub fn unbounded_send(&self, event: impl Into<Event>) -> Result<(), ()> {
+        let event = event.into();
+        let now = Instant::now();
+        {
+            let mut t = self.throttle.lock().unwrap();
+            if !t.admit(&event, now) {
+                return Ok(());
+            }
+        }
+        self.tx.unbounded_send(event).map_err(|_| ())
+    }
+}
+
+impl Throttle {
+    fn admit(&mut self, event: &Event, now: Instant) -> bool {
+        match event {
+            Event::Accounts(accounts::Ev::Error(message)) => {
+                if let Some((last, at)) = &self.last_error {
+                    if last == message && now.saturating_duration_since(*at) < ERROR_REPEAT {
+                        return false;
+                    }
+                }
+                match self.window_start {
+                    Some(start) if now.saturating_duration_since(start) < ERROR_WINDOW => {
+                        if self.errors_in_window >= ERRORS_PER_WINDOW {
+                            return false;
+                        }
+                        self.errors_in_window += 1;
+                    }
+                    _ => {
+                        self.window_start = Some(now);
+                        self.errors_in_window = 1;
+                    }
+                }
+                self.last_error = Some((message.clone(), now));
+                true
+            }
+            Event::Accounts(accounts::Ev::Status(text)) => {
+                if self.last_status.as_deref() == Some(text) {
+                    return false;
+                }
+                self.last_status = Some(text.clone());
+                true
+            }
+            _ => true,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct BackendHandle {
+    tx: TokioSender<Command>,
+}
+
+impl BackendHandle {
+    /// Sends a command. If the backend thread has died, the UI notices because the
+    /// event channel closes; nothing to do here.
+    pub fn send(&self, command: impl Into<Command>) {
+        let _ = self.tx.send(command.into());
+    }
+}
+
+/// Starts the backend thread. Events arrive on `events`. When the thread ends (a panic in
+/// the loop itself), `events` is dropped and the UI's receiver ends.
+pub fn start(events: UnboundedSender<Event>) -> BackendHandle {
+    let events = Ui::new(events);
+    let (tx, rx) = unbounded_channel();
+    std::thread::Builder::new()
+        .name("inlet-backend".into())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("tokio runtime");
+            runtime.block_on(Backend::new(events).run(rx));
+        })
+        .expect("backend thread");
+    BackendHandle { tx }
+}
+
+/// Messages from tasks back to the loop.
+enum Internal {
+    Connected {
+        attempt: u64,
+        mode: Mode,
+        instance: String,
+        credential: Credential,
+        result: Result<session::Connected, Failure>,
+    },
+    HandoffDone {
+        id: u64,
+        result: Result<(p::Instance, p::SignedIn), String>,
+    },
+    /// The session `gen` ended for good (auth failure).
+    Ended {
+        gen: u64,
+        message: String,
+    },
+    /// The gateway of session `gen` stopped without an auth failure.
+    GatewayEnded {
+        gen: u64,
+        end: GatewayEnd,
+    },
+    /// The gateway of session `gen` reached READY or RESUMED.
+    GatewayConnected {
+        gen: u64,
+    },
+    /// Time to start the gateway of session `gen` again.
+    GatewayRestart {
+        gen: u64,
+    },
+    Retry {
+        attempt: u64,
+    },
+    TaskPanicked {
+        what: &'static str,
+        gateway_of: Option<u64>,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Mode {
+    /// The token came from the keychain.
+    Restore,
+    /// The token was just issued or pasted.
+    Fresh,
+}
+
+/// Whether a message from session generation `msg_gen` still applies.
+pub fn same_session(active: Option<u64>, msg_gen: u64) -> bool {
+    active == Some(msg_gen)
+}
+
+/// Seconds to wait before retry number `failures` (1-based): 2, 4, 8 … 60.
+pub fn backoff_secs(failures: u32) -> u64 {
+    2u64.saturating_pow(failures.clamp(1, 6)).min(60)
+}
+
+struct RealActive {
+    gen: u64,
+    /// The token was pasted: sign-out only forgets it.
+    pasted: bool,
+    session: p::Session,
+    gateway: p::GatewayHandle,
+    forward: AbortHandle,
+    guilds: Arc<Mutex<Vec<Guild>>>,
+    cache: ChannelCache,
+    names: SharedNames,
+    active_guild: Option<String>,
+    /// Restart bookkeeping; lives with the session so spacing survives restarts.
+    policy: ReconnectPolicy,
+    restart_timer: Option<AbortHandle>,
+}
+
+/// A new sign-in waiting for "Continue".
+struct PendingConfirm {
+    connected: session::Connected,
+    /// Issued to Inlet by the browser handoff. A pasted token belongs to another client
+    /// and is only forgotten, never signed out.
+    from_handoff: bool,
+}
+
+enum Active {
+    Real(RealActive),
+    #[cfg(feature = "demo")]
+    Demo(crate::demo::MockSession),
+}
+
+struct Offline {
+    instance: String,
+    credential: Credential,
+    failures: u32,
+    timer: Option<AbortHandle>,
+}
+
+struct Backend {
+    events: Ui,
+    internal: TokioSender<Internal>,
+    next_gen: u64,
+    active: Option<Active>,
+    attempt: u64,
+    connecting: Option<(u64, AbortHandle, Mode)>,
+    offline: Option<Offline>,
+    handoff_seq: u64,
+    handoff: Option<(u64, tokio::sync::oneshot::Sender<()>)>,
+    /// A new sign-in waiting for the person to confirm the account.
+    pending_confirm: Option<PendingConfirm>,
+    /// The task writing a new token to the keychain; sign-out waits for it.
+    saving: Option<tokio::task::JoinHandle<()>>,
+    open_guild: Option<AbortHandle>,
+    open_channel: Option<AbortHandle>,
+}
+
+impl Backend {
+    fn new(events: Ui) -> Self {
+        let (internal, _) = unbounded_channel();
+        Self {
+            events,
+            internal,
+            next_gen: 1,
+            active: None,
+            attempt: 0,
+            connecting: None,
+            offline: None,
+            handoff_seq: 0,
+            handoff: None,
+            pending_confirm: None,
+            saving: None,
+            open_guild: None,
+            open_channel: None,
+        }
+    }
+
+    fn emit(&self, event: impl Into<Event>) {
+        let _ = self.events.unbounded_send(event);
+    }
+
+    fn active_gen(&self) -> Option<u64> {
+        match &self.active {
+            Some(Active::Real(r)) => Some(r.gen),
+            _ => None,
+        }
+    }
+
+    /// Spawns a task and reports a panic in it to the loop.
+    fn spawn_guarded(
+        &self,
+        what: &'static str,
+        gateway_of: Option<u64>,
+        fut: impl Future<Output = ()> + Send + 'static,
+    ) -> AbortHandle {
+        let task = tokio::spawn(fut);
+        let abort = task.abort_handle();
+        let internal = self.internal.clone();
+        tokio::spawn(async move {
+            if let Err(err) = task.await {
+                if err.is_panic() {
+                    log::error!("backend task {what} panicked");
+                    let _ = internal.send(Internal::TaskPanicked { what, gateway_of });
+                }
+            }
+        });
+        abort
+    }
+
+    async fn run(mut self, mut rx: UnboundedReceiver<Command>) {
+        let (internal, mut internal_rx) = unbounded_channel();
+        self.internal = internal;
+        loop {
+            tokio::select! {
+                // Internal results first: session end must not wait behind commands.
+                biased;
+                Some(msg) = internal_rx.recv() => self.internal(msg),
+                command = rx.recv() => match command {
+                    Some(command) => self.handle(command),
+                    None => break,
+                },
+            }
+        }
+    }
+
+    /// Hands a command to the domain it belongs to.
+    fn handle(&mut self, command: Command) {
+        match command {
+            Command::Accounts(cmd) => accounts::handle(self, cmd),
+            Command::Messages(cmd) => messages::handle(self, cmd),
+            Command::Composer(cmd) => composer::handle(self, cmd),
+            Command::Media(cmd) => media::handle(self, cmd),
+            Command::Social(cmd) => social::handle(self, cmd),
+            Command::Settings(cmd) => settings::handle(self, cmd),
+            Command::Search(cmd) => search::handle(self, cmd),
+            Command::Notifications(cmd) => notifications::handle(self, cmd),
+            Command::Voice(cmd) => voice::handle(self, cmd),
+            Command::Platform(cmd) => platform::handle(self, cmd),
+        }
+    }
+}
+
+/// Sends a REST failure to the UI (`what` turns the reason into the sentence), or ends
+/// the session when the token is gone.
+fn report(
+    events: &Ui,
+    internal: &TokioSender<Internal>,
+    gen: u64,
+    what: impl FnOnce(String) -> String,
+    err: p::Error,
+) {
+    let failure = Failure::from(err);
+    if failure.kind == FailureKind::SessionEnded {
+        let _ = internal.send(Internal::Ended {
+            gen,
+            message: failure.message,
+        });
+    } else {
+        let _ = events.unbounded_send(accounts::Ev::Error(what(failure.message)));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repeated_errors_are_coalesced() {
+        let mut t = Throttle::default();
+        let now = Instant::now();
+        let err = |m: &str| Event::from(accounts::Ev::Error(m.to_string()));
+        assert!(t.admit(&err("a"), now));
+        assert!(!t.admit(&err("a"), now + Duration::from_secs(1)));
+        assert!(t.admit(&err("a"), now + ERROR_REPEAT));
+        // A loop producing new texts is capped per window.
+        let later = now + Duration::from_secs(60);
+        let passed = (0..100)
+            .filter(|i| t.admit(&err(&format!("e{i}")), later))
+            .count();
+        assert_eq!(passed as u32, ERRORS_PER_WINDOW);
+        assert!(t.admit(&accounts::Ev::Status("Connected".into()).into(), later));
+        assert!(!t.admit(&accounts::Ev::Status("Connected".into()).into(), later));
+    }
+
+    #[test]
+    fn messages_from_an_old_session_are_ignored() {
+        assert!(same_session(Some(3), 3));
+        assert!(!same_session(Some(4), 3));
+        assert!(!same_session(None, 3));
+    }
+
+    #[test]
+    fn backoff_grows_and_caps() {
+        assert_eq!(backoff_secs(1), 2);
+        assert_eq!(backoff_secs(2), 4);
+        assert_eq!(backoff_secs(5), 32);
+        assert_eq!(backoff_secs(6), 60);
+        assert_eq!(backoff_secs(50), 60);
+    }
+}

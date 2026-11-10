@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use crate::markdown::Block;
+use crate::ui::markdown::Block;
 
 /// Longest name shown anywhere (guild, channel, author, file).
 pub const MAX_NAME_CHARS: usize = 100;
@@ -180,9 +180,9 @@ impl Message {
                 &self.content[..]
             }
         };
-        self.blocks = crate::markdown::parse_with(shown, names);
+        self.blocks = crate::ui::markdown::parse_with(shown, names);
         if self.edited {
-            crate::markdown::mark_edited(&mut self.blocks);
+            crate::ui::markdown::mark_edited(&mut self.blocks);
         }
     }
 }
