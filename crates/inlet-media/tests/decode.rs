@@ -512,8 +512,9 @@ fn an_animation_cut_off_after_its_first_frame_shows_what_there_is() {
 // ---- structural scans -----------------------------------------------------------------
 
 #[test]
-fn gif_frames_outside_the_canvas_are_refused_before_decoding() {
-    // The classic: a 1x1 canvas with a 3535x3535 frame.
+fn a_gif_frame_over_the_pixel_limit_is_refused_even_on_a_tiny_canvas() {
+    // The classic: a 1x1 canvas with a 3535x3535 frame (12.5 Mpx, over the 4.2 Mpx
+    // of an avatar). The decoder would allocate the frame.
     let err = decode(
         &raw_gif((1, 1), &[(0, 0, 3535, 3535)]),
         NO_RESIZE,
@@ -521,15 +522,72 @@ fn gif_frames_outside_the_canvas_are_refused_before_decoding() {
         &control(),
     )
     .unwrap_err();
-    assert!(matches!(err, MediaError::Corrupt(_)), "{err:?}");
-    // Partly outside.
+    assert!(matches!(err, MediaError::BadDimensions { .. }), "{err:?}");
+}
+
+#[test]
+fn many_big_frames_on_a_tiny_canvas_hit_the_work_cap_before_decoding() {
+    // Each frame is within the pixel limit, but together they cost 160 Mpx of
+    // decoding against a cap of 128 Mpx.
+    let frames = vec![(0, 0, 2000, 2000); 40];
     let err = decode(
-        &raw_gif((10, 10), &[(5, 5, 6, 6)]),
+        &raw_gif((1, 1), &frames),
         NO_RESIZE,
         &avatar_limits(),
         &control(),
     )
     .unwrap_err();
+    assert_eq!(err, MediaError::AnimationTooLarge);
+}
+
+#[test]
+fn a_gif_frame_that_overhangs_the_canvas_is_clipped_like_in_a_browser() {
+    // The canvas is 4x4 (the first frame). The second frame is 4x4 at (2, 2), so
+    // most of it is outside.
+    let bytes = gif_at(&[(solid(4, 4, RED), 0, 0, 50), (solid(4, 4, BLUE), 2, 2, 50)]);
+    let img = decode(&bytes, NO_RESIZE, &avatar_limits(), &control()).unwrap();
+    assert_eq!((img.width, img.height), (4, 4));
+    assert_eq!(img.frames.len(), 2);
+    assert!(near(rgba_at(&img, 1, 3, 3), BLUE));
+    // The part of the frame that is on the canvas is where the encoder put it, and
+    // the first frame is still the first frame.
+    assert!(near(rgba_at(&img, 0, 0, 0), RED));
+    assert!(near(rgba_at(&img, 0, 3, 3), RED));
+}
+
+#[test]
+fn gif_frames_of_zero_size_are_skipped() {
+    let bytes = raw_gif((8, 8), &[(0, 0, 0, 0), (0, 0, 8, 8), (3, 3, 0, 5)]);
+    let inspected = inlet_media::inspect(bytes::Bytes::from(bytes), &avatar_limits()).unwrap();
+    assert_eq!((inspected.width(), inspected.height()), (8, 8));
+    assert!(!inspected.is_animated(), "one frame has pixels");
+}
+
+#[test]
+fn junk_and_unknown_blocks_after_the_frames_end_the_file() {
+    let frames = [
+        (solid(8, 8, RED), 50),
+        (solid(8, 8, GREEN), 50),
+        (solid(8, 8, BLUE), 50),
+    ];
+    let good = gif(&frames);
+    // Junk after the trailer.
+    let mut junk = good.clone();
+    junk.extend_from_slice(b"\x00\xFF trailing garbage \x2C\x2C");
+    let img = decode(&junk, NO_RESIZE, &avatar_limits(), &control()).unwrap();
+    assert_eq!(img.frames.len(), 3);
+    // An unknown block where the trailer should be.
+    let mut unknown = good.clone();
+    let last = unknown.len() - 1;
+    assert_eq!(unknown[last], 0x3B);
+    unknown.truncate(last);
+    unknown.extend_from_slice(&[0x99, 0x02, 0xAA, 0xBB, 0x00]);
+    let img = decode(&unknown, NO_RESIZE, &avatar_limits(), &control()).unwrap();
+    assert_eq!(img.frames.len(), 3);
+    // Junk where the first frame should be is not a GIF.
+    let mut head = b"GIF89a".to_vec();
+    head.extend_from_slice(&[8, 0, 8, 0, 0, 0, 0, 0x99, 1, 2, 3]);
+    let err = decode(&head, NO_RESIZE, &avatar_limits(), &control()).unwrap_err();
     assert!(matches!(err, MediaError::Corrupt(_)), "{err:?}");
 }
 

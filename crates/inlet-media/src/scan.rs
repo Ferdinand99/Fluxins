@@ -121,20 +121,26 @@ fn walk_riff(
 pub(crate) struct GifScan {
     pub width: u32,
     pub height: u32,
+    /// Frames that have pixels (frames of zero size do not count).
     pub frames: usize,
+    /// The largest area of one frame, which the decoder allocates next to the canvas.
+    pub largest_frame_pixels: u64,
 }
 
 fn le16(data: &[u8], at: usize) -> u32 {
     u32::from(u16::from_le_bytes([data[at], data[at + 1]]))
 }
 
-/// Walks the GIF blocks. It reads the canvas size, then counts frames, adds up
-/// their areas and refuses frames outside the canvas, all before decoding. The
-/// decoder would allocate for the declared size of every frame, and a 1x1 canvas
-/// can carry hundreds of 3500x3500 frames in a few hundred KiB.
+/// Walks the GIF blocks. It reads the canvas size, then counts frames and adds up
+/// their areas, all before decoding. The decoder allocates for the declared size of
+/// every frame, and a 1x1 canvas can carry hundreds of 3500x3500 frames in a few
+/// hundred KiB.
 ///
-/// A file that ends in the middle of a block is fine: the decoder shows the
-/// frames before it.
+/// As lenient as a browser where that costs no memory: a frame that overhangs the
+/// canvas is clipped by the decoder (its whole area still counts, and it has to be
+/// within `max_pixels` like the canvas), a frame of zero size is skipped, and an
+/// unknown block or junk after at least one frame ends the file. A file that ends
+/// in the middle of a block shows the frames before it.
 pub(crate) fn scan_gif(data: &[u8], limits: &KindLimits) -> Result<GifScan, MediaError> {
     if data.len() < 13 || &data[..3] != b"GIF" {
         return Err(corrupt("not a GIF"));
@@ -150,6 +156,7 @@ pub(crate) fn scan_gif(data: &[u8], limits: &KindLimits) -> Result<GifScan, Medi
 
     let mut frames = 0usize;
     let mut area: u64 = 0;
+    let mut largest: u64 = 0;
     while let Some(&block) = data.get(pos) {
         match block {
             0x3B => break,
@@ -164,23 +171,29 @@ pub(crate) fn scan_gif(data: &[u8], limits: &KindLimits) -> Result<GifScan, Medi
                 if pos + 10 > data.len() {
                     break;
                 }
-                let left = le16(data, pos + 1);
-                let top = le16(data, pos + 3);
                 let w = le16(data, pos + 5);
                 let h = le16(data, pos + 7);
                 let local_flags = data[pos + 9];
-                if w == 0 || h == 0 || left + w > width || top + h > height {
-                    return Err(corrupt("GIF frame is outside the canvas"));
-                }
-                frames += 1;
-                if frames > limits.max_frames {
-                    return Err(MediaError::TooManyFrames {
-                        max: limits.max_frames,
-                    });
-                }
-                area += u64::from(w) * u64::from(h);
-                if area > limits.max_animation_work_pixels {
-                    return Err(MediaError::AnimationTooLarge);
+                let pixels = u64::from(w) * u64::from(h);
+                if pixels > 0 {
+                    // The decoder allocates the frame itself, whatever the canvas is.
+                    if pixels > limits.max_pixels {
+                        return Err(MediaError::BadDimensions {
+                            width: w,
+                            height: h,
+                        });
+                    }
+                    frames += 1;
+                    if frames > limits.max_frames {
+                        return Err(MediaError::TooManyFrames {
+                            max: limits.max_frames,
+                        });
+                    }
+                    area += pixels;
+                    if area > limits.max_animation_work_pixels {
+                        return Err(MediaError::AnimationTooLarge);
+                    }
+                    largest = largest.max(pixels);
                 }
                 pos += 10;
                 if local_flags & 0x80 != 0 {
@@ -192,6 +205,9 @@ pub(crate) fn scan_gif(data: &[u8], limits: &KindLimits) -> Result<GifScan, Medi
                     None => break,
                 };
             }
+            // Junk, or a block this scan does not know: the file ends here. What
+            // came before it is shown. Junk before any frame is not a GIF.
+            _ if frames > 0 => break,
             _ => return Err(corrupt("unknown GIF block")),
         }
     }
@@ -199,6 +215,7 @@ pub(crate) fn scan_gif(data: &[u8], limits: &KindLimits) -> Result<GifScan, Medi
         width,
         height,
         frames,
+        largest_frame_pixels: largest,
     })
 }
 

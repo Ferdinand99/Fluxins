@@ -2,6 +2,7 @@
 name = "inlet-media-fuzz"
 version = "0.0.0"
 publish = false
+license = "AGPL-3.0-or-later"
 edition = "2021"
 
 [package.metadata]

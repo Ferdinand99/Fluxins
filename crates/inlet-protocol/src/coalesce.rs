@@ -10,6 +10,9 @@
 //!   A background flush after [`ACK_DELAY`] sends what is pending in one
 //!   `POST /read-states/ack` (up to 100 channels per request), and two ack
 //!   requests of one account are always at least [`ACK_DELAY`] apart.
+//! - Search: message and thread searches of one account start at least
+//!   [`SEARCH_INTERVAL`] apart. A search whose slot is more than
+//!   [`MAX_SEARCH_WAIT`] away returns [`crate::Error::RateLimited`] without a request.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
@@ -27,6 +30,11 @@ pub const ACK_DELAY: Duration = Duration::from_secs(1);
 pub(crate) const ACK_BATCH: usize = 100;
 /// Channels remembered for typing and sent acks.
 const MAX_TRACKED: usize = 4_096;
+/// Shortest time between two search requests (messages or threads) of one account.
+pub const SEARCH_INTERVAL: Duration = Duration::from_secs(1);
+/// A search that would wait longer than this for its slot is refused with
+/// [`crate::Error::RateLimited`] instead of queued.
+pub const MAX_SEARCH_WAIT: Duration = Duration::from_secs(3);
 
 /// One pending acknowledgement.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -128,9 +136,28 @@ pub(crate) struct Shared {
     pub(crate) acks: Mutex<AckState>,
     /// Account traits from `me()`, for limits.
     pub(crate) traits: Mutex<Option<Vec<String>>>,
+    /// Start time of the last search slot handed out.
+    search: Mutex<Option<Instant>>,
 }
 
 impl Shared {
+    /// Claims the next search slot, at least [`SEARCH_INTERVAL`] after the
+    /// previous one: `Ok(wait)` before the request may start, or `Err(retry_after)`
+    /// when the slot is more than [`MAX_SEARCH_WAIT`] away (nothing is reserved).
+    pub(crate) fn reserve_search(&self, now: Instant) -> Result<Duration, Duration> {
+        let mut last = self.search.lock().unwrap_or_else(|e| e.into_inner());
+        let slot = match *last {
+            Some(prev) => (prev + SEARCH_INTERVAL).max(now),
+            None => now,
+        };
+        let wait = slot.saturating_duration_since(now);
+        if wait > MAX_SEARCH_WAIT {
+            return Err(wait);
+        }
+        *last = Some(slot);
+        Ok(wait)
+    }
+
     /// Whether a typing request for `channel_id` may go out now; records it if so.
     pub(crate) fn typing_due(&self, channel_id: &str) -> bool {
         let mut map = self.typing.lock().unwrap_or_else(|e| e.into_inner());
@@ -198,10 +225,19 @@ impl Shared {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take();
-        let mut mine = self.traits.lock().unwrap_or_else(|e| e.into_inner());
-        if mine.is_none() {
-            *mine = traits;
+        {
+            let mut mine = self.traits.lock().unwrap_or_else(|e| e.into_inner());
+            if mine.is_none() {
+                *mine = traits;
+            }
         }
+        // Keep the later search slot so a move cannot skip the interval.
+        let theirs = *other.search.lock().unwrap_or_else(|e| e.into_inner());
+        let mut mine = self.search.lock().unwrap_or_else(|e| e.into_inner());
+        *mine = match (*mine, theirs) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
     }
 }
 
@@ -260,5 +296,20 @@ mod tests {
         assert!(s.typing_due("1"));
         s.reset_typing("1");
         assert!(s.typing_due("1"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn searches_get_one_slot_per_second() {
+        let s = Shared::default();
+        let now = Instant::now();
+        assert_eq!(s.reserve_search(now), Ok(Duration::ZERO));
+        assert_eq!(s.reserve_search(now), Ok(SEARCH_INTERVAL));
+        assert_eq!(s.reserve_search(now), Ok(SEARCH_INTERVAL * 2));
+        assert_eq!(s.reserve_search(now), Ok(SEARCH_INTERVAL * 3));
+        // The next slot is 4 s away: refused, and nothing is reserved.
+        assert_eq!(s.reserve_search(now), Err(SEARCH_INTERVAL * 4));
+        assert_eq!(s.reserve_search(now), Err(SEARCH_INTERVAL * 4));
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert_eq!(s.reserve_search(Instant::now()), Ok(Duration::ZERO));
     }
 }
