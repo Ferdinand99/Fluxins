@@ -9,8 +9,8 @@ mod common;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use fluxins_protocol::gateway::codec::ZstdStream;
-use fluxins_protocol::{
+use inlet_protocol::gateway::codec::ZstdStream;
+use inlet_protocol::{
     ClientInfo, CloseReason, ConnectionState, Discovery, Dispatch, Gateway, GatewayEvent, GatewayOptions, Instance,
     Token,
 };
@@ -163,7 +163,7 @@ async fn identify_dispatch_and_resume_with_zstd() {
     assert_eq!(identify["op"], 2);
     assert_eq!(identify["d"]["token"], "gw-token");
     assert_eq!(identify["d"]["flags"], 14);
-    assert_eq!(identify["d"]["properties"]["browser"], "Fluxins");
+    assert_eq!(identify["d"]["properties"]["browser"], "Inlet");
     assert!(identify["d"]["properties"]["os"].is_string());
 
     c1.dispatch(1, "READY", ready("sess-1")).await;

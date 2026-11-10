@@ -7,8 +7,8 @@
 //! # Flow
 //!
 //! ```no_run
-//! # async fn demo() -> fluxins_protocol::Result<()> {
-//! use fluxins_protocol::{Instance, Handoff, HandoffStatus, Session, GatewayOptions};
+//! # async fn demo() -> inlet_protocol::Result<()> {
+//! use inlet_protocol::{Instance, Handoff, HandoffStatus, Session, GatewayOptions};
 //! use std::time::Duration;
 //!
 //! // 1. Discovery: GET {origin}/.well-known/fluxer. The API base is

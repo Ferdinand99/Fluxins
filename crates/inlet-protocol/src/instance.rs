@@ -28,7 +28,7 @@ impl Default for ClientInfo {
     fn default() -> Self {
         Self {
             user_agent: format!(
-                "Fluxins/{} (+https://github.com/Ferdinand99/Fluxins)",
+                "Inlet/{} (+https://github.com/Ferdinand99/Inlet)",
                 env!("CARGO_PKG_VERSION")
             ),
             installation_id: random_uuid(),

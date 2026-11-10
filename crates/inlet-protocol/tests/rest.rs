@@ -4,7 +4,7 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use fluxins_protocol::{Client, Error, Instance, RateLimitConfig, Token};
+use inlet_protocol::{Client, Error, Instance, RateLimitConfig, Token};
 use serde_json::json;
 use wiremock::matchers::{body_json, header, header_exists, method, path, query_param};
 use wiremock::{Mock, ResponseTemplate};

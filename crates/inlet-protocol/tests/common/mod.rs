@@ -1,7 +1,7 @@
 //! Shared mock-server helpers. The shapes follow Fluxer's OpenAPI document and docs.
 #![allow(dead_code)]
 
-use fluxins_protocol::{ClientInfo, Instance};
+use inlet_protocol::{ClientInfo, Instance};
 use serde_json::{json, Value};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};

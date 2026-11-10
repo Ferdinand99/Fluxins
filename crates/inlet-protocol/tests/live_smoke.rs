@@ -1,5 +1,5 @@
 //! Unauthenticated smoke test against a real instance. Ignored by default; run with
-//! `FLUXINS_SMOKE_ORIGIN=fluxer.opland.net cargo test --test live_smoke -- --ignored --nocapture`.
+//! `INLET_SMOKE_ORIGIN=fluxer.opland.net cargo test --test live_smoke -- --ignored --nocapture`.
 //!
 //! Four requests: discovery, discovery again with If-None-Match, the OpenAPI
 //! document, and one gateway connection with zstd-stream that reads Hello,
@@ -7,8 +7,8 @@
 
 use std::time::Duration;
 
-use fluxins_protocol::gateway::{codec::ZstdStream, gateway_url};
-use fluxins_protocol::Instance;
+use inlet_protocol::gateway::{codec::ZstdStream, gateway_url};
+use inlet_protocol::Instance;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -18,7 +18,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 type Ws = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
 fn origin() -> String {
-    std::env::var("FLUXINS_SMOKE_ORIGIN").unwrap_or_else(|_| "fluxer.opland.net".into())
+    std::env::var("INLET_SMOKE_ORIGIN").unwrap_or_else(|_| "fluxer.opland.net".into())
 }
 
 async fn read_zstd(ws: &mut Ws, codec: &mut ZstdStream) -> Value {

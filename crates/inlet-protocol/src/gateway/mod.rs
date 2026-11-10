@@ -57,7 +57,7 @@ impl Default for IdentifyProperties {
     fn default() -> Self {
         Self {
             os: crate::instance::os_name().to_owned(),
-            browser: "Fluxins".to_owned(),
+            browser: "Inlet".to_owned(),
             device: "desktop".to_owned(),
         }
     }

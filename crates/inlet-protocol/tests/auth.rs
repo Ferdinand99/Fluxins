@@ -4,7 +4,7 @@ mod common;
 
 use std::time::Duration;
 
-use fluxins_protocol::{
+use inlet_protocol::{
     altcha, poll_ip_authorization, sign_in_password, sign_in_totp, Handoff, HandoffStatus, IpAuthorization, MfaMethod,
     Session, SignInResult,
 };
