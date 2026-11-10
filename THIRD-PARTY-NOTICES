@@ -11,7 +11,7 @@ the binary are listed at the end.
 - ISC License: 24 crate(s)
 - Unicode License v3: 23 crate(s)
 - BSD 3-Clause "New" or "Revised" License: 13 crate(s)
-- GNU Affero General Public License v3.0 or later: 3 crate(s)
+- GNU Affero General Public License v3.0 or later: 4 crate(s)
 - Community Data License Agreement Permissive 2.0: 2 crate(s)
 - Mozilla Public License 2.0: 2 crate(s)
 - zlib License: 2 crate(s)
@@ -24,6 +24,7 @@ Used by:
   - fluxer_markdown_parser 0.1.0
   - inlet 0.0.1 (https://github.com/Ferdinand99/Inlet)
   - inlet-protocol 0.0.1 (https://github.com/Ferdinand99/Inlet)
+  - inlet-state 0.0.1 (https://github.com/Ferdinand99/Inlet)
 --------------------------------------------------------------------------------
 GNU AFFERO GENERAL PUBLIC LICENSE
 Version 3, 19 November 2007

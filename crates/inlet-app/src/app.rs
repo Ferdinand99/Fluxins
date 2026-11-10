@@ -4,7 +4,8 @@
 //! event handlers live in the `ui` domains.
 
 use futures::StreamExt;
-use gpui::{App, Context, FocusHandle, Focusable, Subscription, Window};
+use gpui::{App, Context, Entity, FocusHandle, Focusable, Subscription, Window};
+use inlet_state::AccountState;
 
 use crate::backend::{self, accounts, BackendHandle, Event};
 use crate::model::{Channel, Guild};
@@ -54,6 +55,9 @@ pub struct Inlet {
     pub selected_guild: Option<String>,
     pub channels: Vec<Channel>,
     pub selected_channel: Option<String>,
+    /// What the signed-in account knows (guilds, channels, members, read state and the
+    /// message windows), fed with gateway events and REST pages. `None` until READY.
+    pub account: Option<Entity<AccountState>>,
 
     // View state, one per domain. The empty ones are slots for later tasks.
     pub sign_in: ui::accounts::SignInState,
@@ -113,6 +117,7 @@ impl Inlet {
             selected_guild: None,
             channels: Vec::new(),
             selected_channel: None,
+            account: None,
             sign_in,
             sidebar: Default::default(),
             chat: ui::chat::ChatState::new(),
@@ -217,7 +222,7 @@ impl Inlet {
         self.channels.clear();
         self.selected_guild = None;
         self.selected_channel = None;
-        self.set_messages(Vec::new());
+        self.reset_messages();
         self.chat.status.clear();
         self.chat.error = None;
         self.chat.notice = None;

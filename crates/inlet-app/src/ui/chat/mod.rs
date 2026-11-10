@@ -1,12 +1,18 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! The chat column: channel header, error and notice bars, the message list and the
-//! composer.
+//! The chat column: channel header, error and notice bars, the message list (with the
+//! new-messages banner and "Jump to present" over it) and the composer.
 
+mod divider;
 mod embed;
 mod header;
 pub mod header_buttons;
+mod jump;
 mod message;
 pub mod messages;
+mod reply_preview;
+mod system_message;
+pub mod time;
+mod welcome;
 
 use gpui::{div, list, prelude::*, px, Context, FollowMode, ListAlignment, ListState, Window};
 
@@ -14,10 +20,11 @@ use crate::app::Inlet;
 use crate::backend::accounts::Cmd;
 use crate::theme;
 use crate::ui::widgets::button;
-use messages::ShownMessage;
+use messages::MessageView;
 
 pub struct ChatState {
-    pub messages: Vec<ShownMessage>,
+    /// The rows of the open channel and what they are built from.
+    pub view: MessageView,
     pub message_list: ListState,
     /// Connection state for the status line.
     pub status: String,
@@ -34,7 +41,7 @@ impl ChatState {
         let message_list = ListState::new(0, ListAlignment::Bottom, px(800.));
         message_list.set_follow_mode(FollowMode::Tail);
         Self {
-            messages: Vec::new(),
+            view: MessageView::new(),
             message_list,
             status: String::new(),
             error: None,
@@ -62,6 +69,7 @@ impl Inlet {
     }
 
     pub(crate) fn render_chat(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        self.hook_list_scroll(cx);
         let has_channel = self.selected_channel.is_some();
         let bar = |id: &'static str, text: String, bg| {
             div()
@@ -116,12 +124,23 @@ impl Inlet {
                 }))
             }))
             .child(
-                list(
-                    self.chat.message_list.clone(),
-                    cx.processor(|this, ix: usize, _window, cx| this.render_message(ix, cx)),
-                )
-                .flex_1()
-                .w_full(),
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        list(
+                            self.chat.message_list.clone(),
+                            cx.processor(|this, ix: usize, _window, cx| this.render_row(ix, cx)),
+                        )
+                        .flex_1()
+                        .w_full(),
+                    )
+                    .children(self.render_new_messages_bar(cx))
+                    .children(self.render_jump_to_present(cx)),
             )
             .when(has_channel, |d| d.child(self.render_composer()))
     }
