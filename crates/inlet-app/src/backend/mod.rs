@@ -330,6 +330,8 @@ struct Backend {
     saving: Option<tokio::task::JoinHandle<()>>,
     open_guild: Option<AbortHandle>,
     open_channel: Option<AbortHandle>,
+    /// The request for older messages of the open channel.
+    older: messages::OlderPages,
 }
 
 impl Backend {
@@ -349,6 +351,7 @@ impl Backend {
             saving: None,
             open_guild: None,
             open_channel: None,
+            older: Default::default(),
         }
     }
 

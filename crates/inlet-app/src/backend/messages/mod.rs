@@ -1,8 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Messages and the channels they live in: loading guild channel lists and the DM list,
-//! loading messages, and turning protocol data into the UI model. One submodule per
-//! part, so the tasks that add pins, the inbox, threads, actions and read state each
+//! loading pages of messages, and turning protocol data into the UI model. One submodule
+//! per part, so the tasks that add pins, the inbox, threads, actions and read state each
 //! work in their own file.
+//!
+//! The account's messages live in [`inlet_state::AccountState`] on the UI thread. The
+//! backend hands it the gateway's events and the REST pages unchanged, together with the
+//! messages they carry already converted and parsed ([`Message`]), so markdown is never
+//! parsed on the UI thread.
 
 mod ack;
 mod actions;
@@ -12,17 +17,44 @@ pub mod parse;
 mod pins;
 mod threads;
 
+pub(super) use fetch::OlderPages;
+
+use inlet_protocol as p;
+use inlet_state::MessagesPage;
+
 use super::Backend;
 use crate::model::{Channel, Guild, Message};
+
+/// Messages asked for per page (the API allows 1-100).
+pub const PAGE_SIZE: u8 = 50;
 
 pub enum Cmd {
     /// Load channels for a guild, or DMs when `guild_id` is `None`.
     OpenGuild {
         guild_id: Option<String>,
     },
+    /// Load the newest page of a channel. The UI opens the channel's window with
+    /// `AccountState::begin_load` first.
     OpenChannel {
         channel_id: String,
     },
+    /// Load the page before `before` (the person scrolled to the top). At most one runs
+    /// at a time, and the backend drops requests that come within a second of the last.
+    LoadOlder {
+        channel_id: String,
+        before: String,
+    },
+}
+
+/// A message being sent, or one that could not be sent.
+#[derive(Clone, Debug)]
+pub struct Outgoing {
+    pub channel_id: String,
+    /// The nonce sent with the message; the gateway's MESSAGE_CREATE carries it back.
+    pub nonce: String,
+    pub text: String,
+    /// `None` while sending; the reason once sending failed.
+    pub failed: Option<String>,
 }
 
 pub enum Ev {
@@ -31,21 +63,32 @@ pub enum Ev {
         guild_id: Option<String>,
         channels: Vec<Channel>,
     },
-    Messages {
-        channel_id: String,
-        messages: Vec<Message>,
+    /// A gateway event for the account state, with the messages it carries converted.
+    Dispatch {
+        dispatch: Box<p::Dispatch>,
+        rendered: Vec<Message>,
     },
+    /// A page of messages from REST, with its messages converted.
+    Page {
+        channel_id: String,
+        page: MessagesPage,
+        rendered: Vec<Message>,
+    },
+    /// Loading a page failed; the reason was reported as an error.
+    PageFailed { channel_id: String, older: bool },
+    /// A message this account sent, converted from the REST answer. The gateway's
+    /// MESSAGE_CREATE brings it into the account state.
     MessageCreated(Message),
-    MessageUpdated(Message),
-    MessageDeleted {
-        channel_id: String,
-        message_id: String,
-    },
+    /// A message is being sent, or could not be sent (shown with "Retry"). The demo
+    /// sends these; the composer reports its own sends here once it tracks nonces.
+    #[cfg_attr(not(feature = "demo"), allow(dead_code))]
+    Outgoing(Outgoing),
 }
 
 pub(super) fn handle(backend: &mut Backend, cmd: Cmd) {
     match cmd {
         Cmd::OpenGuild { guild_id } => backend.open_guild(guild_id),
         Cmd::OpenChannel { channel_id } => backend.open_channel(channel_id),
+        Cmd::LoadOlder { channel_id, before } => backend.load_older(channel_id, before),
     }
 }

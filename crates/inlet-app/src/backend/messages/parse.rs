@@ -101,7 +101,6 @@ pub fn to_message(m: &p::Message, names: &SharedNames) -> Message {
     let mut out = Message {
         id: m.id.clone(),
         channel_id: m.channel_id.clone(),
-        author_id: m.author.id.clone(),
         author: model::clean_name(m.author.display_name()),
         author_username: model::clean_name(&m.author.username),
         author_bot: m.author.bot,
@@ -122,14 +121,6 @@ pub fn to_message(m: &p::Message, names: &SharedNames) -> Message {
                     .unwrap_or_default(),
             })
             .collect(),
-        mentions_me: snapshot
-            .me
-            .as_ref()
-            .is_some_and(|me| m.mentions.iter().any(|u| &u.id == me))
-            || m.extra
-                .get("mention_everyone")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
         embeds: m
             .embeds
             .iter()
