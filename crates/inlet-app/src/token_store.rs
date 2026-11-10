@@ -17,29 +17,30 @@ fn entry(instance: &str) -> Result<keyring::Entry> {
 }
 
 /// What the keychain entry holds: the token and the hosts it was issued for, as one
-/// JSON value. Older entries hold only the bare token.
+/// JSON value. Older entries hold only the bare token, or pins without the media host
+/// (those read as `media: None` and get it after the next successful restore).
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Blob {
     token: String,
-    pins: Option<inlet_protocol::EndpointPins>,
+    pins: Option<inlet_protocol::SessionPins>,
     /// The token was pasted (it belongs to another client): never sign it out on the
     /// server, only forget it. Entries written before this field count as not pasted.
     #[serde(default)]
     pasted: bool,
 }
 
-/// A stored session: the token (wiped from memory on drop) and its endpoint pins.
+/// A stored session: the token (wiped from memory on drop) and its pins.
 pub struct StoredSession {
     pub token: inlet_protocol::Token,
     /// `None` for an entry written before pinning existed.
-    pub pins: Option<inlet_protocol::EndpointPins>,
+    pub pins: Option<inlet_protocol::SessionPins>,
     /// See [`Blob::pasted`].
     pub pasted: bool,
 }
 
 fn encode(
     token: &inlet_protocol::Token,
-    pins: &inlet_protocol::EndpointPins,
+    pins: &inlet_protocol::SessionPins,
     pasted: bool,
 ) -> Result<Zeroizing<String>> {
     let blob = Blob {
@@ -70,7 +71,7 @@ fn decode(raw: &str) -> StoredSession {
 pub fn save_session(
     instance: &str,
     token: &inlet_protocol::Token,
-    pins: &inlet_protocol::EndpointPins,
+    pins: &inlet_protocol::SessionPins,
     pasted: bool,
 ) -> Result<()> {
     let json = encode(token, pins, pasted)?;
@@ -141,10 +142,11 @@ pub fn client_info() -> inlet_protocol::ClientInfo {
 mod tests {
     use super::*;
 
-    fn pins() -> inlet_protocol::EndpointPins {
-        inlet_protocol::EndpointPins {
+    fn pins() -> inlet_protocol::SessionPins {
+        inlet_protocol::SessionPins {
             api: "https://fluxer.example".into(),
             gateway: "wss://fluxer.example".into(),
+            media: None,
         }
     }
 
@@ -168,5 +170,23 @@ mod tests {
         let bare = decode("bare-token");
         assert!(!bare.pasted);
         assert!(bare.pins.is_none());
+    }
+
+    #[test]
+    fn media_pin_is_stored_and_old_entries_read_without_it() {
+        let token = inlet_protocol::Token::new("secret");
+        let with_media = inlet_protocol::SessionPins {
+            media: Some("https://media.fluxer.example".into()),
+            ..pins()
+        };
+        let stored = decode(&encode(&token, &with_media, true).unwrap());
+        assert_eq!(stored.pins, Some(with_media));
+        assert!(stored.pasted);
+        // Written before the media pin existed: no media host, upgraded on the next save.
+        let old = r#"{"token":"secret","pins":{"api":"https://fluxer.example","gateway":"wss://fluxer.example"},"pasted":true}"#;
+        let stored = decode(old);
+        assert_eq!(stored.pins.as_ref().and_then(|p| p.media.clone()), None);
+        assert_eq!(stored.pins, Some(pins()));
+        assert!(stored.pasted);
     }
 }
