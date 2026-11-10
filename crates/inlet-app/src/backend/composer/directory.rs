@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! What autocomplete offers: a guild's roles, channels and custom emoji, the account's
-//! guild-level rights that change the composer (mention everyone, ignore slowmode), and
+//! rights per channel that change the composer (mention everyone, ignore slowmode), and
 //! member search over the gateway. Everything here comes from the server; the composer
 //! never builds a mention from typed text.
 
@@ -43,6 +43,26 @@ pub struct Person {
 pub struct RoleEntry {
     pub id: u64,
     pub name: String,
+    /// Anyone may mention it; otherwise only with the right to mention everyone.
+    pub mentionable: bool,
+}
+
+/// The account's rights in one channel that change the composer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Rights {
+    /// May mention `@everyone`, `@here` and every role.
+    pub mention_everyone: bool,
+    /// Ignores slowmode.
+    pub bypass_slowmode: bool,
+}
+
+impl Rights {
+    fn from_bits(bits: u64) -> Rights {
+        Rights {
+            mention_everyone: bits & MENTION_EVERYONE != 0,
+            bypass_slowmode: bits & BYPASS_SLOWMODE != 0,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -62,15 +82,21 @@ pub struct CustomEmoji {
 /// One guild's autocomplete data.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Directory {
-    /// Roles the account may mention, highest first.
+    /// The guild's roles but `@everyone`, highest first.
     pub roles: Vec<RoleEntry>,
-    /// Text channels.
+    /// Text channels the account can see.
     pub channels: Vec<ChannelEntry>,
     pub emojis: Vec<CustomEmoji>,
-    /// The account may mention `@everyone`, `@here` and every role.
-    pub mention_everyone: bool,
-    /// The account ignores slowmode.
-    pub bypass_slowmode: bool,
+    /// The account's rights per text channel, with the channel's overwrites. A channel
+    /// that is not here gives no extra rights.
+    pub rights: HashMap<String, Rights>,
+}
+
+impl Directory {
+    /// The account's rights in `channel_id` (none when unknown).
+    pub fn rights(&self, channel_id: &str) -> Rights {
+        self.rights.get(channel_id).copied().unwrap_or_default()
+    }
 }
 
 /// The composer's cache in the backend, shared with its tasks.
@@ -172,45 +198,82 @@ fn plain_emoji_name(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
-/// Builds a directory from the server's answers. `member` is the account's own member.
-pub fn build(
-    guild_id: &str,
-    user_id: &str,
-    roles: &[p::Role],
-    member: Option<&p::GuildMember>,
-    emojis: &[p::GuildEmoji],
-    channels: Vec<ChannelEntry>,
-) -> Directory {
-    // Without the own member the rights are unknown: allow nothing extra.
-    let bits = member.map_or(0, |m| {
-        p::PermissionContext {
-            guild_id,
-            owner_id: None,
-            user_id,
-            roles,
-            member_roles: &m.roles,
-            timed_out: m.is_timed_out(),
-            ..Default::default()
-        }
-        .guild()
+/// Whether a channel type takes text messages in a guild.
+fn is_text(kind: i64) -> bool {
+    use p::models::channel_type::{GUILD_ANNOUNCEMENT, GUILD_TEXT};
+    kind == GUILD_TEXT || kind == GUILD_ANNOUNCEMENT
+}
+
+/// The server's answers for one guild, as [`build`] reads them.
+pub struct Fetched<'a> {
+    pub guild_id: &'a str,
+    pub user_id: &'a str,
+    pub roles: &'a [p::Role],
+    /// The account's own member; without it nothing extra is allowed.
+    pub member: Option<&'a p::GuildMember>,
+    pub emojis: &'a [p::GuildEmoji],
+    /// The guild's channels with their overwrites; empty when they could not be read.
+    pub channels: &'a [p::Channel],
+    /// Channel names from the sidebar, used when `channels` is empty.
+    pub fallback: Vec<ChannelEntry>,
+}
+
+/// Builds a directory from the server's answers. Rights are computed per channel with
+/// its overwrites (the guild owner is not known here, so an owner gets only what the
+/// roles give; the server decides in the end).
+pub fn build(f: Fetched) -> Directory {
+    let ctx = f.member.map(|m| p::PermissionContext {
+        guild_id: f.guild_id,
+        owner_id: None,
+        user_id: f.user_id,
+        roles: f.roles,
+        member_roles: &m.roles,
+        timed_out: m.is_timed_out(),
+        ..Default::default()
     });
-    let mention_everyone = bits & MENTION_EVERYONE != 0;
-    let mut sorted: Vec<&p::Role> = roles.iter().filter(|r| r.id != guild_id).collect();
+    let mut rights = HashMap::new();
+    let mut entries = Vec::new();
+    for c in f.channels.iter().filter(|c| is_text(c.kind)) {
+        let Some(ctx) = &ctx else { break };
+        let parent = c
+            .parent_id
+            .as_ref()
+            .and_then(|pid| f.channels.iter().find(|x| &x.id == pid));
+        let bits = ctx.channel(c, parent);
+        if bits & p::permissions::VIEW_CHANNEL == 0 {
+            continue;
+        }
+        rights.insert(c.id.clone(), Rights::from_bits(bits));
+        if let Some(id) = snowflake(&c.id).and_then(|s| s.parse().ok()) {
+            if entries.len() < MAX_CHANNELS {
+                entries.push(ChannelEntry {
+                    id,
+                    name: model::clean_name(c.name.as_deref().unwrap_or_default()),
+                });
+            }
+        }
+    }
+    if f.channels.is_empty() {
+        entries = f.fallback;
+    }
+    let mut sorted: Vec<&p::Role> = f.roles.iter().filter(|r| r.id != f.guild_id).collect();
     sorted.sort_by_key(|r| std::cmp::Reverse(r.position));
     Directory {
         roles: sorted
             .into_iter()
-            .filter(|r| r.mentionable || mention_everyone)
             .filter_map(|r| {
                 Some(RoleEntry {
                     id: snowflake(&r.id)?.parse().ok()?,
                     name: model::clean_name(&r.name),
+                    mentionable: r.mentionable,
                 })
             })
             .take(MAX_ROLES)
             .collect(),
-        channels,
-        emojis: emojis
+        channels: entries,
+        rights,
+        emojis: f
+            .emojis
             .iter()
             .filter(|e| plain_emoji_name(&e.name))
             .filter_map(|e| {
@@ -222,14 +285,12 @@ pub fn build(
             })
             .take(MAX_EMOJIS)
             .collect(),
-        mention_everyone,
-        bypass_slowmode: bits & BYPASS_SLOWMODE != 0,
     }
 }
 
 impl Backend {
-    /// Sends the directory of `guild_id`: from the cache, or fetched (three requests, at
-    /// most once per guild every ten minutes).
+    /// Sends the directory of `guild_id`: from the cache, or fetched (four requests:
+    /// roles, own member, emoji and channels, at most once per guild every ten minutes).
     pub(super) fn directory(&mut self, guild_id: String) {
         match &self.active {
             #[cfg(feature = "demo")]
@@ -241,7 +302,7 @@ impl Backend {
                 let Some(guild) = snowflake(&guild_id).map(str::to_owned) else {
                     return;
                 };
-                let channels = channel_entries(
+                let fallback = channel_entries(
                     r.cache
                         .lock()
                         .unwrap()
@@ -252,9 +313,8 @@ impl Backend {
                 let gen = r.gen;
                 {
                     let mut inner = self.composer.of(gen);
-                    if let Some((at, dir)) = inner.guilds.get_mut(&guild) {
+                    if let Some((at, dir)) = inner.guilds.get(&guild) {
                         if at.elapsed() < DIRECTORY_TTL {
-                            dir.channels = channels;
                             let directory = dir.clone();
                             drop(inner);
                             self.emit(Ev::Directory {
@@ -275,10 +335,11 @@ impl Backend {
                 );
                 self.spawn_guarded("directory", None, async move {
                     let client = session.client();
-                    let (roles, member, emojis) = tokio::join!(
+                    let (roles, member, emojis, channels) = tokio::join!(
                         client.roles(&guild),
                         client.my_guild_member(&guild),
                         client.guild_emojis(&guild),
+                        client.channels(&guild),
                     );
                     let member = member.ok();
                     let user_id = member
@@ -287,14 +348,20 @@ impl Backend {
                         .map(|u| u.id.clone())
                         .or_else(|| state.session(gen).map(|(id, _)| id))
                         .unwrap_or_default();
-                    let directory = build(
-                        &guild,
-                        &user_id,
-                        &roles.unwrap_or_default(),
-                        member.as_ref(),
-                        &emojis.unwrap_or_default(),
-                        channels,
+                    let (roles, emojis, channels) = (
+                        roles.unwrap_or_default(),
+                        emojis.unwrap_or_default(),
+                        channels.unwrap_or_default(),
                     );
+                    let directory = build(Fetched {
+                        guild_id: &guild,
+                        user_id: &user_id,
+                        roles: &roles,
+                        member: member.as_ref(),
+                        emojis: &emojis,
+                        channels: &channels,
+                        fallback,
+                    });
                     {
                         let mut inner = state.of(gen);
                         inner.loading.remove(&guild);
@@ -380,33 +447,73 @@ mod tests {
         .unwrap()
     }
 
-    #[test]
-    fn only_mentionable_roles_without_the_right_to_mention_everyone() {
-        let roles = [
-            role("1", "@everyone", 0, 0, false),
-            role("2", "Mods", 2, 0, true),
-            role("3", "Secret", 3, 0, false),
-        ];
-        let dir = build("1", "7", &roles, Some(&member(&[])), &[], vec![]);
-        assert_eq!(dir.roles.iter().map(|r| r.id).collect::<Vec<_>>(), [2]);
-        assert!(!dir.mention_everyone);
-        assert!(!dir.bypass_slowmode);
+    fn channel(id: &str, overwrites: serde_json::Value) -> p::Channel {
+        serde_json::from_value(json!({
+            "id": id, "type": 0, "name": format!("c{id}"), "guild_id": "1",
+            "permission_overwrites": overwrites
+        }))
+        .unwrap()
+    }
 
+    const VIEW: u64 = p::permissions::VIEW_CHANNEL | p::permissions::SEND_MESSAGES;
+
+    fn fetched<'a>(
+        roles: &'a [p::Role],
+        member: Option<&'a p::GuildMember>,
+        channels: &'a [p::Channel],
+    ) -> Fetched<'a> {
+        Fetched {
+            guild_id: "1",
+            user_id: "7",
+            roles,
+            member,
+            emojis: &[],
+            channels,
+            fallback: vec![],
+        }
+    }
+
+    #[test]
+    fn rights_follow_the_channel_overwrites() {
         let roles = [
-            role("1", "@everyone", 0, 0, false),
+            role("1", "@everyone", 0, VIEW, false),
             role("2", "Mods", 2, MENTION_EVERYONE | BYPASS_SLOWMODE, true),
             role("3", "Secret", 3, 0, false),
         ];
-        let dir = build("1", "7", &roles, Some(&member(&["2"])), &[], vec![]);
+        let deny = (MENTION_EVERYONE | BYPASS_SLOWMODE).to_string();
+        let channels = [
+            channel("10", json!([])),
+            channel("11", json!([{ "id": "2", "type": 0, "allow": "0", "deny": deny }])),
+            channel("12", json!([{ "id": "1", "type": 0, "allow": "0",
+                                   "deny": p::permissions::VIEW_CHANNEL.to_string() }])),
+        ];
+        let me = member(&["2"]);
+        let dir = build(fetched(&roles, Some(&me), &channels));
         assert_eq!(dir.roles.iter().map(|r| r.id).collect::<Vec<_>>(), [3, 2]);
-        assert!(dir.mention_everyone && dir.bypass_slowmode);
+        assert!(dir.roles.iter().any(|r| r.id == 2 && r.mentionable));
+        let open = dir.rights("10");
+        assert!(open.mention_everyone && open.bypass_slowmode);
+        // The channel denies both: no everyone pills and the countdown runs there.
+        assert_eq!(dir.rights("11"), Rights::default());
+        // A hidden channel is neither offered nor given rights.
+        assert_eq!(dir.rights("12"), Rights::default());
+        assert_eq!(
+            dir.channels.iter().map(|c| c.id).collect::<Vec<_>>(),
+            [10, 11]
+        );
+        // A plain member gets no extra rights anywhere.
+        let plain = member(&[]);
+        let dir = build(fetched(&roles, Some(&plain), &channels));
+        assert_eq!(dir.rights("10"), Rights::default());
     }
 
     #[test]
     fn unknown_own_member_gives_no_extra_rights() {
-        let roles = [role("1", "@everyone", 0, MENTION_EVERYONE, false)];
-        let dir = build("1", "7", &roles, None, &[], vec![]);
-        assert!(!dir.mention_everyone && !dir.bypass_slowmode);
+        let roles = [role("1", "@everyone", 0, VIEW | MENTION_EVERYONE, false)];
+        let channels = [channel("10", json!([]))];
+        let dir = build(fetched(&roles, None, &channels));
+        assert_eq!(dir.rights("10"), Rights::default());
+        assert!(dir.channels.is_empty());
     }
 
     #[test]
@@ -417,7 +524,9 @@ mod tests {
             { "id": "bad", "name": "nope", "animated": false },
         ]))
         .unwrap();
-        let dir = build("1", "7", &[], None, &emojis, vec![]);
+        let mut f = fetched(&[], None, &[]);
+        f.emojis = &emojis;
+        let dir = build(f);
         assert_eq!(dir.emojis.len(), 1);
         assert_eq!(dir.emojis[0].name, "wave");
     }

@@ -212,8 +212,8 @@ impl Inlet {
         self.screen = Screen::SignIn;
         self.sign_in.busy = false;
         self.sign_in.handoff = None;
-        // The account's drafts go with it.
-        self.composer.sign_out();
+        // A new session asks again for the account ID and limit.
+        self.composer.reset_session();
         self.overlays.pending_link = None;
         self.guilds.clear();
         self.channels.clear();

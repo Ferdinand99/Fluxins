@@ -22,11 +22,12 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use gpui::{prelude::*, Context, Entity, Subscription, Window};
+use gpui::{prelude::*, App, Context, Entity, Subscription, Window};
 use inlet_editor::{Id, Resolve};
 
 use crate::app::Inlet;
 use crate::backend::composer::{Cmd, Ev};
+use crate::model::Message;
 use crate::ui::sidebar::channel_list::channel_label;
 pub use editor::{bind_keys, ChannelContext, ComposerEvent, ComposerView, Shared};
 
@@ -34,12 +35,16 @@ pub use editor::{bind_keys, ChannelContext, ComposerEvent, ComposerView, Shared}
 /// two, so nothing typed before can be too long for the server.
 const DEFAULT_MAX_LEN: usize = 2000;
 
+
 pub struct ComposerState {
     pub view: Entity<ComposerView>,
     pub shared: Rc<RefCell<Shared>>,
     /// The signed-in account's ID, once the backend has told.
     pub user_id: Option<String>,
     session_asked: bool,
+    /// Tags each request for the account ID; answers with an older tag are dropped, so
+    /// a slow answer for an account that signed out cannot pick the drafts file.
+    session_token: u64,
 }
 
 impl ComposerState {
@@ -65,15 +70,22 @@ impl ComposerState {
             shared,
             user_id: None,
             session_asked: false,
+            session_token: 0,
         }
+    }
+
+    /// The session is gone (sign-out, or the backend restarts): ask again next time.
+    pub fn reset_session(&mut self) {
+        self.user_id = None;
+        self.session_asked = false;
+        self.session_token += 1;
     }
 
     /// Sign-out: the account's drafts are deleted at once; the view forgets the rest
     /// (reply, edit, failed sends) when it opens the next channel.
     pub fn sign_out(&mut self) {
-        self.shared.borrow_mut().drafts.sign_out();
-        self.user_id = None;
-        self.session_asked = false;
+        self.shared.borrow_mut().sign_out();
+        self.reset_session();
     }
 }
 
@@ -92,8 +104,41 @@ impl Resolve for AuthorNames {
     }
 }
 
+/// Up in an empty composer: opens the account's newest message among `shown` (oldest
+/// first) for editing. This is the one place that reads the message list for it.
+pub(crate) fn edit_last<'a>(
+    view: &Entity<ComposerView>,
+    shown: impl DoubleEndedIterator<Item = &'a Message> + Clone,
+    me: &str,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some(message) = edit_inline::last_editable(shown.clone(), me).cloned() else {
+        return;
+    };
+    let names = AuthorNames(
+        shown
+            .filter_map(|m| Some((m.author_id.parse().ok()?, m.author.clone())))
+            .collect(),
+    );
+    view.update(cx, |v, cx| {
+        // Whether the original reply notified its author is not in the list's model
+        // yet; unknown keeps the author from being added by the edit.
+        v.start_edit(
+            message.id,
+            message.channel_id,
+            &message.content,
+            &names,
+            None,
+            window,
+            cx,
+        )
+    });
+}
+
 impl Inlet {
-    /// Opens `channel_id` in the composer: its draft, placeholder and slowmode.
+    /// Opens `channel_id` in the composer: its draft, placeholder and slowmode. Opening
+    /// the open channel again takes its new settings (for example a changed slowmode).
     pub(crate) fn composer_open_channel(
         &mut self,
         channel_id: &str,
@@ -102,7 +147,9 @@ impl Inlet {
     ) {
         if !self.composer.session_asked {
             self.composer.session_asked = true;
-            self.backend.send(Cmd::Session);
+            self.backend.send(Cmd::Session {
+                token: self.composer.session_token,
+            });
         }
         let channel = self.channels.iter().find(|c| c.id == channel_id);
         let ctx = ChannelContext {
@@ -127,6 +174,9 @@ impl Inlet {
     ) {
         match event {
             ComposerEvent::Send(message) => self.backend.send(Cmd::Send(message)),
+            ComposerEvent::SendUnlessSent(message) => {
+                self.backend.send(Cmd::SendUnlessSent(message))
+            }
             ComposerEvent::Edit {
                 channel_id,
                 message_id,
@@ -161,28 +211,7 @@ impl Inlet {
                 }
                 let me = self.composer.user_id.clone().unwrap_or_default();
                 let shown = self.chat.messages.iter().map(|m| &m.message);
-                let Some(message) = edit_inline::last_editable(shown, &me).cloned() else {
-                    return;
-                };
-                let names = AuthorNames(
-                    self.chat
-                        .messages
-                        .iter()
-                        .filter_map(|m| {
-                            Some((m.message.author_id.parse().ok()?, m.message.author.clone()))
-                        })
-                        .collect(),
-                );
-                self.composer.view.update(cx, |v, cx| {
-                    v.start_edit(
-                        message.id,
-                        message.channel_id,
-                        &message.content,
-                        &names,
-                        window,
-                        cx,
-                    )
-                });
+                edit_last(&self.composer.view, shown, &me, window, cx);
             }
         }
     }
@@ -201,14 +230,16 @@ impl Inlet {
         let view = self.composer.view.clone();
         match event {
             Ev::Session {
+                token,
                 user_id,
                 max_message_length,
             } => {
-                // An answer for a session that has signed out since is dropped.
-                if !self.composer.session_asked {
+                // An answer for an account that has signed out since is dropped.
+                if !self.composer.session_asked || token != self.composer.session_token {
                     return;
                 }
-                let file = dirs::config_dir()
+                // Local, not roaming: drafts are message text and stay on this machine.
+                let file = dirs::data_local_dir()
                     .and_then(|dir| drafts::path_for(&dir, &self.instance, &user_id));
                 self.composer.user_id = Some(user_id);
                 view.update(cx, |v, cx| {
@@ -220,8 +251,12 @@ impl Inlet {
                 nonce,
                 reason,
                 retry_after_secs,
+                ambiguous,
             } => view.update(cx, |v, cx| {
-                v.on_send_failed(&nonce, reason, retry_after_secs, cx)
+                v.on_send_failed(&nonce, reason, retry_after_secs, ambiguous, cx)
+            }),
+            Ev::DirectMessageFailed { nonce, reason } => view.update(cx, |v, cx| {
+                v.on_direct_message_failed(&nonce, reason, window, cx)
             }),
             Ev::EditFailed { reason } => view.update(cx, |v, cx| v.on_edit_failed(reason, cx)),
             Ev::Directory {

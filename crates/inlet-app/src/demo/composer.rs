@@ -3,7 +3,9 @@
 //! (pills need real snowflakes), and edits of the demo's own messages.
 
 use super::MockSession;
-use crate::backend::composer::{ChannelEntry, CustomEmoji, Directory, Person, RoleEntry};
+use crate::backend::composer::{
+    ChannelEntry, CustomEmoji, Directory, Person, RoleEntry, Rights,
+};
 use crate::backend::messages as msgs;
 
 /// The demo account's ID: the author ID of the demo's own messages.
@@ -16,10 +18,12 @@ pub fn directory(_guild_id: &str) -> Directory {
             RoleEntry {
                 id: 3001,
                 name: "Moderators".into(),
+                mentionable: true,
             },
             RoleEntry {
                 id: 3002,
                 name: "Helpers".into(),
+                mentionable: false,
             },
         ],
         channels: vec![
@@ -37,8 +41,19 @@ pub fn directory(_guild_id: &str) -> Directory {
             name: "inlet_wave".into(),
             animated: false,
         }],
-        mention_everyone: true,
-        bypass_slowmode: false,
+        // The demo account may mention everyone in its text channels.
+        rights: ["c-welcome", "c-general", "c-dev", "r-general", "s-general"]
+            .into_iter()
+            .map(|c| {
+                (
+                    c.to_owned(),
+                    Rights {
+                        mention_everyone: true,
+                        bypass_slowmode: false,
+                    },
+                )
+            })
+            .collect(),
     }
 }
 

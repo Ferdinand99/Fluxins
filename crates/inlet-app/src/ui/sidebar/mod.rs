@@ -52,6 +52,9 @@ impl Inlet {
             if self.selected_channel.is_some() && !open_still_exists {
                 self.chat.notice = Some(t!("sidebar-channel-deleted"));
                 self.selected_channel = None;
+            } else if let Some(open) = self.selected_channel.clone() {
+                // The open channel may have changed (for example its slowmode).
+                self.composer_open_channel(&open, window, cx);
             }
             #[cfg(feature = "demo")]
             if let Some(wanted) = self.demo_channel.take() {

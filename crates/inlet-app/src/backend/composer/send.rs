@@ -6,23 +6,21 @@
 //! looks like a mention, but that depends on how the server parses today;
 //! `allowed_mentions` is the guard that does not: the server drops every user and role
 //! mention that is not on the list, and `@everyone`/`@here` unless one was picked.
-//! The protocol's `send` cannot carry such a list yet, so the body is built here and goes
-//! through `request_json`, which uses the same rate limiter.
+//! Sends and edits go through the protocol's `send` and `edit_message_with`.
 
 use inlet_protocol as p;
 use reqwest::Method;
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 
 use super::Ev;
 use crate::backend::messages::{self, parse};
 use crate::backend::session::{Failure, FailureKind};
 use crate::backend::{Active, Backend, Internal, Ui};
 
-/// `SUPPRESS_NOTIFICATIONS`: the message is sent without a notification (`@silent`).
-const SILENT_FLAG: u64 = p::models::message_flags::SUPPRESS_NOTIFICATIONS;
-
 /// The longest nickname Fluxer takes.
 const MAX_NICK_CHARS: usize = 32;
+/// Recent messages read to find out whether a send went through after all.
+const NONCE_LOOKBACK: u8 = 50;
 
 /// Who a message may notify: the mentions picked in the editor.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -31,14 +29,19 @@ pub struct Mentions {
     pub roles: Vec<u64>,
     /// An `@everyone` or `@here` pill was picked.
     pub everyone: bool,
-    /// For a reply: whether the author of the message replied to is notified.
-    pub replied_user: bool,
+    /// Whether the author of the message replied to is notified. For a send it is the
+    /// reply bar's switch (`None` for a message that is no reply); for an edit, what the
+    /// original message did (`false` when that is not known).
+    pub replied_user: Option<bool>,
 }
 
 impl Mentions {
     /// From the editor's [`inlet_editor::AllowedMentions`] (always build it from the
     /// editor's buffer, never from the text).
-    pub fn from_editor(allowed: &inlet_editor::AllowedMentions, replied_user: bool) -> Self {
+    pub fn from_editor(
+        allowed: &inlet_editor::AllowedMentions,
+        replied_user: Option<bool>,
+    ) -> Self {
         Mentions {
             users: allowed.users.iter().map(|id| id.0).collect(),
             roles: allowed.roles.iter().map(|id| id.0).collect(),
@@ -47,28 +50,20 @@ impl Mentions {
         }
     }
 
-    /// The `allowed_mentions` object: the picked lists with `parse: []`, or
-    /// `parse: ["everyone"]` alone (never with lists) when an everyone pill was picked.
-    /// The server refuses a non-empty `parse` together with lists, so with an everyone pill
-    /// and picked users or roles at once it gets all three kinds
-    /// (the editor then escapes every typed look-alike).
-    pub fn to_json(&self, reply: bool) -> Value {
+    /// The protocol's `allowed_mentions`: exactly the picked users, roles and everyone.
+    /// Fluxer cannot express "these users and roles plus `@everyone`"; in that case
+    /// every kind is allowed, which is safe because the editor then escapes every typed
+    /// look-alike, so only the picked pills are mentions in the text.
+    pub fn to_allowed(&self) -> Result<p::AllowedMentions, p::AllowedMentionsError> {
         let ids = |list: &[u64]| -> Vec<String> { list.iter().map(u64::to_string).collect() };
-        let mut out = Map::new();
-        if self.everyone && (!self.users.is_empty() || !self.roles.is_empty()) {
-            out.insert("parse".into(), json!(["everyone", "users", "roles"]));
-        } else if self.everyone {
-            out.insert("parse".into(), json!(["everyone"]));
-        } else {
-            // An empty `parse` is sent as `[]`: nothing is parsed, only the lists count.
-            out.insert("parse".into(), json!([]));
-            out.insert("users".into(), json!(ids(&self.users)));
-            out.insert("roles".into(), json!(ids(&self.roles)));
-        }
-        if reply {
-            out.insert("replied_user".into(), json!(self.replied_user));
-        }
-        Value::Object(out)
+        let mut allowed =
+            match p::AllowedMentions::only(&ids(&self.users), &ids(&self.roles), self.everyone) {
+                Ok(a) => a,
+                Err(p::AllowedMentionsError::ParseWithUsersOrRoles) => p::AllowedMentions::all(),
+                Err(e) => return Err(e),
+            };
+        allowed.replied_user = self.replied_user;
+        Ok(allowed)
     }
 }
 
@@ -88,31 +83,31 @@ pub struct Outgoing {
 }
 
 impl Outgoing {
-    /// The body of `POST /channels/{id}/messages`.
-    pub fn to_json(&self) -> Value {
-        let mut body = Map::new();
-        body.insert("content".into(), json!(self.content));
-        body.insert("nonce".into(), json!(self.nonce));
-        body.insert(
-            "allowed_mentions".into(),
-            self.mentions.to_json(self.reply_to.is_some()),
-        );
+    /// The protocol's message.
+    pub fn to_message(&self) -> Result<p::OutgoingMessage, p::AllowedMentionsError> {
+        let mut m = p::OutgoingMessage::text(self.content.clone())
+            .with_nonce(self.nonce.clone())
+            .with_allowed_mentions(self.mentions.to_allowed()?);
         if let Some(id) = &self.reply_to {
-            body.insert(
-                "message_reference".into(),
-                json!({ "message_id": id, "type": 0 }),
-            );
+            m = m.reply_to(id.clone(), self.mentions.replied_user.unwrap_or(true));
         }
         if self.silent {
-            body.insert("flags".into(), json!(SILENT_FLAG));
+            m = m.silent();
         }
-        Value::Object(body)
+        Ok(m)
     }
 }
 
-/// The body of `PATCH /channels/{id}/messages/{id}`.
-pub fn edit_json(content: &str, mentions: &Mentions) -> Value {
-    json!({ "content": content, "allowed_mentions": mentions.to_json(false) })
+/// The protocol's edit: new text and its `allowed_mentions`.
+pub fn edit_of(
+    content: &str,
+    mentions: &Mentions,
+) -> Result<p::MessageEdit, p::AllowedMentionsError> {
+    Ok(p::MessageEdit {
+        content: Some(content.to_owned()),
+        flags: None,
+        allowed_mentions: Some(mentions.to_allowed()?),
+    })
 }
 
 /// A snowflake as it may go into a path: 1 to 20 digits, no leading zero.
@@ -130,16 +125,31 @@ pub fn snowflake_u64(s: &str) -> Option<u64> {
     snowflake(s)?.parse().ok()
 }
 
-/// What a failed request means for the UI: the reason and how long the server asked to
-/// wait, or `None` when the session has ended (the loop is told).
+/// Why a send failed, for the UI.
+pub struct SendError {
+    pub reason: String,
+    /// The server asked to wait this long (slowmode or a rate limit).
+    pub retry_after_secs: Option<u64>,
+    /// The request may have reached the server (timeout, broken connection, an answer
+    /// that could not be read, a server error): the message may exist.
+    pub ambiguous: bool,
+}
+
+/// What a failed request means for the UI, or `None` when the session has ended (the
+/// loop is told).
 fn failed(
     internal: &tokio::sync::mpsc::UnboundedSender<Internal>,
     gen: u64,
     err: p::Error,
-) -> Option<(String, Option<u64>)> {
-    let retry = match &err {
+) -> Option<SendError> {
+    let retry_after_secs = match &err {
         p::Error::RateLimited { retry_after } => Some(retry_after.as_secs().max(1)),
         _ => None,
+    };
+    let ambiguous = match &err {
+        p::Error::Http(_) | p::Error::Decode(_) => true,
+        p::Error::Api(api) => api.status >= 500 || api.status == 0,
+        _ => false,
     };
     let failure = Failure::from(err);
     if failure.kind == FailureKind::SessionEnded {
@@ -149,68 +159,114 @@ fn failed(
         });
         return None;
     }
-    Some((failure.message, retry))
+    Some(SendError {
+        reason: failure.message,
+        retry_after_secs,
+        ambiguous,
+    })
 }
 
-fn path_for(channel_id: &str) -> Result<String, p::Error> {
-    snowflake(channel_id)
-        .map(|id| format!("/channels/{id}/messages"))
-        .ok_or_else(|| p::Error::InvalidInput("an ID is not a snowflake".into()))
+/// The one place the composer hands a sent or edited message to the message list.
+fn show_in_list(events: &Ui, names: &parse::SharedNames, m: &p::Message, edited: bool) {
+    let shown = parse::to_message(m, names);
+    let _ = if edited {
+        events.unbounded_send(messages::Ev::MessageUpdated(shown))
+    } else {
+        events.unbounded_send(messages::Ev::MessageCreated(shown))
+    };
 }
 
-/// Posts `message` and reports the result.
-async fn post(
+/// The session's parts a send task needs.
+#[derive(Clone)]
+struct Ctx {
     session: p::Session,
-    message: Outgoing,
     names: parse::SharedNames,
     events: Ui,
     internal: tokio::sync::mpsc::UnboundedSender<Internal>,
     gen: u64,
-) {
-    let result = match path_for(&message.channel_id) {
-        Ok(path) => {
-            session
-                .client()
-                .request_json(Method::POST, &path, Some(&message.to_json()))
-                .await
+}
+
+impl Ctx {
+    /// Posts `message`. `Ok(())` when the server took it; `Err(None)` when the session
+    /// ended.
+    async fn post(&self, message: &Outgoing) -> Result<(), Option<SendError>> {
+        let result = match message.to_message() {
+            Ok(m) => self.session.client().send(&message.channel_id, &m).await,
+            Err(e) => Err(e.into()),
+        };
+        match result {
+            Ok(sent) => {
+                show_in_list(&self.events, &self.names, &sent, false);
+                Ok(())
+            }
+            Err(err) => Err(failed(&self.internal, self.gen, err)),
         }
-        Err(err) => Err(err),
-    };
-    match result.and_then(|v| {
-        serde_json::from_value::<p::Message>(v).map_err(|e| p::Error::Decode(e.to_string()))
-    }) {
-        Ok(sent) => {
-            let _ = events.unbounded_send(Ev::Sent {
-                nonce: message.nonce.clone(),
-            });
-            let _ = events.unbounded_send(messages::Ev::MessageCreated(parse::to_message(
-                &sent, &names,
-            )));
-        }
-        Err(err) => {
-            if let Some((reason, retry_after_secs)) = failed(&internal, gen, err) {
-                let _ = events.unbounded_send(Ev::SendFailed {
+    }
+
+    /// Posts `message` and reports `Sent` or `SendFailed` with its nonce.
+    async fn post_and_report(&self, message: Outgoing) {
+        match self.post(&message).await {
+            Ok(()) => {
+                let _ = self.events.unbounded_send(Ev::Sent {
                     nonce: message.nonce,
-                    reason,
-                    retry_after_secs,
                 });
             }
+            Err(Some(e)) => {
+                let _ = self.events.unbounded_send(Ev::SendFailed {
+                    nonce: message.nonce,
+                    reason: e.reason,
+                    retry_after_secs: e.retry_after_secs,
+                    ambiguous: e.ambiguous,
+                });
+            }
+            Err(None) => {}
+        }
+    }
+
+    /// Whether a message with this nonce is among the channel's newest messages.
+    async fn already_sent(&self, message: &Outgoing) -> Result<bool, Option<SendError>> {
+        match self
+            .session
+            .client()
+            .messages(&message.channel_id, None, NONCE_LOOKBACK)
+            .await
+        {
+            Ok(list) => Ok(list
+                .iter()
+                .any(|m| m.nonce.as_deref() == Some(message.nonce.as_str()))),
+            Err(err) => Err(failed(&self.internal, self.gen, err)),
         }
     }
 }
 
 impl Backend {
-    /// The account ID and message length limit, fetched once per session.
-    pub(super) fn composer_session(&mut self) {
+    fn send_ctx(&self) -> Option<Ctx> {
+        match &self.active {
+            Some(Active::Real(r)) => Some(Ctx {
+                session: r.session.clone(),
+                names: r.names.clone(),
+                events: self.events.clone(),
+                internal: self.internal.clone(),
+                gen: r.gen,
+            }),
+            _ => None,
+        }
+    }
+
+    /// The account ID and message length limit, fetched once per session. `token` is
+    /// echoed so the UI can drop an answer meant for an account that signed out since.
+    pub(super) fn composer_session(&mut self, token: u64) {
         match &self.active {
             #[cfg(feature = "demo")]
             Some(Active::Demo(_)) => self.emit(Ev::Session {
+                token,
                 user_id: crate::demo::composer::DEMO_USER_ID.into(),
                 max_message_length: 2000,
             }),
             Some(Active::Real(r)) => {
                 if let Some((user_id, max)) = self.composer.session(r.gen) {
                     self.emit(Ev::Session {
+                        token,
                         user_id,
                         max_message_length: max,
                     });
@@ -234,6 +290,7 @@ impl Backend {
                                 .clamp(1, 100_000) as usize;
                             state.set_session(gen, me.id.clone(), max);
                             let _ = events.unbounded_send(Ev::Session {
+                                token,
                                 user_id: me.id.clone(),
                                 max_message_length: max,
                             });
@@ -250,29 +307,46 @@ impl Backend {
     }
 
     pub(super) fn send(&mut self, message: Outgoing) {
-        match &mut self.active {
-            #[cfg(feature = "demo")]
-            Some(Active::Demo(m)) => {
-                let nonce = message.nonce.clone();
-                m.send(message.channel_id, message.content);
-                let _ = self.events.unbounded_send(Ev::Sent { nonce });
-            }
-            Some(Active::Real(r)) => {
-                let (session, events, internal, gen, names) = (
-                    r.session.clone(),
-                    self.events.clone(),
-                    self.internal.clone(),
-                    r.gen,
-                    r.names.clone(),
-                );
-                self.spawn_guarded(
-                    "send",
-                    None,
-                    post(session, message, names, events, internal, gen),
-                );
-            }
-            None => {}
+        #[cfg(feature = "demo")]
+        if let Some(Active::Demo(m)) = &mut self.active {
+            let nonce = message.nonce.clone();
+            m.send(message.channel_id, message.content);
+            let _ = self.events.unbounded_send(Ev::Sent { nonce });
+            return;
         }
+        if let Some(ctx) = self.send_ctx() {
+            self.spawn_guarded("send", None, async move {
+                ctx.post_and_report(message).await
+            });
+        }
+    }
+
+    /// A retry long after an unclear failure: the server only recognises a nonce for a
+    /// few minutes, so first look whether the message arrived; send it only if not.
+    pub(super) fn send_unless_sent(&mut self, message: Outgoing) {
+        let Some(ctx) = self.send_ctx() else {
+            self.send(message);
+            return;
+        };
+        self.spawn_guarded("send unless sent", None, async move {
+            match ctx.already_sent(&message).await {
+                Ok(true) => {
+                    let _ = ctx.events.unbounded_send(Ev::Sent {
+                        nonce: message.nonce,
+                    });
+                }
+                Ok(false) => ctx.post_and_report(message).await,
+                Err(Some(e)) => {
+                    let _ = ctx.events.unbounded_send(Ev::SendFailed {
+                        nonce: message.nonce,
+                        reason: e.reason,
+                        retry_after_secs: e.retry_after_secs,
+                        ambiguous: true,
+                    });
+                }
+                Err(None) => {}
+            }
+        });
     }
 
     pub(super) fn edit(
@@ -282,53 +356,39 @@ impl Backend {
         content: String,
         mentions: Mentions,
     ) {
-        match &mut self.active {
-            #[cfg(feature = "demo")]
-            Some(Active::Demo(m)) => {
-                m.edit(&channel_id, &message_id, &content);
-            }
-            Some(Active::Real(r)) => {
-                let (session, events, internal, gen, names) = (
-                    r.session.clone(),
-                    self.events.clone(),
-                    self.internal.clone(),
-                    r.gen,
-                    r.names.clone(),
-                );
-                self.spawn_guarded("edit", None, async move {
-                    let path = match (snowflake(&channel_id), snowflake(&message_id)) {
-                        (Some(c), Some(m)) => format!("/channels/{c}/messages/{m}"),
-                        _ => return,
-                    };
-                    let body = edit_json(&content, &mentions);
-                    let result = session
-                        .client()
-                        .request_json(Method::PATCH, &path, Some(&body))
-                        .await
-                        .and_then(|v| {
-                            serde_json::from_value::<p::Message>(v)
-                                .map_err(|e| p::Error::Decode(e.to_string()))
-                        });
-                    match result {
-                        Ok(edited) => {
-                            let _ = events.unbounded_send(messages::Ev::MessageUpdated(
-                                parse::to_message(&edited, &names),
-                            ));
-                        }
-                        Err(err) => {
-                            if let Some((reason, _)) = failed(&internal, gen, err) {
-                                let _ = events.unbounded_send(Ev::EditFailed { reason });
-                            }
-                        }
-                    }
-                });
-            }
-            None => {}
+        #[cfg(feature = "demo")]
+        if let Some(Active::Demo(m)) = &mut self.active {
+            m.edit(&channel_id, &message_id, &content);
+            return;
         }
+        let Some(ctx) = self.send_ctx() else {
+            return;
+        };
+        self.spawn_guarded("edit", None, async move {
+            let result = match edit_of(&content, &mentions) {
+                Ok(edit) => {
+                    ctx.session
+                        .client()
+                        .edit_message_with(&channel_id, &message_id, &edit)
+                        .await
+                }
+                Err(e) => Err(e.into()),
+            };
+            match result {
+                Ok(edited) => show_in_list(&ctx.events, &ctx.names, &edited, true),
+                Err(err) => {
+                    if let Some(e) = failed(&ctx.internal, ctx.gen, err) {
+                        let _ = ctx
+                            .events
+                            .unbounded_send(Ev::EditFailed { reason: e.reason });
+                    }
+                }
+            }
+        });
     }
 
     /// The protocol sends at most one typing request per channel every 8 s; the other
-    /// calls return at once without a request.
+    /// calls return at once without a request. A send resets it.
     pub(super) fn typing(&mut self, channel_id: String) {
         if let Some(Active::Real(r)) = &self.active {
             let session = r.session.clone();
@@ -345,98 +405,101 @@ impl Backend {
             .map(|n| crate::model::clean_name(n.trim()))
             .filter(|n| !n.is_empty())
             .map(|n| n.chars().take(MAX_NICK_CHARS).collect::<String>());
-        match &self.active {
-            #[cfg(feature = "demo")]
-            Some(Active::Demo(_)) => self.emit(Ev::Notice(nick_notice(nick.as_deref()))),
-            Some(Active::Real(r)) => {
-                let Some(guild) = snowflake(&guild_id).map(str::to_owned) else {
-                    return;
-                };
-                let (session, events, internal, gen) = (
-                    r.session.clone(),
-                    self.events.clone(),
-                    self.internal.clone(),
-                    r.gen,
-                );
-                self.spawn_guarded("nick", None, async move {
-                    let body = json!({ "nick": nick });
-                    let path = format!("/guilds/{guild}/members/@me");
-                    match session
-                        .client()
-                        .request_json(Method::PATCH, &path, Some(&body))
-                        .await
-                    {
-                        Ok(_) => {
-                            let _ = events.unbounded_send(Ev::Notice(nick_notice(nick.as_deref())));
-                        }
-                        Err(err) => {
-                            if let Some((reason, _)) = failed(&internal, gen, err) {
-                                let _ = events.unbounded_send(Ev::Notice(t!(
-                                    "composer-command-failed",
-                                    error = reason
-                                )));
-                            }
-                        }
-                    }
-                });
-            }
-            None => {}
+        #[cfg(feature = "demo")]
+        if let Some(Active::Demo(_)) = &self.active {
+            self.emit(Ev::Notice(nick_notice(nick.as_deref())));
+            return;
         }
+        let (Some(guild), Some(ctx)) = (snowflake(&guild_id).map(str::to_owned), self.send_ctx())
+        else {
+            return;
+        };
+        self.spawn_guarded("nick", None, async move {
+            // The protocol has no method for this route yet.
+            let body = json!({ "nick": nick });
+            let path = format!("/guilds/{guild}/members/@me");
+            match ctx
+                .session
+                .client()
+                .request_json(Method::PATCH, &path, Some(&body))
+                .await
+            {
+                Ok(_) => {
+                    let _ = ctx
+                        .events
+                        .unbounded_send(Ev::Notice(nick_notice(nick.as_deref())));
+                }
+                Err(err) => {
+                    if let Some(e) = failed(&ctx.internal, ctx.gen, err) {
+                        let _ = ctx.events.unbounded_send(Ev::Notice(t!(
+                            "composer-command-failed",
+                            error = e.reason
+                        )));
+                    }
+                }
+            }
+        });
     }
 
-    /// `/msg`: opens (or finds) the DM with `user_id` and sends `message` there.
+    /// `/msg`: opens (or finds) the DM with `user_id` and sends `message` there. Says
+    /// "sent" only when the server took it; otherwise `DirectMessageFailed` lets the
+    /// composer put the text back.
     pub(super) fn direct_message(&mut self, user_id: String, mut message: Outgoing) {
-        match &mut self.active {
-            #[cfg(feature = "demo")]
-            Some(Active::Demo(_)) => self.emit(Ev::Notice(t!("composer-msg-sent"))),
-            Some(Active::Real(r)) => {
-                let Some(user) = snowflake(&user_id).map(str::to_owned) else {
-                    return;
-                };
-                let (session, events, internal, gen, names) = (
-                    r.session.clone(),
-                    self.events.clone(),
-                    self.internal.clone(),
-                    r.gen,
-                    r.names.clone(),
-                );
-                self.spawn_guarded("direct message", None, async move {
-                    let body = json!({ "recipient_id": user });
-                    let channel = session
-                        .client()
-                        .request_json(Method::POST, "/users/@me/channels", Some(&body))
-                        .await;
-                    let channel_id = match channel {
-                        Ok(v) => v
-                            .get("id")
-                            .and_then(Value::as_str)
-                            .and_then(snowflake)
-                            .map(str::to_owned),
-                        Err(err) => {
-                            if let Some((reason, _)) = failed(&internal, gen, err) {
-                                let _ = events.unbounded_send(Ev::Notice(t!(
-                                    "composer-msg-failed",
-                                    error = reason
-                                )));
-                            }
-                            return;
-                        }
-                    };
-                    let Some(channel_id) = channel_id else {
-                        let _ = events.unbounded_send(Ev::Notice(t!(
-                            "composer-msg-failed",
-                            error = t!("composer-bad-answer")
-                        )));
-                        return;
-                    };
-                    message.channel_id = channel_id;
-                    let notice = events.clone();
-                    post(session, message, names, events, internal, gen).await;
-                    let _ = notice.unbounded_send(Ev::Notice(t!("composer-msg-sent")));
-                });
-            }
-            None => {}
+        #[cfg(feature = "demo")]
+        if let Some(Active::Demo(_)) = &self.active {
+            self.emit(Ev::Notice(t!("composer-msg-sent")));
+            return;
         }
+        let Some(ctx) = self.send_ctx() else {
+            return;
+        };
+        let nonce = message.nonce.clone();
+        let fail = move |events: &Ui, reason: String| {
+            let _ = events.unbounded_send(Ev::DirectMessageFailed {
+                nonce: nonce.clone(),
+                reason,
+            });
+        };
+        let Some(user) = snowflake(&user_id).map(str::to_owned) else {
+            fail(&ctx.events, t!("composer-bad-answer"));
+            return;
+        };
+        self.spawn_guarded("direct message", None, async move {
+            // The protocol has no method for this route yet.
+            let body = json!({ "recipient_id": user });
+            let channel = ctx
+                .session
+                .client()
+                .request_json(Method::POST, "/users/@me/channels", Some(&body))
+                .await;
+            let channel_id = match channel {
+                Ok(v) => v
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .and_then(snowflake)
+                    .map(str::to_owned),
+                Err(err) => {
+                    if let Some(e) = failed(&ctx.internal, ctx.gen, err) {
+                        fail(&ctx.events, e.reason);
+                    }
+                    return;
+                }
+            };
+            let Some(channel_id) = channel_id else {
+                fail(&ctx.events, t!("composer-bad-answer"));
+                return;
+            };
+            message.channel_id = channel_id;
+            match ctx.post(&message).await {
+                Ok(()) => {
+                    let _ = ctx
+                        .events
+                        .unbounded_send(Ev::Notice(t!("composer-msg-sent")));
+                }
+                Err(Some(e)) => fail(&ctx.events, e.reason),
+                Err(None) => {}
+            }
+        });
     }
 }
 
@@ -462,91 +525,87 @@ mod tests {
         }
     }
 
+    fn strings(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| (*s).to_owned()).collect()
+    }
+
     #[test]
-    fn every_send_carries_allowed_mentions_from_the_picked_pills() {
-        let plain = outgoing(Mentions::default(), None, false).to_json();
-        assert_eq!(
-            plain["allowed_mentions"],
-            json!({ "parse": [], "users": [], "roles": [] }),
-            "nothing picked: nothing may ping, whatever the text says"
-        );
+    fn a_send_becomes_the_protocols_message_with_the_picked_mentions() {
         let picked = Mentions {
             users: vec![1, 2],
             roles: vec![3],
             ..Default::default()
         };
-        let body = outgoing(picked, None, false).to_json();
-        assert_eq!(
-            body["allowed_mentions"],
-            json!({ "parse": [], "users": ["1", "2"], "roles": ["3"] })
-        );
-        assert!(body.get("flags").is_none());
-        assert!(body.get("message_reference").is_none());
-        assert_eq!(body["nonce"], "99");
+        let m = outgoing(picked, None, false).to_message().unwrap();
+        assert_eq!(m.content.as_deref(), Some("hi <@1>"));
+        assert_eq!(m.nonce.as_deref(), Some("99"));
+        let a = m.allowed_mentions.unwrap();
+        assert!(a.parse.is_empty(), "nothing is parsed beyond the lists");
+        assert_eq!(a.users, strings(&["1", "2"]));
+        assert_eq!(a.roles, strings(&["3"]));
+        assert!(m.reply_to.is_none() && m.flags.is_none());
+
+        let none = outgoing(Mentions::default(), None, true)
+            .to_message()
+            .unwrap();
+        let a = none.allowed_mentions.unwrap();
+        assert!(a.parse.is_empty() && a.users.is_empty() && a.roles.is_empty());
+        assert_eq!(none.flags, Some(4096), "@silent");
     }
 
     #[test]
-    fn everyone_is_parsed_only_when_picked() {
+    fn everyone_alone_is_parsed_and_with_lists_falls_back_to_all() {
         let only = Mentions {
             everyone: true,
             ..Default::default()
         };
-        assert_eq!(only.to_json(false), json!({ "parse": ["everyone"] }));
+        let a = only.to_allowed().unwrap();
+        assert_eq!(a.parse, strings(&["everyone"]));
+        assert!(a.users.is_empty());
         let both = Mentions {
             users: vec![1],
             everyone: true,
             ..Default::default()
         };
-        assert_eq!(
-            both.to_json(false),
-            json!({ "parse": ["everyone", "users", "roles"] })
-        );
+        assert_eq!(both.to_allowed().unwrap(), p::AllowedMentions::all());
     }
 
     #[test]
-    fn a_reply_says_whether_the_author_is_notified_and_silent_sets_the_flag() {
+    fn a_reply_carries_the_mention_switch() {
         let quiet = Mentions {
-            replied_user: false,
+            replied_user: Some(false),
             ..Default::default()
         };
-        let body = outgoing(quiet, Some("55"), true).to_json();
-        assert_eq!(body["allowed_mentions"]["replied_user"], false);
-        assert_eq!(body["message_reference"]["message_id"], "55");
-        assert_eq!(body["flags"], 4096);
-        let loud = Mentions {
-            replied_user: true,
-            ..Default::default()
-        };
-        let body = outgoing(loud, Some("55"), false).to_json();
-        assert_eq!(body["allowed_mentions"]["replied_user"], true);
+        let m = outgoing(quiet, Some("55"), false).to_message().unwrap();
+        let reply = m.reply_to.unwrap();
+        assert_eq!(reply.message_id, "55");
+        assert!(!reply.mention_author);
+        assert_eq!(m.allowed_mentions.unwrap().replied_user, Some(false));
     }
 
     #[test]
-    fn edits_carry_allowed_mentions_too() {
-        let m = Mentions {
-            users: vec![7],
-            ..Default::default()
-        };
-        let body = edit_json("new <@7>", &m);
-        assert_eq!(
-            body["allowed_mentions"],
-            json!({ "parse": [], "users": ["7"], "roles": [] })
+    fn an_edit_never_adds_the_replied_author() {
+        // The original is not known to have mentioned its reply's author: false, so the
+        // server cannot add that author as a mention the person never picked.
+        let m = Mentions::from_editor(
+            &inlet_editor::AllowedMentions {
+                users: vec![inlet_editor::Id(7)],
+                ..Default::default()
+            },
+            Some(false),
         );
-        assert!(body["allowed_mentions"].get("replied_user").is_none());
+        let edit = edit_of("new <@7>", &m).unwrap();
+        assert_eq!(edit.content.as_deref(), Some("new <@7>"));
+        let a = edit.allowed_mentions.unwrap();
+        assert_eq!(a.users, strings(&["7"]));
+        assert!(a.parse.is_empty());
+        assert_eq!(a.replied_user, Some(false));
     }
 
     #[test]
     fn only_snowflakes_go_into_paths() {
         assert_eq!(snowflake("123"), Some("123"));
-        for bad in [
-            "",
-            "0123",
-            "12a",
-            "../1",
-            "1/2",
-            "123456789012345678901",
-            "@me",
-        ] {
+        for bad in ["", "0123", "12a", "../1", "1/2", "123456789012345678901", "@me"] {
             assert_eq!(snowflake(bad), None, "{bad:?}");
         }
     }

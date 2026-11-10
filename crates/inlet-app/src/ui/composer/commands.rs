@@ -164,21 +164,11 @@ fn user_mention_at_start(s: &str) -> Option<(String, usize)> {
     Some((digits, len))
 }
 
-/// Fluxer's `@silent` prefix: the message is sent without a notification. Returns the
-/// text without the prefix and whether it was there.
-pub fn strip_silent(content: &str) -> (&str, bool) {
-    let trimmed = content.trim_start();
-    match trimmed
-        .strip_prefix('@')
-        .and_then(|rest| rest.strip_prefix("silent"))
-    {
-        Some("") => ("", true),
-        Some(rest) if rest.starts_with(char::is_whitespace) => {
-            let ws = rest.chars().next().map_or(0, char::len_utf8);
-            (&rest[ws..], true)
-        }
-        _ => (content, false),
-    }
+/// The nickname of a `/nick` from the text the person sees (no escapes, pills as their
+/// labels). `None` removes the nickname.
+pub fn nick_from_display(text: &str) -> Option<String> {
+    let rest = after_command(text.trim(), "/nick")?.trim();
+    (!rest.is_empty()).then(|| rest.to_owned())
 }
 
 #[cfg(test)]
@@ -230,11 +220,10 @@ mod tests {
     }
 
     #[test]
-    fn silent_prefix_is_a_whole_word_at_the_start() {
-        assert_eq!(strip_silent("@silent hi"), ("hi", true));
-        assert_eq!(strip_silent("  @silent\nhi"), ("hi", true));
-        assert_eq!(strip_silent("@silent"), ("", true));
-        assert_eq!(strip_silent("@silently hi"), ("@silently hi", false));
-        assert_eq!(strip_silent("hi @silent"), ("hi @silent", false));
+    fn the_nickname_is_the_text_shown() {
+        assert_eq!(nick_from_display("/nick o/ x"), Some("o/ x".into()));
+        assert_eq!(nick_from_display("/nick @ada"), Some("@ada".into()));
+        assert_eq!(nick_from_display("  /nick  "), None);
+        assert_eq!(nick_from_display("/nickname"), None);
     }
 }

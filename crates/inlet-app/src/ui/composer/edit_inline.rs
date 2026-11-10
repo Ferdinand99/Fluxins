@@ -20,6 +20,8 @@ pub struct InlineEdit {
     pub editor: Entity<Editor>,
     /// The wire text it started with; saving it unchanged sends nothing.
     original: String,
+    /// Whether the original reply notified its author; `None` when not known.
+    replied_user: Option<bool>,
     _events: Subscription,
 }
 
@@ -43,6 +45,7 @@ impl ComposerView {
         channel_id: String,
         content: &str,
         names: &dyn Resolve,
+        replied_user: Option<bool>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -65,6 +68,7 @@ impl ComposerView {
             channel_id,
             editor,
             original,
+            replied_user,
             _events: events,
         });
         cx.notify();
@@ -95,7 +99,9 @@ impl ComposerView {
                 channel_id: edit.channel_id.clone(),
                 message_id: edit.message_id.clone(),
                 content,
-                mentions: Mentions::from_editor(&allowed, false),
+                // Keep what the original did for its reply's author; when that is not
+                // known, never let the edit add that author as a mention.
+                mentions: Mentions::from_editor(&allowed, Some(edit.replied_user.unwrap_or(false))),
             });
         }
         self.cancel_edit(window, cx);

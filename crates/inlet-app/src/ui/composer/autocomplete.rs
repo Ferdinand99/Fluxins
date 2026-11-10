@@ -12,7 +12,9 @@ use inlet_state::{AccountState, ChannelId, GuildId};
 
 use super::commands;
 use super::editor::ComposerView;
-use crate::backend::composer::{ChannelEntry, CustomEmoji, Directory, Person, RoleEntry};
+use crate::backend::composer::{
+    ChannelEntry, CustomEmoji, Directory, Person, RoleEntry, Rights,
+};
 use crate::theme;
 
 /// Rows the list shows at most.
@@ -57,6 +59,8 @@ pub struct Sources<'a> {
     /// Members found by searches in this guild.
     pub members: &'a [Person],
     pub in_guild: bool,
+    /// The account's rights in the open channel.
+    pub rights: Rights,
 }
 
 /// The rows for a trigger, best first, at most [`MAX_ROWS`].
@@ -105,7 +109,8 @@ fn mentions(query: &str, src: &Sources) -> Vec<Candidate> {
         }
     }
     if let Some(dir) = src.directory {
-        for role in &dir.roles {
+        let all_roles = src.rights.mention_everyone;
+        for role in dir.roles.iter().filter(|r| r.mentionable || all_roles) {
             if let Some(r) = rank(&role.name, &q) {
                 ranked.push((
                     r,
@@ -118,7 +123,7 @@ fn mentions(query: &str, src: &Sources) -> Vec<Candidate> {
                 ));
             }
         }
-        if dir.mention_everyone {
+        if src.rights.mention_everyone {
             for (name, token) in [(EVERYONE, Token::Everyone), (HERE, Token::Here)] {
                 if name.starts_with(&q) {
                     ranked.push((
@@ -234,7 +239,7 @@ pub fn remember_members(known: &mut Vec<Person>, found: Vec<Person>) {
     known.truncate(MAX_MEMBERS);
 }
 
-/// The same data from an [`AccountState`]: members it holds, mentionable roles, text
+/// The same data from an [`AccountState`]: members it holds, roles, text
 /// channels the account can see, custom emoji, and the account's rights in `channel`.
 // Used once the app keeps an account state per account; until then the backend fills
 // the directory from the server.
@@ -249,7 +254,10 @@ pub fn from_account_state(
     let clean = crate::model::clean_name;
     let id = |s: &str| crate::backend::composer::snowflake_u64(s);
     let perms = state.permissions(guild, channel);
-    let mention_everyone = perms.has(MENTION_EVERYONE);
+    let rights = Rights {
+        mention_everyone: perms.has(MENTION_EVERYONE),
+        bypass_slowmode: perms.has(BYPASS_SLOWMODE),
+    };
     let Some(g) = state.guild(guild) else {
         return (Directory::default(), Vec::new());
     };
@@ -257,11 +265,12 @@ pub fn from_account_state(
         .roles
         .by_rank()
         .into_iter()
-        .filter(|r| r.id != guild.to_string() && (r.mentionable || mention_everyone))
+        .filter(|r| r.id != guild.to_string())
         .filter_map(|r| {
             Some(RoleEntry {
                 id: id(&r.id)?,
                 name: clean(&r.name),
+                mentionable: r.mentionable,
             })
         })
         .collect();
@@ -312,8 +321,7 @@ pub fn from_account_state(
             roles,
             channels,
             emojis,
-            mention_everyone,
-            bypass_slowmode: perms.has(BYPASS_SLOWMODE),
+            rights: std::iter::once((channel.to_string(), rights)).collect(),
         },
         members,
     )
@@ -412,10 +420,18 @@ mod tests {
 
     fn dir() -> Directory {
         Directory {
-            roles: vec![RoleEntry {
-                id: 21,
-                name: "Admins".into(),
-            }],
+            roles: vec![
+                RoleEntry {
+                    id: 21,
+                    name: "Admins".into(),
+                    mentionable: true,
+                },
+                RoleEntry {
+                    id: 22,
+                    name: "Hidden".into(),
+                    mentionable: false,
+                },
+            ],
             channels: vec![ChannelEntry {
                 id: 31,
                 name: "general".into(),
@@ -425,8 +441,7 @@ mod tests {
                 name: "party_ada".into(),
                 animated: true,
             }],
-            mention_everyone: false,
-            bypass_slowmode: false,
+            rights: Default::default(),
         }
     }
 
@@ -447,6 +462,7 @@ mod tests {
             directory: Some(&d),
             members: &members,
             in_guild: true,
+            rights: Rights::default(),
         };
         let known = [
             Token::User(Id(11)),
@@ -485,21 +501,28 @@ mod tests {
             directory: None,
             members: &members,
             in_guild: false,
+            rights: Rights::default(),
         };
         assert!(candidates(&Trigger::Mention("a".into()), &dm).1.is_empty());
     }
 
     #[test]
     fn everyone_is_offered_only_with_the_right() {
-        let mut d = dir();
-        d.mention_everyone = true;
+        let d = dir();
         let src = Sources {
             directory: Some(&d),
             members: &[],
             in_guild: true,
+            rights: Rights {
+                mention_everyone: true,
+                bypass_slowmode: false,
+            },
         };
         let (_, rows) = candidates(&Trigger::Mention("e".into()), &src);
         assert_eq!(picked_ids(&rows), [Token::Everyone]);
+        // With the right, roles nobody else may mention are offered too.
+        let (_, rows) = candidates(&Trigger::Mention("hid".into()), &src);
+        assert_eq!(picked_ids(&rows), [Token::Role(Id(22))]);
         let (_, rows) = candidates(&Trigger::Mention(String::new()), &src);
         assert!(picked_ids(&rows).contains(&Token::Here));
     }
@@ -511,6 +534,7 @@ mod tests {
             directory: Some(&d),
             members: &[],
             in_guild: true,
+            rights: Rights::default(),
         };
         let (_, rows) = candidates(&Trigger::Channel("gen".into()), &src);
         assert_eq!(picked_ids(&rows), [Token::Channel(Id(31))]);
@@ -580,10 +604,10 @@ mod tests {
             GuildId::parse("100").unwrap(),
             ChannelId::parse("301").unwrap(),
         );
-        assert_eq!(d.roles.iter().map(|r| r.id).collect::<Vec<_>>(), [7]);
+        assert_eq!(d.roles.iter().map(|r| r.id).collect::<Vec<_>>(), [8, 7]);
         assert!(d.channels.iter().any(|c| c.id == 301));
         assert_eq!(d.emojis.len(), 1);
-        assert!(!d.mention_everyone);
+        assert_eq!(d.rights("301"), Rights::default());
         assert_eq!(members.len(), 1);
         assert_eq!(members[0].name, "Ada L");
     }

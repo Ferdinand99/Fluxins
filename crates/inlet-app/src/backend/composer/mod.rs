@@ -9,9 +9,11 @@
 //!   `/nick` is one `PATCH`;
 //! - typing: at most one request per channel every 8 s (the protocol's debounce), and the
 //!   UI asks at most once a second;
-//! - autocomplete: `GET` roles, own member and custom emoji, at most once per guild every
-//!   ten minutes, and only for a guild whose channel the person opened; member search goes
-//!   over the gateway (op 8), which the protocol caps at 10 per 10 s.
+//! - a Retry more than five minutes after an unclear failure first reads the channel's 50
+//!   newest messages (one `GET`) and sends only if the nonce is not among them;
+//! - autocomplete: `GET` roles, own member, custom emoji and channels, at most once per
+//!   guild every ten minutes, and only for a guild whose channel the person opened; member
+//!   search goes over the gateway (op 8), which the protocol caps at 10 per 10 s.
 
 mod directory;
 mod gif;
@@ -19,16 +21,21 @@ mod send;
 mod upload;
 
 pub(super) use directory::{members_chunk, State};
-pub use directory::{ChannelEntry, CustomEmoji, Directory, Person, RoleEntry};
+pub use directory::{ChannelEntry, CustomEmoji, Directory, Person, RoleEntry, Rights};
 pub use send::{snowflake_u64, Mentions, Outgoing};
 
 use super::Backend;
 
 pub enum Cmd {
-    /// Who is signed in and how long a message may be. Answered with [`Ev::Session`].
-    Session,
+    /// Who is signed in and how long a message may be. Answered with [`Ev::Session`]
+    /// carrying the same `token`.
+    Session { token: u64 },
     /// Send a message.
     Send(Outgoing),
+    /// Retry a send that failed in a way that may have reached the server, long enough
+    /// ago that the server no longer recognises the nonce: send it only if the channel's
+    /// newest messages do not hold it.
+    SendUnlessSent(Outgoing),
     /// New text for one of the account's messages.
     Edit {
         channel_id: String,
@@ -57,6 +64,8 @@ pub enum Cmd {
 
 pub enum Ev {
     Session {
+        /// The `token` of the request.
+        token: u64,
         user_id: String,
         /// The instance's limit for this account, in UTF-16 code units.
         max_message_length: usize,
@@ -69,7 +78,11 @@ pub enum Ev {
         reason: String,
         /// The server asked to wait this long (slowmode or a rate limit).
         retry_after_secs: Option<u64>,
+        /// The request may have reached the server; the message may exist.
+        ambiguous: bool,
     },
+    /// A `/msg` was not delivered.
+    DirectMessageFailed { nonce: String, reason: String },
     /// An edit was refused (a saved edit shows up as `MessageUpdated`).
     EditFailed { reason: String },
     Directory {
@@ -86,8 +99,9 @@ pub enum Ev {
 
 pub(super) fn handle(backend: &mut Backend, cmd: Cmd) {
     match cmd {
-        Cmd::Session => backend.composer_session(),
+        Cmd::Session { token } => backend.composer_session(token),
         Cmd::Send(message) => backend.send(message),
+        Cmd::SendUnlessSent(message) => backend.send_unless_sent(message),
         Cmd::Edit {
             channel_id,
             message_id,

@@ -28,7 +28,7 @@ use super::drafts::{Draft, Drafts};
 use super::edit_inline::InlineEdit;
 use super::reply_bar::Reply;
 use super::slowmode::Slowmode;
-use crate::backend::composer::{Directory, Mentions, Outgoing, Person};
+use crate::backend::composer::{Directory, Mentions, Outgoing, Person, Rights};
 use crate::theme;
 
 actions!(inlet_composer, [AcceptCompletion, Cancel]);
@@ -45,6 +45,8 @@ const MAX_PENDING: usize = 20;
 const TYPING_EVERY: Duration = Duration::from_secs(1);
 /// Wait after the last key before a member search goes out.
 const SEARCH_DELAY: Duration = Duration::from_millis(250);
+/// How long the server recognises a nonce (Fluxer keeps it five minutes).
+const NONCE_MEMORY_MS: u64 = 5 * 60 * 1000;
 /// Wait after the last change before drafts are written to disk.
 const SAVE_DELAY: Duration = Duration::from_secs(1);
 
@@ -102,6 +104,8 @@ pub enum ComposerEvent {
     EditLast {
         channel_id: String,
     },
+    /// A retry long after an unclear failure: send only if the message is not there.
+    SendUnlessSent(Outgoing),
 }
 
 /// State the app shares with the composer: the drafts survive the view, and sign-out
@@ -111,12 +115,24 @@ pub struct Shared {
     pub drafts: Drafts,
 }
 
+impl Shared {
+    /// Sign-out: the account's drafts are deleted at once; the view forgets the rest
+    /// (reply, edit, failed sends) when it opens the next channel.
+    pub fn sign_out(&mut self) {
+        self.drafts.sign_out();
+    }
+}
+
 /// A message on its way, or one the server refused.
 #[derive(Clone, Debug)]
 pub struct PendingSend {
     pub outgoing: Outgoing,
     /// Why it failed; `None` while it is being sent.
     pub failed: Option<String>,
+    /// The failed request may have reached the server.
+    pub ambiguous: bool,
+    /// When it was first sent ([`ComposerView::now_ms`]).
+    pub first_sent_ms: u64,
 }
 
 /// The open autocomplete list.
@@ -146,8 +162,14 @@ pub struct ComposerView {
     /// A sentence under the box (too long, a command that needs a guild).
     pub(super) error: Option<String>,
     clock: Instant,
+    /// Moves the clock forward (tests only; 0 otherwise).
+    skew_ms: u64,
     last_typing: Option<Instant>,
     last_search: Option<(String, String)>,
+    /// Text the composer put in itself (a restored draft): not typing.
+    quiet_text: Option<String>,
+    /// The text of the last `/msg`, put back if it fails.
+    dm_backup: Option<(String, Draft)>,
     search_task: Option<Task<()>>,
     ticker: Option<Task<()>>,
     save_task: Option<Task<()>>,
@@ -211,8 +233,11 @@ impl ComposerView {
             pending: Vec::new(),
             error: None,
             clock: Instant::now(),
+            skew_ms: 0,
             last_typing: None,
             last_search: None,
+            quiet_text: None,
+            dm_backup: None,
             search_task: None,
             ticker: None,
             save_task: None,
@@ -229,7 +254,14 @@ impl ComposerView {
                     EditorEvent::Changed => {
                         this.error = None;
                         this.store_draft(cx);
-                        this.typing(cx);
+                        // A draft the composer restored is no typing.
+                        let text = this.editor.read(cx).buffer().text();
+                        if this.quiet_text.as_deref() == Some(text) {
+                            this.quiet_text = None;
+                        } else {
+                            this.quiet_text = None;
+                            this.typing(cx);
+                        }
                         this.update_autocomplete(cx);
                     }
                     EditorEvent::SelectionChanged => this.update_autocomplete(cx),
@@ -241,7 +273,7 @@ impl ComposerView {
     }
 
     pub(super) fn now_ms(&self) -> u64 {
-        self.clock.elapsed().as_millis() as u64
+        self.clock.elapsed().as_millis() as u64 + self.skew_ms
     }
 
     /// Sends and failed sends of a channel, oldest first (for the message list).
@@ -265,8 +297,16 @@ impl ComposerView {
             .map_or(&[], Vec::as_slice)
     }
 
+    /// The account's rights in the open channel.
+    pub(super) fn rights(&self) -> Rights {
+        match (self.directory(), &self.channel) {
+            (Some(d), Some(ch)) => d.rights(&ch.channel_id),
+            _ => Rights::default(),
+        }
+    }
+
     pub(super) fn bypasses_slowmode(&self) -> bool {
-        self.directory().is_some_and(|d| d.bypass_slowmode)
+        self.rights().bypass_slowmode
     }
 
     /// Seconds left in the open channel's slowmode.
@@ -322,9 +362,11 @@ impl ComposerView {
     ) {
         self.check_generation(window, cx);
         if self.channel.as_ref().map(|c| &c.channel_id) == Some(&ctx.channel_id) {
+            // The same channel again (it changed, for example its slowmode).
             self.editor
                 .update(cx, |e, cx| e.set_placeholder(ctx.placeholder.clone(), cx));
             self.channel = Some(ctx);
+            self.start_ticker(cx);
             cx.notify();
             return;
         }
@@ -342,6 +384,7 @@ impl ComposerView {
             }
             e.set_placeholder(ctx.placeholder.clone(), cx);
         });
+        self.quiet_text = Some(self.editor.read(cx).buffer().text().to_owned());
         if let Some(guild_id) = ctx.guild_id.clone() {
             cx.emit(ComposerEvent::Directory { guild_id });
         }
@@ -375,6 +418,7 @@ impl ComposerView {
                     e.set_placeholder(ch.placeholder.clone(), cx);
                 }
             });
+            self.quiet_text = Some(editor.read(cx).buffer().text().to_owned());
             self._editor_events = Self::watch(&editor, window, cx);
             let focused = self.editor.focus_handle(cx).is_focused(window);
             self.editor = editor;
@@ -453,6 +497,7 @@ impl ComposerView {
             directory: self.directory(),
             members: self.known_members(),
             in_guild: guild.is_some(),
+            rights: self.rights(),
         };
         let (section, rows) = autocomplete::candidates(&trigger, &src);
         let selected = match &self.autocomplete {
@@ -583,6 +628,16 @@ impl ComposerView {
     }
 
     fn on_cancel(&mut self, _: &Cancel, window: &mut Window, cx: &mut Context<Self>) {
+        // Escape belongs to an input method while it composes.
+        let composing = self.editor.read(cx).marked_range().is_some()
+            || self
+                .edit
+                .as_ref()
+                .is_some_and(|e| e.editor.read(cx).marked_range().is_some());
+        if composing {
+            cx.propagate();
+            return;
+        }
         if let Some(open) = self.autocomplete.take() {
             self.dismissed_at = Some(open.start);
         } else if self.edit.is_some() {
@@ -603,15 +658,16 @@ impl ComposerView {
         let Some(ch) = self.channel.clone() else {
             return;
         };
-        let (wire, empty, over, allowed) = {
+        let (wire, text, over, allowed) = {
             let buffer = self.editor.read(cx).buffer();
             (
                 buffer.to_wire(),
-                buffer.text().trim().is_empty(),
+                buffer.text().to_owned(),
                 buffer.is_over_limit(),
                 buffer.allowed_mentions(),
             )
         };
+        let empty = text.trim().is_empty();
         if empty {
             return;
         }
@@ -621,7 +677,10 @@ impl ComposerView {
             return;
         }
         let content = match commands::parse(&wire) {
-            Parsed::Nick(nick) => {
+            Parsed::Nick(_) => {
+                // The nickname is what the person sees, not the wire text with its
+                // escapes and tags.
+                let nick = commands::nick_from_display(&text);
                 match ch.guild_id.clone() {
                     Some(guild_id) => {
                         cx.emit(ComposerEvent::SetNick { guild_id, nick });
@@ -632,13 +691,17 @@ impl ComposerView {
                 return;
             }
             Parsed::Msg { user_id, message } => {
+                let nonce = p::new_nonce();
+                if let Some(draft) = Draft::of(self.editor.read(cx).buffer()) {
+                    self.dm_backup = Some((nonce.clone(), draft));
+                }
                 cx.emit(ComposerEvent::DirectMessage {
                     user_id,
                     message: Outgoing {
                         channel_id: String::new(),
-                        nonce: p::new_nonce(),
+                        nonce,
                         content: message,
-                        mentions: Mentions::from_editor(&allowed, false),
+                        mentions: Mentions::from_editor(&allowed, None),
                         reply_to: None,
                         silent: false,
                     },
@@ -653,8 +716,10 @@ impl ComposerView {
             Parsed::Wrapped(text) => text,
             Parsed::Text => wire.trim().to_owned(),
         };
-        let (content, silent) = commands::strip_silent(&content);
-        let content = content.trim().to_owned();
+        let (content, silent) = match p::models::strip_silent_prefix(&content) {
+            Some(rest) => (rest.trim().to_owned(), true),
+            None => (content.trim().to_owned(), false),
+        };
         if content.is_empty() {
             return;
         }
@@ -667,7 +732,7 @@ impl ComposerView {
             channel_id: ch.channel_id.clone(),
             nonce: p::new_nonce(),
             content,
-            mentions: Mentions::from_editor(&allowed, reply.as_ref().is_some_and(|r| r.mention)),
+            mentions: Mentions::from_editor(&allowed, reply.as_ref().map(|r| r.mention)),
             reply_to: reply.map(|r| r.message_id),
             silent,
         };
@@ -677,14 +742,21 @@ impl ComposerView {
         self.pending.push(PendingSend {
             outgoing: outgoing.clone(),
             failed: None,
+            ambiguous: false,
+            first_sent_ms: self.now_ms(),
         });
         cx.emit(ComposerEvent::Send(outgoing));
+        self.count_send(&ch, cx);
+        self.sent(window, cx);
+    }
+
+    /// Starts the slowmode countdown after a send in `ch`, unless the account may skip it.
+    fn count_send(&mut self, ch: &ChannelContext, cx: &mut Context<Self>) {
         if ch.guild_id.is_some() && ch.slowmode_secs > 0 && !self.bypasses_slowmode() {
             let now = self.now_ms();
             self.slowmode.record_send(&ch.channel_id, now);
             self.start_ticker(cx);
         }
-        self.sent(window, cx);
     }
 
     /// Empties the composer after a send or a command.
@@ -705,13 +777,28 @@ impl ComposerView {
             window.play_system_bell();
             return;
         }
-        if let Some(p) = self
+        let now = self.now_ms();
+        let Some(p) = self
             .pending
             .iter_mut()
             .find(|p| p.outgoing.nonce == nonce && p.failed.is_some())
-        {
-            p.failed = None;
-            cx.emit(ComposerEvent::Send(p.outgoing.clone()));
+        else {
+            return;
+        };
+        p.failed = None;
+        let outgoing = p.outgoing.clone();
+        // The server knows a nonce only for a few minutes. After an unclear failure
+        // older than that, the message may exist: look for it before sending again.
+        let unclear = p.ambiguous && now.saturating_sub(p.first_sent_ms) > NONCE_MEMORY_MS;
+        p.ambiguous = false;
+        let channel = outgoing.channel_id.clone();
+        if unclear {
+            cx.emit(ComposerEvent::SendUnlessSent(outgoing));
+        } else {
+            cx.emit(ComposerEvent::Send(outgoing));
+        }
+        if let Some(ch) = self.channel.clone().filter(|c| c.channel_id == channel) {
+            self.count_send(&ch, cx);
         }
         cx.notify();
     }
@@ -758,11 +845,13 @@ impl ComposerView {
         nonce: &str,
         reason: String,
         retry_after_secs: Option<u64>,
+        ambiguous: bool,
         cx: &mut Context<Self>,
     ) {
         let now = self.now_ms();
         if let Some(p) = self.pending.iter_mut().find(|p| p.outgoing.nonce == nonce) {
             p.failed = Some(reason);
+            p.ambiguous = ambiguous;
             if let Some(secs) = retry_after_secs {
                 let channel = p.outgoing.channel_id.clone();
                 self.slowmode.server_wait(&channel, secs, now);
@@ -787,6 +876,26 @@ impl ComposerView {
         }
         autocomplete::remember_members(self.members.entry(guild_id).or_default(), members);
         self.update_autocomplete(cx);
+        cx.notify();
+    }
+
+    /// A `/msg` failed: say why, and put its text back if the box is still empty.
+    pub fn on_direct_message_failed(
+        &mut self,
+        nonce: &str,
+        reason: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.error = Some(t!("composer-msg-failed", error = reason));
+        let backup = self.dm_backup.take().filter(|(n, _)| n == nonce);
+        if let Some((_, draft)) = backup {
+            if self.editor.read(cx).buffer().is_empty() {
+                self.editor
+                    .update(cx, |e, cx| e.set_wire(&draft.wire, &draft, window, cx));
+                self.quiet_text = Some(self.editor.read(cx).buffer().text().to_owned());
+            }
+        }
         cx.notify();
     }
 
@@ -949,7 +1058,7 @@ mod tests {
 
     #[gpui::test]
     fn up_arrow_edits_my_last_message_only(cx: &mut TestAppContext) {
-        use super::super::edit_inline::{last_editable, tests::message};
+        use super::super::edit_inline::tests::message;
         let (host, view, cx) = host(cx);
         open(&view, "1", cx);
         // With text in the composer, Up moves the caret and edits nothing.
@@ -962,20 +1071,16 @@ mod tests {
         // Empty: Up asks for the last own message.
         cx.simulate_keystrokes("up");
         assert_eq!(edit_requests(&host, cx), 1);
-        // The app picks the newest message of the account, never someone else's.
-        let list = [message("10", "me"), message("11", "other")];
-        let mine = last_editable(list.iter(), "me").unwrap();
-        assert_eq!(mine.id, "10");
-        view.update_in(cx, |v, window, cx| {
-            v.start_edit(
-                mine.id.clone(),
-                "1".into(),
-                "old <@5>",
-                &inlet_editor::NoNames,
-                window,
-                cx,
-            )
+        // The app's handler opens the newest message of the account, never someone
+        // else's, even when theirs are newer.
+        let mut mine = message("10", "me");
+        mine.content = "old <@5>".into();
+        let list = [message("9", "me"), mine, message("11", "other")];
+        cx.update(|window, cx| {
+            crate::ui::composer::edit_last(&view, list.iter(), "me", window, cx)
         });
+        let editing = view.read_with(cx, |v, _| v.edit.as_ref().map(|e| e.message_id.clone()));
+        assert_eq!(editing.as_deref(), Some("10"));
         let edit_editor = view.read_with(cx, |v, _| v.edit.as_ref().map(|e| e.editor.clone()));
         edit_editor
             .expect("an edit is open")
@@ -1004,6 +1109,11 @@ mod tests {
             edits[0].2.users,
             [5],
             "the edit carries allowed_mentions too"
+        );
+        assert_eq!(
+            edits[0].2.replied_user,
+            Some(false),
+            "an edit never adds the replied author"
         );
         assert!(view.read_with(cx, |v, _| v.edit.is_none()));
         assert!(
@@ -1061,7 +1171,8 @@ mod tests {
             write.run();
         }
         assert!(file.exists());
-        shared.borrow_mut().drafts.sign_out();
+        // The sign-out the app runs when the account signs out or its session ends.
+        shared.borrow_mut().sign_out();
         assert!(!file.exists(), "sign-out deletes the drafts file");
         open(&view, "2", cx);
         assert_eq!(text(cx), "", "no draft of the old account");
@@ -1124,5 +1235,116 @@ mod tests {
         assert!(left > 55 && left <= 60);
         let text = view.read_with(cx, |v, cx| v.editor.read(cx).buffer().text().to_owned());
         assert_eq!(text, "two", "the text stays");
+        // At zero, sending works again.
+        view.update(cx, |v, _| v.skew_ms += 61_000);
+        cx.simulate_keystrokes("enter");
+        assert_eq!(sends(&host, cx).len(), 2, "the countdown is over");
+    }
+
+    fn typings(host: &Entity<Host>, cx: &mut VisualTestContext) -> usize {
+        host.read_with(cx, |h, _| {
+            h.events
+                .iter()
+                .filter(|e| matches!(e, ComposerEvent::Typing { .. }))
+                .count()
+        })
+    }
+
+    #[gpui::test]
+    fn opening_a_channel_with_a_draft_is_not_typing(cx: &mut TestAppContext) {
+        let (host, view, cx) = host(cx);
+        open(&view, "1", cx);
+        type_text(&view, "half a thought", cx);
+        assert_eq!(typings(&host, cx), 1, "the person typed");
+        open(&view, "2", cx);
+        open(&view, "1", cx);
+        let text = view.read_with(cx, |v, cx| v.editor.read(cx).buffer().text().to_owned());
+        assert_eq!(text, "half a thought", "the draft is back");
+        assert_eq!(typings(&host, cx), 1, "restoring the draft sent no typing");
+        // A real edit after that counts again (once the one-second spacing has passed).
+        view.update(cx, |v, _| v.last_typing = None);
+        type_text(&view, "!", cx);
+        assert_eq!(typings(&host, cx), 2);
+    }
+
+    #[gpui::test]
+    fn a_failed_direct_message_says_so_and_keeps_the_text(cx: &mut TestAppContext) {
+        let (host, view, cx) = host(cx);
+        open(&view, "1", cx);
+        view.update(cx, |v, cx| {
+            v.on_members(
+                "100".into(),
+                vec![Person {
+                    id: 42,
+                    name: "ada".into(),
+                    username: "ada".into(),
+                }],
+                cx,
+            )
+        });
+        type_text(&view, "/msg @ad", cx);
+        cx.simulate_keystrokes("tab");
+        type_text(&view, "the meeting moved", cx);
+        cx.simulate_keystrokes("enter");
+        let dm = host.read_with(cx, |h, _| {
+            h.events.iter().find_map(|e| match e {
+                ComposerEvent::DirectMessage { user_id, message } => {
+                    Some((user_id.clone(), message.clone()))
+                }
+                _ => None,
+            })
+        });
+        let (user_id, message) = dm.expect("a direct message was asked for");
+        assert_eq!(user_id, "42");
+        assert_eq!(message.content, "the meeting moved");
+        let text = |cx: &mut VisualTestContext| {
+            view.read_with(cx, |v, cx| v.editor.read(cx).buffer().text().to_owned())
+        };
+        assert_eq!(text(cx), "");
+        // The server refused it: the reason shows and the text comes back with its pill.
+        view.update_in(cx, |v, window, cx| {
+            v.on_direct_message_failed(&message.nonce, "blocked".into(), window, cx)
+        });
+        assert_eq!(text(cx), "/msg @ada the meeting moved");
+        let error = view.read_with(cx, |v, _| v.error.clone());
+        assert!(error.is_some_and(|e| e.contains("blocked")));
+    }
+
+    #[gpui::test]
+    fn a_late_retry_after_an_unclear_failure_looks_first(cx: &mut TestAppContext) {
+        let (host, view, cx) = host(cx);
+        open(&view, "1", cx);
+        type_text(&view, "hello", cx);
+        cx.simulate_keystrokes("enter");
+        let nonce = sends(&host, cx)[0].nonce.clone();
+        let unless = |host: &Entity<Host>, cx: &mut VisualTestContext| {
+            host.read_with(cx, |h, _| {
+                h.events
+                    .iter()
+                    .filter(|e| matches!(e, ComposerEvent::SendUnlessSent(_)))
+                    .count()
+            })
+        };
+        // A clear refusal is simply sent again.
+        view.update(cx, |v, cx| {
+            v.on_send_failed(&nonce, "no".into(), None, false, cx)
+        });
+        view.update(cx, |v, _| v.skew_ms += 600_000);
+        view.update_in(cx, |v, window, cx| v.retry(&nonce, window, cx));
+        assert_eq!(sends(&host, cx).len(), 2);
+        assert_eq!(unless(&host, cx), 0);
+        // An unclear one, retried right away, keeps the nonce and sends.
+        view.update(cx, |v, cx| {
+            v.pending[0].first_sent_ms = v.now_ms();
+            v.on_send_failed(&nonce, "timeout".into(), None, true, cx)
+        });
+        view.update_in(cx, |v, window, cx| v.retry(&nonce, window, cx));
+        assert_eq!(sends(&host, cx).len(), 3);
+        // An unclear one, retried after the server forgot the nonce: look first.
+        view.update(cx, |v, cx| v.on_send_failed(&nonce, "timeout".into(), None, true, cx));
+        view.update(cx, |v, _| v.skew_ms += 301_000);
+        view.update_in(cx, |v, window, cx| v.retry(&nonce, window, cx));
+        assert_eq!(sends(&host, cx).len(), 3);
+        assert_eq!(unless(&host, cx), 1);
     }
 }
