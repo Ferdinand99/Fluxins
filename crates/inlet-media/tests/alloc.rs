@@ -61,10 +61,15 @@ static ALLOCATOR: Counting = Counting;
 
 static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
 
+/// Every test holds this for its whole length, fixtures included: building a
+/// 40 MiB fixture in one test while another measures would count as its peak.
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Runs `f` and returns its result and the most memory it held beyond what was
-/// live when it started.
+/// live when it started. Call it with `serial()` held.
 fn measure<T>(f: impl FnOnce() -> T) -> (T, usize) {
-    let _guard = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let base = CURRENT.load(Ordering::SeqCst);
     PEAK.store(base, Ordering::SeqCst);
     let result = f();
@@ -98,6 +103,7 @@ fn icc_bomb(inflated: usize) -> Vec<u8> {
 
 #[test]
 fn an_iccp_bomb_never_allocates_what_it_claims() {
+    let _serial = serial();
     // 40 MiB of zeros in a few dozen KiB. Before the chunk was stripped, the png
     // crate inflated it without a limit.
     let bomb = icc_bomb(40 * MIB);
@@ -121,6 +127,7 @@ fn an_iccp_bomb_never_allocates_what_it_claims() {
 
 #[test]
 fn text_chunks_are_bombs_too() {
+    let _serial = serial();
     let plain = png(&solid(1, 1, RED));
     let (head, tail) = plain.split_at(8 + 25);
     let mut chunks = Vec::new();
@@ -140,6 +147,7 @@ fn text_chunks_are_bombs_too() {
 
 #[test]
 fn a_webp_that_claims_four_gigabytes_of_exif_is_refused_before_it_allocates() {
+    let _serial = serial();
     let bytes = webp_claiming_exif(0xFFFF_FFFE);
     for kind in [MediaKind::Emoji, MediaKind::Avatar, MediaKind::Attachment] {
         let (result, peak) = measure(|| run(&bytes, NO_RESIZE, &KindLimits::for_kind(kind)));
@@ -154,6 +162,7 @@ fn a_webp_that_claims_four_gigabytes_of_exif_is_refused_before_it_allocates() {
 
 #[test]
 fn a_gif_with_a_tiny_canvas_and_huge_frames_is_refused_before_it_allocates() {
+    let _serial = serial();
     let frames = vec![(0u16, 0u16, 3535u16, 3535u16); 512];
     let bytes = raw_gif((1, 1), &frames);
     let (result, peak) = measure(|| run(&bytes, NO_RESIZE, &avatar_limits()));
@@ -163,6 +172,7 @@ fn a_gif_with_a_tiny_canvas_and_huge_frames_is_refused_before_it_allocates() {
 
 #[test]
 fn an_apng_that_announces_two_billion_frames_stays_small() {
+    let _serial = serial();
     // IHDR 10x10 RGBA, acTL with 0x7FFFFFFF frames, one real frame, no more.
     let mut out = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
     let mut ihdr = Vec::new();
@@ -199,6 +209,7 @@ fn an_apng_that_announces_two_billion_frames_stays_small() {
 
 #[test]
 fn a_rejected_decompression_bomb_within_the_header_limits_peaks_at_what_the_estimate_says() {
+    let _serial = serial();
     // The largest an avatar may be, all zeros: tiny to send, big to decode.
     let limits = avatar_limits();
     let raw = vec![0u8; 2048 * (1 + 2048 * 4)];
@@ -248,6 +259,7 @@ fn png16(width: u32, height: u32) -> Vec<u8> {
 
 #[test]
 fn the_estimate_covers_the_real_peak_for_every_format_at_the_size_limits() {
+    let _serial = serial();
     let attachment = KindLimits::for_kind(MediaKind::Attachment);
     let mut cases: Vec<(&str, Vec<u8>, KindLimits, Fit)> = vec![
         (
