@@ -1055,6 +1055,7 @@ impl Inlet {
                             let cat = c.id.clone();
                             return div()
                                 .id(SharedString::from(format!("ch-{}", c.id)))
+                                .flex_none()
                                 .pt_4()
                                 .px_1()
                                 .flex()
@@ -1079,6 +1080,10 @@ impl Inlet {
                         let id = c.id.clone();
                         div()
                             .id(SharedString::from(format!("ch-{}", c.id)))
+                            // Rows must not shrink: a scrolling flex column shrinks its
+                            // children when the list is taller than the view, and
+                            // `overflow_hidden` lets a row shrink to nothing.
+                            .flex_none()
                             .px_2()
                             .py(px(5.))
                             .rounded_md()

@@ -402,8 +402,7 @@ pub fn to_embed(v: &serde_json::Value, names: &Names) -> Option<Embed> {
             let value = str_at(f, &["value"])
                 .map(|t| crate::markdown::parse_with(capped(t), names))
                 .unwrap_or_default();
-            let inline = f.get("inline").and_then(|i| i.as_bool()).unwrap_or(false);
-            embed.fields.push(EmbedField { name, value, inline });
+            embed.fields.push(EmbedField { name, value });
         }
     }
     for (key, label) in [("image", "Image"), ("thumbnail", "Thumbnail"), ("video", "Video")] {

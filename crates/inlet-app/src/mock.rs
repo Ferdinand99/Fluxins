@@ -59,7 +59,6 @@ fn embed(color: u32, title: &str, description: &str, fields: &[(&str, &str)], fo
             .map(|(name, value)| EmbedField {
                 name: (*name).into(),
                 value: crate::markdown::parse_with(value, &names),
-                inline: false,
             })
             .collect(),
         footer: footer.map(Into::into),

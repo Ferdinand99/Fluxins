@@ -87,7 +87,6 @@ pub struct Embed {
 pub struct EmbedField {
     pub name: String,
     pub value: Vec<Block>,
-    pub inline: bool,
 }
 
 /// The message a reply points to, for the line above the reply.
@@ -153,7 +152,7 @@ impl Message {
     }
 
     /// Fills `blocks` and `truncated` from `content`, without mention names.
-    #[cfg_attr(not(any(test, feature = "demo")), allow(dead_code))]
+    #[cfg(test)]
     pub fn parse(&mut self) {
         self.parse_with(&Names::default());
     }
