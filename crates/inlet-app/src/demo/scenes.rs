@@ -23,7 +23,7 @@ use inlet_protocol as p;
 use serde_json::{json, Value};
 
 use super::{
-    guilds, media, messages, snowflake, social, user, user_id, ME, ROLE_CONTRIBUTORS,
+    guilds, media, messages, snowflake, social, unread, user, user_id, ME, ROLE_CONTRIBUTORS,
     ROLE_MODERATORS,
 };
 use crate::backend::messages::Pending;
@@ -106,6 +106,7 @@ fn channel_json(
     c: &Channel,
     guild: Option<&str>,
     messages: &HashMap<String, Vec<p::Message>>,
+    unread_demo: bool,
 ) -> Value {
     let mut v = json!({
         "id": c.id,
@@ -113,7 +114,7 @@ fn channel_json(
         "guild_id": guild,
         "position": c.position,
         "parent_id": c.parent_id,
-        "last_message_id": newest_id(messages, &c.id),
+        "last_message_id": newest_id(messages, &c.id).or_else(|| unread_demo.then(|| unread::newest(&c.id)).flatten()),
     });
     if guild.is_some() {
         v["name"] = json!(c.name);
@@ -130,6 +131,8 @@ fn ready(
     channels: &HashMap<Option<String>, Vec<Channel>>,
     messages: &HashMap<String, Vec<p::Message>>,
     read_states: Vec<Value>,
+    guild_settings: Vec<Value>,
+    unread_demo: bool,
 ) -> p::Ready {
     let guilds: Vec<Value> = guilds
         .iter()
@@ -138,7 +141,7 @@ fn ready(
                 .get(&Some(g.id.clone()))
                 .map(|l| {
                     l.iter()
-                        .map(|c| channel_json(c, Some(&g.id), messages))
+                        .map(|c| channel_json(c, Some(&g.id), messages, unread_demo))
                         .collect()
                 })
                 .unwrap_or_default();
@@ -163,7 +166,11 @@ fn ready(
         .collect();
     let private: Vec<Value> = channels
         .get(&None)
-        .map(|l| l.iter().map(|c| channel_json(c, None, messages)).collect())
+        .map(|l| {
+            l.iter()
+                .map(|c| channel_json(c, None, messages, unread_demo))
+                .collect()
+        })
         .unwrap_or_default();
     serde_json::from_value(json!({
         "session_id": "demo",
@@ -172,6 +179,7 @@ fn ready(
         "private_channels": private,
         "users": [],
         "read_states": read_states,
+        "user_guild_settings": guild_settings,
     }))
     .expect("the demo READY is valid")
 }
@@ -242,7 +250,21 @@ pub fn data(scene: Scene) -> Data {
             failed: Some("the network is unreachable".into()),
         });
     }
-    let ready = ready(&guilds, &channels, &messages, read_states);
+    let mut guild_settings = Vec::new();
+    let unread_demo = scene == Scene::Default;
+    if unread_demo {
+        // Unread messages, mentions and mutes in the sidebar and the rail.
+        read_states.extend(unread::read_states());
+        guild_settings = unread::guild_settings();
+    }
+    let ready = ready(
+        &guilds,
+        &channels,
+        &messages,
+        read_states,
+        guild_settings,
+        unread_demo,
+    );
     Data {
         guilds,
         channels,

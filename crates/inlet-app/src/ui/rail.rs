@@ -6,6 +6,7 @@ use gpui::{div, prelude::*, px, AnyElement, Context, FontWeight, SharedString};
 use crate::app::Inlet;
 use crate::assets::Icon;
 use crate::theme;
+use crate::ui::notifications::badge::{rail_badge, RailMarks};
 
 /// Guild rail width.
 pub const RAIL_WIDTH: f32 = 72.;
@@ -13,9 +14,10 @@ pub const RAIL_WIDTH: f32 = 72.;
 impl Inlet {
     pub(crate) fn render_guild_rail(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let selected = self.selected_guild.clone();
-        // One rail entry: a 4 px pill on the left (8 px at rest, 20 on hover, 40 when
-        // selected) and a 44 px icon, a circle that becomes a rounded square.
-        let item = |id: SharedString, content: AnyElement, active: bool| {
+        // One rail entry: a 4 px pill on the left (8 px at rest when there are unread
+        // messages, 20 on hover, 40 when selected) and a 44 px icon, a circle that
+        // becomes a rounded square, with the mention count at its bottom right.
+        let item = |id: SharedString, content: AnyElement, active: bool, marks: RailMarks| {
             let group = SharedString::from(format!("{id}-g"));
             div()
                 .id(id)
@@ -38,13 +40,15 @@ impl Inlet {
                         .rounded_r(px(4.))
                         .bg(theme::text_strong())
                         .when(!active, |d| {
-                            d.opacity(0.).group_hover(group.clone(), |s| {
-                                s.opacity(1.).top(px(14.)).h(px(20.))
-                            })
+                            d.opacity(if marks.pill { 1. } else { 0. })
+                                .group_hover(group.clone(), |s| {
+                                    s.opacity(1.).top(px(14.)).h(px(20.))
+                                })
                         }),
                 )
                 .child(
                     div()
+                        .relative()
                         .size(px(44.))
                         .flex()
                         .items_center()
@@ -59,7 +63,10 @@ impl Inlet {
                         .font_weight(FontWeight::MEDIUM)
                         .text_size(px(15.))
                         .group_hover(group, |s| s.rounded(px(13.)).bg(theme::brand()))
-                        .child(content),
+                        .child(content)
+                        .when(marks.mentions > 0, |d| {
+                            d.child(rail_badge(marks.mentions, theme::bg_app()))
+                        }),
                 )
         };
         div()
@@ -81,6 +88,7 @@ impl Inlet {
                         .el(px(22.), theme::text_strong())
                         .into_any_element(),
                     selected.is_none(),
+                    RailMarks::of(self.guild_badge(None)),
                 )
                 .on_click(cx.listener(|this, _, _, cx| this.select_guild(None, cx))),
             )
@@ -105,6 +113,7 @@ impl Inlet {
                     format!("guild-{}", g.id).into(),
                     icon.unwrap_or_else(|| g.initials().into_any_element()),
                     active,
+                    RailMarks::of(self.guild_badge(Some(&g.id))),
                 )
                 .on_click(
                     cx.listener(move |this, _, _, cx| this.select_guild(Some(id.clone()), cx)),

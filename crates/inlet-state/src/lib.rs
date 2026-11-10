@@ -130,8 +130,8 @@ pub mod limits {
     pub const TYPING_EXPIRY_MS: i64 = 10_000;
     /// Guild notification settings entries.
     pub const MAX_GUILD_SETTINGS: usize = 1_100;
-    /// Channel overrides per guild settings entry.
-    pub const MAX_CHANNEL_OVERRIDES: usize = 2_000;
+    /// Channel overrides per guild settings entry (Fluxer allows 10 000).
+    pub const MAX_CHANNEL_OVERRIDES: usize = 10_000;
     /// Raw `extra` bytes kept per user.
     pub const MAX_USER_EXTRA_BYTES: usize = 16 * 1024;
     /// Raw `extra` bytes kept per member.

@@ -4,6 +4,7 @@
 mod context_menu;
 mod link_confirm;
 pub mod modal;
+mod notification_settings;
 mod tooltip;
 
 use gpui::{AnyElement, Context};
@@ -23,6 +24,9 @@ impl Inlet {
         out.extend(self.render_image_viewer(cx));
         if let Some(url) = self.overlays.pending_link.clone() {
             out.push(self.render_link_confirm(&url, cx));
+        }
+        if self.notifications.settings.is_some() {
+            out.push(self.render_notification_settings(cx));
         }
         out
     }

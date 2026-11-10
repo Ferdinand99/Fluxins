@@ -770,6 +770,15 @@ impl MessageView {
         }
     }
 
+    /// A view whose channel's newest page has landed, for tests of the read rules.
+    #[cfg(test)]
+    pub fn loaded_for_tests() -> Self {
+        Self {
+            loaded: true,
+            ..Self::default()
+        }
+    }
+
     /// Whether channel `ch` may be marked read now: its newest page landed, its window
     /// has the newest messages, the list shows the bottom and the window has focus.
     pub fn may_mark_read(
@@ -967,7 +976,7 @@ impl Inlet {
         }
     }
 
-    fn open_channel_id(&self) -> Option<ChannelId> {
+    pub(crate) fn open_channel_id(&self) -> Option<ChannelId> {
         self.selected_channel.as_deref().and_then(ChannelId::parse)
     }
 
@@ -978,8 +987,11 @@ impl Inlet {
         window_active: bool,
         cx: &mut Context<Self>,
     ) {
+        if self.settings_update_is_stale(&dispatch) {
+            return;
+        }
         if let p::Dispatch::Ready(ready) = &dispatch {
-            let changes = match self.account.clone() {
+            let mut changes = match self.account.clone() {
                 None => {
                     let state = AccountState::from_ready_at(ready, now_ms());
                     self.account = Some(cx.new(|_| state));
@@ -990,6 +1002,7 @@ impl Inlet {
                 }
                 Some(account) => account.update(cx, |s, _| s.apply(&dispatch)),
             };
+            self.settings_applied(&dispatch, &mut changes, cx);
             self.after_changes(changes, false, cx);
             // A first READY, or a new one after a reconnect: the open channel's window is
             // missing or stale, so load its newest page.
@@ -1001,6 +1014,7 @@ impl Inlet {
             return;
         };
         let mut changes = account.update(cx, |s, _| s.apply(&dispatch));
+        self.settings_applied(&dispatch, &mut changes, cx);
         let edits = match &dispatch {
             p::Dispatch::MessageCreate(m) | p::Dispatch::MessageUpdate(m) => edits_of([&**m]),
             _ => Edits::new(),
@@ -1032,9 +1046,7 @@ impl Inlet {
                     .view
                     .may_mark_read(account.read(cx), ch, at_bottom, window_active)
                 {
-                    changes.merge(
-                        account.update(cx, |s, _| s.mark_read(ch, None, AckKind::Automatic)),
-                    );
+                    changes.merge(self.read_channel(ch, AckKind::Automatic, false, cx));
                 }
             }
         }
@@ -1097,8 +1109,7 @@ impl Inlet {
                     .view
                     .may_mark_read(account.read(cx), ch, at_bottom, window_active)
                 {
-                    changes
-                        .merge(account.update(cx, |s, _| s.mark_read(ch, None, AckKind::Explicit)));
+                    changes.merge(self.read_channel(ch, AckKind::Explicit, false, cx));
                 }
             } else if is_detached(account.read(cx), ch)
                 && self.chat.view.newest_retries < MAX_NEWEST_RETRIES
@@ -1139,10 +1150,18 @@ impl Inlet {
     }
 
     /// Re-renders what changed in the account state.
-    fn after_changes(&mut self, changes: Changes, members: bool, cx: &mut Context<Self>) {
+    pub(crate) fn after_changes(
+        &mut self,
+        changes: Changes,
+        members: bool,
+        cx: &mut Context<Self>,
+    ) {
         let Some(account) = self.account.clone() else {
             return;
         };
+        // The sidebar and the rail read their badges from the same state.
+        self.notifications
+            .refresh_badges(account.read(cx), &changes);
         self.chat.view.conversions.prune(account.read(cx), &changes);
         let Some(ch) = self.open_channel_id() else {
             return;
@@ -1299,6 +1318,12 @@ impl Inlet {
     /// "NEW" line and the newest messages are out of view (for the banner and "Jump to
     /// present"). The list reports only scrolling by the person, so loading never
     /// repeats by itself.
+    ///
+    /// The handler runs while gpui holds the list's state borrowed for the scroll: anything
+    /// that touches `message_list` in it (`splice`, `reset`, `scroll_to_end`, even
+    /// `is_following_tail`) would panic. So the handler only notes plain view fields;
+    /// loading pages and reading the channel (which can rebuild rows and splice the list)
+    /// are deferred until the scroll is done and the borrow is released.
     pub(crate) fn hook_list_scroll(&mut self, cx: &mut Context<Self>) {
         if self.chat.view.scroll_hooked {
             return;
@@ -1306,10 +1331,14 @@ impl Inlet {
         self.chat.view.scroll_hooked = true;
         let weak = cx.entity().downgrade();
         self.chat.message_list.set_scroll_handler(
-            move |event: &ListScrollEvent, _window: &mut Window, cx: &mut App| {
+            move |event: &ListScrollEvent, window: &mut Window, cx: &mut App| {
+                let window_active = window.is_window_active();
                 let range = event.visible_range.clone();
                 let following = event.is_following_tail;
                 let count = event.count;
+                let at_top = range.start <= 1;
+                let at_bottom = range.end >= count;
+                // Inside the list's borrow: plain fields of the view only.
                 let _ = weak.update(cx, |this, cx| {
                     let view = &mut this.chat.view;
                     view.divider_above = view
@@ -1318,13 +1347,28 @@ impl Inlet {
                         .position(|r| matches!(r, Row::Unread | Row::Day { new: true, .. }))
                         .is_some_and(|ix| ix < range.start);
                     view.scrolled_away = !following && range.end < count;
-                    let at_bottom = range.end >= count;
-                    if range.start <= 1 {
-                        this.load_older(cx);
-                    } else if at_bottom && this.chat.view.detached {
-                        this.reload_newest(cx);
-                    }
                     cx.notify();
+                });
+                if !at_top && !at_bottom {
+                    return;
+                }
+                // After the scroll: the list is free again.
+                let weak = weak.clone();
+                cx.defer(move |cx| {
+                    let _ = weak.update(cx, |this, cx| {
+                        if at_top {
+                            this.load_older(cx);
+                        } else if this.chat.view.detached {
+                            this.reload_newest(cx);
+                        }
+                        // Back at the bottom with focus: the channel is read. The tick
+                        // does the same once a second, for the ways to the bottom that
+                        // report nothing here.
+                        if at_bottom {
+                            this.read_if_watched(window_active, following, cx);
+                        }
+                        cx.notify();
+                    });
                 });
             },
         );
@@ -1342,6 +1386,7 @@ impl Inlet {
     }
 
     fn tick_account(&mut self, cx: &mut Context<Self>) {
+        self.tick_notifications(cx);
         let Some(account) = self.account.clone() else {
             return;
         };
@@ -1400,12 +1445,20 @@ impl Inlet {
     pub(crate) fn mark_open_channel_read(&mut self, cx: &mut Context<Self>) {
         self.chat.view.unread_after = None;
         self.chat.view.divider_above = false;
-        if let (Some(ch), Some(account)) = (self.open_channel_id(), self.account.clone()) {
-            let changes = account.update(cx, |s, _| s.mark_read(ch, None, AckKind::Explicit));
+        if let Some(ch) = self.open_channel_id() {
+            let changes = self.read_channel(ch, AckKind::Explicit, true, cx);
             self.after_changes(changes, false, cx);
         }
         self.refresh_rows(cx);
         cx.notify();
+    }
+
+    /// The open channel was read some other way ("mark as read" for a server): its "NEW"
+    /// line and banner go.
+    pub(crate) fn clear_unread_marker(&mut self, cx: &mut Context<Self>) {
+        self.chat.view.unread_after = None;
+        self.chat.view.divider_above = false;
+        self.refresh_rows(cx);
     }
 
     /// Shows the spoilers of a message.

@@ -9,7 +9,7 @@
 //! messages they carry already converted and parsed ([`Message`]), so markdown is never
 //! parsed on the UI thread.
 
-mod ack;
+pub(crate) mod ack;
 mod actions;
 mod fetch;
 mod inbox;
