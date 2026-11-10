@@ -3,6 +3,8 @@ name: Release
 # Pushing a tag that starts with "v" builds Inlet on all three platforms and
 # creates a GitHub Release. Releases are always marked as pre-releases while
 # the version starts with 0 or has a pre-release suffix, and are never "latest".
+# The macOS build is signed and notarised by macos-sign.yml, which waits for
+# approval in the protected environment "release".
 
 on:
   push:
@@ -22,9 +24,22 @@ jobs:
     permissions:
       contents: read
 
+  # Signs and notarises the macOS app and DMG in the protected environment
+  # "release". The run waits here until it is approved.
+  macos-sign:
+    name: macOS signing
+    needs: build
+    uses: ./.github/workflows/macos-sign.yml
+    permissions:
+      contents: read
+    with:
+      app-artifact: inlet-macos-aarch64-app
+      dmg-artifact: inlet-macos-aarch64-dmg
+      retention-days: 7
+
   release:
     name: Create release
-    needs: build
+    needs: [build, macos-sign]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -42,7 +57,7 @@ jobs:
         run: |
           mkdir release
           cp artifacts/inlet-windows-x86_64/inlet.exe release/inlet-windows-x86_64.exe
-          cp artifacts/inlet-macos-aarch64/inlet-macos-aarch64.zip release/
+          cp artifacts/inlet-macos-aarch64-dmg/inlet-macos-aarch64.dmg release/
           cp artifacts/inlet-linux-x86_64/inlet-linux-x86_64.tar.gz release/
           cp LICENSE release/LICENSE
           # Third-party licence notices, if the repository carries them.
@@ -50,7 +65,7 @@ jobs:
             if [ -f "$f" ]; then cp "$f" release/; fi
           done
           cd release
-          sha256sum * > SHA256SUMS.txt
+          sha256sum -- * > SHA256SUMS.txt
           cat SHA256SUMS.txt
           ls -l
 
@@ -64,7 +79,7 @@ jobs:
           ## Downloads
 
           - Windows (x86_64): `inlet-windows-x86_64.exe`. The file is not code-signed, so Windows SmartScreen may warn you. Choose "More info", then "Run anyway".
-          - macOS (Apple silicon): `inlet-macos-aarch64.zip`. The app is not signed yet, so Gatekeeper blocks it on first start. Unzip, then right-click the file and choose Open. If that does not work, run `xattr -d com.apple.quarantine inlet` in a terminal.
+          - macOS (Apple silicon, macOS 12 or later): `inlet-macos-aarch64.dmg`. Signed with a Developer ID and notarised by Apple. Open the DMG and drag Inlet to Applications.
           - Linux (x86_64): `inlet-linux-x86_64.tar.gz`.
 
           Check the downloads against `SHA256SUMS.txt`. Licence notices for third-party code are in the `THIRD-PARTY-NOTICES` file when it is attached.

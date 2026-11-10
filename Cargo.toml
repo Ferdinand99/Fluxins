@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/inlet-protocol", "crates/inlet-app", "crates/inlet-emoji", "crates/inlet-media", "crates/inlet-state"]
+members = ["crates/*"]
 
 [workspace.package]
 version = "0.0.1"
