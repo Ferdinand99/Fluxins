@@ -251,7 +251,10 @@ impl Inlet {
         a: &Attachment,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let size = requests::fit_inside(a.width, a.height, requests::PREVIEW_MAX);
+        let size = self.fit_column(
+            requests::fit_inside(a.width, a.height, requests::PREVIEW_MAX),
+            0.,
+        );
         if let Some(cover) = self.cover(key, a.spoiler, a.explicit, size, cx) {
             return cover;
         }

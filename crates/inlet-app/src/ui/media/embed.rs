@@ -13,17 +13,20 @@ use crate::model::EmbedMedia;
 
 impl Inlet {
     /// An embed image inside `max` logical pixels (the box of its kind), covered when
-    /// explicit, opening the viewer on click.
+    /// explicit, opening the viewer on click. `chrome` is the width the card takes
+    /// around it, so a narrow window shrinks the image instead of clipping it.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn embed_image(
         &self,
         key: &str,
         m: &EmbedMedia,
         max: (f32, f32),
+        chrome: f32,
         nsfw: bool,
         name: String,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let size = requests::fit_inside(m.width, m.height, max);
+        let size = self.fit_column(requests::fit_inside(m.width, m.height, max), chrome);
         if let Some(cover) = self.cover(key, false, nsfw || m.explicit, size, cx) {
             return cover;
         }

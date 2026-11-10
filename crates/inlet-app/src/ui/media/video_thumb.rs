@@ -68,7 +68,10 @@ impl Inlet {
         a: &Attachment,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let size = requests::fit_inside(a.width, a.height, requests::PREVIEW_MAX);
+        let size = self.fit_column(
+            requests::fit_inside(a.width, a.height, requests::PREVIEW_MAX),
+            0.,
+        );
         if let Some(cover) = self.cover(key, a.spoiler, a.explicit, size, cx) {
             return cover;
         }
@@ -123,7 +126,8 @@ impl Inlet {
             }
             None => Shown::Unavailable,
         };
-        let still = picture_of(shown, size, 4., ObjectFit::Cover);
+        let shown_size = self.fit_column(size, super::EMBED_CHROME);
+        let still = picture_of(shown, shown_size, 4., ObjectFit::Cover);
         let link = link.or_else(|| (!video.url.is_empty()).then(|| video.url.clone()));
         with_play(format!("evid-{key}"), still, None)
             .on_click(cx.listener(move |this, _, _, cx| {

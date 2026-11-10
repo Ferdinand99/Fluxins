@@ -31,6 +31,24 @@ pub use viewer::Viewer;
 
 /// Spoilers and explicit media shown on request, remembered for this many items.
 const MAX_REVEALED: usize = 1_000;
+/// Width around the content of a cozy message row: 16 | 40 avatar | 12 | … | 16.
+const COZY_GUTTER: f32 = 84.;
+/// The same for compact rows: 16 | 64 time | 8 | name | 8 | … | 16, with room for a
+/// name (the content starts after it).
+const COMPACT_GUTTER: f32 = 220.;
+/// Media never shrink below this width.
+const MIN_MEDIA_WIDTH: f32 = 120.;
+/// Width an embed card takes around its media: border, colour bar and padding.
+pub const EMBED_CHROME: f32 = 30.;
+
+/// `(w, h)` scaled down, keeping its shape, to at most `max_w` wide.
+fn fit_width((w, h): (f32, f32), max_w: f32) -> (f32, f32) {
+    if w <= max_w || w <= 0. {
+        return (w, h);
+    }
+    let max_w = max_w.floor();
+    (max_w, (h * max_w / w).round().max(1.))
+}
 
 /// The media view state of the signed-in session.
 pub struct State {
@@ -135,6 +153,22 @@ impl Inlet {
         self.media.pending_drop = keep;
         #[cfg(feature = "demo")]
         self.demo_open_viewer(cx);
+    }
+
+    /// The shown size of media of `size`, shrunk to fit the message column (less
+    /// `chrome`, the width of a card around it) so a narrow window never clips it. The
+    /// request keeps its own size, so resizing the window loads nothing again.
+    pub(crate) fn fit_column(&self, size: (f32, f32), chrome: f32) -> (f32, f32) {
+        let list = self.chat.message_list.viewport_bounds().size.width.as_f32();
+        if list <= 0. {
+            return size;
+        }
+        let gutter = if self.chat.view.compact {
+            COMPACT_GUTTER
+        } else {
+            COZY_GUTTER
+        };
+        fit_width(size, (list - gutter - chrome).max(MIN_MEDIA_WIDTH))
     }
 
     /// Events from the backend's media domain.
@@ -253,6 +287,17 @@ mod tests {
         assert_eq!(file_size(300 * 1024 * 1024), "300 MB");
         assert_eq!(duration(187), "3:07");
         assert_eq!(duration(3725), "1:02:05");
+    }
+
+    #[test]
+    fn media_shrink_to_a_narrow_column_keeping_their_shape() {
+        // Fits: unchanged.
+        assert_eq!(fit_width((480., 350.), 600.), (480., 350.));
+        // Too wide: scaled down, same shape.
+        assert_eq!(fit_width((480., 350.), 440.), (440., 321.));
+        assert_eq!(fit_width((550., 100.), 275.5), (275., 50.));
+        // Degenerate sizes stay as they are.
+        assert_eq!(fit_width((0., 10.), 100.), (0., 10.));
     }
 
     #[test]
