@@ -31,7 +31,6 @@ enum Screen {
 #[derive(Clone, Copy, PartialEq)]
 enum SignInMode {
     Browser,
-    Password,
     Token,
 }
 
@@ -49,18 +48,12 @@ struct Inlet {
 
     // Sign-in
     instance_input: Entity<TextInput>,
-    email_input: Entity<TextInput>,
-    password_input: Entity<TextInput>,
-    totp_input: Entity<TextInput>,
     token_input: Entity<TextInput>,
     sign_in_mode: SignInMode,
-    awaiting_totp: bool,
     busy: bool,
     sign_in_error: Option<String>,
     /// Browser sign-in in progress: page URL and the code to enter there.
     handoff: Option<(String, String)>,
-    /// Waiting for something outside the app (email link).
-    sign_in_info: Option<String>,
 
     // Main
     username: String,
@@ -85,14 +78,11 @@ impl Inlet {
         let backend = backend::start(events_tx);
 
         let instance_input = cx.new(|cx| TextInput::new("fluxer.opland.net", cx).with_text(DEFAULT_INSTANCE));
-        let email_input = cx.new(|cx| TextInput::new("you@example.com", cx));
-        let password_input = cx.new(|cx| TextInput::new("Password", cx).masked());
-        let totp_input = cx.new(|cx| TextInput::new("6-digit code", cx));
         let token_input = cx.new(|cx| TextInput::new("Paste your token", cx).masked());
         let composer = cx.new(|cx| TextInput::new("Message", cx));
 
         let mut subscriptions = Vec::new();
-        for input in [&instance_input, &email_input, &password_input, &totp_input, &token_input] {
+        for input in [&instance_input, &token_input] {
             subscriptions.push(cx.subscribe_in(input, window, |this, _, event: &InputEvent, window, cx| {
                 match event {
                     InputEvent::Submit => this.submit_sign_in(window, cx),
@@ -125,16 +115,11 @@ impl Inlet {
             focus: cx.focus_handle(),
             screen: Screen::Starting,
             instance_input,
-            email_input,
-            password_input,
-            totp_input,
             token_input,
             sign_in_mode: SignInMode::Browser,
-            awaiting_totp: false,
             busy: false,
             sign_in_error: None,
             handoff: None,
-            sign_in_info: None,
             username: String::new(),
             instance: String::new(),
             guilds: Vec::new(),
@@ -158,7 +143,7 @@ impl Inlet {
                 }
                 self.screen = Screen::SignIn;
                 self.busy = false;
-                self.email_input.focus_handle(cx).focus(window, cx);
+                self.instance_input.focus_handle(cx).focus(window, cx);
             }
             Event::HandoffStarted { url, code } => {
                 self.busy = false;
@@ -168,21 +153,10 @@ impl Inlet {
                 }
                 self.handoff = Some((url, code));
             }
-            Event::SignInInfo(message) => {
-                self.busy = false;
-                self.sign_in_info = Some(message);
-            }
-            Event::NeedsTotp => {
-                self.busy = false;
-                self.awaiting_totp = true;
-                self.sign_in_error = None;
-                self.totp_input.focus_handle(cx).focus(window, cx);
-            }
             Event::SignInFailed(message) => {
                 self.busy = false;
                 self.handoff = None;
-                self.sign_in_info = None;
-                self.sign_in_error = Some(message);
+                        self.sign_in_error = Some(message);
                 if self.screen == Screen::Starting {
                     self.screen = Screen::SignIn;
                 }
@@ -190,24 +164,19 @@ impl Inlet {
             Event::SignedIn { username, instance } => {
                 self.busy = false;
                 self.handoff = None;
-                self.sign_in_info = None;
-                self.awaiting_totp = false;
-                self.sign_in_error = None;
-                for input in [&self.password_input, &self.totp_input, &self.token_input] {
-                    input.update(cx, |i, cx| i.clear(cx));
-                }
+                        self.sign_in_error = None;
+                self.token_input.update(cx, |i, cx| i.clear(cx));
                 self.username = username;
                 self.instance = instance;
                 self.screen = Screen::Main;
                 self.select_guild(None, cx);
             }
+            Event::SessionEnded(message) => {
+                self.sign_in_error = Some(message);
+                self.reset_main();
+            }
             Event::SignedOut => {
-                self.screen = Screen::SignIn;
-                self.guilds.clear();
-                self.channels.clear();
-                self.selected_channel = None;
-                self.set_messages(Vec::new());
-                self.status.clear();
+                self.reset_main();
             }
             Event::Guilds(guilds) => self.guilds = guilds,
             Event::Channels { guild_id, channels } => {
@@ -257,6 +226,19 @@ impl Inlet {
         cx.notify();
     }
 
+    fn reset_main(&mut self) {
+        self.screen = Screen::SignIn;
+        self.busy = false;
+        self.handoff = None;
+        self.guilds.clear();
+        self.channels.clear();
+        self.selected_guild = None;
+        self.selected_channel = None;
+        self.set_messages(Vec::new());
+        self.status.clear();
+        self.error = None;
+    }
+
     fn set_messages(&mut self, messages: Vec<Message>) {
         let mut shown: Vec<ShownMessage> = Vec::with_capacity(messages.len());
         for message in messages {
@@ -279,34 +261,16 @@ impl Inlet {
             cx.notify();
             return;
         }
-        let command = if self.awaiting_totp {
-            let code: String = self.totp_input.read(cx).text().chars().filter(|c| !c.is_whitespace()).collect();
-            if code.is_empty() {
-                return;
-            }
-            Command::SignInTotp { code }
-        } else {
-            match self.sign_in_mode {
-                SignInMode::Browser => Command::SignInBrowser { instance },
-                SignInMode::Password => {
-                    let email = self.email_input.read(cx).text().trim().to_string();
-                    let password = self.password_input.read(cx).text().to_string();
-                    if !backend::is_demo_origin(&instance) && (email.is_empty() || password.is_empty()) {
-                        self.sign_in_error = Some("Enter your email and password.".into());
-                        cx.notify();
-                        return;
-                    }
-                    Command::SignInPassword { instance, email, password }
+        let command = match self.sign_in_mode {
+            SignInMode::Browser => Command::SignInBrowser { instance },
+            SignInMode::Token => {
+                let token = self.token_input.read(cx).text().trim().to_string();
+                if token.is_empty() {
+                    self.sign_in_error = Some("Paste a token first.".into());
+                    cx.notify();
+                    return;
                 }
-                SignInMode::Token => {
-                    let token = self.token_input.read(cx).text().trim().to_string();
-                    if !backend::is_demo_origin(&instance) && token.is_empty() {
-                        self.sign_in_error = Some("Paste a token first.".into());
-                        cx.notify();
-                        return;
-                    }
-                    Command::SignInToken { instance, token }
-                }
+                Command::SignInToken { instance, token }
             }
         };
         self.busy = true;
@@ -347,7 +311,6 @@ impl Inlet {
     fn cancel_wait(&mut self, _: &ClickEvent, _window: &mut Window, cx: &mut Context<Self>) {
         self.backend.send(Command::CancelSignIn);
         self.handoff = None;
-        self.sign_in_info = None;
         self.busy = false;
         cx.notify();
     }
@@ -375,26 +338,30 @@ impl Inlet {
         };
 
         let mut form = div().flex().flex_col().gap_3();
-        form = form.child(field("Instance", self.instance_input.clone()));
-        if self.awaiting_totp {
+        if let Some((url, code)) = self.handoff.clone() {
             form = form
-                .child(div().text_color(theme::text_muted()).child("Enter the code from your authenticator app."))
-                .child(field("Two-factor code", self.totp_input.clone()));
+                .child(div().child("Your browser should now show the sign-in page. Sign in there, then enter this code:"))
+                .child(
+                    div()
+                        .text_size(px(28.))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(theme::text_strong())
+                        .font_family(markdown::mono_font())
+                        .child(code),
+                )
+                .child(div().text_size(px(12.)).text_color(theme::text_muted()).child(url.clone()))
+                .child(div().text_color(theme::text_muted()).child("Waiting for the browser\u{2026}"))
+                .child(button("reopen", "Open the page again", false).on_click(move |_, _, cx| cx.open_url(&url)))
+                .child(button("cancel-wait", "Cancel", false).on_click(cx.listener(Self::cancel_wait)));
         } else {
-            form = form.child(
+            form = form.child(field("Instance", self.instance_input.clone())).child(
                 div()
                     .flex()
                     .flex_row()
                     .gap_2()
-                    .child(tab("mode-browser", "Browser", mode == SignInMode::Browser).on_click(cx.listener(
-                        |this, _, _, cx| {
-                            this.sign_in_mode = SignInMode::Browser;
-                            cx.notify();
-                        },
-                    )))
-                    .child(tab("mode-password", "Email and password", mode == SignInMode::Password).on_click(
+                    .child(tab("mode-browser", "Sign in with browser", mode == SignInMode::Browser).on_click(
                         cx.listener(|this, _, _, cx| {
-                            this.sign_in_mode = SignInMode::Password;
+                            this.sign_in_mode = SignInMode::Browser;
                             cx.notify();
                         }),
                     ))
@@ -406,14 +373,9 @@ impl Inlet {
                     ))),
             );
             form = match mode {
-                SignInMode::Browser => form.child(
-                    div().text_size(px(13.)).text_color(theme::text_muted()).child(
-                        "Inlet opens the instance's sign-in page in your browser. Sign in there (passkeys, SSO and email codes all work) and enter the code Inlet shows.",
-                    ),
-                ),
-                SignInMode::Password => form
-                    .child(field("Email", self.email_input.clone()))
-                    .child(field("Password", self.password_input.clone())),
+                SignInMode::Browser => form.child(div().text_size(px(13.)).text_color(theme::text_muted()).child(
+                    "Inlet opens the instance's sign-in page in your browser. Sign in there (passkeys, SSO and email codes all work) and enter the code Inlet shows.",
+                )),
                 SignInMode::Token => form.child(field("Token", self.token_input.clone())).child(
                     div()
                         .text_size(px(12.))
@@ -421,52 +383,15 @@ impl Inlet {
                         .child("The token is kept in your system keychain, never in a file."),
                 ),
             };
-        }
-
-        let label = if self.busy {
-            "Signing in\u{2026}"
-        } else if self.awaiting_totp {
-            "Verify"
-        } else if mode == SignInMode::Browser {
-            "Sign in with browser"
-        } else {
-            "Sign in"
-        };
-        if let Some((url, code)) = self.handoff.clone() {
-            form = div()
-                .flex()
-                .flex_col()
-                .gap_3()
-                .child(div().child("Your browser should now show the sign-in page. Sign in there, then enter this code:"))
-                .child(
-                    div()
-                        .text_size(px(28.))
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(theme::text_strong())
-                        .font_family(markdown::mono_font())
-                        .child(code),
-                )
-                .child(div().text_size(px(12.)).text_color(theme::text_muted()).child(url.clone()))
-                .child(button("reopen", "Open the page again", false).on_click(move |_, _, cx| cx.open_url(&url)))
-                .child(button("cancel-wait", "Cancel", false).on_click(cx.listener(Self::cancel_wait)));
-        } else if let Some(info) = self.sign_in_info.clone() {
-            form = div()
-                .flex()
-                .flex_col()
-                .gap_3()
-                .child(div().child(info))
-                .child(button("cancel-wait", "Cancel", false).on_click(cx.listener(Self::cancel_wait)));
-        } else {
-        form = form.child(
-            button("sign-in", label, true).on_click(cx.listener(|this, _, window, cx| this.submit_sign_in(window, cx))),
-        );
-        if self.awaiting_totp {
-            form = form.child(button("cancel-totp", "Back", false).on_click(cx.listener(|this, _, _, cx| {
-                this.awaiting_totp = false;
-                this.busy = false;
-                cx.notify();
-            })));
-        }
+            let label = match (self.busy, mode) {
+                (true, _) => "Signing in\u{2026}",
+                (false, SignInMode::Browser) => "Open the sign-in page",
+                (false, SignInMode::Token) => "Sign in",
+            };
+            form = form.child(
+                button("sign-in", label, true)
+                    .on_click(cx.listener(|this, _, window, cx| this.submit_sign_in(window, cx))),
+            );
         }
         if let Some(err) = &self.sign_in_error {
             form = form.child(div().text_color(theme::danger()).child(err.clone()));
@@ -480,7 +405,7 @@ impl Inlet {
             .bg(theme::rail_bg())
             .child(
                 div()
-                    .w(px(440.))
+                    .w(px(460.))
                     .p_8()
                     .rounded_lg()
                     .bg(theme::chat_bg())
@@ -500,15 +425,13 @@ impl Inlet {
                                     .text_color(theme::text_strong())
                                     .child("Inlet"),
                             )
-                            .child(div().text_color(theme::text_muted()).child("Works with Fluxer. Sign in to any Fluxer instance.")),
+                            .child(
+                                div()
+                                    .text_color(theme::text_muted())
+                                    .child("A desktop client that works with Fluxer"),
+                            ),
                     )
-                    .child(form)
-                    .child(
-                        div()
-                            .text_size(px(12.))
-                            .text_color(theme::text_muted())
-                            .child("Tip: use the instance \"demo\" to try the app without an account."),
-                    ),
+                    .child(form),
             )
     }
 

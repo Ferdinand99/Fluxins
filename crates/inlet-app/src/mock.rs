@@ -1,4 +1,4 @@
-//! Demo data, used when the instance is `demo` or `INLET_DEMO` is set.
+//! Demo data, used only when the `INLET_DEMO` environment variable is set.
 //! Lets the UI be tried and screenshotted without an account.
 
 use std::collections::HashMap;

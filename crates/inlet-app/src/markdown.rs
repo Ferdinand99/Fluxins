@@ -19,7 +19,7 @@ pub enum Block {
     Text(Inline),
     Heading(u8, Inline),
     Subtext(Inline),
-    Code { language: Option<String>, content: SharedString },
+    Code { content: SharedString },
     Quote(Vec<Block>),
     Alert(&'static str, Vec<Block>),
     List(Vec<(String, Vec<Block>)>),
@@ -79,12 +79,9 @@ fn blocks(nodes: &[Node]) -> Vec<Block> {
                 flush(&mut current, &mut out);
                 out.push(Block::Subtext(inline_of(children)));
             }
-            Node::CodeBlock { language, content } => {
+            Node::CodeBlock { content, .. } => {
                 flush(&mut current, &mut out);
-                out.push(Block::Code {
-                    language: language.clone(),
-                    content: content.trim_end_matches('\n').to_string().into(),
-                });
+                out.push(Block::Code { content: content.trim_end_matches('\n').to_string().into() });
             }
             Node::Blockquote { children, .. } => {
                 flush(&mut current, &mut out);
@@ -113,7 +110,7 @@ fn blocks(nodes: &[Node]) -> Vec<Block> {
                     inline.text.push('\n');
                     table_row(row, &mut inline);
                 }
-                out.push(Block::Code { language: None, content: inline.text.into() });
+                out.push(Block::Code { content: inline.text.into() });
             }
             other => push_inline(other, &mut current),
         }
@@ -362,7 +359,7 @@ fn render_block(id: &str, block: &Block) -> AnyElement {
             .text_color(theme::text_muted())
             .child(inline_element(id.to_string().into(), inline))
             .into_any_element(),
-        Block::Code { content, .. } => div()
+        Block::Code { content } => div()
             .bg(theme::code_bg())
             .border_1()
             .border_color(theme::rail_bg())

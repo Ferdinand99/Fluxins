@@ -1,6 +1,7 @@
 //! Keeps the session token in the OS keychain (macOS Keychain, Windows Credential
 //! Manager, Secret Service on Linux). The token is never written to a file and never
-//! logged. The only thing on disk is the address of the last instance, which is not secret.
+//! logged. On disk are only the address of the last instance and the installation ID,
+//! neither of which is secret.
 
 use anyhow::{Context, Result};
 
@@ -46,4 +47,25 @@ pub fn set_last_instance(instance: &str) {
         }
         let _ = std::fs::write(path, instance);
     }
+}
+
+fn installation_id_file() -> Option<std::path::PathBuf> {
+    dirs::config_dir().map(|d| d.join("inlet").join("installation-id"))
+}
+
+/// The client description sent to the instance, with an installation ID that stays the
+/// same between starts (it identifies this install in the account's session list).
+pub fn client_info() -> inlet_protocol::ClientInfo {
+    let mut info = inlet_protocol::ClientInfo::default();
+    let Some(path) = installation_id_file() else { return info };
+    match std::fs::read_to_string(&path) {
+        Ok(id) if !id.trim().is_empty() => info.installation_id = id.trim().to_string(),
+        _ => {
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let _ = std::fs::write(&path, &info.installation_id);
+        }
+    }
+    info
 }

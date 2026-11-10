@@ -12,24 +12,18 @@ use inlet_protocol as p;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender as TokioSender, unbounded_channel};
 
 use crate::model::{Channel, Guild, Message};
-use crate::{mock, real, token_store};
+use crate::real::{self, Failure, RealSession};
+use crate::{mock, token_store};
 
 /// Default instance shown on the sign-in screen.
 pub const DEFAULT_INSTANCE: &str = "fluxer.opland.net";
-
-/// Origins that select the built-in demo data instead of a real instance.
-pub fn is_demo_origin(origin: &str) -> bool {
-    matches!(origin.trim(), "demo" | "mock")
-}
 
 pub enum Command {
     /// Look for a saved session at start-up.
     Restore,
     SignInBrowser { instance: String },
-    SignInPassword { instance: String, email: String, password: String },
-    SignInTotp { code: String },
     SignInToken { instance: String, token: String },
-    /// Stop a browser sign-in or an email approval that is waiting.
+    /// Stop a browser sign-in that is waiting.
     CancelSignIn,
     SignOut,
     /// Load channels for a guild, or DMs when `guild_id` is `None`.
@@ -43,13 +37,12 @@ pub enum Event {
     NeedsSignIn { instance: Option<String> },
     /// Browser sign-in started: the page to open and the code to enter there.
     HandoffStarted { url: String, code: String },
-    /// The password was right; a TOTP code is needed.
-    NeedsTotp,
-    /// Something to tell the person while sign-in waits (e.g. "check your email").
-    SignInInfo(String),
     SignInFailed(String),
     SignedIn { username: String, instance: String },
     SignedOut,
+    /// The session ended on the server side (token rejected or revoked). The token is
+    /// already removed from the keychain; show sign-in with this message.
+    SessionEnded(String),
     Guilds(Vec<Guild>),
     Channels { guild_id: Option<String>, channels: Vec<Channel> },
     Messages { channel_id: String, messages: Vec<Message> },
@@ -92,28 +85,29 @@ pub fn start(events: UnboundedSender<Event>) -> BackendHandle {
     BackendHandle { tx }
 }
 
-/// The signed-in connection: either the demo data or a real instance.
+/// The signed-in connection. `Demo` is built-in sample data, only reachable with the
+/// `INLET_DEMO` environment variable (for screenshots and UI checks without an account).
 enum Active {
-    Mock(mock::MockSession),
-    Real(real::RealSession),
+    Demo(mock::MockSession),
+    Real(RealSession),
 }
 
-/// Result of a sign-in that ran as a background task (browser, email approval).
+/// Result of a browser sign-in that ran as a background task.
 type Finished = Result<(p::Instance, p::Token), String>;
 
 struct Backend {
     events: UnboundedSender<Event>,
     active: Option<Active>,
-    pending_totp: Option<real::PendingTotp>,
     waiting: Option<tokio::task::JoinHandle<()>>,
     finished_tx: TokioSender<Finished>,
-    finished_rx: Option<UnboundedReceiver<Finished>>,
+    ended_tx: TokioSender<String>,
 }
 
 impl Backend {
     fn new(events: UnboundedSender<Event>) -> Self {
-        let (finished_tx, finished_rx) = unbounded_channel();
-        Self { events, active: None, pending_totp: None, waiting: None, finished_tx, finished_rx: Some(finished_rx) }
+        let (finished_tx, _) = unbounded_channel();
+        let (ended_tx, _) = unbounded_channel();
+        Self { events, active: None, waiting: None, finished_tx, ended_tx }
     }
 
     fn emit(&self, event: Event) {
@@ -121,7 +115,10 @@ impl Backend {
     }
 
     async fn run(mut self, mut rx: UnboundedReceiver<Command>) {
-        let mut finished_rx = self.finished_rx.take().expect("receiver");
+        let (finished_tx, mut finished_rx) = unbounded_channel();
+        let (ended_tx, mut ended_rx) = unbounded_channel();
+        self.finished_tx = finished_tx;
+        self.ended_tx = ended_tx;
         loop {
             tokio::select! {
                 command = rx.recv() => match command {
@@ -135,33 +132,26 @@ impl Backend {
                         Err(message) => self.emit(Event::SignInFailed(message)),
                     }
                 }
+                Some(message) = ended_rx.recv() => self.session_ended(message),
             }
         }
     }
 
-    fn start_mock(&mut self) {
-        self.active = Some(Active::Mock(mock::MockSession::start(self.events.clone())));
-    }
-
-    /// Runs a waiting sign-in in the background so the UI can still cancel it.
-    fn spawn_wait(
-        &mut self,
-        fut: impl std::future::Future<Output = anyhow::Result<(p::Instance, p::Token)>> + Send + 'static,
-    ) {
-        if let Some(previous) = self.waiting.take() {
-            previous.abort();
+    /// The token is gone: forget it and send the person back to sign-in.
+    fn session_ended(&mut self, message: String) {
+        if let Some(Active::Real(session)) = self.active.take() {
+            if let Err(err) = token_store::delete_token(session.instance()) {
+                log::warn!("could not remove the token from the keychain: {err:#}");
+            }
         }
-        let tx = self.finished_tx.clone();
-        self.waiting = Some(tokio::spawn(async move {
-            let _ = tx.send(fut.await.map_err(|e| e.to_string()));
-        }));
+        self.emit(Event::SessionEnded(message));
     }
 
     async fn handle(&mut self, command: Command) {
         match command {
             Command::Restore => {
                 if std::env::var_os("INLET_DEMO").is_some() {
-                    self.start_mock();
+                    self.active = Some(Active::Demo(mock::MockSession::start(self.events.clone())));
                     return;
                 }
                 let instance = token_store::last_instance();
@@ -174,69 +164,48 @@ impl Backend {
                 });
                 match (instance, token) {
                     (Some(instance), Some(token)) => {
-                        let started = match real::instance_for_token(&instance).await {
-                            Ok(inst) => real::RealSession::start(inst, p::Token::new(token), self.events.clone()).await,
+                        let started = match real::discover(&instance).await {
+                            Ok(inst) => {
+                                RealSession::start(inst, p::Token::new(token), self.events.clone(), self.ended_tx.clone())
+                                    .await
+                            }
                             Err(err) => Err(err),
                         };
                         match started {
                             Ok(session) => self.active = Some(Active::Real(session)),
-                            Err(err) => {
-                                log::warn!("saved session did not work: {err:#}");
+                            Err(Failure { message, session_ended }) => {
+                                if session_ended {
+                                    let _ = token_store::delete_token(&instance);
+                                }
                                 self.emit(Event::NeedsSignIn { instance: Some(instance) });
-                                self.emit(Event::SignInFailed(format!("{err:#}")));
+                                self.emit(Event::SignInFailed(message));
                             }
                         }
                     }
                     (instance, _) => self.emit(Event::NeedsSignIn { instance }),
                 }
             }
-            Command::SignInBrowser { instance } => {
-                if is_demo_origin(&instance) {
-                    self.start_mock();
-                    return;
-                }
-                match real::start_handoff(&instance).await {
-                    Ok((inst, handoff)) => {
-                        self.emit(Event::HandoffStarted { url: handoff.browser_url(), code: handoff.display_code() });
-                        self.spawn_wait(real::wait_handoff(inst, handoff));
+            Command::SignInBrowser { instance } => match real::start_handoff(&instance).await {
+                Ok((inst, handoff)) => {
+                    self.emit(Event::HandoffStarted { url: handoff.browser_url(), code: handoff.display_code() });
+                    if let Some(previous) = self.waiting.take() {
+                        previous.abort();
                     }
-                    Err(err) => self.emit(Event::SignInFailed(format!("{err:#}"))),
+                    let tx = self.finished_tx.clone();
+                    self.waiting = Some(tokio::spawn(async move {
+                        let _ = tx.send(real::wait_handoff(inst, handoff).await);
+                    }));
                 }
-            }
-            Command::SignInPassword { instance, email, password } => {
-                if is_demo_origin(&instance) {
-                    self.start_mock();
-                    return;
-                }
-                let result = real::sign_in_password(&instance, &email, &password).await;
-                drop(password);
-                self.password_outcome(result).await;
-            }
-            Command::SignInTotp { code } => match self.pending_totp.take() {
-                Some(pending) => match real::sign_in_totp(pending, &code).await {
-                    Ok(outcome) => self.password_outcome(Ok(outcome)).await,
-                    Err((message, pending)) => {
-                        self.pending_totp = pending;
-                        self.emit(Event::SignInFailed(message));
-                    }
-                },
-                None => self.emit(Event::SignInFailed("The sign-in expired. Start again.".into())),
+                Err(err) => self.emit(Event::SignInFailed(err.message)),
             },
-            Command::SignInToken { instance, token } => {
-                if is_demo_origin(&instance) {
-                    self.start_mock();
-                    return;
-                }
-                match real::instance_for_token(&instance).await {
-                    Ok(inst) => self.finish(inst, p::Token::new(token.trim())).await,
-                    Err(err) => self.emit(Event::SignInFailed(format!("{err:#}"))),
-                }
-            }
+            Command::SignInToken { instance, token } => match real::discover(&instance).await {
+                Ok(inst) => self.finish(inst, p::Token::new(token.trim())).await,
+                Err(err) => self.emit(Event::SignInFailed(err.message)),
+            },
             Command::CancelSignIn => {
                 if let Some(task) = self.waiting.take() {
                     task.abort();
                 }
-                self.pending_totp = None;
             }
             Command::SignOut => {
                 if let Some(Active::Real(session)) = self.active.take() {
@@ -250,44 +219,26 @@ impl Backend {
                 self.emit(Event::SignedOut);
             }
             Command::OpenGuild { guild_id } => match &mut self.active {
-                Some(Active::Mock(m)) => m.open_guild(guild_id),
+                Some(Active::Demo(m)) => m.open_guild(guild_id),
                 Some(Active::Real(r)) => r.open_guild(guild_id).await,
                 None => {}
             },
             Command::OpenChannel { channel_id } => match &mut self.active {
-                Some(Active::Mock(m)) => m.open_channel(channel_id),
+                Some(Active::Demo(m)) => m.open_channel(channel_id),
                 Some(Active::Real(r)) => r.open_channel(channel_id).await,
                 None => {}
             },
             Command::Send { channel_id, text } => match &mut self.active {
-                Some(Active::Mock(m)) => m.send(channel_id, text),
+                Some(Active::Demo(m)) => m.send(channel_id, text),
                 Some(Active::Real(r)) => r.send(channel_id, text).await,
                 None => {}
             },
         }
     }
 
-    async fn password_outcome(&mut self, result: anyhow::Result<real::PasswordOutcome>) {
-        match result {
-            Ok(real::PasswordOutcome::Done(instance, token)) => self.finish(instance, token).await,
-            Ok(real::PasswordOutcome::NeedsTotp(pending)) => {
-                self.pending_totp = Some(pending);
-                self.emit(Event::NeedsTotp);
-            }
-            Ok(real::PasswordOutcome::IpAuthorization(instance, ticket)) => {
-                self.emit(Event::SignInInfo(
-                    "New device: Fluxer sent you an email. Open the link in it to approve this sign-in. Inlet waits here."
-                        .into(),
-                ));
-                self.spawn_wait(real::wait_ip_authorization(instance, ticket));
-            }
-            Err(err) => self.emit(Event::SignInFailed(format!("{err:#}"))),
-        }
-    }
-
     async fn finish(&mut self, instance: p::Instance, token: p::Token) {
         self.active = None;
-        match real::RealSession::start(instance, token, self.events.clone()).await {
+        match RealSession::start(instance, token, self.events.clone(), self.ended_tx.clone()).await {
             Ok(session) => {
                 if let Err(err) = token_store::save_token(session.instance(), session.token().expose_secret()) {
                     log::warn!("could not save the token in the keychain: {err:#}");
@@ -299,7 +250,7 @@ impl Backend {
                 token_store::set_last_instance(session.instance());
                 self.active = Some(Active::Real(session));
             }
-            Err(err) => self.emit(Event::SignInFailed(format!("{err:#}"))),
+            Err(err) => self.emit(Event::SignInFailed(err.message)),
         }
     }
 }

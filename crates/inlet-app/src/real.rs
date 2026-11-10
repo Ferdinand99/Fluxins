@@ -8,28 +8,53 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{Result, anyhow};
 use futures::channel::mpsc::UnboundedSender;
 use inlet_protocol as p;
 use inlet_protocol::models::channel_type;
+use tokio::sync::mpsc::UnboundedSender as TokioSender;
 
 use crate::backend::Event;
 use crate::model::{self, Attachment, Channel, ChannelKind, Guild, Message};
+use crate::token_store;
+
+/// A failure, and whether it ended the session (the person must sign in again).
+#[derive(Debug)]
+pub struct Failure {
+    pub message: String,
+    pub session_ended: bool,
+}
+
+impl From<p::Error> for Failure {
+    fn from(err: p::Error) -> Self {
+        Failure { session_ended: ends_session(&err), message: describe(&err) }
+    }
+}
+
+impl From<String> for Failure {
+    fn from(message: String) -> Self {
+        Failure { message, session_ended: false }
+    }
+}
+
+/// Errors after which the token is gone: the instance rejected it, or the global rate
+/// limit was hit (Fluxer revokes the token then).
+pub fn ends_session(err: &p::Error) -> bool {
+    matches!(err, p::Error::Unauthorized | p::Error::GlobalRateLimited)
+}
 
 /// Turns a protocol error into a sentence for the sign-in screen or the error bar.
 pub fn describe(err: &p::Error) -> String {
     match err {
-        p::Error::Unauthorized => "The instance did not accept the token. Sign in again.".into(),
+        p::Error::Unauthorized => "The instance did not accept the session. Sign in again.".into(),
         p::Error::GlobalRateLimited => {
             "Fluxer's global rate limit was hit, which ends the session. Sign in again.".into()
         }
         p::Error::Api(api) => {
             let code = api.field_code().unwrap_or(&api.code);
-            match code {
-                "INVALID_EMAIL_OR_PASSWORD" => "Wrong email or password.".into(),
-                "INVALID_CODE" => "That code is not valid. Try again.".into(),
-                _ if !api.message.is_empty() => format!("{} ({code})", api.message),
-                _ => format!("The instance refused: {api}"),
+            if api.message.is_empty() {
+                format!("The instance refused: {api}")
+            } else {
+                format!("{} ({code})", api.message)
             }
         }
         p::Error::Http(_) => format!("Could not reach the instance: {err}"),
@@ -37,99 +62,25 @@ pub fn describe(err: &p::Error) -> String {
     }
 }
 
-async fn discover(instance: &str) -> Result<p::Instance> {
-    p::Instance::discover(instance.trim()).await.map_err(|e| anyhow!(describe(&e)))
+pub async fn discover(instance: &str) -> Result<p::Instance, Failure> {
+    Ok(p::Instance::discover_with(instance.trim(), token_store::client_info()).await?)
 }
 
-/// A password sign-in that waits for a TOTP code.
-pub struct PendingTotp {
-    instance: p::Instance,
-    ticket: p::Ticket,
-}
-
-pub enum PasswordOutcome {
-    Done(p::Instance, p::Token),
-    NeedsTotp(PendingTotp),
-    /// Fluxer emailed a link to approve this device; poll with the ticket.
-    IpAuthorization(p::Instance, p::Ticket),
-}
-
-fn outcome(instance: p::Instance, result: p::SignInResult) -> Result<PasswordOutcome> {
-    match result {
-        p::SignInResult::Ok(signed_in) => Ok(PasswordOutcome::Done(instance, signed_in.token.clone())),
-        p::SignInResult::NeedsMfa { ticket, methods } => {
-            if methods
-                .iter()
-                .any(|m| matches!(m, p::MfaMethod::Totp | p::MfaMethod::BackupCodes))
-            {
-                Ok(PasswordOutcome::NeedsTotp(PendingTotp { instance, ticket }))
-            } else {
-                Err(anyhow!(
-                    "This account uses a passkey as second factor. Use \"Sign in with browser\" instead."
-                ))
-            }
-        }
-        p::SignInResult::IpAuthorizationRequired { ticket } => Ok(PasswordOutcome::IpAuthorization(instance, ticket)),
-        p::SignInResult::Captcha => Err(anyhow!(
-            "The instance asked for a CAPTCHA that Inlet could not solve. Use \"Sign in with browser\" instead."
-        )),
-        p::SignInResult::Error(api) => Err(anyhow!(describe(&p::Error::Api(Box::new(api))))),
-    }
-}
-
-pub async fn sign_in_password(instance: &str, email: &str, password: &str) -> Result<PasswordOutcome> {
+/// Starts a browser sign-in ("desktop handoff").
+pub async fn start_handoff(instance: &str) -> Result<(p::Instance, p::Handoff), Failure> {
     let instance = discover(instance).await?;
-    let result = p::sign_in_password(&instance, email, password)
-        .await
-        .map_err(|e| anyhow!(describe(&e)))?;
-    outcome(instance, result)
-}
-
-/// Sends a TOTP or backup code. On a wrong code the pending sign-in is handed back,
-/// so the person can try again with the same ticket.
-pub async fn sign_in_totp(pending: PendingTotp, code: &str) -> std::result::Result<PasswordOutcome, (String, Option<PendingTotp>)> {
-    let result = match p::sign_in_totp(&pending.instance, &pending.ticket, code).await {
-        Ok(r) => r,
-        Err(e) => return Err((describe(&e), Some(pending))),
-    };
-    match result {
-        p::SignInResult::Error(api) => Err((describe(&p::Error::Api(Box::new(api))), Some(pending))),
-        p::SignInResult::NeedsMfa { .. } => Err(("That code is not valid. Try again.".into(), Some(pending))),
-        other => outcome(pending.instance.clone(), other).map_err(|e| (e.to_string(), None)),
-    }
-}
-
-/// Polls the "approve this device" email link for up to ten minutes.
-pub async fn wait_ip_authorization(instance: p::Instance, ticket: p::Ticket) -> Result<(p::Instance, p::Token)> {
-    for _ in 0..200 {
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        match p::poll_ip_authorization(&instance, &ticket).await.map_err(|e| anyhow!(describe(&e)))? {
-            p::IpAuthorization::Completed(signed_in) => return Ok((instance, signed_in.token.clone())),
-            p::IpAuthorization::Pending => {}
-        }
-    }
-    Err(anyhow!("The approval link was not used in time. Start again."))
-}
-
-/// Starts a browser sign-in. Returns the handoff to wait on.
-pub async fn start_handoff(instance: &str) -> Result<(p::Instance, p::Handoff)> {
-    let instance = discover(instance).await?;
-    let handoff = p::Handoff::start(&instance).await.map_err(|e| anyhow!(describe(&e)))?;
+    let handoff = p::Handoff::start(&instance).await?;
     Ok((instance, handoff))
 }
 
-pub async fn wait_handoff(instance: p::Instance, handoff: p::Handoff) -> Result<(p::Instance, p::Token)> {
-    match handoff.wait(Duration::from_secs(2)).await.map_err(|e| anyhow!(describe(&e)))? {
+/// Waits until the person has approved the handoff in the browser.
+pub async fn wait_handoff(instance: p::Instance, handoff: p::Handoff) -> Result<(p::Instance, p::Token), String> {
+    match handoff.wait(Duration::from_secs(3)).await.map_err(|e| describe(&e))? {
         p::HandoffStatus::Completed(signed_in) => Ok((instance, signed_in.token.clone())),
-        p::HandoffStatus::Denied => Err(anyhow!("The sign-in was denied in the browser.")),
-        p::HandoffStatus::Expired => Err(anyhow!("The code expired. Start again.")),
-        p::HandoffStatus::Pending => Err(anyhow!("The sign-in did not finish.")),
+        p::HandoffStatus::Denied => Err("The sign-in was denied in the browser.".into()),
+        p::HandoffStatus::Expired => Err("The code expired. Start again.".into()),
+        p::HandoffStatus::Pending => Err("The sign-in did not finish.".into()),
     }
-}
-
-/// Discovers the instance for a stored or pasted token.
-pub async fn instance_for_token(instance: &str) -> Result<p::Instance> {
-    discover(instance).await
 }
 
 fn channel_kind(kind: i64) -> ChannelKind {
@@ -147,6 +98,7 @@ fn to_channel(c: &p::Channel) -> Channel {
     let name = match (&c.name, c.recipients.is_empty()) {
         (Some(n), _) if !n.is_empty() => n.clone(),
         (_, false) => c.recipients.iter().map(|u| u.display_name().to_string()).collect::<Vec<_>>().join(", "),
+        _ if c.kind == channel_type::PERSONAL_NOTES => "personal notes".into(),
         _ => format!("channel {}", c.id),
     };
     Channel {
@@ -177,7 +129,7 @@ fn to_message(m: &p::Message) -> Message {
     }
 }
 
-/// Snowflakes compare as numbers; shorter strings are older.
+/// Snowflakes compare as numbers; a shorter string is older.
 fn snowflake_key(id: &str) -> (usize, &str) {
     (id.len(), id)
 }
@@ -186,21 +138,27 @@ pub struct RealSession {
     session: p::Session,
     gateway: p::GatewayHandle,
     events: UnboundedSender<Event>,
+    ended: TokioSender<String>,
     channel_cache: HashMap<Option<String>, Vec<Channel>>,
     active_guild: Option<String>,
     forward: tokio::task::JoinHandle<()>,
 }
 
 impl RealSession {
-    /// Checks the token, loads guilds and starts the gateway.
-    pub async fn start(instance: p::Instance, token: p::Token, events: UnboundedSender<Event>) -> Result<Self> {
+    /// Checks the token, loads guilds and starts the gateway. Must run inside the
+    /// backend's tokio runtime. `ended` receives a message when the session ends for good.
+    pub async fn start(
+        instance: p::Instance,
+        token: p::Token,
+        events: UnboundedSender<Event>,
+        ended: TokioSender<String>,
+    ) -> Result<Self, Failure> {
         let session = p::Session::from_token(instance, token);
-        let me = session.client().me().await.map_err(|e| anyhow!(describe(&e)))?;
+        let me = session.client().me().await?;
         let guilds: Vec<Guild> = session
             .client()
             .guilds()
-            .await
-            .map_err(|e| anyhow!(describe(&e)))?
+            .await?
             .into_iter()
             .map(|g| Guild { id: g.id, name: g.name })
             .collect();
@@ -215,14 +173,15 @@ impl RealSession {
         let (gateway, mut rx) = session.connect_gateway(p::GatewayOptions::default());
         let forward = {
             let events = events.clone();
+            let ended = ended.clone();
             tokio::spawn(async move {
                 while let Some(event) = rx.recv().await {
-                    forward_gateway_event(event, &events, &guilds);
+                    forward_gateway_event(event, &events, &guilds, &ended);
                 }
             })
         };
 
-        Ok(Self { session, gateway, events, channel_cache: HashMap::new(), active_guild: None, forward })
+        Ok(Self { session, gateway, events, ended, channel_cache: HashMap::new(), active_guild: None, forward })
     }
 
     pub fn instance(&self) -> &str {
@@ -233,10 +192,10 @@ impl RealSession {
         self.session.token()
     }
 
-    /// Signs out on the server (ends this session's token) and stops the gateway.
+    /// Signs out on the server (ends this token) and stops the gateway.
     pub async fn close(self) {
         if let Err(err) = self.session.client().sign_out().await {
-            log::warn!("server sign-out failed: {err}");
+            log::warn!("server sign-out failed: {}", describe(&err));
         }
     }
 
@@ -244,12 +203,20 @@ impl RealSession {
         let _ = self.events.unbounded_send(event);
     }
 
+    fn fail(&self, prefix: &str, err: p::Error) {
+        if ends_session(&err) {
+            let _ = self.ended.send(describe(&err));
+        } else {
+            self.emit(Event::Error(format!("{prefix}{}", describe(&err))));
+        }
+    }
+
     pub async fn open_guild(&mut self, guild_id: Option<String>) {
         if let Some(previous) = self.active_guild.take() {
             self.gateway.set_guild_active(&previous, false);
         }
         if let Some(id) = &guild_id {
-            // Large guilds are passive until a session marks them active.
+            // Guilds with more than 250 members are passive until marked active.
             self.gateway.set_guild_active(id, true);
             self.active_guild = Some(id.clone());
         }
@@ -268,18 +235,19 @@ impl RealSession {
                 self.channel_cache.insert(guild_id.clone(), channels.clone());
                 self.emit(Event::Channels { guild_id, channels });
             }
-            Err(err) => self.emit(Event::Error(describe(&err))),
+            Err(err) => self.fail("Could not load channels: ", err),
         }
     }
 
     pub async fn open_channel(&mut self, channel_id: String) {
         match self.session.client().messages(&channel_id, None, 50).await {
             Ok(list) => {
+                // The API returns newest first; the view wants oldest first.
                 let mut messages: Vec<Message> = list.iter().map(to_message).collect();
                 messages.sort_by(|a, b| snowflake_key(&a.id).cmp(&snowflake_key(&b.id)));
                 self.emit(Event::Messages { channel_id, messages });
             }
-            Err(err) => self.emit(Event::Error(describe(&err))),
+            Err(err) => self.fail("Could not load messages: ", err),
         }
     }
 
@@ -287,7 +255,7 @@ impl RealSession {
         let nonce = p::new_nonce();
         match self.session.client().send_message(&channel_id, &text, Some(&nonce)).await {
             Ok(message) => self.emit(Event::MessageCreated(to_message(&message))),
-            Err(err) => self.emit(Event::Error(format!("Could not send: {}", describe(&err)))),
+            Err(err) => self.fail("Could not send: ", err),
         }
     }
 }
@@ -299,7 +267,12 @@ impl Drop for RealSession {
     }
 }
 
-fn forward_gateway_event(event: p::GatewayEvent, events: &UnboundedSender<Event>, guilds: &Arc<Mutex<Vec<Guild>>>) {
+fn forward_gateway_event(
+    event: p::GatewayEvent,
+    events: &UnboundedSender<Event>,
+    guilds: &Arc<Mutex<Vec<Guild>>>,
+    ended: &TokioSender<String>,
+) {
     let send = |e: Event| {
         let _ = events.unbounded_send(e);
     };
@@ -314,7 +287,7 @@ fn forward_gateway_event(event: p::GatewayEvent, events: &UnboundedSender<Event>
                     format!("Reconnecting in {} s\u{2026}", delay.as_secs())
                 }
                 p::ConnectionState::Closed(p::CloseReason::AuthenticationFailed) => {
-                    send(Event::Error("The instance ended this session. Sign out and sign in again.".into()));
+                    let _ = ended.send("The instance ended this session. Sign in again.".into());
                     "Disconnected".into()
                 }
                 p::ConnectionState::Closed(reason) => format!("Disconnected ({reason:?})"),
