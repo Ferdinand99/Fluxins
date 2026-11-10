@@ -9,12 +9,12 @@ mod common;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use futures_util::{SinkExt, StreamExt};
 use inlet_protocol::gateway::codec::ZstdStream;
 use inlet_protocol::{
-    ClientInfo, CloseReason, ConnectionState, Discovery, Dispatch, Gateway, GatewayEvent, GatewayOptions, Instance,
-    Token,
+    ClientInfo, CloseReason, ConnectionState, Discovery, Dispatch, Gateway, GatewayEvent,
+    GatewayOptions, Instance, Token,
 };
-use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::Receiver;
@@ -39,14 +39,17 @@ impl Conn {
             .unwrap();
         let uri = Arc::new(Mutex::new(String::new()));
         let seen = uri.clone();
-        let ws = tokio_tungstenite::accept_hdr_async(stream, move |req: &Request, resp: Response| {
-            *seen.lock().unwrap() = req.uri().to_string();
-            Ok(resp)
-        })
-        .await
-        .unwrap();
+        let ws =
+            tokio_tungstenite::accept_hdr_async(stream, move |req: &Request, resp: Response| {
+                *seen.lock().unwrap() = req.uri().to_string();
+                Ok(resp)
+            })
+            .await
+            .unwrap();
         let query = uri.lock().unwrap().clone();
-        let codec = query.contains("compress=zstd-stream").then(|| ZstdStream::new().unwrap());
+        let codec = query
+            .contains("compress=zstd-stream")
+            .then(|| ZstdStream::new().unwrap());
         Conn { ws, codec, query }
     }
 
@@ -69,7 +72,12 @@ impl Conn {
                 .unwrap();
             let bytes = match msg {
                 WsMessage::Text(t) => t.as_str().as_bytes().to_vec(),
-                WsMessage::Binary(b) => self.codec.as_mut().expect("binary only with zstd").decompress(&b).unwrap(),
+                WsMessage::Binary(b) => self
+                    .codec
+                    .as_mut()
+                    .expect("binary only with zstd")
+                    .decompress(&b)
+                    .unwrap(),
                 WsMessage::Close(_) => panic!("client closed"),
                 _ => continue,
             };
@@ -82,18 +90,23 @@ impl Conn {
     }
 
     async fn hello(&mut self, interval_ms: u64) {
-        self.send(json!({"op": 10, "d": {"heartbeat_interval": interval_ms}})).await;
+        self.send(json!({"op": 10, "d": {"heartbeat_interval": interval_ms}}))
+            .await;
     }
 
     async fn dispatch(&mut self, seq: u64, name: &str, d: Value) {
-        self.send(json!({"op": 0, "s": seq, "t": name, "d": d})).await;
+        self.send(json!({"op": 0, "s": seq, "t": name, "d": d}))
+            .await;
     }
 }
 
 fn instance_for(port: u16) -> Instance {
     let base = "http://127.0.0.1:9";
-    let doc: Discovery =
-        serde_json::from_value(common::discovery_json(base, &format!("ws://127.0.0.1:{port}/gateway"))).unwrap();
+    let doc: Discovery = serde_json::from_value(common::discovery_json(
+        base,
+        &format!("ws://127.0.0.1:{port}/gateway"),
+    ))
+    .unwrap();
     Instance::from_cached(base, doc, None, ClientInfo::default()).unwrap()
 }
 
@@ -123,7 +136,10 @@ fn ready(session: &str) -> Value {
     })
 }
 
-async fn next_dispatch(events: &mut Receiver<GatewayEvent>, states: &mut Vec<ConnectionState>) -> (u64, Dispatch) {
+async fn next_dispatch(
+    events: &mut Receiver<GatewayEvent>,
+    states: &mut Vec<ConnectionState>,
+) -> (u64, Dispatch) {
     loop {
         let ev = timeout(Duration::from_secs(10), events.recv())
             .await
@@ -138,7 +154,10 @@ async fn next_dispatch(events: &mut Receiver<GatewayEvent>, states: &mut Vec<Con
 
 async fn next_state(events: &mut Receiver<GatewayEvent>) -> ConnectionState {
     loop {
-        let ev = timeout(Duration::from_secs(10), events.recv()).await.expect("event in time").expect("alive");
+        let ev = timeout(Duration::from_secs(10), events.recv())
+            .await
+            .expect("event in time")
+            .expect("alive");
         if let GatewayEvent::State(s) = ev {
             return s;
         }
@@ -149,7 +168,11 @@ async fn next_state(events: &mut Receiver<GatewayEvent>) -> ConnectionState {
 async fn identify_dispatch_and_resume_with_zstd() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let (handle, mut events) = Gateway::connect(instance_for(port), Token::new("gw-token"), fast_options(true));
+    let (handle, mut events) = Gateway::connect(
+        instance_for(port),
+        Token::new("gw-token"),
+        fast_options(true),
+    );
     let mut states = Vec::new();
 
     // First connection: Hello, Identify, READY, a message, then the socket dies.
@@ -173,7 +196,12 @@ async fn identify_dispatch_and_resume_with_zstd() {
         m
     })
     .await;
-    c1.dispatch(3, "PRESENCE_UPDATE", json!({"user": {"id": "11"}, "status": "online"})).await;
+    c1.dispatch(
+        3,
+        "PRESENCE_UPDATE",
+        json!({"user": {"id": "11"}, "status": "online"}),
+    )
+    .await;
 
     let (seq, ev) = next_dispatch(&mut events, &mut states).await;
     assert_eq!(seq, 1);
@@ -197,7 +225,10 @@ async fn identify_dispatch_and_resume_with_zstd() {
         other => panic!("{other:?}"),
     }
     let (_, ev) = next_dispatch(&mut events, &mut states).await;
-    assert!(matches!(ev, Dispatch::Other { ref name, .. } if name == "PRESENCE_UPDATE"), "{ev:?}");
+    assert!(
+        matches!(ev, Dispatch::Other { ref name, .. } if name == "PRESENCE_UPDATE"),
+        "{ev:?}"
+    );
     assert!(states.contains(&ConnectionState::Identifying));
     assert!(states.contains(&ConnectionState::Connected));
     drop(c1);
@@ -211,20 +242,41 @@ async fn identify_dispatch_and_resume_with_zstd() {
     assert_eq!(resume["d"]["seq"], 3);
     assert_eq!(resume["d"]["token"], "gw-token");
     // Replay one missed event, then RESUMED.
-    c2.dispatch(4, "MESSAGE_DELETE", json!({"id": "500", "channel_id": "200", "guild_id": "100"})).await;
+    c2.dispatch(
+        4,
+        "MESSAGE_DELETE",
+        json!({"id": "500", "channel_id": "200", "guild_id": "100"}),
+    )
+    .await;
     c2.dispatch(4, "RESUMED", json!({})).await;
-    c2.dispatch(5, "TYPING_START", json!({"channel_id": "200", "user_id": "11", "timestamp": 1_800_000_000})).await;
+    c2.dispatch(
+        5,
+        "TYPING_START",
+        json!({"channel_id": "200", "user_id": "11", "timestamp": 1_800_000_000}),
+    )
+    .await;
 
     states.clear();
     let (_, ev) = next_dispatch(&mut events, &mut states).await;
-    assert!(matches!(ev, Dispatch::MessageDelete(ref d) if d.id == "500"), "{ev:?}");
-    assert!(states.iter().any(|s| matches!(s, ConnectionState::Reconnecting { .. })), "{states:?}");
+    assert!(
+        matches!(ev, Dispatch::MessageDelete(ref d) if d.id == "500"),
+        "{ev:?}"
+    );
+    assert!(
+        states
+            .iter()
+            .any(|s| matches!(s, ConnectionState::Reconnecting { .. })),
+        "{states:?}"
+    );
     assert!(states.contains(&ConnectionState::Resuming), "{states:?}");
     let (_, ev) = next_dispatch(&mut events, &mut states).await;
     assert_eq!(ev, Dispatch::Resumed);
     let (seq, ev) = next_dispatch(&mut events, &mut states).await;
     assert_eq!(seq, 5);
-    assert!(matches!(ev, Dispatch::TypingStart(ref t) if t.user_id == "11"), "{ev:?}");
+    assert!(
+        matches!(ev, Dispatch::TypingStart(ref t) if t.user_id == "11"),
+        "{ev:?}"
+    );
 
     // Commands reach the server, compressed.
     handle.set_guild_active("100", true);
@@ -248,7 +300,8 @@ async fn identify_dispatch_and_resume_with_zstd() {
 async fn heartbeats_and_answers_server_heartbeat() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let (_handle, mut events) = Gateway::connect(instance_for(port), Token::new("gw-hb"), fast_options(false));
+    let (_handle, mut events) =
+        Gateway::connect(instance_for(port), Token::new("gw-hb"), fast_options(false));
     let mut c = Conn::accept(&listener).await;
     assert!(!c.query.contains("compress"));
     c.hello(300).await;
@@ -270,7 +323,9 @@ async fn heartbeats_and_answers_server_heartbeat() {
     c.send(json!({"op": 11})).await;
     // A server heartbeat request gets an immediate answer.
     c.send(json!({"op": 1, "d": null})).await;
-    let answer = timeout(Duration::from_millis(250), c.recv(true)).await.expect("immediate heartbeat");
+    let answer = timeout(Duration::from_millis(250), c.recv(true))
+        .await
+        .expect("immediate heartbeat");
     assert_eq!(answer["op"], 1);
 }
 
@@ -278,7 +333,11 @@ async fn heartbeats_and_answers_server_heartbeat() {
 async fn missing_ack_reconnects_and_resumes() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let (_handle, mut events) = Gateway::connect(instance_for(port), Token::new("gw-zombie"), fast_options(false));
+    let (_handle, mut events) = Gateway::connect(
+        instance_for(port),
+        Token::new("gw-zombie"),
+        fast_options(false),
+    );
     let mut c = Conn::accept(&listener).await;
     c.hello(200).await;
     c.recv(false).await;
@@ -298,7 +357,8 @@ async fn missing_ack_reconnects_and_resumes() {
 async fn invalid_session_identifies_again() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let (_handle, mut events) = Gateway::connect(instance_for(port), Token::new("gw-inv"), fast_options(true));
+    let (_handle, mut events) =
+        Gateway::connect(instance_for(port), Token::new("gw-inv"), fast_options(true));
     let mut c = Conn::accept(&listener).await;
     c.hello(45_000).await;
     assert_eq!(c.recv(false).await["op"], 2);
@@ -316,7 +376,11 @@ async fn invalid_session_identifies_again() {
 async fn auth_failure_stops_for_good() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let (_handle, mut events) = Gateway::connect(instance_for(port), Token::new("gw-bad"), fast_options(false));
+    let (_handle, mut events) = Gateway::connect(
+        instance_for(port),
+        Token::new("gw-bad"),
+        fast_options(false),
+    );
     let mut c = Conn::accept(&listener).await;
     c.hello(45_000).await;
     c.recv(false).await;
@@ -337,14 +401,17 @@ async fn auth_failure_stops_for_good() {
         }
     }
     // No second connection attempt.
-    assert!(timeout(Duration::from_millis(300), listener.accept()).await.is_err());
+    assert!(timeout(Duration::from_millis(300), listener.accept())
+        .await
+        .is_err());
 }
 
 #[tokio::test]
 async fn server_reconnect_request_resumes() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let (_handle, mut events) = Gateway::connect(instance_for(port), Token::new("gw-op7"), fast_options(true));
+    let (_handle, mut events) =
+        Gateway::connect(instance_for(port), Token::new("gw-op7"), fast_options(true));
     let mut c = Conn::accept(&listener).await;
     c.hello(45_000).await;
     c.recv(false).await;

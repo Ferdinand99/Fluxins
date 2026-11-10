@@ -50,18 +50,26 @@ fn parse(parameters: &Value) -> Result<Params> {
             .and_then(Value::as_str)
             .ok_or_else(|| Error::Captcha(format!("challenge has no {k}")))
     };
-    let hexd = |k: &str| -> Result<Vec<u8>> { hex::decode(s(k)?).map_err(|_| Error::Captcha(format!("{k} is not hex"))) };
+    let hexd = |k: &str| -> Result<Vec<u8>> {
+        hex::decode(s(k)?).map_err(|_| Error::Captcha(format!("{k} is not hex")))
+    };
     let cost = parameters
         .get("cost")
         .and_then(Value::as_u64)
         .filter(|c| *c >= 1 && *c <= 10_000_000)
         .ok_or_else(|| Error::Captcha("bad cost".into()))? as u32;
-    let key_length = parameters.get("keyLength").and_then(Value::as_u64).unwrap_or(32) as usize;
+    let key_length = parameters
+        .get("keyLength")
+        .and_then(Value::as_u64)
+        .unwrap_or(32) as usize;
     if !(1..=128).contains(&key_length) {
         return Err(Error::Captcha("bad keyLength".into()));
     }
     let prefix_hex = s("keyPrefix")?.to_ascii_lowercase();
-    if prefix_hex.is_empty() || prefix_hex.len() > key_length * 2 || !prefix_hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if prefix_hex.is_empty()
+        || prefix_hex.len() > key_length * 2
+        || !prefix_hex.bytes().all(|b| b.is_ascii_hexdigit())
+    {
         return Err(Error::Captcha("bad keyPrefix".into()));
     }
     Ok(Params {
@@ -92,7 +100,9 @@ pub fn solve_blocking(challenge: &Value, timeout: Duration) -> Result<String> {
     // Fail fast on an unsupported algorithm.
     derive(&params.algorithm, b"", b"", 1, &mut [0u8; 1])?;
 
-    let workers = std::thread::available_parallelism().map_or(2, |n| n.get()).clamp(1, 8);
+    let workers = std::thread::available_parallelism()
+        .map_or(2, |n| n.get())
+        .clamp(1, 8);
     let stop = Arc::new(AtomicBool::new(false));
     let start = Instant::now();
     let found = std::thread::scope(|scope| {
@@ -122,7 +132,8 @@ pub fn solve_blocking(challenge: &Value, timeout: Duration) -> Result<String> {
             .filter_map(|h| h.join().ok().flatten())
             .min_by_key(|(c, _)| *c)
     });
-    let (counter, key) = found.ok_or_else(|| Error::Captcha("no solution before the timeout".into()))?;
+    let (counter, key) =
+        found.ok_or_else(|| Error::Captcha("no solution before the timeout".into()))?;
     let token = json!({
         "challenge": { "parameters": parameters, "signature": signature },
         "solution": {
@@ -206,7 +217,9 @@ mod tests {
         let challenge = make_test_challenge(1234, 50);
         let token = solve_blocking(&challenge, Duration::from_secs(60)).unwrap();
         assert!(verify_test_token(&token));
-        let raw = base64::engine::general_purpose::STANDARD.decode(&token).unwrap();
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(&token)
+            .unwrap();
         let v: Value = serde_json::from_slice(&raw).unwrap();
         // Parameters and signature are copied unchanged.
         assert_eq!(v["challenge"], challenge);

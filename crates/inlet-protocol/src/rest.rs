@@ -32,9 +32,8 @@ pub(crate) struct RawResponse {
 
 impl RawResponse {
     pub(crate) fn json<T: DeserializeOwned>(&self) -> Result<T> {
-        serde_json::from_slice(&self.body).map_err(|e| {
-            Error::Decode(format!("{e} (HTTP {})", self.status))
-        })
+        serde_json::from_slice(&self.body)
+            .map_err(|e| Error::Decode(format!("{e} (HTTP {})", self.status)))
     }
 
     pub(crate) fn value(&self) -> Value {
@@ -45,7 +44,10 @@ impl RawResponse {
         let mut err: ApiError = serde_json::from_slice(&self.body).unwrap_or(ApiError {
             status: 0,
             code: String::new(),
-            message: String::from_utf8_lossy(&self.body).chars().take(200).collect(),
+            message: String::from_utf8_lossy(&self.body)
+                .chars()
+                .take(200)
+                .collect(),
             errors: None,
         });
         err.status = self.status;
@@ -85,7 +87,10 @@ pub(crate) async fn send(
             .header("Accept", "application/json")
             .header("X-Fluxer-Features", FLUXER_FEATURES)
             .header("X-Fluxer-Capabilities", FLUXER_CAPABILITIES)
-            .header("X-Fluxer-Client-Installation-ID", &inner.info.installation_id);
+            .header(
+                "X-Fluxer-Client-Installation-ID",
+                &inner.info.installation_id,
+            );
         if let Some(t) = token {
             builder = builder.header("Authorization", t.expose_secret());
         }
@@ -109,7 +114,9 @@ pub(crate) async fn send(
         limiter.record_headers(
             &route,
             header_f64("x-ratelimit-remaining").map(|v| v.max(0.0) as u32),
-            header_f64("x-ratelimit-reset-after").filter(|v| *v >= 0.0).map(Duration::from_secs_f64),
+            header_f64("x-ratelimit-reset-after")
+                .filter(|v| *v >= 0.0)
+                .map(Duration::from_secs_f64),
         );
 
         if status == 429 {
@@ -120,8 +127,14 @@ pub(crate) async fn send(
                 .or_else(|| header_f64("retry-after"))
                 .unwrap_or(1.0)
                 .max(0.001);
-            let global = parsed.get("global").and_then(Value::as_bool).unwrap_or(false)
-                || headers.get("x-ratelimit-global").and_then(|v| v.to_str().ok()) == Some("true");
+            let global = parsed
+                .get("global")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+                || headers
+                    .get("x-ratelimit-global")
+                    .and_then(|v| v.to_str().ok())
+                    == Some("true");
             let wait = Duration::from_secs_f64(retry_after);
             limiter.record_429(&route, wait, global);
             tracing::warn!(route = %route, ?wait, global, "rate limited by the instance");
@@ -193,7 +206,12 @@ impl Client {
 
     /// Sends any request and returns the parsed JSON (or `Value::Null` for 204).
     /// Use it for routes this crate has no method for yet.
-    pub async fn request_json(&self, method: Method, path: &str, body: Option<&Value>) -> Result<Value> {
+    pub async fn request_json(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&Value>,
+    ) -> Result<Value> {
         let raw = self.raw(method, path, body).await?;
         if raw.body.is_empty() {
             return Ok(Value::Null);
@@ -248,7 +266,8 @@ impl Client {
 
     /// `GET /guilds/{id}/channels`: the guild's channels the account can see.
     pub async fn channels(&self, guild_id: &str) -> Result<Vec<Channel>> {
-        self.get(&format!("/guilds/{}/channels", enc(guild_id))).await
+        self.get(&format!("/guilds/{}/channels", enc(guild_id)))
+            .await
     }
 
     /// `GET /users/@me/channels`: DMs and group DMs.
@@ -258,7 +277,12 @@ impl Client {
 
     /// `GET /channels/{id}/messages`: up to `limit` (1-100) messages before
     /// `before`, newest first, as the API returns them.
-    pub async fn messages(&self, channel_id: &str, before: Option<&str>, limit: u8) -> Result<Vec<Message>> {
+    pub async fn messages(
+        &self,
+        channel_id: &str,
+        before: Option<&str>,
+        limit: u8,
+    ) -> Result<Vec<Message>> {
         let limit = limit.clamp(1, 100);
         let mut path = format!("/channels/{}/messages?limit={limit}", enc(channel_id));
         if let Some(b) = before {
@@ -270,19 +294,33 @@ impl Client {
 
     /// `POST /channels/{id}/messages` with text content. Pass a `nonce` (see
     /// [`new_nonce`]) to match the MESSAGE_CREATE echo to an optimistic message.
-    pub async fn send_message(&self, channel_id: &str, content: &str, nonce: Option<&str>) -> Result<Message> {
+    pub async fn send_message(
+        &self,
+        channel_id: &str,
+        content: &str,
+        nonce: Option<&str>,
+    ) -> Result<Message> {
         let mut body = json!({ "content": content });
         if let Some(n) = nonce {
             body["nonce"] = Value::String(n.to_owned());
         }
-        self.raw(Method::POST, &format!("/channels/{}/messages", enc(channel_id)), Some(&body))
-            .await?
-            .json()
+        self.raw(
+            Method::POST,
+            &format!("/channels/{}/messages", enc(channel_id)),
+            Some(&body),
+        )
+        .await?
+        .json()
     }
 
     /// `POST /channels/{id}/typing`: shows the typing indicator for about 10 seconds.
     pub async fn trigger_typing(&self, channel_id: &str) -> Result<()> {
-        self.raw(Method::POST, &format!("/channels/{}/typing", enc(channel_id)), None).await?;
+        self.raw(
+            Method::POST,
+            &format!("/channels/{}/typing", enc(channel_id)),
+            None,
+        )
+        .await?;
         Ok(())
     }
 

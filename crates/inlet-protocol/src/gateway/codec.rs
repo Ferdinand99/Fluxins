@@ -45,7 +45,10 @@ mod tests {
         let mut a = ZstdStream::new().unwrap();
         let mut b = ZstdStream::new().unwrap();
         for i in 0..20 {
-            let msg = format!("{{\"op\":0,\"s\":{i},\"d\":{{\"content\":\"{}\"}}}}", "x".repeat(i * 50));
+            let msg = format!(
+                "{{\"op\":0,\"s\":{i},\"d\":{{\"content\":\"{}\"}}}}",
+                "x".repeat(i * 50)
+            );
             let frame = a.compress(msg.as_bytes()).unwrap();
             assert!(!frame.is_empty());
             let out = b.decompress(&frame).unwrap();

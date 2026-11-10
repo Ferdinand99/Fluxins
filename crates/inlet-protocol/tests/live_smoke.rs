@@ -7,9 +7,9 @@
 
 use std::time::Duration;
 
+use futures_util::{SinkExt, StreamExt};
 use inlet_protocol::gateway::{codec::ZstdStream, gateway_url, tls_connector};
 use inlet_protocol::Instance;
-use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
@@ -29,7 +29,9 @@ async fn read_zstd(ws: &mut Ws, codec: &mut ZstdStream) -> Value {
             .expect("socket open")
             .expect("frame");
         match msg {
-            WsMessage::Binary(b) => return serde_json::from_slice(&codec.decompress(&b).unwrap()).unwrap(),
+            WsMessage::Binary(b) => {
+                return serde_json::from_slice(&codec.decompress(&b).unwrap()).unwrap()
+            }
             WsMessage::Text(t) => panic!("expected a zstd binary frame, got text {t}"),
             WsMessage::Close(f) => panic!("closed: {f:?}"),
             _ => continue,
@@ -53,7 +55,10 @@ async fn live_discovery_openapi_and_gateway_hello() {
     println!("refresh kept etag: {}", again.etag() == instance.etag());
 
     let ua = instance.client_info().user_agent.clone();
-    let http = reqwest::Client::builder().user_agent(ua.clone()).build().unwrap();
+    let http = reqwest::Client::builder()
+        .user_agent(ua.clone())
+        .build()
+        .unwrap();
     let resp = http
         .get(format!("{}/openapi.json", instance.api_base()))
         .send()
@@ -65,7 +70,9 @@ async fn live_discovery_openapi_and_gateway_hello() {
         "openapi      HTTP {} {} paths, {} schemas",
         status,
         doc["paths"].as_object().map_or(0, |p| p.len()),
-        doc["components"]["schemas"].as_object().map_or(0, |s| s.len()),
+        doc["components"]["schemas"]
+            .as_object()
+            .map_or(0, |s| s.len()),
     );
     for path in [
         "/auth/login",
@@ -85,16 +92,19 @@ async fn live_discovery_openapi_and_gateway_hello() {
     let mut req = url.as_str().into_client_request().unwrap();
     req.headers_mut().insert("User-Agent", ua.parse().unwrap());
     // The same TLS setup as the gateway task.
-    let (mut ws, _) = tokio_tungstenite::connect_async_tls_with_config(req, None, true, tls_connector())
-        .await
-        .expect("gateway connect");
+    let (mut ws, _) =
+        tokio_tungstenite::connect_async_tls_with_config(req, None, true, tls_connector())
+            .await
+            .expect("gateway connect");
     let mut codec = ZstdStream::new().unwrap();
     let hello = read_zstd(&mut ws, &mut codec).await;
     println!("gateway      Hello: {hello}");
     assert_eq!(hello["op"], 10);
     assert!(hello["d"]["heartbeat_interval"].as_u64().is_some());
 
-    let beat = codec.compress(json!({"op": 1, "d": null}).to_string().as_bytes()).unwrap();
+    let beat = codec
+        .compress(json!({"op": 1, "d": null}).to_string().as_bytes())
+        .unwrap();
     ws.send(WsMessage::binary(beat)).await.unwrap();
     let ack = read_zstd(&mut ws, &mut codec).await;
     println!("gateway      after Heartbeat: {ack}");

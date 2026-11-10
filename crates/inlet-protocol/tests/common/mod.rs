@@ -44,7 +44,9 @@ pub async fn instance() -> (MockServer, Instance) {
         installation_id: "00000000-0000-4000-a000-000000000000".into(),
         ..ClientInfo::default()
     };
-    let instance = Instance::discover_with(&server.uri(), info).await.expect("discovery");
+    let instance = Instance::discover_with(&server.uri(), info)
+        .await
+        .expect("discovery");
     (server, instance)
 }
 

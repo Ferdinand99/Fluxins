@@ -156,14 +156,21 @@ impl RateLimiter {
     }
 
     fn refill(&self, state: &mut State, now: Instant) {
-        let elapsed = now.saturating_duration_since(state.last_refill).as_secs_f64();
-        state.tokens = (state.tokens + elapsed * self.config.rate_per_sec)
-            .min(f64::from(self.config.burst));
+        let elapsed = now
+            .saturating_duration_since(state.last_refill)
+            .as_secs_f64();
+        state.tokens =
+            (state.tokens + elapsed * self.config.rate_per_sec).min(f64::from(self.config.burst));
         state.last_refill = now;
     }
 
     /// Records the route bucket headers of a response.
-    pub fn record_headers(&self, route: &str, remaining: Option<u32>, reset_after: Option<Duration>) {
+    pub fn record_headers(
+        &self,
+        route: &str,
+        remaining: Option<u32>,
+        reset_after: Option<Duration>,
+    ) {
         if remaining.is_none() && reset_after.is_none() {
             return;
         }
@@ -215,7 +222,11 @@ pub(crate) fn route_key(method: &reqwest::Method, path: &str) -> String {
 mod tests {
     use super::*;
 
-    async fn run_concurrent(limiter: Arc<RateLimiter>, callers: usize, route: impl Fn(usize) -> String) -> Vec<Instant> {
+    async fn run_concurrent(
+        limiter: Arc<RateLimiter>,
+        callers: usize,
+        route: impl Fn(usize) -> String,
+    ) -> Vec<Instant> {
         let times = Arc::new(Mutex::new(Vec::new()));
         let mut handles = Vec::new();
         for i in 0..callers {
@@ -255,7 +266,10 @@ mod tests {
         assert_eq!(times.len(), 300);
         let peak = max_in_window(&times, Duration::from_secs(1));
         assert!(peak <= config.max_per_second() as usize, "peak {peak}");
-        assert!(peak < 50, "peak {peak} must stay below the API's global limit");
+        assert!(
+            peak < 50,
+            "peak {peak} must stay below the API's global limit"
+        );
         // 280 requests after the burst at 10/s take about 28 s.
         let span = *times.last().unwrap() - times[0];
         assert!(span >= Duration::from_secs(27), "span {span:?}");
@@ -273,7 +287,10 @@ mod tests {
         // The burst starts at once, then one every 200 ms.
         assert!(times[2] - start < Duration::from_millis(5));
         let total = *times.last().unwrap() - start;
-        assert!(total >= Duration::from_millis(3_900) && total <= Duration::from_millis(4_200), "{total:?}");
+        assert!(
+            total >= Duration::from_millis(3_900) && total <= Duration::from_millis(4_200),
+            "{total:?}"
+        );
         assert!(max_in_window(&times, Duration::from_secs(1)) <= config.max_per_second() as usize);
     }
 

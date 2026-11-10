@@ -57,7 +57,9 @@ async fn endpoints_send_token_and_parse_models() {
         .and(path("/api/v1/users/@me"))
         .and(auth())
         .and(|req: &wiremock::Request| {
-            req.headers.get("x-fluxer-features").and_then(|v| v.to_str().ok())
+            req.headers
+                .get("x-fluxer-features")
+                .and_then(|v| v.to_str().ok())
                 == Some("view_channel_members_permission,channel_threads")
         })
         .and(header_exists("X-Fluxer-Client-Installation-ID"))
@@ -112,7 +114,9 @@ async fn endpoints_send_token_and_parse_models() {
         .and(path("/api/v1/channels/200/messages"))
         .and(auth())
         .and(body_json(json!({"content": "hello", "nonce": "12345"})))
-        .respond_with(ResponseTemplate::new(200).set_body_json(common::message_json("1001", "200", "hello")))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(common::message_json("1001", "200", "hello")),
+        )
         .expect(1)
         .mount(&server)
         .await;
@@ -139,9 +143,15 @@ async fn endpoints_send_token_and_parse_models() {
     let messages = client.messages("200", Some("1000"), 50).await.unwrap();
     assert_eq!(messages.len(), 2);
     assert_eq!(messages[0].content, "second");
-    assert_eq!(messages[0].attachments[0].content_type.as_deref(), Some("image/png"));
+    assert_eq!(
+        messages[0].attachments[0].content_type.as_deref(),
+        Some("image/png")
+    );
 
-    let sent = client.send_message("200", "hello", Some("12345")).await.unwrap();
+    let sent = client
+        .send_message("200", "hello", Some("12345"))
+        .await
+        .unwrap();
     assert_eq!(sent.id, "1001");
 }
 
@@ -171,7 +181,10 @@ async fn route_429_is_retried_after_retry_after() {
     assert_eq!(me.id, "10");
     // Waited the body's retry_after (0.3 s), not the rounded header (1 s).
     let waited = start.elapsed();
-    assert!(waited >= Duration::from_millis(300) && waited < Duration::from_millis(1000), "{waited:?}");
+    assert!(
+        waited >= Duration::from_millis(300) && waited < Duration::from_millis(1000),
+        "{waited:?}"
+    );
 }
 
 #[tokio::test]
@@ -194,15 +207,24 @@ async fn global_429_stops_and_reports_revocation() {
 async fn unauthorized_and_api_errors() {
     let (server, instance) = common::instance().await;
     Mock::given(path("/api/v1/users/@me"))
-        .respond_with(ResponseTemplate::new(401).set_body_json(json!({"code": "UNAUTHORIZED", "message": "no"})))
+        .respond_with(
+            ResponseTemplate::new(401)
+                .set_body_json(json!({"code": "UNAUTHORIZED", "message": "no"})),
+        )
         .mount(&server)
         .await;
     Mock::given(path("/api/v1/guilds/1/channels"))
-        .respond_with(ResponseTemplate::new(404).set_body_json(json!({"code": "UNKNOWN_GUILD", "message": "Unknown guild"})))
+        .respond_with(
+            ResponseTemplate::new(404)
+                .set_body_json(json!({"code": "UNKNOWN_GUILD", "message": "Unknown guild"})),
+        )
         .mount(&server)
         .await;
     let client = Client::new(instance, Token::new("tok-401"));
-    assert!(matches!(client.me().await.unwrap_err(), Error::Unauthorized));
+    assert!(matches!(
+        client.me().await.unwrap_err(),
+        Error::Unauthorized
+    ));
     match client.channels("1").await.unwrap_err() {
         Error::Api(e) => {
             assert_eq!(e.status, 404);
@@ -233,7 +255,9 @@ async fn concurrent_requests_respect_the_shared_cap() {
     let mut tasks = Vec::new();
     for i in 0..45 {
         let c = if i % 2 == 0 { a.clone() } else { b.clone() };
-        tasks.push(tokio::spawn(async move { c.me().await.map(|_| Instant::now()) }));
+        tasks.push(tokio::spawn(
+            async move { c.me().await.map(|_| Instant::now()) },
+        ));
     }
     let mut times = Vec::new();
     for t in tasks {
@@ -249,6 +273,10 @@ async fn concurrent_requests_respect_the_shared_cap() {
         while times[end] - times[start_idx] >= Duration::from_secs(1) {
             start_idx += 1;
         }
-        assert!(end - start_idx < 26, "window of {} requests", end - start_idx + 1);
+        assert!(
+            end - start_idx < 26,
+            "window of {} requests",
+            end - start_idx + 1
+        );
     }
 }

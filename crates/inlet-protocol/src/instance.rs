@@ -50,7 +50,14 @@ pub fn os_name() -> &'static str {
 fn random_uuid() -> String {
     let b: [u8; 16] = rand::random();
     let h = hex::encode(b);
-    format!("{}-{}-4{}-a{}-{}", &h[0..8], &h[8..12], &h[13..16], &h[17..20], &h[20..32])
+    format!(
+        "{}-{}-4{}-a{}-{}",
+        &h[0..8],
+        &h[8..12],
+        &h[13..16],
+        &h[17..20],
+        &h[20..32]
+    )
 }
 
 /// The `endpoints` of the discovery document.
@@ -108,7 +115,10 @@ pub struct Discovery {
 impl Discovery {
     /// The instance's own name, from the branding, if it has one.
     pub fn product_name(&self) -> Option<&str> {
-        self.app_public.get("branding")?.get("product_name")?.as_str()
+        self.app_public
+            .get("branding")?
+            .get("product_name")?
+            .as_str()
     }
 
     /// Whether password sign-in needs a CAPTCHA.
@@ -199,7 +209,12 @@ impl Instance {
     }
 
     /// Builds an instance from a discovery document cached earlier, without network.
-    pub fn from_cached(origin: &str, discovery: Discovery, etag: Option<String>, info: ClientInfo) -> Result<Instance> {
+    pub fn from_cached(
+        origin: &str,
+        discovery: Discovery,
+        etag: Option<String>,
+        info: ClientInfo,
+    ) -> Result<Instance> {
         let origin = normalize_origin(origin)?;
         let http = build_http(&info)?;
         let anon_limiter = Arc::new(RateLimiter::new(RateLimitConfig::default()));
@@ -217,9 +232,13 @@ impl Instance {
         if discovery.api_code_version > SUPPORTED_API_CODE_VERSION {
             return Err(Error::UnsupportedApiVersion(discovery.api_code_version));
         }
-        let api_base = format!("{}/v1", discovery.endpoints.api_public.trim_end_matches('/'));
+        let api_base = format!(
+            "{}/v1",
+            discovery.endpoints.api_public.trim_end_matches('/')
+        );
         url::Url::parse(&api_base).map_err(|e| Error::Url(format!("api_public: {e}")))?;
-        url::Url::parse(&discovery.endpoints.gateway).map_err(|e| Error::Url(format!("gateway: {e}")))?;
+        url::Url::parse(&discovery.endpoints.gateway)
+            .map_err(|e| Error::Url(format!("gateway: {e}")))?;
         Ok(Instance {
             inner: Arc::new(InstanceInner {
                 origin,
@@ -288,15 +307,37 @@ impl Instance {
 
     /// Media proxy URL of a user avatar, or `None` when the user has no avatar.
     /// `size` is a power of two from 16 to 4096; Fluxer serves WebP.
-    pub fn avatar_url(&self, user_id: &str, avatar_hash: Option<&str>, size: u32) -> Option<String> {
-        let media = self.inner.discovery.endpoints.media.as_deref()?.trim_end_matches('/');
+    pub fn avatar_url(
+        &self,
+        user_id: &str,
+        avatar_hash: Option<&str>,
+        size: u32,
+    ) -> Option<String> {
+        let media = self
+            .inner
+            .discovery
+            .endpoints
+            .media
+            .as_deref()?
+            .trim_end_matches('/');
         let hash = avatar_hash?;
         Some(format!("{media}/avatars/{user_id}/{hash}.webp?size={size}"))
     }
 
     /// Media proxy URL of a guild icon.
-    pub fn guild_icon_url(&self, guild_id: &str, icon_hash: Option<&str>, size: u32) -> Option<String> {
-        let media = self.inner.discovery.endpoints.media.as_deref()?.trim_end_matches('/');
+    pub fn guild_icon_url(
+        &self,
+        guild_id: &str,
+        icon_hash: Option<&str>,
+        size: u32,
+    ) -> Option<String> {
+        let media = self
+            .inner
+            .discovery
+            .endpoints
+            .media
+            .as_deref()?
+            .trim_end_matches('/');
         let hash = icon_hash?;
         Some(format!("{media}/icons/{guild_id}/{hash}.webp?size={size}"))
     }
@@ -319,7 +360,10 @@ async fn fetch(
         return Ok(None);
     }
     if !resp.status().is_success() {
-        return Err(Error::Decode(format!("discovery returned HTTP {}", resp.status())));
+        return Err(Error::Decode(format!(
+            "discovery returned HTTP {}",
+            resp.status()
+        )));
     }
     let new_etag = resp
         .headers()
@@ -327,8 +371,8 @@ async fn fetch(
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
     let bytes = resp.bytes().await?;
-    let discovery: Discovery =
-        serde_json::from_slice(&bytes).map_err(|e| Error::Decode(format!("discovery document: {e}")))?;
+    let discovery: Discovery = serde_json::from_slice(&bytes)
+        .map_err(|e| Error::Decode(format!("discovery document: {e}")))?;
     Ok(Some((discovery, new_etag)))
 }
 
@@ -338,9 +382,18 @@ mod tests {
 
     #[test]
     fn origins_normalize() {
-        assert_eq!(normalize_origin("fluxer.opland.net").unwrap(), "https://fluxer.opland.net");
-        assert_eq!(normalize_origin("https://fluxer.opland.net/x/").unwrap(), "https://fluxer.opland.net");
-        assert_eq!(normalize_origin("http://127.0.0.1:8080").unwrap(), "http://127.0.0.1:8080");
+        assert_eq!(
+            normalize_origin("fluxer.opland.net").unwrap(),
+            "https://fluxer.opland.net"
+        );
+        assert_eq!(
+            normalize_origin("https://fluxer.opland.net/x/").unwrap(),
+            "https://fluxer.opland.net"
+        );
+        assert_eq!(
+            normalize_origin("http://127.0.0.1:8080").unwrap(),
+            "http://127.0.0.1:8080"
+        );
         assert!(normalize_origin("ftp://x").is_err());
     }
 

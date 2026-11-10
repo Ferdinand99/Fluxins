@@ -119,17 +119,24 @@ fn signed_in_from(v: &Value) -> Option<SignedIn> {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_owned(),
-        user: v.get("user").and_then(|u| serde_json::from_value(u.clone()).ok()),
+        user: v
+            .get("user")
+            .and_then(|u| serde_json::from_value(u.clone()).ok()),
     })
 }
 
 /// Sends an unauthenticated POST and solves CAPTCHAs on the way (at most twice).
-async fn post_with_captcha(instance: &Instance, path: &str, body: &Value) -> Result<(RawResponse, bool)> {
+async fn post_with_captcha(
+    instance: &Instance,
+    path: &str,
+    body: &Value,
+) -> Result<(RawResponse, bool)> {
     let props = client_properties(instance);
     let mut captcha_token: Option<String> = None;
     let mut solves = 0;
     loop {
-        let mut headers: Vec<(&'static str, String)> = vec![("X-Fluxer-Client-Properties", props.clone())];
+        let mut headers: Vec<(&'static str, String)> =
+            vec![("X-Fluxer-Client-Properties", props.clone())];
         if let Some(t) = &captcha_token {
             headers.push(("X-Captcha-Token", t.clone()));
         }
@@ -194,7 +201,9 @@ fn interpret_login(raw: RawResponse, captcha_failed: bool) -> Result<SignInResul
                 methods,
             });
         }
-        return Err(Error::Decode("sign-in response has neither token nor mfa".into()));
+        return Err(Error::Decode(
+            "sign-in response has neither token nor mfa".into(),
+        ));
     }
     let err = raw.api_error();
     if err.code == "IP_AUTHORIZATION_REQUIRED" {
@@ -209,14 +218,22 @@ fn interpret_login(raw: RawResponse, captcha_failed: bool) -> Result<SignInResul
 
 /// `POST /auth/login`. `login` is an email address or, on a username instance, a username.
 /// The password is only sent to the instance; this crate keeps no copy.
-pub async fn sign_in_password(instance: &Instance, login: &str, password: &str) -> Result<SignInResult> {
+pub async fn sign_in_password(
+    instance: &Instance,
+    login: &str,
+    password: &str,
+) -> Result<SignInResult> {
     let body = json!({ "login": login, "password": password });
     let (raw, captcha_failed) = post_with_captcha(instance, "/auth/login", &body).await?;
     interpret_login(raw, captcha_failed)
 }
 
 /// `POST /auth/login/mfa/totp`: finishes a sign-in with an authenticator or backup code.
-pub async fn sign_in_totp(instance: &Instance, ticket: &Ticket, code: &str) -> Result<SignInResult> {
+pub async fn sign_in_totp(
+    instance: &Instance,
+    ticket: &Ticket,
+    code: &str,
+) -> Result<SignInResult> {
     let body = json!({ "ticket": ticket.expose_secret(), "code": code.trim() });
     let (raw, captcha_failed) = post_with_captcha(instance, "/auth/login/mfa/totp", &body).await?;
     interpret_login(raw, captcha_failed)
@@ -232,7 +249,10 @@ pub enum IpAuthorization {
 }
 
 /// `GET /auth/ip-authorization/poll`.
-pub async fn poll_ip_authorization(instance: &Instance, ticket: &Ticket) -> Result<IpAuthorization> {
+pub async fn poll_ip_authorization(
+    instance: &Instance,
+    ticket: &Ticket,
+) -> Result<IpAuthorization> {
     let path = format!(
         "/auth/ip-authorization/poll?ticket={}",
         url::form_urlencoded::byte_serialize(ticket.expose_secret().as_bytes()).collect::<String>()
@@ -250,7 +270,13 @@ pub async fn poll_ip_authorization(instance: &Instance, ticket: &Ticket) -> Resu
     Ok(IpAuthorization::Pending)
 }
 
-async fn anon(instance: &Instance, method: Method, path: &str, body: Option<&Value>, origin_header: bool) -> Result<RawResponse> {
+async fn anon(
+    instance: &Instance,
+    method: Method,
+    path: &str,
+    body: Option<&Value>,
+    origin_header: bool,
+) -> Result<RawResponse> {
     let headers: Vec<(&'static str, String)> = if origin_header {
         // The official desktop shell sends the web app origin on handoff POSTs.
         vec![("Origin", web_origin(instance))]
@@ -306,7 +332,14 @@ impl Handoff {
     /// `POST /auth/handoff/initiate` without a return URI (code method).
     pub async fn start(instance: &Instance) -> Result<Handoff> {
         let body = json!({});
-        let raw = anon(instance, Method::POST, "/auth/handoff/initiate", Some(&body), true).await?;
+        let raw = anon(
+            instance,
+            Method::POST,
+            "/auth/handoff/initiate",
+            Some(&body),
+            true,
+        )
+        .await?;
         if !raw.is_success() {
             return Err(Error::Api(Box::new(raw.api_error())));
         }
@@ -314,13 +347,21 @@ impl Handoff {
         let code = v
             .get("code")
             .and_then(Value::as_str)
-            .filter(|c| !c.is_empty() && c.len() <= 64 && c.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
+            .filter(|c| {
+                !c.is_empty()
+                    && c.len() <= 64
+                    && c.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            })
             .ok_or_else(|| Error::Decode("handoff initiate without a valid code".into()))?
             .to_owned();
         Ok(Handoff {
             instance: instance.clone(),
             code,
-            expires_at: v.get("expires_at").and_then(Value::as_str).unwrap_or_default().to_owned(),
+            expires_at: v
+                .get("expires_at")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
             poll_secret: v
                 .get("poll_secret")
                 .and_then(Value::as_str)
@@ -336,7 +377,12 @@ impl Handoff {
 
     /// The code as Fluxer shows it: two groups of six (`ABCDEF-GHIJKL`).
     pub fn display_code(&self) -> String {
-        let clean: String = self.code.chars().filter(char::is_ascii_alphanumeric).collect::<String>().to_uppercase();
+        let clean: String = self
+            .code
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .collect::<String>()
+            .to_uppercase();
         if clean.len() == 12 {
             format!("{}-{}", &clean[..6], &clean[6..])
         } else {
@@ -368,15 +414,17 @@ impl Handoff {
             return Err(Error::Api(Box::new(raw.api_error())));
         }
         let v = raw.value();
-        Ok(match v.get("status").and_then(Value::as_str).unwrap_or("pending") {
-            "completed" => match signed_in_from(&v) {
-                Some(ok) => HandoffStatus::Completed(ok),
-                None => HandoffStatus::Pending,
+        Ok(
+            match v.get("status").and_then(Value::as_str).unwrap_or("pending") {
+                "completed" => match signed_in_from(&v) {
+                    Some(ok) => HandoffStatus::Completed(ok),
+                    None => HandoffStatus::Pending,
+                },
+                "denied" => HandoffStatus::Denied,
+                "expired" => HandoffStatus::Expired,
+                _ => HandoffStatus::Pending,
             },
-            "denied" => HandoffStatus::Denied,
-            "expired" => HandoffStatus::Expired,
-            _ => HandoffStatus::Pending,
-        })
+        )
     }
 
     /// Polls every `every` (at least one second) until the handoff is no longer pending.
@@ -445,7 +493,10 @@ impl Session {
     pub fn connect_gateway(
         &self,
         options: crate::gateway::GatewayOptions,
-    ) -> (crate::gateway::GatewayHandle, tokio::sync::mpsc::Receiver<crate::gateway::GatewayEvent>) {
+    ) -> (
+        crate::gateway::GatewayHandle,
+        tokio::sync::mpsc::Receiver<crate::gateway::GatewayEvent>,
+    ) {
         crate::gateway::Gateway::connect(self.instance().clone(), self.token().clone(), options)
     }
 }

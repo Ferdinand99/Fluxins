@@ -176,7 +176,11 @@ pub enum Dispatch {
 impl Dispatch {
     /// Parses one Dispatch by event name.
     pub fn parse(name: &str, data: Value) -> Dispatch {
-        fn typed<T: serde::de::DeserializeOwned>(name: &str, data: Value, wrap: impl FnOnce(T) -> Dispatch) -> Dispatch {
+        fn typed<T: serde::de::DeserializeOwned>(
+            name: &str,
+            data: Value,
+            wrap: impl FnOnce(T) -> Dispatch,
+        ) -> Dispatch {
             match serde_json::from_value::<T>(data.clone()) {
                 Ok(v) => wrap(v),
                 Err(e) => {
@@ -253,13 +257,19 @@ impl GatewayHandle {
     /// events) or passive. Call it for the guild the person is looking at.
     pub fn set_guild_active(&self, guild_id: &str, active: bool) {
         let mut subs = serde_json::Map::new();
-        subs.insert(guild_id.to_owned(), json!({ "active": active, "typing": active }));
+        subs.insert(
+            guild_id.to_owned(),
+            json!({ "active": active, "typing": active }),
+        );
         self.send_raw(14, json!({ "subscriptions": subs }));
     }
 
     /// Presence Update (op 3): `online`, `idle`, `dnd` or `invisible`.
     pub fn set_status(&self, status: &str) {
-        self.send_raw(3, json!({ "status": status, "afk": false, "mobile": false }));
+        self.send_raw(
+            3,
+            json!({ "status": status, "afk": false, "mobile": false }),
+        );
     }
 
     /// Closes the connection and ends the session (no resume).
@@ -307,7 +317,11 @@ enum Outcome {
     /// The event receiver is gone; stop quietly.
     ReceiverGone,
     /// Connect again. `fresh` drops the session so the next try identifies.
-    Reconnect { reason: String, fresh: bool, was_connected: bool },
+    Reconnect {
+        reason: String,
+        fresh: bool,
+        was_connected: bool,
+    },
 }
 
 struct Task {
@@ -321,17 +335,20 @@ struct Task {
     seq: Option<u64>,
 }
 
-type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+type Ws =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 /// TLS for the gateway: rustls with the ring provider and the Mozilla roots.
 pub fn tls_connector() -> Option<tokio_tungstenite::Connector> {
     let mut roots = rustls::RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let config = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-        .with_safe_default_protocol_versions()
-        .ok()?
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+    let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .ok()?
+    .with_root_certificates(roots)
+    .with_no_client_auth();
     Some(tokio_tungstenite::Connector::Rustls(Arc::new(config)))
 }
 
@@ -342,7 +359,8 @@ pub fn gateway_url(base: &str, compress: bool) -> Result<url::Url, url::ParseErr
         let mut q = url.query_pairs_mut();
         q.append_pair("v", "1").append_pair("encoding", "json");
         if compress {
-            q.append_pair("compress", "zstd-stream").append_pair("stream", "1");
+            q.append_pair("compress", "zstd-stream")
+                .append_pair("stream", "1");
         }
     }
     Ok(url)
@@ -356,12 +374,17 @@ impl Task {
     async fn run(mut self) {
         let mut attempt: u32 = 0;
         loop {
-            if !self.emit(GatewayEvent::State(ConnectionState::Connecting { attempt })).await {
+            if !self
+                .emit(GatewayEvent::State(ConnectionState::Connecting { attempt }))
+                .await
+            {
                 return;
             }
             match self.connect_once().await {
                 Outcome::Stop(reason) => {
-                    let _ = self.emit(GatewayEvent::State(ConnectionState::Closed(reason))).await;
+                    let _ = self
+                        .emit(GatewayEvent::State(ConnectionState::Closed(reason)))
+                        .await;
                     return;
                 }
                 Outcome::ReceiverGone => return,
@@ -374,11 +397,18 @@ impl Task {
                         self.session = None;
                         self.seq = None;
                     }
-                    attempt = if was_connected { 0 } else { attempt.saturating_add(1) };
+                    attempt = if was_connected {
+                        0
+                    } else {
+                        attempt.saturating_add(1)
+                    };
                     let delay = self.backoff(attempt);
                     tracing::info!(%reason, ?delay, "gateway reconnecting");
                     if !self
-                        .emit(GatewayEvent::State(ConnectionState::Reconnecting { delay, reason }))
+                        .emit(GatewayEvent::State(ConnectionState::Reconnecting {
+                            delay,
+                            reason,
+                        }))
                         .await
                     {
                         return;
@@ -420,7 +450,10 @@ impl Task {
         };
         let url = match gateway_url(&self.url, self.options.compress) {
             Ok(u) => u,
-            Err(e) => return Outcome::Stop(CloseReason::InvalidApiVersion).also_log(&format!("bad gateway URL: {e}")),
+            Err(e) => {
+                return Outcome::Stop(CloseReason::InvalidApiVersion)
+                    .also_log(&format!("bad gateway URL: {e}"))
+            }
         };
         let mut request = match url.as_str().into_client_request() {
             Ok(r) => r,
@@ -449,23 +482,31 @@ impl Task {
         };
 
         // Hello.
-        let hello = match timeout(Duration::from_secs(20), read_payload(&mut ws, &mut codec)).await {
+        let hello = match timeout(Duration::from_secs(20), read_payload(&mut ws, &mut codec)).await
+        {
             Ok(Ok(Some(p))) => p,
             Ok(Ok(None)) => return reconnect("closed before Hello".into()),
-            Ok(Err(ReadEnd::Closed(code, reason))) => return self.classify_close(code, reason, false),
+            Ok(Err(ReadEnd::Closed(code, reason))) => {
+                return self.classify_close(code, reason, false)
+            }
             Ok(Err(ReadEnd::Error(e))) => return reconnect(e),
             Err(_) => return reconnect("no Hello within 20 s".into()),
         };
         if hello.get("op").and_then(Value::as_u64) != Some(10) {
             return reconnect("first payload was not Hello".into());
         }
-        let interval_ms = hello["d"]["heartbeat_interval"].as_u64().unwrap_or(41_250).max(100);
+        let interval_ms = hello["d"]["heartbeat_interval"]
+            .as_u64()
+            .unwrap_or(41_250)
+            .max(100);
         let interval = Duration::from_millis(interval_ms);
 
         // Identify or Resume.
         let first = match &self.session {
             Some(session_id) => {
-                let _ = self.emit(GatewayEvent::State(ConnectionState::Resuming)).await;
+                let _ = self
+                    .emit(GatewayEvent::State(ConnectionState::Resuming))
+                    .await;
                 json!({ "op": 6, "d": {
                     "token": self.token.expose_secret(),
                     "session_id": session_id,
@@ -473,7 +514,9 @@ impl Task {
                 }})
             }
             None => {
-                let _ = self.emit(GatewayEvent::State(ConnectionState::Identifying)).await;
+                let _ = self
+                    .emit(GatewayEvent::State(ConnectionState::Identifying))
+                    .await;
                 self.identify_payload()
             }
         };
@@ -593,7 +636,10 @@ impl Task {
     }
 
     fn classify_close(&self, code: Option<u16>, reason: String, was_connected: bool) -> Outcome {
-        let text = format!("closed with {} {reason}", code.map_or("no code".into(), |c| c.to_string()));
+        let text = format!(
+            "closed with {} {reason}",
+            code.map_or("no code".into(), |c| c.to_string())
+        );
         match code {
             Some(4004) => Outcome::Stop(CloseReason::AuthenticationFailed),
             Some(4012) => Outcome::Stop(CloseReason::InvalidApiVersion),
@@ -630,7 +676,10 @@ enum ReadEnd {
 }
 
 /// Reads the next JSON payload. `Ok(None)` means the stream ended.
-async fn read_payload(ws: &mut Ws, codec: &mut Option<ZstdStream>) -> Result<Option<Value>, ReadEnd> {
+async fn read_payload(
+    ws: &mut Ws,
+    codec: &mut Option<ZstdStream>,
+) -> Result<Option<Value>, ReadEnd> {
     loop {
         let msg = match ws.next().await {
             None => return Ok(None),
@@ -662,10 +711,17 @@ async fn read_payload(ws: &mut Ws, codec: &mut Option<ZstdStream>) -> Result<Opt
     }
 }
 
-async fn send_payload(ws: &mut Ws, codec: &mut Option<ZstdStream>, payload: &Value) -> Result<(), String> {
+async fn send_payload(
+    ws: &mut Ws,
+    codec: &mut Option<ZstdStream>,
+    payload: &Value,
+) -> Result<(), String> {
     let text = payload.to_string();
     let msg = match codec {
-        Some(c) => WsMessage::binary(c.compress(text.as_bytes()).map_err(|e| format!("zstd: {e}"))?),
+        Some(c) => WsMessage::binary(
+            c.compress(text.as_bytes())
+                .map_err(|e| format!("zstd: {e}"))?,
+        ),
         None => WsMessage::text(text),
     };
     ws.send(msg).await.map_err(|e| format!("send: {e}"))
@@ -704,6 +760,9 @@ mod tests {
             }
         );
         // A known event with a broken payload is passed through raw too.
-        assert!(matches!(Dispatch::parse("MESSAGE_CREATE", json!({})), Dispatch::Other { .. }));
+        assert!(matches!(
+            Dispatch::parse("MESSAGE_CREATE", json!({})),
+            Dispatch::Other { .. }
+        ));
     }
 }

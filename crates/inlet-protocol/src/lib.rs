@@ -79,15 +79,18 @@ pub mod rest;
 pub mod token;
 
 pub use auth::{
-    poll_ip_authorization, sign_in_password, sign_in_totp, Handoff, HandoffStatus, IpAuthorization, MfaMethod,
-    Session, SignInResult, SignedIn, Ticket,
+    poll_ip_authorization, sign_in_password, sign_in_totp, Handoff, HandoffStatus, IpAuthorization,
+    MfaMethod, Session, SignInResult, SignedIn, Ticket,
 };
 pub use error::{ApiError, Error, Result};
 pub use gateway::{
-    CloseReason, ConnectionState, Dispatch, Gateway, GatewayEvent, GatewayHandle, GatewayOptions, IdentifyProperties,
+    CloseReason, ConnectionState, Dispatch, Gateway, GatewayEvent, GatewayHandle, GatewayOptions,
+    IdentifyProperties,
 };
 pub use instance::{ClientInfo, Discovery, Endpoints, Instance};
-pub use models::{Attachment, Channel, CurrentUser, Guild, GuildReady, Message, Ready, Snowflake, User};
+pub use models::{
+    Attachment, Channel, CurrentUser, Guild, GuildReady, Message, Ready, Snowflake, User,
+};
 pub use ratelimit::{RateLimitConfig, RateLimiter};
 pub use rest::{new_nonce, Client};
 pub use token::Token;

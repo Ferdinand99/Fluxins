@@ -58,7 +58,10 @@ pub struct User {
 impl User {
     /// The name to show: the display name, or else the username.
     pub fn display_name(&self) -> &str {
-        self.global_name.as_deref().filter(|s| !s.is_empty()).unwrap_or(&self.username)
+        self.global_name
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&self.username)
     }
 }
 
@@ -85,7 +88,11 @@ impl CurrentUser {
 
     /// Whether the account has a second factor.
     pub fn mfa_enabled(&self) -> bool {
-        self.user.extra.get("mfa_enabled").and_then(Value::as_bool).unwrap_or(false)
+        self.user
+            .extra
+            .get("mfa_enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
     }
 }
 
@@ -190,7 +197,14 @@ impl Channel {
         use channel_type::*;
         matches!(
             self.kind,
-            GUILD_TEXT | DM | GROUP_DM | GUILD_ANNOUNCEMENT | ANNOUNCEMENT_THREAD | PUBLIC_THREAD | PRIVATE_THREAD | PERSONAL_NOTES
+            GUILD_TEXT
+                | DM
+                | GROUP_DM
+                | GUILD_ANNOUNCEMENT
+                | ANNOUNCEMENT_THREAD
+                | PUBLIC_THREAD
+                | PRIVATE_THREAD
+                | PERSONAL_NOTES
         )
     }
 }
