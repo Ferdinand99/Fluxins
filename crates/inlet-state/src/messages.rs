@@ -26,7 +26,8 @@ use crate::bounded::LruMap;
 use crate::ids::{ChannelId, MessageId};
 use crate::limits::{
     MAX_MESSAGES_PER_CHANNEL, MAX_MESSAGE_BYTES, MAX_MESSAGE_WINDOWS, MAX_PENDING_LIVE,
-    MAX_PENDING_REACTIONS, MAX_REACTIONS_PER_MESSAGE, MAX_RECENTLY_DELETED, MAX_WINDOW_BYTES,
+    LOAD_TIMEOUT_MS, MAX_PENDING_REACTIONS, MAX_REACTIONS_PER_MESSAGE, MAX_RECENTLY_DELETED,
+    MAX_WINDOW_BYTES,
 };
 use crate::size::{map_size, opt_len, value_size};
 
@@ -111,8 +112,12 @@ pub struct MessageWindow {
     /// Something was lost while waiting (buffer or delete memory full): the
     /// page merge leaves the window waiting for another page.
     pending_overflow: bool,
-    /// A newest page was asked for and has not landed: never evicted.
+    /// A newest page was asked for and has not landed: evicted last.
     loading: bool,
+    /// When the load began (the account clock), for the load timeout.
+    loading_since_ms: i64,
+    /// Marked stale by a new READY until its newest page lands.
+    stale: bool,
     recently_deleted: VecDeque<MessageId>,
 }
 
@@ -250,6 +255,7 @@ impl MessageWindow {
         let reactions = std::mem::take(&mut self.pending_reactions);
         let overflow = std::mem::take(&mut self.pending_overflow);
         self.loading = false;
+        self.stale = false;
         let fresh = self.has_newest;
         let mut merged = BTreeMap::new();
         let mut has_more_before = !reached_start;
@@ -396,10 +402,11 @@ impl MessageWindow {
         self.take(id).is_some()
     }
 
-    /// A reaction event. While the window waits for its newest page the
-    /// event is buffered and applied after the merge, like creates.
+    /// A reaction event. While the window is loading or stale the event is
+    /// buffered and applied after the merge, like creates; a window that is
+    /// only scrolled back applies it to the messages it holds.
     fn react(&mut self, id: MessageId, op: ReactionOp) -> bool {
-        if !self.has_newest {
+        if self.loading || self.stale {
             // A repeat of an idempotent event (the account's own reaction, a
             // clear) adds nothing.
             let idempotent = match &op {
@@ -612,28 +619,44 @@ impl MessageWindows {
     }
 
     /// Marks the channel's window as loading (creating it if needed) before
-    /// the newest page is requested. A loading window is never evicted: the
-    /// least recently used idle window makes room, and when every window is
-    /// loading the call is refused (`None`). Otherwise returns a channel whose
-    /// window was evicted.
-    pub(crate) fn begin_load(&mut self, channel: ChannelId) -> Option<Option<ChannelId>> {
+    /// the newest page is requested; it never refuses. The least recently
+    /// used idle window makes room; when every window is loading, the least
+    /// recently used loading window goes. Returns a channel whose window was
+    /// evicted.
+    pub(crate) fn begin_load(&mut self, channel: ChannelId, now_ms: i64) -> Option<ChannelId> {
         if let Some(w) = self.windows.get_mut(&channel) {
             w.loading = true;
+            w.loading_since_ms = now_ms;
             self.windows.touch(&channel);
-            return Some(None);
+            return None;
         }
         let mut evicted = None;
         if self.windows.len() >= MAX_MESSAGE_WINDOWS {
-            let idle = self.windows.oldest_where(|w| !w.loading)?;
-            self.windows.remove(&idle);
-            evicted = Some(idle);
+            if let Some(idle) = self.windows.oldest_where(|w| !w.loading) {
+                self.windows.remove(&idle);
+                evicted = Some(idle);
+            }
         }
         let w = MessageWindow {
             loading: true,
+            loading_since_ms: now_ms,
             ..Default::default()
         };
-        self.windows.insert(channel, w);
-        Some(evicted)
+        // Full of loading windows: the insert evicts the least recently used.
+        evicted.or(self.windows.insert(channel, w))
+    }
+
+    /// Ends loading states older than [`LOAD_TIMEOUT_MS`]; returns their
+    /// channels. Their pages may still land later.
+    pub(crate) fn expire_loading(&mut self, now_ms: i64) -> Vec<ChannelId> {
+        let mut out = Vec::new();
+        for (ch, w) in self.windows.iter_mut() {
+            if w.loading && now_ms.saturating_sub(w.loading_since_ms) >= LOAD_TIMEOUT_MS {
+                w.loading = false;
+                out.push(*ch);
+            }
+        }
+        out
     }
 
     /// The request for the newest page failed: the window may be evicted again.
@@ -649,16 +672,13 @@ impl MessageWindows {
         &mut self,
         channel: ChannelId,
         page: &MessagesPage,
+        now_ms: i64,
     ) -> (bool, Option<ChannelId>) {
         let mut map = page_map(channel, &page.messages);
         let reached_start = page.reached_start();
         let mut evicted = None;
         if page.before.is_none() {
-            match self.begin_load(channel) {
-                Some(e) => evicted = e,
-                // Every window is loading: no room for this page.
-                None => return (false, None),
-            }
+            evicted = self.begin_load(channel, now_ms);
         } else {
             self.windows.touch(&channel);
         }
@@ -749,9 +769,12 @@ impl MessageWindows {
 
     /// After a new READY the windows may have missed messages: keep them,
     /// but buffer live messages until the newest page is loaded again.
+    /// Requests from before the READY no longer count as loading.
     pub(crate) fn mark_stale(&mut self) {
         for w in self.windows.values_mut() {
             w.has_newest = false;
+            w.stale = true;
+            w.loading = false;
         }
     }
 

@@ -125,6 +125,10 @@ impl<K: Ord + Copy, V> LruMap<K, V> {
         self.entries.iter().map(|(k, (v, _))| (k, v))
     }
 
+    pub(crate) fn iter_mut(&mut self) -> impl Iterator<Item = (&K, &mut V)> {
+        self.entries.iter_mut().map(|(k, (v, _))| (k, v))
+    }
+
     pub(crate) fn values_mut(&mut self) -> impl Iterator<Item = &mut V> {
         self.entries.values_mut().map(|(v, _)| v)
     }

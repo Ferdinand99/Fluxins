@@ -1286,7 +1286,8 @@ fn too_many_deletes_while_loading_ask_for_another_page() {
 }
 
 #[test]
-fn loading_windows_are_not_evicted() {
+fn loads_are_never_refused_and_end_by_page_timeout_or_ready() {
+    use inlet_state::limits::LOAD_TIMEOUT_MS;
     let count = MAX_MESSAGE_WINDOWS + 2;
     let channels: Vec<_> = (0..count)
         .map(|i| channel(&(1000 + i).to_string(), 0, None, i as i64, json!([])))
@@ -1296,25 +1297,58 @@ fn loading_windows_are_not_evicted() {
         json!([]),
         json!([]),
     ));
-    let mut s = AccountState::from_ready_at(&r, JOINED_MS as i64);
+    let start = JOINED_MS as i64;
+    let mut s = AccountState::from_ready_at(&r, start);
     let id = |i: usize| ch(&(1000 + i).to_string());
-    for i in 0..MAX_MESSAGE_WINDOWS {
+    // 31 loads whose pages never arrive: the newest still opens a window,
+    // and the least recently used loading window makes room.
+    for i in 0..=MAX_MESSAGE_WINDOWS {
         s.begin_load(id(i));
     }
-    // Every window is loading: no room, nothing evicted.
-    let c = s.begin_load(id(MAX_MESSAGE_WINDOWS));
-    assert!(c.messages.is_empty());
-    assert!(s.messages(id(MAX_MESSAGE_WINDOWS)).is_none());
-    assert!((0..MAX_MESSAGE_WINDOWS).all(|i| s.messages(id(i)).unwrap().is_loading()));
-    // A failed request frees its window for eviction.
-    s.cancel_load(id(3));
-    let c = s.begin_load(id(MAX_MESSAGE_WINDOWS));
-    assert!(c.messages.contains(&id(3)));
-    assert!(s.messages(id(3)).is_none());
-    assert!(s.messages(id(MAX_MESSAGE_WINDOWS)).unwrap().is_loading());
+    let w = s.messages(id(MAX_MESSAGE_WINDOWS)).expect("the newest load works");
+    assert!(w.is_loading());
+    assert!(s.messages(id(0)).is_none());
+    // An idle window goes before a loading one.
+    s.cancel_load(id(5));
+    let c = s.begin_load(id(MAX_MESSAGE_WINDOWS + 1));
+    assert!(c.messages.contains(&id(5)) && s.messages(id(5)).is_none());
+    assert!(s.messages(id(1)).unwrap().is_loading());
     // A page that lands ends the loading state.
-    s.apply_messages(id(0), MessagesPage::latest(vec![], 50));
-    assert!(!s.messages(id(0)).unwrap().is_loading());
+    s.apply_messages(id(1), MessagesPage::latest(vec![], 50));
+    assert!(!s.messages(id(1)).unwrap().is_loading());
+    // Without a page, the load ends after the timeout.
+    let c = s.tick(start + LOAD_TIMEOUT_MS - 1);
+    assert!(c.messages.is_empty());
+    let c = s.tick(start + LOAD_TIMEOUT_MS);
+    assert!(c.messages.contains(&id(2)));
+    assert!(!s.messages(id(2)).unwrap().is_loading());
+    // A new READY ends every load.
+    s.begin_load(id(2));
+    s.apply(&Dispatch::Ready(Box::new(r.clone())));
+    assert!(s
+        .message_windows()
+        .channels()
+        .all(|c| !s.messages(c).unwrap().is_loading()));
+}
+
+#[test]
+fn a_window_scrolled_back_applies_reactions_at_once() {
+    let mut s = state();
+    let page: Vec<_> = (0..50).rev().map(|i| message(mid(100 + i, 0), GENERAL, OTHER)).collect();
+    s.apply_messages(ch(GENERAL), MessagesPage::latest(page, 50));
+    for i in 0..(MAX_MESSAGES_PER_CHANNEL as u64 - 50) {
+        s.apply(&create(mid(200 + i, 0), GENERAL, OTHER, json!({})));
+    }
+    // An older page pushes the newest messages out: scrolled back, not stale.
+    let older: Vec<_> = (0..50).rev().map(|i| message(mid(10 + i, 0), GENERAL, OTHER)).collect();
+    s.apply_messages(ch(GENERAL), MessagesPage::before(mid(100, 0), older, 50));
+    let w = s.messages(ch(GENERAL)).unwrap();
+    assert!(!w.has_newest() && !w.is_loading());
+    let c = s.apply(&d("MESSAGE_REACTION_ADD", json!({"user_id": OTHER, "channel_id": GENERAL,
+        "message_id": mid(10, 0).to_string(), "emoji": {"name": "🦔"}})));
+    assert!(c.messages.contains(&ch(GENERAL)));
+    let m = s.messages(ch(GENERAL)).unwrap().get(mid(10, 0)).unwrap();
+    assert_eq!(m.reactions()[0].count, 1);
 }
 
 #[test]

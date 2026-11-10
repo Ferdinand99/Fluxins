@@ -517,22 +517,19 @@ impl AccountState {
             return c;
         }
         let existed = self.windows.get(ch).is_some();
-        // `None`: every window is loading, so `messages(ch)` stays `None`.
-        // Try again when a page lands or after `cancel_load`.
-        if let Some(evicted) = self.windows.begin_load(ch) {
-            if let Some(e) = evicted {
-                c.message(e);
-            }
-            if !existed {
-                c.message(ch);
-            }
+        if let Some(e) = self.windows.begin_load(ch, self.now_ms) {
+            c.message(e);
+        }
+        if !existed {
+            c.message(ch);
         }
         c
     }
 
     /// The request for a channel's newest page failed: its window stops
-    /// counting as loading and may be evicted again. A window stays
-    /// loading (and buffering) until its page lands or this is called.
+    /// counting as loading and is evicted before loading ones. A load also
+    /// ends after [`crate::limits::LOAD_TIMEOUT_MS`] without a page
+    /// ([`AccountState::tick`]), and a new READY ends every load.
     pub fn cancel_load(&mut self, ch: ChannelId) {
         self.windows.cancel_load(ch);
     }
@@ -546,7 +543,7 @@ impl AccountState {
         if self.channels.get(ch).is_none() {
             return c;
         }
-        let (changed, evicted) = self.windows.apply_page(ch, &page);
+        let (changed, evicted) = self.windows.apply_page(ch, &page, self.now_ms);
         if changed {
             c.message(ch);
         }
@@ -635,6 +632,9 @@ impl AccountState {
         self.now_ms = now_ms;
         for ch in self.typing.expire(now_ms) {
             c.typing(ch);
+        }
+        for ch in self.windows.expire_loading(now_ms) {
+            c.message(ch);
         }
         let flipped: Vec<GuildId> = self
             .guilds

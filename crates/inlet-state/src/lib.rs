@@ -78,6 +78,9 @@ pub mod limits {
     pub const MAX_MESSAGE_BYTES: usize = 256 * 1024;
     /// Live messages buffered while a window waits for its newest page.
     pub const MAX_PENDING_LIVE: usize = 100;
+    /// How long a window counts as loading without its page; then it is
+    /// evicted like an idle window (reported by [`crate::AccountState::tick`]).
+    pub const LOAD_TIMEOUT_MS: i64 = 60_000;
     /// Reaction events buffered while a window waits for its newest page.
     pub const MAX_PENDING_REACTIONS: usize = 500;
     /// Channels with a message window; the least recently used is evicted.
