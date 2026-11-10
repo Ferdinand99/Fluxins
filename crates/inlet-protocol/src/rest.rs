@@ -215,7 +215,7 @@ impl Client {
         )
         .await?;
         if !raw.is_success() {
-            return Err(Error::Api(raw.api_error()));
+            return Err(Error::Api(Box::new(raw.api_error())));
         }
         Ok(raw)
     }

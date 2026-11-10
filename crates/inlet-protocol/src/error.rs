@@ -41,7 +41,7 @@ pub enum Error {
     Http(#[from] reqwest::Error),
     /// The instance answered with an error.
     #[error("API error: {0}")]
-    Api(ApiError),
+    Api(Box<ApiError>),
     /// The token is not valid any more (HTTP 401). Sign in again.
     #[error("the session token was rejected; sign in again")]
     Unauthorized,

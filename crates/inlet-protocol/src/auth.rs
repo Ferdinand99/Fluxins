@@ -62,7 +62,7 @@ pub struct SignedIn {
     /// The account ID.
     pub user_id: Snowflake,
     /// The account, when the API sent it.
-    pub user: Option<User>,
+    pub user: Option<Box<User>>,
 }
 
 /// A second-factor method.
@@ -239,7 +239,7 @@ pub async fn poll_ip_authorization(instance: &Instance, ticket: &Ticket) -> Resu
     );
     let raw = anon(instance, Method::GET, &path, None, false).await?;
     if !raw.is_success() {
-        return Err(Error::Api(raw.api_error()));
+        return Err(Error::Api(Box::new(raw.api_error())));
     }
     let v = raw.value();
     if v.get("completed").and_then(Value::as_bool) == Some(true) {
@@ -308,7 +308,7 @@ impl Handoff {
         let body = json!({});
         let raw = anon(instance, Method::POST, "/auth/handoff/initiate", Some(&body), true).await?;
         if !raw.is_success() {
-            return Err(Error::Api(raw.api_error()));
+            return Err(Error::Api(Box::new(raw.api_error())));
         }
         let v = raw.value();
         let code = v
@@ -365,7 +365,7 @@ impl Handoff {
             None => anon(&self.instance, Method::GET, &path, None, false).await?,
         };
         if !raw.is_success() {
-            return Err(Error::Api(raw.api_error()));
+            return Err(Error::Api(Box::new(raw.api_error())));
         }
         let v = raw.value();
         Ok(match v.get("status").and_then(Value::as_str).unwrap_or("pending") {
@@ -401,7 +401,7 @@ impl Handoff {
         if raw.is_success() {
             Ok(())
         } else {
-            Err(Error::Api(raw.api_error()))
+            Err(Error::Api(Box::new(raw.api_error())))
         }
     }
 }
