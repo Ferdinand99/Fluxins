@@ -7,27 +7,32 @@
 //!
 //! The list is updated with the smallest splice between the old and the new rows, so
 //! the scroll position holds while messages arrive, change or older pages load above.
+//!
+//! Loads are paired: every `begin_load` gets exactly one `apply_messages` or
+//! `cancel_load`, because the backend answers every page request exactly once (see
+//! `backend::messages::fetch::PageAnswer`) and requests carry an ID, so an answer to a
+//! request that a newer one replaced is recognised.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::NaiveDate;
-use gpui::{App, AppContext, Context, FollowMode, ListScrollEvent, Task, Window};
+use gpui::{App, AppContext, Context, FollowMode, ListScrollEvent, SharedString, Task, Window};
 use inlet_protocol as p;
 use inlet_protocol::models::{channel_type, message_flags, message_reference_type, message_type};
 use inlet_state::{
-    AccountState, AckKind, Changes, ChannelId, GuildId, MessageId, MessagesPage, RoleId, UserId,
+    limits, AccountState, AckKind, Changes, ChannelId, GuildId, MessageId, MessagesPage, RoleId,
+    UserId,
 };
 use serde_json::Value;
 
 use super::time;
 use crate::app::Inlet;
-use crate::backend::composer;
 use crate::backend::messages::parse::{self, SharedNames};
-use crate::backend::messages::{Cmd, Ev, Outgoing};
+use crate::backend::messages::{Cmd, Ev, Pending};
 use crate::model::{self, Message, Names};
 use crate::ui::markdown::{self, Block};
 
@@ -35,28 +40,36 @@ use crate::ui::markdown::{self, Block};
 const JUMP_HIGHLIGHT_MS: i64 = 2_000;
 /// Shortest time between two requests for older messages from the UI.
 pub const OLDER_PAGE_INTERVAL_MS: i64 = 1_000;
+/// Shortest time between two reloads of the newest page that the person asks for
+/// ("Jump to present", reaching the bottom of a list that lost its newest messages).
+const NEWEST_RELOAD_INTERVAL_MS: i64 = 1_000;
+/// The new-messages banner says "50+" past this many.
+const BANNER_MAX_COUNTED: usize = 50;
 /// Newest pages asked for again in a row when live messages overflowed the state's
 /// buffer during the load.
 const MAX_NEWEST_RETRIES: u8 = 3;
+/// Channels whose converted messages are kept (the open one and the last few opened),
+/// while they have a message window.
+pub const RECENT_CHANNELS: usize = 5;
+/// Converted messages kept per channel: a full window and a full live buffer.
+pub const MAX_CONVERSIONS_PER_CHANNEL: usize =
+    limits::MAX_MESSAGES_PER_CHANNEL + limits::MAX_PENDING_LIVE;
 
 /// One row of the message list.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Row {
     /// The start of the channel ("Welcome to #general!").
-    Welcome(WelcomeRow),
+    Welcome(Rc<WelcomeRow>),
     /// A date separator; `new` when the first unread message is also the first of the day.
-    Day {
-        day: NaiveDate,
-        new: bool,
-    },
+    Day { day: NaiveDate, new: bool },
     /// The unread line with "NEW".
     Unread,
-    Message(Box<MessageRow>),
+    Message(Rc<MessageRow>),
     /// A system message (someone joined, a message was pinned, …) or a type Inlet does
     /// not know.
-    System(Box<SystemRow>),
+    System(Rc<SystemRow>),
     /// A message of this account that is being sent or could not be sent.
-    Outgoing(Box<OutgoingRow>),
+    Pending(Rc<PendingRow>),
 }
 
 impl Row {
@@ -112,15 +125,12 @@ pub struct MessageRow {
     pub tag: Option<Tag>,
     pub reply: Option<ReplyRow>,
     /// Time alone, for grouped and compact rows.
-    pub clock: String,
+    pub clock: SharedString,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReplyState {
-    Loaded {
-        author: String,
-        snippet: String,
-    },
+    Loaded { author: String, snippet: String },
     /// The message replied to was deleted.
     Deleted,
     /// The server did not send it.
@@ -165,24 +175,27 @@ pub struct WelcomeRow {
 }
 
 #[derive(Clone, Debug)]
-pub struct OutgoingRow {
+pub struct PendingRow {
     pub nonce: String,
     pub author: String,
     pub blocks: Rc<Vec<Block>>,
     pub failed: Option<String>,
+    /// Under an own message or another pending one: no header.
+    pub grouped: bool,
 }
 
-impl PartialEq for OutgoingRow {
+impl PartialEq for PendingRow {
     fn eq(&self, other: &Self) -> bool {
         self.nonce == other.nonce
             && self.failed == other.failed
+            && self.grouped == other.grouped
             && Rc::ptr_eq(&self.blocks, &other.blocks)
     }
 }
 
 /// An entry of the outbox: a message of this account on its way, or one that failed.
 pub struct OutboxEntry {
-    pub out: Outgoing,
+    pub out: Pending,
     blocks: Rc<Vec<Block>>,
 }
 
@@ -190,20 +203,22 @@ pub struct OutboxEntry {
 /// and only while older messages exist. Scrolling at the top never fetches in a loop.
 #[derive(Default, Debug)]
 pub struct OlderPager {
-    in_flight: bool,
+    /// The request waiting for its answer.
+    in_flight: Option<u64>,
     last_ms: Option<i64>,
 }
 
 impl OlderPager {
-    /// Returns `before` for a new request, or `None` when none may start now.
+    /// Returns `before` for request `request`, or `None` when none may start now.
     pub fn request(
         &mut self,
         now_ms: i64,
         has_more_before: bool,
         loading: bool,
         oldest: Option<MessageId>,
+        request: u64,
     ) -> Option<MessageId> {
-        if !has_more_before || loading || self.in_flight {
+        if !has_more_before || loading || self.in_flight.is_some() {
             return None;
         }
         if self
@@ -213,41 +228,193 @@ impl OlderPager {
             return None;
         }
         let before = oldest?;
-        self.in_flight = true;
+        self.in_flight = Some(request);
         self.last_ms = Some(now_ms);
         Some(before)
     }
 
-    /// The page arrived or failed.
-    pub fn done(&mut self) {
-        self.in_flight = false;
+    /// The answer to `request` came (a page or a failure). Answers to other requests
+    /// change nothing.
+    pub fn done(&mut self, request: u64) {
+        if self.in_flight == Some(request) {
+            self.in_flight = None;
+        }
     }
 }
 
-/// Converted messages of one channel, with the edit time each was converted from.
-type Conversions = HashMap<MessageId, (Option<String>, Rc<Message>)>;
+/// The edit time of each raw message, by ID, that came with a batch of conversions.
+type Edits = HashMap<String, Option<String>>;
+
+fn edits_of<'a>(raw: impl IntoIterator<Item = &'a p::Message>) -> Edits {
+    raw.into_iter()
+        .map(|m| (m.id.clone(), m.edited_timestamp.clone()))
+        .collect()
+}
+
+/// A converted message and what the rows need of it, worked out once.
+#[derive(Clone, Debug)]
+struct Converted {
+    /// The edit time it was converted from.
+    edit: Option<String>,
+    shown: Rc<Message>,
+    ms: i64,
+    day: Option<NaiveDate>,
+    clock: SharedString,
+}
+
+impl Converted {
+    fn new(edit: Option<String>, m: Message) -> Self {
+        let ms = if m.timestamp_ms > 0 {
+            m.timestamp_ms
+        } else {
+            MessageId::parse(&m.id).map_or(0, MessageId::timestamp_ms)
+        };
+        Converted {
+            edit,
+            shown: Rc::new(m),
+            ms,
+            day: time::day(ms),
+            clock: time::clock(ms).into(),
+        }
+    }
+}
+
+/// The converted messages of the open channel and the few opened before it, only
+/// while the account state holds a window for them. Bounded by
+/// [`RECENT_CHANNELS`] × [`MAX_CONVERSIONS_PER_CHANNEL`]; everything else the backend
+/// converts (live messages in other channels) is dropped at once.
+#[derive(Default)]
+struct Conversions {
+    by_channel: HashMap<ChannelId, HashMap<MessageId, Converted>>,
+    /// Most recently opened first.
+    recent: VecDeque<ChannelId>,
+}
+
+impl Conversions {
+    /// The channel was opened: it is kept first.
+    fn touch(&mut self, ch: ChannelId) {
+        self.recent.retain(|c| *c != ch);
+        self.recent.push_front(ch);
+        while self.recent.len() > RECENT_CHANNELS {
+            if let Some(old) = self.recent.pop_back() {
+                self.by_channel.remove(&old);
+            }
+        }
+    }
+
+    fn keeps(&self, state: &AccountState, ch: ChannelId) -> bool {
+        self.recent.contains(&ch) && state.messages(ch).is_some()
+    }
+
+    /// Keeps the conversions of messages the state holds (or buffers while a window
+    /// loads or misses its newest messages), after the state took the event or page.
+    /// A conversion of an older edit never replaces a newer one.
+    fn remember(&mut self, state: &AccountState, edits: &Edits, rendered: Vec<Message>) {
+        for m in rendered {
+            let (Some(ch), Some(id)) = (ChannelId::parse(&m.channel_id), MessageId::parse(&m.id))
+            else {
+                continue;
+            };
+            if !self.keeps(state, ch) {
+                continue;
+            }
+            let Some(w) = state.messages(ch) else {
+                continue;
+            };
+            let buffering = w.is_loading() || !w.has_newest();
+            if w.get(id).is_none() && !buffering {
+                continue;
+            }
+            let edit = edits.get(&m.id).cloned().flatten();
+            let map = self.by_channel.entry(ch).or_default();
+            if map.get(&id).is_some_and(|old| old.edit > edit) {
+                continue;
+            }
+            map.insert(id, Converted::new(edit, m));
+            if map.len() > MAX_CONVERSIONS_PER_CHANNEL {
+                map.retain(|id, _| w.get(*id).is_some());
+            }
+        }
+    }
+
+    /// Drops conversions the state no longer needs.
+    fn prune(&mut self, state: &AccountState, changes: &Changes) {
+        let recent = &self.recent;
+        self.by_channel.retain(|ch, map| {
+            let Some(w) = state.messages(*ch).filter(|_| recent.contains(ch)) else {
+                return false;
+            };
+            if changes.messages.contains(ch) && !w.is_loading() && w.has_newest() {
+                map.retain(|id, _| w.get(*id).is_some());
+            }
+            true
+        });
+    }
+
+    /// The conversion of `m`; converted here when it is missing or older than the
+    /// stored message (an edit only the state saw, or a channel opened long ago).
+    fn get(&mut self, state: &AccountState, ch: ChannelId, id: MessageId, m: &p::Message) -> Converted {
+        let map = self.by_channel.entry(ch).or_default();
+        if let Some(c) = map.get(&id) {
+            if c.edit == m.edited_timestamp {
+                return c.clone();
+            }
+        }
+        let names: SharedNames = Arc::new(Mutex::new(names_for(state, ch, m)));
+        let c = Converted::new(m.edited_timestamp.clone(), parse::to_message(m, &names));
+        map.insert(id, c.clone());
+        c
+    }
+
+    fn get_mut(&mut self, ch: ChannelId, id: MessageId) -> Option<&mut Converted> {
+        self.by_channel.get_mut(&ch)?.get_mut(&id)
+    }
+
+    /// How many conversions are kept, over all channels.
+    fn len(&self) -> usize {
+        self.by_channel.values().map(HashMap::len).sum()
+    }
+}
+
+/// What "Jump to present" does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JumpAction {
+    /// The window has the newest messages: scroll to them.
+    Scroll,
+    /// The window lost its newest messages (scrolled far back, or a load that could
+    /// not keep up): load the newest page, which replaces it.
+    LoadNewest,
+}
 
 /// The message list's view state.
 #[derive(Default)]
 pub struct MessageView {
     pub rows: Vec<Row>,
-    /// Converted messages per channel, with the edit time they were converted from.
-    rendered: HashMap<ChannelId, Conversions>,
+    conversions: Conversions,
     outbox: Vec<OutboxEntry>,
     /// The account's read position when the channel was opened: the "NEW" line goes
     /// above the first message after it.
     unread_after: Option<(ChannelId, MessageId)>,
-    /// Messages after the read position, and the time of the first, for the banner.
+    /// Messages after the read position, for the banner.
     pub unread_count: usize,
-    pub unread_since_ms: i64,
+    /// The banner's text, worked out with the rows.
+    pub banner: Option<String>,
     revealed: HashSet<MessageId>,
     jumped: Option<(MessageId, i64)>,
     pager: OlderPager,
+    /// Newest-page requests waiting for their answer, per channel.
+    loading: HashMap<ChannelId, u64>,
+    next_request: u64,
     /// Compact mode: no avatars, the time before the name, no space between groups.
     pub compact: bool,
     /// The open channel's newest page has landed.
     loaded: bool,
     newest_retries: u8,
+    last_reload_ms: Option<i64>,
+    /// The open channel's window lost its newest messages (see [`JumpAction`]).
+    pub detached: bool,
+    /// Live messages that arrived while detached.
+    pub detached_new: usize,
     ticker: Option<Task<()>>,
     scroll_hooked: bool,
     /// The person scrolled the "NEW" line out of view above (the banner shows).
@@ -258,13 +425,6 @@ pub struct MessageView {
 
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
-}
-
-/// The message's time in Unix milliseconds: its timestamp, or the ID's.
-pub fn message_ms(m: &p::Message) -> i64 {
-    p::models::parse_timestamp_ms(&m.timestamp)
-        .or_else(|| MessageId::parse(&m.id).map(MessageId::timestamp_ms))
-        .unwrap_or(0)
 }
 
 /// Default and reply messages; everything else is a system line.
@@ -281,6 +441,18 @@ fn is_reply(m: &p::Message) -> bool {
 /// published copy, both have the same "silent" flag, they are on the same day and at
 /// most seven minutes apart. Grouping is by account ID, never by display name.
 pub fn groups_with(prev: &p::Message, prev_ms: i64, next: &p::Message, next_ms: i64) -> bool {
+    groups_on(prev, prev_ms, time::day(prev_ms), next, next_ms, time::day(next_ms))
+}
+
+/// [`groups_with`] with the local days already worked out.
+fn groups_on(
+    prev: &p::Message,
+    prev_ms: i64,
+    prev_day: Option<NaiveDate>,
+    next: &p::Message,
+    next_ms: i64,
+    next_day: Option<NaiveDate>,
+) -> bool {
     let silent = |m: &p::Message| m.flag_bits() & message_flags::SUPPRESS_NOTIFICATIONS;
     is_regular(prev.kind)
         && is_regular(next.kind)
@@ -292,7 +464,7 @@ pub fn groups_with(prev: &p::Message, prev_ms: i64, next: &p::Message, next_ms: 
         && silent(prev) == silent(next)
         && next_ms >= prev_ms
         && next_ms - prev_ms <= model::GROUP_WINDOW_MS
-        && time::day(prev_ms) == time::day(next_ms)
+        && prev_day == next_day
 }
 
 /// Whether the row is highlighted for the account: it is mentioned, one of its roles
@@ -482,7 +654,7 @@ fn welcome_row(state: &AccountState, ch: ChannelId) -> WelcomeRow {
     }
 }
 
-/// Mention names for a message converted on the UI thread (rare: see `shown`).
+/// Mention names for a message converted on the UI thread (rare: see `Conversions::get`).
 fn names_for(state: &AccountState, ch: ChannelId, m: &p::Message) -> Names {
     let mut n = Names::default();
     for u in &m.mentions {
@@ -534,6 +706,13 @@ fn starts_compact() -> bool {
     }
 }
 
+/// Whether the window of `ch` misses its newest messages and is not loading them.
+fn is_detached(state: &AccountState, ch: ChannelId) -> bool {
+    state
+        .messages(ch)
+        .is_some_and(|w| !w.has_newest() && !w.is_loading())
+}
+
 impl MessageView {
     pub fn new() -> Self {
         Self {
@@ -542,82 +721,61 @@ impl MessageView {
         }
     }
 
-    /// Keeps converted messages that came with an event or a page. A conversion of an
-    /// older edit never replaces a newer one, the rule the account state follows too.
-    fn remember(&mut self, raw: &[&p::Message], rendered: Vec<Message>) {
-        let edits: HashMap<&str, &Option<String>> = raw
-            .iter()
-            .map(|m| (m.id.as_str(), &m.edited_timestamp))
-            .collect();
-        for m in rendered {
-            let (Some(ch), Some(id)) = (ChannelId::parse(&m.channel_id), MessageId::parse(&m.id))
-            else {
-                continue;
-            };
-            let edit = edits
-                .get(m.id.as_str())
-                .map(|e| (*e).clone())
-                .unwrap_or_default();
-            let map = self.rendered.entry(ch).or_default();
-            match map.get(&id) {
-                Some((old, _)) if *old > edit => {}
-                _ => {
-                    map.insert(id, (edit, Rc::new(m)));
-                }
-            }
+    fn request_id(&mut self) -> u64 {
+        self.next_request += 1;
+        self.next_request
+    }
+
+    /// What "Jump to present" should do for channel `ch`.
+    pub fn jump_action(&self, state: &AccountState, ch: ChannelId) -> JumpAction {
+        if is_detached(state, ch) {
+            JumpAction::LoadNewest
+        } else {
+            JumpAction::Scroll
         }
     }
 
-    /// The conversion of `m`; converted here when it is missing or older than the
-    /// stored message (an edit that only the state saw).
-    fn shown(
-        &mut self,
+    /// Whether channel `ch` may be marked read now: its newest page landed, its window
+    /// has the newest messages, the list shows the bottom and the window has focus.
+    pub fn may_mark_read(
+        &self,
         state: &AccountState,
         ch: ChannelId,
-        id: MessageId,
-        m: &p::Message,
-    ) -> Rc<Message> {
-        let map = self.rendered.entry(ch).or_default();
-        if let Some((edit, shown)) = map.get(&id) {
-            if *edit == m.edited_timestamp {
-                return shown.clone();
-            }
-        }
-        let names: SharedNames = Arc::new(Mutex::new(names_for(state, ch, m)));
-        let shown = Rc::new(parse::to_message(m, &names));
-        map.insert(id, (m.edited_timestamp.clone(), shown.clone()));
-        shown
+        at_bottom: bool,
+        window_active: bool,
+    ) -> bool {
+        self.loaded
+            && at_bottom
+            && window_active
+            && state.messages(ch).is_some_and(|w| w.has_newest())
     }
 
-    /// Drops conversions of messages the state no longer holds.
-    fn prune(&mut self, state: &AccountState, changes: &Changes) {
-        self.rendered.retain(|ch, map| {
-            if !changes.messages.contains(ch) {
-                return true;
-            }
-            match state.messages(*ch) {
-                // A loading window still has messages on their way in its buffer.
-                Some(w) if w.is_loading() => true,
-                Some(w) => {
-                    map.retain(|id, _| w.get(*id).is_some());
-                    true
-                }
-                None => false,
-            }
-        });
+    /// A live message in the open channel `ch`, after the state took it: counted for
+    /// the "new messages" pill while the window misses its newest messages.
+    pub fn note_live(&mut self, state: &AccountState, ch: ChannelId) {
+        if is_detached(state, ch) {
+            self.detached_new += 1;
+        }
     }
 
     /// Builds the rows of channel `ch` from the account state.
     pub fn build_rows(&mut self, state: &AccountState, ch: ChannelId) -> Vec<Row> {
         let mut rows = Vec::new();
         self.unread_count = 0;
-        self.unread_since_ms = 0;
+        let mut unread_since_ms = 0;
         if self.jumped.is_some_and(|(_, until)| until <= now_ms()) {
             self.jumped = None;
         }
+        self.detached = is_detached(state, ch);
+        if !self.detached {
+            self.detached_new = 0;
+        }
+        let me = state.me_id();
+        // Whether the last row is this account's message (pending rows group under it).
+        let mut last_mine = false;
         if let Some(window) = state.messages(ch) {
             if !window.has_more_before() && !window.is_loading() {
-                rows.push(Row::Welcome(welcome_row(state, ch)));
+                rows.push(Row::Welcome(Rc::new(welcome_row(state, ch))));
             }
             let channel = state.channel(ch);
             let guild = state.channels().guild_of(ch);
@@ -630,18 +788,13 @@ impl MessageView {
                 let Some(id) = MessageId::parse(&m.id) else {
                     continue;
                 };
-                let shown = self.shown(state, ch, id, m);
-                let ms = if shown.timestamp_ms > 0 {
-                    shown.timestamp_ms
-                } else {
-                    message_ms(m)
-                };
-                let day = time::day(ms);
+                let c = self.conversions.get(state, ch, id, m);
+                let (ms, day) = (c.ms, c.day);
                 let unread = unread_after.is_some_and(|a| id > a);
                 let first_unread = unread && self.unread_count == 0;
                 if unread {
                     if first_unread {
-                        self.unread_since_ms = ms;
+                        unread_since_ms = ms;
                     }
                     self.unread_count += 1;
                 }
@@ -654,44 +807,61 @@ impl MessageView {
                     _ if first_unread => rows.push(Row::Unread),
                     _ => {}
                 }
+                last_mine = UserId::parse(&m.author.id) == Some(me) && is_regular(m.kind);
                 if !is_regular(m.kind) {
-                    rows.push(Row::System(Box::new(system_row(id, m, &shown))));
+                    rows.push(Row::System(Rc::new(system_row(id, m, &c.shown))));
                     prev = Some((m, ms, day));
                     continue;
                 }
-                let grouped =
-                    !first_unread && prev.is_some_and(|(pm, pms, _)| groups_with(pm, pms, m, ms));
-                rows.push(Row::Message(Box::new(MessageRow {
+                let grouped = !first_unread
+                    && prev.is_some_and(|(pm, pms, pday)| groups_on(pm, pms, pday, m, ms, day));
+                rows.push(Row::Message(Rc::new(MessageRow {
                     id,
                     grouped,
                     mention: mentions_me(state, ch, m),
                     jumped: self.jumped.is_some_and(|(j, _)| j == id),
                     revealed: self.revealed.contains(&id),
                     name_color: name_color(state, guild, m),
-                    tag: tag(channel, m, &shown),
-                    reply: reply_of(m, &shown),
-                    clock: time::clock(ms),
-                    message: Shown(shown),
+                    tag: tag(channel, m, &c.shown),
+                    reply: reply_of(m, &c.shown),
+                    clock: c.clock.clone(),
+                    message: Shown(c.shown.clone()),
                 })));
                 prev = Some((m, ms, day));
             }
         }
-        let me = model::clean_name(state.me().display_name());
+        let author = model::clean_name(state.me().display_name());
         for o in &self.outbox {
             if ChannelId::parse(&o.out.channel_id) == Some(ch) {
-                rows.push(Row::Outgoing(Box::new(OutgoingRow {
+                rows.push(Row::Pending(Rc::new(PendingRow {
                     nonce: o.out.nonce.clone(),
-                    author: me.clone(),
+                    author: author.clone(),
                     blocks: o.blocks.clone(),
                     failed: o.out.failed.clone(),
+                    grouped: last_mine,
                 })));
+                last_mine = true;
             }
         }
+        self.banner = match self.unread_count {
+            0 => None,
+            1 => Some(t!("chat-new-message", since = time::full(unread_since_ms))),
+            n if n > BANNER_MAX_COUNTED => Some(t!(
+                "chat-new-messages-many",
+                count = BANNER_MAX_COUNTED,
+                since = time::full(unread_since_ms)
+            )),
+            n => Some(t!(
+                "chat-new-messages",
+                count = n,
+                since = time::full(unread_since_ms)
+            )),
+        };
         rows
     }
 
     /// Adds or updates an outbox entry.
-    fn upsert_outgoing(&mut self, out: Outgoing) {
+    fn upsert_pending(&mut self, out: Pending) {
         match self.outbox.iter_mut().find(|o| o.out.nonce == out.nonce) {
             Some(entry) => entry.out = out,
             None => {
@@ -702,6 +872,17 @@ impl MessageView {
     }
 }
 
+/// Events that change members, and so maybe a name colour on screen.
+fn changes_members(d: &p::Dispatch) -> bool {
+    matches!(
+        d,
+        p::Dispatch::GuildMemberAdd(_)
+            | p::Dispatch::GuildMemberUpdate(_)
+            | p::Dispatch::GuildMembersChunk(_)
+            | p::Dispatch::GuildMemberListUpdate(_)
+    )
+}
+
 impl Inlet {
     pub(crate) fn on_messages_event(
         &mut self,
@@ -709,27 +890,34 @@ impl Inlet {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let active = window.is_window_active();
         match event {
             Ev::Guilds(guilds) => self.on_guilds(guilds, cx),
             Ev::Channels { guild_id, channels } => self.on_channels(guild_id, channels, window, cx),
-            Ev::Dispatch { dispatch, rendered } => self.on_dispatch(*dispatch, rendered, cx),
+            Ev::Dispatch { dispatch, rendered } => {
+                self.on_dispatch(*dispatch, rendered, active, cx)
+            }
             Ev::Page {
                 channel_id,
+                request,
                 page,
                 rendered,
-            } => self.on_page(channel_id, page, rendered, cx),
-            Ev::PageFailed { channel_id, older } => {
-                if older {
-                    self.chat.view.pager.done();
-                } else if let (Some(ch), Some(account)) =
-                    (ChannelId::parse(&channel_id), self.account.clone())
-                {
-                    account.update(cx, |s, _| s.cancel_load(ch));
+            } => self.on_page(channel_id, request, page, rendered, active, cx),
+            Ev::PageFailed {
+                channel_id,
+                request,
+                older,
+            } => self.on_page_failed(channel_id, request, older, cx),
+            Ev::MessageCreated(message) => {
+                if let Some(account) = self.account.clone() {
+                    self.chat
+                        .view
+                        .conversions
+                        .remember(account.read(cx), &Edits::new(), vec![message]);
                 }
             }
-            Ev::MessageCreated(message) => self.chat.view.remember(&[], vec![message]),
-            Ev::Outgoing(out) => {
-                self.chat.view.upsert_outgoing(out);
+            Ev::Pending(out) => {
+                self.chat.view.upsert_pending(out);
                 self.refresh_rows(cx);
             }
         }
@@ -743,19 +931,22 @@ impl Inlet {
         &mut self,
         dispatch: p::Dispatch,
         rendered: Vec<Message>,
+        window_active: bool,
         cx: &mut Context<Self>,
     ) {
         if let p::Dispatch::Ready(ready) = &dispatch {
-            match self.account.clone() {
+            let changes = match self.account.clone() {
                 None => {
                     let state = AccountState::from_ready_at(ready, now_ms());
                     self.account = Some(cx.new(|_| state));
                     self.start_ticker(cx);
+                    let mut c = Changes::default();
+                    c.reset = true;
+                    c
                 }
-                Some(account) => {
-                    account.update(cx, |s, _| s.apply(&dispatch));
-                }
-            }
+                Some(account) => account.update(cx, |s, _| s.apply(&dispatch)),
+            };
+            self.after_changes(changes, false, cx);
             // A first READY, or a new one after a reconnect: the open channel's window is
             // missing or stale, so load its newest page.
             self.chat.view.newest_retries = 0;
@@ -765,12 +956,15 @@ impl Inlet {
         let Some(account) = self.account.clone() else {
             return;
         };
-        let raw = match &dispatch {
-            p::Dispatch::MessageCreate(m) | p::Dispatch::MessageUpdate(m) => vec![&**m],
-            _ => Vec::new(),
-        };
-        self.chat.view.remember(&raw, rendered);
         let mut changes = account.update(cx, |s, _| s.apply(&dispatch));
+        let edits = match &dispatch {
+            p::Dispatch::MessageCreate(m) | p::Dispatch::MessageUpdate(m) => edits_of([&**m]),
+            _ => Edits::new(),
+        };
+        self.chat
+            .view
+            .conversions
+            .remember(account.read(cx), &edits, rendered);
         if let p::Dispatch::MessageCreate(m) = &dispatch {
             if let Some(nonce) = &m.nonce {
                 let before = self.chat.view.outbox.len();
@@ -779,25 +973,33 @@ impl Inlet {
                     self.refresh_rows(cx);
                 }
             }
-            // A message in the open channel while it shows the newest messages: read.
             let open = self.open_channel_id();
-            let at_bottom = self.chat.message_list.is_following_tail() && self.chat.view.loaded;
-            if let (true, Some(ch)) = (at_bottom, open) {
-                if ChannelId::parse(&m.channel_id) == Some(ch) {
-                    changes.merge(
-                        account.update(cx, |s, _| s.mark_read(ch, None, AckKind::Automatic)),
-                    );
+            if let Some(ch) = open.filter(|ch| ChannelId::parse(&m.channel_id) == Some(*ch)) {
+                self.chat.view.note_live(account.read(cx), ch);
+                // A message in the open channel while it shows the newest messages and
+                // has focus: read.
+                let at_bottom = self.chat.message_list.is_following_tail();
+                if self
+                    .chat
+                    .view
+                    .may_mark_read(account.read(cx), ch, at_bottom, window_active)
+                {
+                    changes.merge(account.update(cx, |s, _| {
+                        s.mark_read(ch, None, AckKind::Automatic)
+                    }));
                 }
             }
         }
-        self.after_changes(changes, cx);
+        self.after_changes(changes, changes_members(&dispatch), cx);
     }
 
     fn on_page(
         &mut self,
         channel_id: String,
+        request: u64,
         page: MessagesPage,
         rendered: Vec<Message>,
+        window_active: bool,
         cx: &mut Context<Self>,
     ) {
         let (Some(ch), Some(account)) = (ChannelId::parse(&channel_id), self.account.clone())
@@ -805,36 +1007,71 @@ impl Inlet {
             return;
         };
         let older = page.before.is_some();
-        {
-            let raw: Vec<&p::Message> = page.messages.iter().collect();
-            self.chat.view.remember(&raw, rendered);
-        }
-        let mut changes = account.update(cx, |s, _| s.apply_messages(ch, page));
         if older {
-            self.chat.view.pager.done();
-        } else if self.open_channel_id() == Some(ch) {
+            self.chat.view.pager.done(request);
+        } else if self.chat.view.loading.get(&ch) == Some(&request) {
+            self.chat.view.loading.remove(&ch);
+        }
+        let edits = edits_of(&page.messages);
+        let mut changes = account.update(cx, |s, _| s.apply_messages(ch, page));
+        self.chat
+            .view
+            .conversions
+            .remember(account.read(cx), &edits, rendered);
+        if !older && self.open_channel_id() == Some(ch) {
             self.chat.view.loaded = true;
-            // Opened and shown: the channel is read.
-            changes.merge(account.update(cx, |s, _| s.mark_read(ch, None, AckKind::Explicit)));
-            // Too many live messages arrived during the load: ask again (a few times).
-            let incomplete = account
-                .read(cx)
-                .messages(ch)
-                .is_some_and(|w| !w.has_newest() && !w.is_loading());
-            if incomplete && self.chat.view.newest_retries < MAX_NEWEST_RETRIES {
+            let complete = account.read(cx).messages(ch).is_some_and(|w| w.has_newest());
+            if complete {
+                self.chat.view.newest_retries = 0;
+                // Opened and shown at the bottom with focus: the channel is read.
+                let at_bottom = self.chat.message_list.is_following_tail();
+                if self
+                    .chat
+                    .view
+                    .may_mark_read(account.read(cx), ch, at_bottom, window_active)
+                {
+                    changes.merge(
+                        account.update(cx, |s, _| s.mark_read(ch, None, AckKind::Explicit)),
+                    );
+                }
+            } else if is_detached(account.read(cx), ch)
+                && self.chat.view.newest_retries < MAX_NEWEST_RETRIES
+            {
+                // Too many live messages arrived during the load: ask again.
                 self.chat.view.newest_retries += 1;
                 self.load_open_channel(cx);
             }
         }
-        self.after_changes(changes, cx);
+        self.after_changes(changes, false, cx);
+    }
+
+    fn on_page_failed(&mut self, channel_id: String, request: u64, older: bool, cx: &mut Context<Self>) {
+        if older {
+            self.chat.view.pager.done(request);
+            return;
+        }
+        let Some(ch) = ChannelId::parse(&channel_id) else {
+            return;
+        };
+        // An answer to a request a newer one replaced: the newer one pairs the load.
+        if self.chat.view.loading.get(&ch) != Some(&request) {
+            return;
+        }
+        self.chat.view.loading.remove(&ch);
+        if let Some(account) = self.account.clone() {
+            account.update(cx, |s, _| s.cancel_load(ch));
+            if self.open_channel_id() == Some(ch) {
+                self.refresh_rows(cx);
+            }
+        }
     }
 
     /// Re-renders what changed in the account state.
-    fn after_changes(&mut self, changes: Changes, cx: &mut Context<Self>) {
+    fn after_changes(&mut self, changes: Changes, members: bool, cx: &mut Context<Self>) {
         let Some(account) = self.account.clone() else {
             return;
         };
-        self.chat.view.prune(account.read(cx), &changes);
+        self.chat.view.conversions.prune(account.read(cx), &changes);
         let Some(ch) = self.open_channel_id() else {
             return;
         };
@@ -842,7 +1079,7 @@ impl Inlet {
         let relevant = changes.reset
             || changes.messages.contains(&ch)
             || changes.guilds
-            || guild.is_some_and(|g| changes.member_guilds.contains(&g));
+            || (members && guild.is_some_and(|g| changes.member_guilds.contains(&g)));
         if relevant {
             self.refresh_rows(cx);
         }
@@ -867,6 +1104,9 @@ impl Inlet {
     /// Shows a newly selected channel: an empty list until its messages are there.
     pub(crate) fn open_channel_messages(&mut self, cx: &mut Context<Self>) {
         self.clear_messages();
+        if let Some(ch) = self.open_channel_id() {
+            self.chat.view.conversions.touch(ch);
+        }
         self.load_open_channel(cx);
     }
 
@@ -877,9 +1117,10 @@ impl Inlet {
         view.unread_after = None;
         view.revealed.clear();
         view.jumped = None;
-        view.pager = OlderPager::default();
         view.loaded = false;
         view.newest_retries = 0;
+        view.detached = false;
+        view.detached_new = 0;
         view.divider_above = false;
         view.scrolled_away = false;
         self.chat.message_list.reset(0);
@@ -919,14 +1160,36 @@ impl Inlet {
             (marker, changes)
         });
         let view = &mut self.chat.view;
+        view.conversions.touch(ch);
         if view.unread_after.is_none_or(|(c, _)| c != ch) {
             view.unread_after = marker.map(|m| (ch, m));
         }
         view.loaded = false;
-        self.backend.send(Cmd::OpenChannel { channel_id });
-        self.after_changes(changes, cx);
+        view.detached_new = 0;
+        let request = view.request_id();
+        view.loading.insert(ch, request);
+        self.backend.send(Cmd::OpenChannel {
+            channel_id,
+            request,
+        });
+        self.after_changes(changes, false, cx);
         // An existing window shows right away; the page merges into it.
         self.refresh_rows(cx);
+    }
+
+    /// Loads the newest page again when the person asks for it, at most once a second.
+    fn reload_newest(&mut self, cx: &mut Context<Self>) {
+        let now = now_ms();
+        let view = &mut self.chat.view;
+        if view
+            .last_reload_ms
+            .is_some_and(|last| now.saturating_sub(last) < NEWEST_RELOAD_INTERVAL_MS)
+        {
+            return;
+        }
+        view.last_reload_ms = Some(now);
+        view.newest_retries = 0;
+        self.load_open_channel(cx);
     }
 
     /// The list was scrolled to its top: ask for older messages, within the budget.
@@ -945,21 +1208,25 @@ impl Inlet {
             .unwrap_or((false, true, None));
         let view = &mut self.chat.view;
         let loaded = view.loaded;
-        if let Some(before) = view
-            .pager
-            .request(now_ms(), has_more && loaded, loading, oldest)
+        let request = view.next_request + 1;
+        if let Some(before) =
+            view.pager
+                .request(now_ms(), has_more && loaded, loading, oldest, request)
         {
+            view.next_request = request;
             self.backend.send(Cmd::LoadOlder {
                 channel_id,
                 before: before.to_string(),
+                request,
             });
         }
     }
 
-    /// Follows the person's scrolling: asks for older messages near the top, and notes
-    /// whether the "NEW" line and the newest messages are out of view (for the banner
-    /// and "Jump to present"). The list reports only scrolling by the person, so loading
-    /// never repeats by itself.
+    /// Follows the person's scrolling: asks for older messages near the top, loads the
+    /// newest page again at the bottom of a list that lost it, and notes whether the
+    /// "NEW" line and the newest messages are out of view (for the banner and "Jump to
+    /// present"). The list reports only scrolling by the person, so loading never
+    /// repeats by itself.
     pub(crate) fn hook_list_scroll(&mut self, cx: &mut Context<Self>) {
         if self.chat.view.scroll_hooked {
             return;
@@ -979,8 +1246,11 @@ impl Inlet {
                         .position(|r| matches!(r, Row::Unread | Row::Day { new: true, .. }))
                         .is_some_and(|ix| ix < range.start);
                     view.scrolled_away = !following && range.end < count;
+                    let at_bottom = range.end >= count;
                     if range.start <= 1 {
                         this.load_older(cx);
+                    } else if at_bottom && this.chat.view.detached {
+                        this.reload_newest(cx);
                     }
                     cx.notify();
                 });
@@ -991,7 +1261,9 @@ impl Inlet {
     /// Ticks the account state about once a second (typing, timeouts, load timeouts).
     fn start_ticker(&mut self, cx: &mut Context<Self>) {
         self.chat.view.ticker = Some(cx.spawn(async move |this, cx| loop {
-            cx.background_executor().timer(Duration::from_secs(1)).await;
+            cx.background_executor()
+                .timer(Duration::from_secs(1))
+                .await;
             let alive = this.update(cx, |this, cx| this.tick_account(cx));
             if alive.is_err() {
                 break;
@@ -1013,7 +1285,7 @@ impl Inlet {
             self.refresh_rows(cx);
         }
         if !changes.is_empty() || jump_over {
-            self.after_changes(changes, cx);
+            self.after_changes(changes, false, cx);
             cx.notify();
         }
     }
@@ -1038,8 +1310,16 @@ impl Inlet {
         cx.notify();
     }
 
-    /// Back to the newest messages, following new ones again.
+    /// Back to the newest messages, following new ones again. A window that lost its
+    /// newest messages loads them; the page replaces it.
     pub(crate) fn jump_to_present(&mut self, cx: &mut Context<Self>) {
+        let action = match (self.open_channel_id(), self.account.clone()) {
+            (Some(ch), Some(account)) => self.chat.view.jump_action(account.read(cx), ch),
+            _ => JumpAction::Scroll,
+        };
+        if action == JumpAction::LoadNewest {
+            self.reload_newest(cx);
+        }
         self.chat.view.scrolled_away = false;
         self.chat.message_list.scroll_to_end();
         self.chat.message_list.set_follow_mode(FollowMode::Tail);
@@ -1052,7 +1332,7 @@ impl Inlet {
         self.chat.view.divider_above = false;
         if let (Some(ch), Some(account)) = (self.open_channel_id(), self.account.clone()) {
             let changes = account.update(cx, |s, _| s.mark_read(ch, None, AckKind::Explicit));
-            self.after_changes(changes, cx);
+            self.after_changes(changes, false, cx);
         }
         self.refresh_rows(cx);
         cx.notify();
@@ -1070,33 +1350,33 @@ impl Inlet {
         let Some(ch) = self.open_channel_id() else {
             return;
         };
-        if let Some((_, shown)) = self
-            .chat
-            .view
-            .rendered
-            .get_mut(&ch)
-            .and_then(|m| m.get_mut(&id))
-        {
-            let mut full = (**shown).clone();
+        if let Some(c) = self.chat.view.conversions.get_mut(ch, id) {
+            let mut full = (*c.shown).clone();
             full.blocks = markdown::parse(&full.content);
             if full.edited {
                 markdown::mark_edited(&mut full.blocks);
             }
             full.truncated = false;
-            *shown = Rc::new(full);
+            c.shown = Rc::new(full);
         }
         self.refresh_rows(cx);
         cx.notify();
     }
 
-    /// Sends a failed message again.
-    pub(crate) fn retry_outgoing(&mut self, nonce: &str, cx: &mut Context<Self>) {
+    /// Sends a failed message again, with the nonce it had: the row shows "sending"
+    /// until the gateway's MESSAGE_CREATE with that nonce replaces it.
+    pub(crate) fn retry_pending(&mut self, nonce: &str, cx: &mut Context<Self>) {
         let view = &mut self.chat.view;
-        if let Some(ix) = view.outbox.iter().position(|o| o.out.nonce == nonce) {
-            let entry = view.outbox.remove(ix);
-            self.backend.send(composer::Cmd::Send {
-                channel_id: entry.out.channel_id,
-                text: entry.out.text,
+        if let Some(entry) = view
+            .outbox
+            .iter_mut()
+            .find(|o| o.out.nonce == nonce && o.out.failed.is_some())
+        {
+            entry.out.failed = None;
+            self.backend.send(Cmd::Resend {
+                channel_id: entry.out.channel_id.clone(),
+                nonce: entry.out.nonce.clone(),
+                text: entry.out.text.clone(),
             });
             self.refresh_rows(cx);
         }
@@ -1118,10 +1398,10 @@ mod tests {
             .timestamp_millis()
     }
 
-    fn raw(id: u64, author: &str, extra: Value) -> p::Message {
+    fn raw_in(channel: &str, id: u64, author: &str, extra: Value) -> p::Message {
         let mut v = json!({
             "id": id.to_string(),
-            "channel_id": "100",
+            "channel_id": channel,
             "author": {"id": author, "username": format!("u{author}")},
             "type": 0,
             "content": "hi",
@@ -1135,6 +1415,10 @@ mod tests {
         serde_json::from_value(v).unwrap()
     }
 
+    fn raw(id: u64, author: &str, extra: Value) -> p::Message {
+        raw_in("100", id, author, extra)
+    }
+
     #[test]
     fn grouping_breaks_on_reply_author_day_and_seven_minutes() {
         let t0 = local_ms(12, 0, 1);
@@ -1143,7 +1427,12 @@ mod tests {
         assert!(groups_with(&a, t0, &same, t0 + 60_000));
         assert!(groups_with(&a, t0, &same, t0 + model::GROUP_WINDOW_MS));
         // Seven minutes is the edge.
-        assert!(!groups_with(&a, t0, &same, t0 + model::GROUP_WINDOW_MS + 1));
+        assert!(!groups_with(
+            &a,
+            t0,
+            &same,
+            t0 + model::GROUP_WINDOW_MS + 1
+        ));
         // Another account with the same display name.
         let other = raw(3, "8", json!({}));
         assert!(!groups_with(&a, t0, &other, t0 + 1_000));
@@ -1171,14 +1460,18 @@ mod tests {
         assert!(!groups_with(&a, t0, &same, t0 - 1));
     }
 
-    fn state_with_roles(my_roles: &[&str], settings: Value) -> AccountState {
+    fn state_with(my_roles: &[&str], settings: Value, extra_channels: u64) -> AccountState {
+        let mut channels = vec![json!({"id": "100", "type": 0, "guild_id": "20", "name": "general"})];
+        for i in 0..extra_channels {
+            channels.push(json!({"id": (10_000 + i).to_string(), "type": 0, "guild_id": "20", "name": "c"}));
+        }
         let ready: p::Ready = serde_json::from_value(json!({
             "session_id": "s",
             "user": {"id": "10", "username": "me"},
             "guilds": [{
                 "id": "20",
                 "properties": {"id": "20", "name": "G", "owner_id": "99"},
-                "channels": [{"id": "100", "type": 0, "guild_id": "20", "name": "general"}],
+                "channels": channels,
                 "roles": [
                     {"id": "20", "name": "@everyone", "permissions": "1024", "position": 0},
                     {"id": "30", "name": "Mods", "color": 0xFF0000, "position": 2},
@@ -1192,6 +1485,10 @@ mod tests {
         AccountState::from_ready_at(&ready, 1)
     }
 
+    fn state_with_roles(my_roles: &[&str], settings: Value) -> AccountState {
+        state_with(my_roles, settings, 0)
+    }
+
     fn page(state: &mut AccountState, ch: ChannelId, msgs: Vec<p::Message>) {
         let _ = state.begin_load(ch);
         let _ = state.apply_messages(ch, MessagesPage::latest(msgs, 50));
@@ -1203,11 +1500,7 @@ mod tests {
         let mut state = state_with_roles(&["30"], json!([]));
         let role_ping = raw(1, "7", json!({"mention_roles": ["30"]}));
         let other_role = raw(2, "7", json!({"mention_roles": ["31"]}));
-        let me = raw(
-            3,
-            "7",
-            json!({"mentions": [{"id": "10", "username": "me"}]}),
-        );
+        let me = raw(3, "7", json!({"mentions": [{"id": "10", "username": "me"}]}));
         let everyone = raw(4, "7", json!({"mention_everyone": true}));
         let plain = raw(5, "7", json!({}));
         assert!(mentions_me(&state, ch, &role_ping));
@@ -1295,6 +1588,7 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert_eq!(view.unread_count, 2);
+        assert!(view.banner.is_some());
         // Building again gives equal rows: nothing to splice.
         let again = view.build_rows(&state, ch);
         assert_eq!(splice_range(&rows, &again), None);
@@ -1307,15 +1601,9 @@ mod tests {
             day: NaiveDate::from_ymd_opt(2026, 10, d).unwrap(),
             new: false,
         };
-        assert_eq!(
-            splice_range(&[day(1), a.clone()], &[day(1), a.clone()]),
-            None
-        );
+        assert_eq!(splice_range(&[day(1), a.clone()], &[day(1), a.clone()]), None);
         // Appended at the end.
-        assert_eq!(
-            splice_range(&[day(1)], &[day(1), a.clone()]),
-            Some((1..1, 1))
-        );
+        assert_eq!(splice_range(&[day(1)], &[day(1), a.clone()]), Some((1..1, 1)));
         // Prepended (an older page).
         assert_eq!(splice_range(&[day(2)], &[day(1), day(2)]), Some((0..0, 1)));
         // One changed in the middle.
@@ -1324,10 +1612,7 @@ mod tests {
             Some((1..2, 1))
         );
         // Removed.
-        assert_eq!(
-            splice_range(&[day(1), a.clone()], &[day(1)]),
-            Some((1..2, 0))
-        );
+        assert_eq!(splice_range(&[day(1), a.clone()], &[day(1)]), Some((1..2, 0)));
         assert_eq!(splice_range(&[], &[a]), Some((0..0, 1)));
     }
 
@@ -1338,35 +1623,116 @@ mod tests {
         let mut pager = OlderPager::default();
         let mut requests = 0;
         for i in 0..625i64 {
+            let id = i as u64;
             if pager
-                .request(i * 16, true, false, Some(MessageId(1_000)))
+                .request(i * 16, true, false, Some(MessageId(1_000)), id)
                 .is_some()
             {
                 requests += 1;
-                pager.done();
+                pager.done(id);
             }
         }
         assert!((10..=11).contains(&requests), "{requests} requests");
 
-        // A slow server: one request at a time.
+        // A slow server: one request at a time; only its own answer frees the pager.
         let mut pager = OlderPager::default();
-        assert!(pager.request(0, true, false, Some(MessageId(5))).is_some());
-        assert!(pager
-            .request(5_000, true, false, Some(MessageId(5)))
-            .is_none());
-        pager.done();
-        assert!(pager
-            .request(5_000, true, false, Some(MessageId(5)))
-            .is_some());
+        assert!(pager.request(0, true, false, Some(MessageId(5)), 1).is_some());
+        assert!(pager.request(5_000, true, false, Some(MessageId(5)), 2).is_none());
+        pager.done(7);
+        assert!(pager.request(5_000, true, false, Some(MessageId(5)), 2).is_none());
+        pager.done(1);
+        assert!(pager.request(5_000, true, false, Some(MessageId(5)), 2).is_some());
 
         // At the start of the channel, or while the newest page loads: never.
         let mut pager = OlderPager::default();
         for i in 0..1_000i64 {
             let now = i * 1_000;
-            assert!(pager
-                .request(now, false, false, Some(MessageId(5)))
-                .is_none());
-            assert!(pager.request(now, true, true, Some(MessageId(5))).is_none());
+            assert!(pager.request(now, false, false, Some(MessageId(5)), 1).is_none());
+            assert!(pager.request(now, true, true, Some(MessageId(5)), 1).is_none());
         }
+    }
+
+    #[test]
+    fn conversions_stay_bounded_for_channels_without_a_window() {
+        let mut state = state_with_roles(&[], json!([]));
+        let mut view = MessageView::default();
+        // Live messages in 1 000 channels nobody opened (most unknown to the state).
+        for ch in 0..1_000u64 {
+            let m = raw_in(&(10_000 + ch).to_string(), 1_000 + ch, "7", json!({}));
+            let rendered = parse::to_message(&m, &SharedNames::default());
+            let _ = state.apply(&p::Dispatch::MessageCreate(Box::new(m.clone())));
+            view.conversions
+                .remember(&state, &edits_of([&m]), vec![rendered]);
+        }
+        assert_eq!(view.conversions.len(), 0);
+
+        // Opening 20 channels in turn keeps the conversions of the last few only.
+        let mut state = state_with(&[], json!([]), 20);
+        for i in 0..20u64 {
+            let ch = ChannelId(10_000 + i);
+            view.conversions.touch(ch);
+            let msgs: Vec<p::Message> = (1..=10)
+                .map(|n| raw_in(&ch.to_string(), i * 100 + n, "7", json!({})))
+                .collect();
+            let rendered = msgs
+                .iter()
+                .map(|m| parse::to_message(m, &SharedNames::default()))
+                .collect();
+            page(&mut state, ch, msgs.clone());
+            view.conversions
+                .remember(&state, &edits_of(&msgs), rendered);
+        }
+        assert_eq!(view.conversions.by_channel.len(), RECENT_CHANNELS);
+        assert_eq!(view.conversions.len(), RECENT_CHANNELS * 10);
+        // Live messages in an opened channel whose window was dropped are not kept.
+        let gone = ChannelId(10_019);
+        let _ = state.drop_message_windows();
+        let m = raw_in(&gone.to_string(), 99_999, "7", json!({}));
+        let rendered = parse::to_message(&m, &SharedNames::default());
+        view.conversions
+            .remember(&state, &edits_of([&m]), vec![rendered]);
+        view.conversions.prune(&state, &Changes::default());
+        assert_eq!(view.conversions.len(), 0);
+    }
+
+    #[test]
+    fn a_window_without_its_newest_messages_is_reloaded_not_marked_read() {
+        let ch = ChannelId(100);
+        let mut state = state_with_roles(&[], json!([]));
+        let mut view = MessageView::default();
+        // The newest page, then eleven older pages of 50: the window keeps 500 and drops
+        // the newest.
+        let newest: Vec<p::Message> = (10_000..10_050).map(|i| raw(i, "7", json!({}))).collect();
+        page(&mut state, ch, newest);
+        view.loaded = true;
+        assert_eq!(view.jump_action(&state, ch), JumpAction::Scroll);
+        assert!(view.may_mark_read(&state, ch, true, true));
+        for p_ix in 0..11u64 {
+            let oldest = state.messages(ch).and_then(|w| w.oldest_id()).unwrap();
+            let msgs: Vec<p::Message> = (0..50)
+                .map(|i| raw(oldest.0 - 1 - i, "7", json!({})))
+                .collect();
+            let _ = state.apply_messages(ch, MessagesPage::before(oldest, msgs, 50));
+            let _ = p_ix;
+        }
+        assert!(!state.messages(ch).unwrap().has_newest());
+        assert_eq!(view.jump_action(&state, ch), JumpAction::LoadNewest);
+        // Not read while the newest messages are missing, even at the bottom.
+        assert!(!view.may_mark_read(&state, ch, true, true));
+        // Live messages are buffered by the state and counted for the pill.
+        let live = raw(20_000, "7", json!({}));
+        let _ = state.apply(&p::Dispatch::MessageCreate(Box::new(live)));
+        view.note_live(&state, ch);
+        let _ = view.build_rows(&state, ch);
+        assert!(view.detached);
+        assert_eq!(view.detached_new, 1);
+        // Loading the newest page replaces the window.
+        let fresh: Vec<p::Message> = (19_960..=20_000).map(|i| raw(i, "7", json!({}))).collect();
+        page(&mut state, ch, fresh);
+        assert!(state.messages(ch).unwrap().has_newest());
+        assert_eq!(view.jump_action(&state, ch), JumpAction::Scroll);
+        let _ = view.build_rows(&state, ch);
+        assert!(!view.detached);
+        assert_eq!(view.detached_new, 0);
     }
 }

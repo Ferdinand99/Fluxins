@@ -204,6 +204,10 @@ pub async fn forward_gateway(
                 let mut reconnected = false;
                 // Messages the event carries, converted and parsed here, off the UI thread.
                 let mut rendered = Vec::new();
+                // Channel lists and the guild list to send once the account state has the
+                // event, so a channel picked from a list is always known to the state.
+                let mut lists: Vec<Option<String>> = Vec::new();
+                let mut guild_list = None;
                 match &event {
                     p::Dispatch::Ready(ready) => {
                         // A fresh Identify: rebuild the guild channel lists, keep the DM
@@ -226,9 +230,7 @@ pub async fn forward_gateway(
                             *cache = map;
                             cache.keys().cloned().collect()
                         };
-                        for key in keys {
-                            channels_event(key);
-                        }
+                        lists.extend(keys);
                         // Messages may have been missed while disconnected.
                         reconnected = ready_seen;
                         ready_seen = true;
@@ -239,7 +241,7 @@ pub async fn forward_gateway(
                     p::Dispatch::ChannelCreate(c) | p::Dispatch::ChannelUpdate(c) => {
                         remember_channels(&names, &[to_channel(c)]);
                         if upsert_channel(&cache, c) {
-                            channels_event(c.guild_id.clone());
+                            lists.push(c.guild_id.clone());
                         }
                     }
                     p::Dispatch::ChannelDelete(c) => {
@@ -250,7 +252,7 @@ pub async fn forward_gateway(
                                 .is_some()
                         };
                         if removed {
-                            channels_event(c.guild_id.clone());
+                            lists.push(c.guild_id.clone());
                         }
                     }
                     p::Dispatch::GuildCreate(g) | p::Dispatch::GuildSync(g) => {
@@ -259,7 +261,7 @@ pub async fn forward_gateway(
                             let list: Vec<Channel> = g.channels.iter().map(to_channel).collect();
                             remember_channels(&names, &list);
                             cache.lock().unwrap().insert(Some(g.id.clone()), list);
-                            channels_event(Some(g.id.clone()));
+                            lists.push(Some(g.id.clone()));
                         }
                         let mut list = guilds.lock().unwrap();
                         if !list.iter().any(|x| x.id == g.id) {
@@ -268,7 +270,7 @@ pub async fn forward_gateway(
                                     id: g.id.clone(),
                                     name: model::clean_name(name),
                                 });
-                                send!(messages::Ev::Guilds(list.clone()));
+                                guild_list = Some(list.clone());
                             }
                         }
                     }
@@ -276,16 +278,22 @@ pub async fn forward_gateway(
                         cache.lock().unwrap().remove(&Some(d.id.clone()));
                         let mut list = guilds.lock().unwrap();
                         list.retain(|g| g.id != d.id);
-                        send!(messages::Ev::Guilds(list.clone()));
+                        guild_list = Some(list.clone());
                     }
                     _ => {}
                 }
-                // Every event goes to the account state on the UI thread (READY before
-                // `Reconnected`, so the reload sees the new state).
+                // Every event goes to the account state on the UI thread first (and READY
+                // before `Reconnected`), then the lists the sidebar shows.
                 send!(messages::Ev::Dispatch {
                     dispatch: Box::new(event),
                     rendered,
                 });
+                for key in lists {
+                    channels_event(key);
+                }
+                if let Some(list) = guild_list {
+                    send!(messages::Ev::Guilds(list));
+                }
                 if reconnected {
                     send!(accounts::Ev::Reconnected);
                 }

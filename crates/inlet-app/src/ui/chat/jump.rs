@@ -7,38 +7,20 @@ use gpui::{div, prelude::*, px, AnyElement, Context, FontWeight};
 
 use super::messages::Row;
 use super::system_message::ChatIcon;
-use super::time;
 use crate::app::Inlet;
 use crate::theme;
-
-/// The banner says "50+" past this many.
-const MAX_COUNTED: usize = 50;
 
 impl Inlet {
     pub(super) fn render_new_messages_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let view = &self.chat.view;
-        if view.unread_count == 0 || !view.divider_above {
+        if !view.divider_above {
             return None;
         }
+        let text = view.banner.clone()?;
         let divider = view
             .rows
             .iter()
             .position(|r| matches!(r, Row::Unread | Row::Day { new: true, .. }))?;
-        let text = if view.unread_count == 1 {
-            t!("chat-new-message", since = time::full(view.unread_since_ms))
-        } else if view.unread_count > MAX_COUNTED {
-            t!(
-                "chat-new-messages-many",
-                count = MAX_COUNTED,
-                since = time::full(view.unread_since_ms)
-            )
-        } else {
-            t!(
-                "chat-new-messages",
-                count = view.unread_count,
-                since = time::full(view.unread_since_ms)
-            )
-        };
         Some(
             div()
                 .absolute()
@@ -86,13 +68,20 @@ impl Inlet {
     }
 
     pub(super) fn render_jump_to_present(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if self.chat.view.rows.is_empty() || !self.chat.view.scrolled_away {
+        let view = &self.chat.view;
+        // Also while the list lost its newest messages, even at its bottom.
+        if view.rows.is_empty() || !(view.scrolled_away || view.detached) {
             return None;
         }
+        let label = if view.detached_new > 0 {
+            t!("chat-jump-new-messages", count = view.detached_new)
+        } else {
+            t!("chat-jump-to-present")
+        };
         Some(
             div()
                 .absolute()
-                .bottom(px(16.))
+                .bottom(px(42.))
                 .left_0()
                 .right_0()
                 .flex()
@@ -117,7 +106,7 @@ impl Inlet {
                         .cursor_pointer()
                         .hover(|s| s.bg(theme::guild_item()))
                         .child(ChatIcon::ArrowDown.el(px(16.), theme::text()))
-                        .child(t!("chat-jump-to-present"))
+                        .child(label)
                         .on_click(cx.listener(|this, _, _, cx| this.jump_to_present(cx))),
                 )
                 .into_any_element(),

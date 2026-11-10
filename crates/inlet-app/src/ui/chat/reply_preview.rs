@@ -92,7 +92,7 @@ pub fn render(id: &str, reply: &ReplyRow, compact: bool, cx: &mut Context<Inlet>
                     .h(px(LINE_HEIGHT / 2. + 2.))
                     .border_t_2()
                     .border_l_2()
-                    .rounded_tl(px(6.))
+                    .rounded_tl(px(10.))
                     .border_color(theme::reply_spine()),
             )
     };

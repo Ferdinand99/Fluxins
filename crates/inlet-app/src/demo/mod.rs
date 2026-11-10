@@ -26,7 +26,7 @@ use serde_json::{json, Value};
 use crate::backend::messages::parse::{self, SharedNames};
 use crate::backend::messages::PAGE_SIZE;
 use crate::backend::{accounts, messages as msgs, Ui};
-use crate::model::{Channel, ChannelKind, Names};
+use crate::model::{Channel, ChannelKind, Message, Names};
 
 /// The demo's own account.
 pub const ME: &str = "demo";
@@ -335,7 +335,7 @@ impl MockSession {
         });
         let _ = events.unbounded_send(msgs::Ev::Guilds(guilds));
         for out in outgoing {
-            let _ = events.unbounded_send(msgs::Ev::Outgoing(out));
+            let _ = events.unbounded_send(msgs::Ev::Pending(out));
         }
         let _ = events.unbounded_send(accounts::Ev::Status("Demo mode".into()));
 
@@ -357,12 +357,12 @@ impl MockSession {
             .unbounded_send(msgs::Ev::Channels { guild_id, channels });
     }
 
-    fn send_page(&self, channel_id: String, before: Option<MessageId>) {
+    fn page(&self, channel_id: &str, before: Option<MessageId>) -> (MessagesPage, Vec<Message>) {
         let list = page_of(
             self.messages
                 .lock()
                 .unwrap()
-                .get(&channel_id)
+                .get(channel_id)
                 .map(Vec::as_slice)
                 .unwrap_or_default(),
             before,
@@ -375,25 +375,33 @@ impl MockSession {
             Some(b) => MessagesPage::before(b, list, PAGE_SIZE),
             None => MessagesPage::latest(list, PAGE_SIZE),
         };
-        let _ = self.events.unbounded_send(msgs::Ev::Page {
-            channel_id,
-            page,
-            rendered,
-        });
+        (page, rendered)
     }
 
-    pub fn open_channel(&mut self, channel_id: String) {
-        *self.open_channel.lock().unwrap() = Some(channel_id.clone());
-        self.send_page(channel_id, None);
+    /// The newest page of a channel, which also becomes the one the demo gateway
+    /// posts live messages in.
+    pub fn newest_page(&mut self, channel_id: &str) -> (MessagesPage, Vec<Message>) {
+        *self.open_channel.lock().unwrap() = Some(channel_id.to_string());
+        self.page(channel_id, None)
     }
 
-    pub fn load_older(&mut self, channel_id: String, before: MessageId) {
-        self.send_page(channel_id, Some(before));
+    pub fn older_page(&mut self, channel_id: &str, before: MessageId) -> (MessagesPage, Vec<Message>) {
+        self.page(channel_id, Some(before))
     }
 
     pub fn send(&mut self, channel_id: String, text: String) {
         self.next_seq += 1;
         let nonce = format!("demo-{}", self.next_seq);
+        self.post(channel_id, nonce, text);
+    }
+
+    /// "Retry" in the demo: the message goes through this time, with its nonce.
+    pub fn resend(&mut self, channel_id: String, nonce: String, text: String) {
+        self.next_seq += 1;
+        self.post(channel_id, nonce, text);
+    }
+
+    fn post(&mut self, channel_id: String, nonce: String, text: String) {
         let m = live(
             self.next_seq,
             &channel_id,

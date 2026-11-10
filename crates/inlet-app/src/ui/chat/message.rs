@@ -10,7 +10,7 @@ use std::rc::Rc;
 use gpui::{div, prelude::*, px, AnyElement, Context, FontWeight, Hsla, SharedString};
 
 use super::embed::render_embed;
-use super::messages::{MessageRow, OutgoingRow, Row, Tag};
+use super::messages::{MessageRow, PendingRow, Row, Tag};
 use super::{divider, reply_preview, system_message, welcome};
 use crate::app::Inlet;
 use crate::model::Guild;
@@ -38,7 +38,7 @@ impl Inlet {
             Row::Unread => divider::render_unread(),
             Row::System(s) => system_message::render(&s, compact),
             Row::Message(m) => self.render_message(&m, compact, cx),
-            Row::Outgoing(o) => self.render_outgoing(&o, compact, cx),
+            Row::Pending(o) => self.render_pending(&o, compact, cx),
         }
     }
 
@@ -274,8 +274,17 @@ impl Inlet {
                     .text_color(theme::text())
                     .line_height(px(22.))
                     .when_some(bg, |d, bg| d.bg(bg))
-                    .when_some(bar, |d, bar| d.border_l_2().border_color(bar))
                     .when(bg.is_none(), |d| d.hover(|s| s.bg(theme::hover_bg())))
+                    // The bar is drawn over the row's edge, so the content does not move.
+                    .children(bar.map(|bar| {
+                        div()
+                            .absolute()
+                            .left_0()
+                            .top_0()
+                            .bottom_0()
+                            .w(px(2.))
+                            .bg(bar)
+                    }))
                     .children(reply)
                     .child(main)
                     .children(actions),
@@ -283,12 +292,9 @@ impl Inlet {
             .into_any_element()
     }
 
-    fn render_outgoing(
-        &self,
-        row: &OutgoingRow,
-        compact: bool,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    /// A message of this account on its way (dimmed) or failed (red, with "Retry"),
+    /// drawn like the account's other messages and grouped under them.
+    fn render_pending(&self, row: &PendingRow, compact: bool, cx: &mut Context<Self>) -> AnyElement {
         let weak = cx.entity().downgrade();
         let ctx = RenderCtx {
             revealed: true,
@@ -322,41 +328,56 @@ impl Inlet {
                         .text_color(theme::link())
                         .cursor_pointer()
                         .child(t!("message-retry"))
-                        .on_click(
-                            cx.listener(move |this, _, _, cx| this.retry_outgoing(&nonce, cx)),
-                        ),
+                        .on_click(cx.listener(move |this, _, _, cx| this.retry_pending(&nonce, cx))),
                 )
         });
-        let lead = if compact {
-            div().w(px(COMPACT_TIME_COLUMN)).flex_none()
-        } else {
-            div().w(px(AVATAR_COLUMN)).flex_none()
+        let name = || {
+            div()
+                .flex_none()
+                .font_weight(FontWeight::MEDIUM)
+                .line_height(px(22.))
+                .text_color(theme::text_strong())
+                .child(row.author.clone())
         };
-        let name = div()
-            .flex_none()
-            .font_weight(FontWeight::MEDIUM)
-            .text_color(theme::text_strong())
-            .child(row.author.clone());
+        let body = div().flex_1().min_w_0().flex().flex_col().child(text).children(failed);
+        let main = if compact {
+            div()
+                .flex()
+                .flex_row()
+                .items_start()
+                .gap_2()
+                .child(div().w(px(COMPACT_TIME_COLUMN)).flex_none())
+                .child(name())
+                .child(body)
+        } else {
+            let side = (!row.grouped).then(|| avatar(&row.author));
+            div()
+                .flex()
+                .flex_row()
+                .gap_3()
+                .child(div().w(px(AVATAR_COLUMN)).flex_none().children(side))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .when(!row.grouped, |d| d.child(name()))
+                        .child(body),
+                )
+        };
         div()
             .w_full()
-            .pl_4()
-            .pr_4()
-            .py(px(2.))
-            .flex()
-            .flex_row()
-            .gap_3()
-            .line_height(px(22.))
-            .text_color(theme::text())
-            .child(lead)
+            .when(!row.grouped && !compact, |d| d.pt(px(GROUP_SPACING)))
             .child(
                 div()
-                    .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .flex_col()
-                    .child(name)
-                    .child(text)
-                    .children(failed),
+                    .w_full()
+                    .pl_4()
+                    .pr_4()
+                    .py(px(2.))
+                    .line_height(px(22.))
+                    .text_color(theme::text())
+                    .child(main),
             )
             .into_any_element()
     }

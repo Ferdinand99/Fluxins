@@ -20,7 +20,7 @@ use serde_json::{json, Value};
 use super::{
     guilds, messages, snowflake, social, user, user_id, ME, ROLE_CONTRIBUTORS, ROLE_MODERATORS,
 };
-use crate::backend::messages::Outgoing;
+use crate::backend::messages::Pending;
 use crate::model::{Channel, ChannelKind, Guild};
 
 /// A demo scene.
@@ -67,7 +67,7 @@ pub struct Data {
     /// The READY the demo gateway sends first.
     pub ready: p::Ready,
     /// Messages of the demo account on their way, or failed.
-    pub outgoing: Vec<Outgoing>,
+    pub outgoing: Vec<Pending>,
 }
 
 fn channel_type(kind: ChannelKind) -> i64 {
@@ -215,13 +215,13 @@ pub fn data(scene: Scene) -> Data {
         if let Some(ack) = ids.iter().rev().nth(3) {
             read_states.push(json!({"id": general, "last_message_id": ack.to_string()}));
         }
-        outgoing.push(Outgoing {
+        outgoing.push(Pending {
             channel_id: general.clone(),
             nonce: "demo-sending".into(),
             text: "On its way \u{2026}".into(),
             failed: None,
         });
-        outgoing.push(Outgoing {
+        outgoing.push(Pending {
             channel_id: general.clone(),
             nonce: "demo-failed".into(),
             text: "This one did not go through.".into(),

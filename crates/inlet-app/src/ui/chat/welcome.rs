@@ -14,7 +14,7 @@ pub fn render(w: &WelcomeRow) -> AnyElement {
     div()
         .w_full()
         .px_4()
-        .pt(px(40.))
+        .pt(px(120.))
         .pb_2()
         .flex()
         .flex_col()

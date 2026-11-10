@@ -13,6 +13,7 @@ mod ack;
 mod actions;
 mod fetch;
 mod inbox;
+mod outbox;
 pub mod parse;
 mod pins;
 mod threads;
@@ -32,16 +33,29 @@ pub enum Cmd {
     /// Load channels for a guild, or DMs when `guild_id` is `None`.
     OpenGuild { guild_id: Option<String> },
     /// Load the newest page of a channel. The UI opens the channel's window with
-    /// `AccountState::begin_load` first.
-    OpenChannel { channel_id: String },
+    /// `AccountState::begin_load` first. Exactly one `Ev::Page` or `Ev::PageFailed` with
+    /// the same `request` answers it, also when the load is aborted or panics.
+    OpenChannel { channel_id: String, request: u64 },
     /// Load the page before `before` (the person scrolled to the top). At most one runs
     /// at a time, and the backend drops requests that come within a second of the last.
-    LoadOlder { channel_id: String, before: String },
+    /// Answered like `OpenChannel`.
+    LoadOlder {
+        channel_id: String,
+        before: String,
+        request: u64,
+    },
+    /// Send a failed message again with the nonce it had, so the server can drop a
+    /// copy that did arrive the first time.
+    Resend {
+        channel_id: String,
+        nonce: String,
+        text: String,
+    },
 }
 
-/// A message being sent, or one that could not be sent.
+/// A message being sent, or one that could not be sent (a row with "Retry").
 #[derive(Clone, Debug)]
-pub struct Outgoing {
+pub struct Pending {
     pub channel_id: String,
     /// The nonce sent with the message; the gateway's MESSAGE_CREATE carries it back.
     pub nonce: String,
@@ -64,27 +78,40 @@ pub enum Ev {
     /// A page of messages from REST, with its messages converted.
     Page {
         channel_id: String,
+        request: u64,
         page: MessagesPage,
         rendered: Vec<Message>,
     },
-    /// Loading a page failed; the reason was reported as an error.
+    /// Loading a page failed or was given up (aborted, panicked, no session). A failure
+    /// is also reported as an error.
     PageFailed {
         channel_id: String,
+        request: u64,
         older: bool,
     },
     /// A message this account sent, converted from the REST answer. The gateway's
     /// MESSAGE_CREATE brings it into the account state.
     MessageCreated(Message),
-    /// A message is being sent, or could not be sent (shown with "Retry"). The demo
-    /// sends these; the composer reports its own sends here once it tracks nonces.
-    #[cfg_attr(not(feature = "demo"), allow(dead_code))]
-    Outgoing(Outgoing),
+    /// A message is being sent, or could not be sent.
+    Pending(Pending),
 }
 
 pub(super) fn handle(backend: &mut Backend, cmd: Cmd) {
     match cmd {
         Cmd::OpenGuild { guild_id } => backend.open_guild(guild_id),
-        Cmd::OpenChannel { channel_id } => backend.open_channel(channel_id),
-        Cmd::LoadOlder { channel_id, before } => backend.load_older(channel_id, before),
+        Cmd::OpenChannel {
+            channel_id,
+            request,
+        } => backend.open_channel(channel_id, request),
+        Cmd::LoadOlder {
+            channel_id,
+            before,
+            request,
+        } => backend.load_older(channel_id, before, request),
+        Cmd::Resend {
+            channel_id,
+            nonce,
+            text,
+        } => backend.resend(channel_id, nonce, text),
     }
 }

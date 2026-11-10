@@ -19,6 +19,7 @@ chat-new-messages = { $count } new messages since { $since }
 chat-new-messages-many = { $count }+ new messages since { $since }
 chat-mark-as-read = Mark as read
 chat-jump-to-present = Jump to present
+chat-jump-new-messages = { $count } new messages — jump to present
 reply-deleted = Original message was deleted
 reply-unknown = Original message could not be loaded
 
