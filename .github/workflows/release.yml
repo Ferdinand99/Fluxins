@@ -46,7 +46,7 @@ jobs:
           cp artifacts/inlet-linux-x86_64/inlet-linux-x86_64.tar.gz release/
           # Third-party licence notices, if the repository carries them.
           for f in THIRD-PARTY-NOTICES*; do
-            [ -f "$f" ] && cp "$f" release/
+            if [ -f "$f" ]; then cp "$f" release/; fi
           done
           cd release
           sha256sum * > SHA256SUMS.txt
