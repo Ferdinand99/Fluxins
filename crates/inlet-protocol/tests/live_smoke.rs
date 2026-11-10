@@ -7,7 +7,7 @@
 
 use std::time::Duration;
 
-use inlet_protocol::gateway::{codec::ZstdStream, gateway_url};
+use inlet_protocol::gateway::{codec::ZstdStream, gateway_url, tls_connector};
 use inlet_protocol::Instance;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
@@ -84,7 +84,10 @@ async fn live_discovery_openapi_and_gateway_hello() {
     println!("gateway url  {url}");
     let mut req = url.as_str().into_client_request().unwrap();
     req.headers_mut().insert("User-Agent", ua.parse().unwrap());
-    let (mut ws, _) = tokio_tungstenite::connect_async(req).await.expect("gateway connect");
+    // The same TLS setup as the gateway task.
+    let (mut ws, _) = tokio_tungstenite::connect_async_tls_with_config(req, None, true, tls_connector())
+        .await
+        .expect("gateway connect");
     let mut codec = ZstdStream::new().unwrap();
     let hello = read_zstd(&mut ws, &mut codec).await;
     println!("gateway      Hello: {hello}");

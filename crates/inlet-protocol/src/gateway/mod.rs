@@ -323,7 +323,8 @@ struct Task {
 
 type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
-fn tls_connector() -> Option<tokio_tungstenite::Connector> {
+/// TLS for the gateway: rustls with the ring provider and the Mozilla roots.
+pub fn tls_connector() -> Option<tokio_tungstenite::Connector> {
     let mut roots = rustls::RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     let config = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
