@@ -413,9 +413,8 @@ struct Task {
     pending: VecDeque<GatewayEvent>,
 }
 
-type Ws = tokio_tungstenite::WebSocketStream<
-    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
->;
+type Ws =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 /// TLS for the gateway: rustls with the ring provider and the Mozilla roots.
 pub fn tls_connector() -> Option<tokio_tungstenite::Connector> {
@@ -875,7 +874,12 @@ impl Task {
     }
 
     /// Maps a close code (see Fluxer's `gateway/opcodes-and-close-codes`) to what happens next.
-    fn classify_close(&self, code: Option<u16>, reason: String, connected_at: Option<Instant>) -> Outcome {
+    fn classify_close(
+        &self,
+        code: Option<u16>,
+        reason: String,
+        connected_at: Option<Instant>,
+    ) -> Outcome {
         let stable = connected_at.is_some_and(|t| t.elapsed() >= STABLE_AFTER);
         let text = format!(
             "closed with {} {reason}",
@@ -938,9 +942,7 @@ async fn read_payload(
             Some(Err(e)) => {
                 use tokio_tungstenite::tungstenite::Error as WsError;
                 return Err(match e {
-                    WsError::Capacity(_) => {
-                        ReadEnd::BadData(format!("read: {e}"))
-                    }
+                    WsError::Capacity(_) => ReadEnd::BadData(format!("read: {e}")),
                     _ => ReadEnd::Error(format!("read: {e}")),
                 });
             }

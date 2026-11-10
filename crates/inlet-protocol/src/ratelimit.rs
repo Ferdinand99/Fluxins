@@ -194,46 +194,47 @@ impl RateLimiter {
 
         let _turn = self.queue.lock().await;
         loop {
-            let wait = {
-                let mut state = self.lock();
-                let now = Instant::now();
-                self.refill(&mut state, now);
-                while state
-                    .recent
-                    .front()
-                    .is_some_and(|t| now.saturating_duration_since(*t) >= Duration::from_secs(1))
+            let wait =
                 {
-                    state.recent.pop_front();
-                }
-                if let Some(until) = state.global_until.filter(|u| *u > now) {
-                    until - now
-                } else if let Some(d) = route_wait(&state, route, now) {
-                    // A route 429 can arrive while this caller waits in the queue.
-                    d
-                } else if state.recent.len() >= HARD_CAP_PER_SECOND as usize {
-                    let oldest = state.recent.front().copied().unwrap_or(now);
-                    (oldest + Duration::from_secs(1)).saturating_duration_since(now)
-                } else if state.tokens >= 1.0 {
-                    state.tokens -= 1.0;
-                    state.recent.push_back(now);
-                    if let Some(r) = state.routes.get_mut(route) {
-                        if let Some(rem) = r.remaining.as_mut() {
-                            *rem = rem.saturating_sub(1);
-                        }
+                    let mut state = self.lock();
+                    let now = Instant::now();
+                    self.refill(&mut state, now);
+                    while state.recent.front().is_some_and(|t| {
+                        now.saturating_duration_since(*t) >= Duration::from_secs(1)
+                    }) {
+                        state.recent.pop_front();
                     }
-                    return;
-                } else {
-                    Duration::from_secs_f64((1.0 - state.tokens) / self.config.rate_per_sec)
-                }
-            };
+                    if let Some(until) = state.global_until.filter(|u| *u > now) {
+                        until - now
+                    } else if let Some(d) = route_wait(&state, route, now) {
+                        // A route 429 can arrive while this caller waits in the queue.
+                        d
+                    } else if state.recent.len() >= HARD_CAP_PER_SECOND as usize {
+                        let oldest = state.recent.front().copied().unwrap_or(now);
+                        (oldest + Duration::from_secs(1)).saturating_duration_since(now)
+                    } else if state.tokens >= 1.0 {
+                        state.tokens -= 1.0;
+                        state.recent.push_back(now);
+                        if let Some(r) = state.routes.get_mut(route) {
+                            if let Some(rem) = r.remaining.as_mut() {
+                                *rem = rem.saturating_sub(1);
+                            }
+                        }
+                        return;
+                    } else {
+                        Duration::from_secs_f64((1.0 - state.tokens) / self.config.rate_per_sec)
+                    }
+                };
             sleep(wait.max(Duration::from_millis(1))).await;
         }
     }
 
     fn refill(&self, state: &mut State, now: Instant) {
-        let elapsed = now.saturating_duration_since(state.last_refill).as_secs_f64();
-        state.tokens = (state.tokens + elapsed * self.config.rate_per_sec)
-            .min(f64::from(self.config.burst));
+        let elapsed = now
+            .saturating_duration_since(state.last_refill)
+            .as_secs_f64();
+        state.tokens =
+            (state.tokens + elapsed * self.config.rate_per_sec).min(f64::from(self.config.burst));
         state.last_refill = now;
     }
 

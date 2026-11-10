@@ -73,7 +73,10 @@ async fn oversized_bodies_are_refused() {
         .mount(&server)
         .await;
     let client = Client::new(instance, Token::new("tok-big"));
-    assert!(matches!(client.me().await.unwrap_err(), Error::TooLarge { .. }));
+    assert!(matches!(
+        client.me().await.unwrap_err(),
+        Error::TooLarge { .. }
+    ));
 }
 
 #[tokio::test]
@@ -152,7 +155,10 @@ async fn two_tokens_of_one_user_share_a_limiter() {
         .await;
     let a = Client::new(instance.clone(), Token::new("tok-user-a"));
     let b = Client::new(instance, Token::new("tok-user-b"));
-    assert!(!std::sync::Arc::ptr_eq(&a.rate_limiter(), &b.rate_limiter()));
+    assert!(!std::sync::Arc::ptr_eq(
+        &a.rate_limiter(),
+        &b.rate_limiter()
+    ));
     a.me().await.unwrap();
     b.me().await.unwrap();
     assert!(std::sync::Arc::ptr_eq(&a.rate_limiter(), &b.rate_limiter()));
@@ -175,12 +181,19 @@ async fn global_pause_survives_dropping_the_client() {
         .mount(&server)
         .await;
     let first = Client::new(instance.clone(), Token::new("tok-pause"));
-    assert!(matches!(first.me().await.unwrap_err(), Error::GlobalRateLimited));
+    assert!(matches!(
+        first.me().await.unwrap_err(),
+        Error::GlobalRateLimited
+    ));
     drop(first);
     let again = Client::new(instance, Token::new("tok-pause"));
     let start = std::time::Instant::now();
     again.me().await.unwrap();
-    assert!(start.elapsed() >= Duration::from_millis(900), "{:?}", start.elapsed());
+    assert!(
+        start.elapsed() >= Duration::from_millis(900),
+        "{:?}",
+        start.elapsed()
+    );
 }
 
 #[tokio::test]
@@ -195,12 +208,16 @@ async fn pinned_session_refuses_moved_endpoints() {
         "ws://127.0.0.1:1/gateway",
     ))
     .unwrap();
-    let elsewhere = Instance::from_cached(&server.uri(), moved, None, ClientInfo::default()).unwrap();
+    let elsewhere =
+        Instance::from_cached(&server.uri(), moved, None, ClientInfo::default()).unwrap();
     assert!(matches!(
         Session::from_token_pinned(elsewhere.clone(), Token::new("tok-pin"), &pins),
         Err(Error::EndpointsChanged { .. })
     ));
-    assert!(matches!(session.check_endpoints(&elsewhere), Err(Error::EndpointsChanged { .. })));
+    assert!(matches!(
+        session.check_endpoints(&elsewhere),
+        Err(Error::EndpointsChanged { .. })
+    ));
 }
 
 #[tokio::test]
@@ -222,8 +239,13 @@ async fn insecure_endpoints_from_discovery_are_refused() {
         .respond_with(ResponseTemplate::new(200).set_body_json(doc))
         .mount(&server)
         .await;
-    assert!(matches!(Instance::discover(&server.uri()).await, Err(Error::Url(_))));
-    assert!(Instance::discover("http://fluxer.opland.net").await.is_err());
+    assert!(matches!(
+        Instance::discover(&server.uri()).await,
+        Err(Error::Url(_))
+    ));
+    assert!(Instance::discover("http://fluxer.opland.net")
+        .await
+        .is_err());
 }
 
 #[tokio::test]
@@ -297,12 +319,10 @@ fn errors_do_not_show_urls() {
         ))
         .unwrap();
         let instance = Instance::from_cached("http://127.0.0.1:9", doc, None, info).unwrap();
-        let ticket_poll = inlet_protocol::poll_ip_authorization(
-            &instance,
-            &sign_in_ticket_for_test(),
-        )
-        .await
-        .unwrap_err();
+        let ticket_poll =
+            inlet_protocol::poll_ip_authorization(&instance, &sign_in_ticket_for_test())
+                .await
+                .unwrap_err();
         let text = format!("{ticket_poll} {ticket_poll:?}");
         assert!(!text.contains("secret-ticket-value"), "{text}");
     });

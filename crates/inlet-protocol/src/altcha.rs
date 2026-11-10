@@ -150,8 +150,8 @@ fn solve_cancellable(challenge: &Value, timeout: Duration, cancel: &AtomicBool) 
             .filter_map(|h| h.join().ok().flatten())
             .min_by_key(|(c, _)| *c)
     });
-    let (counter, key) =
-        found.ok_or_else(|| Error::Captcha("no solution within the time and work limits".into()))?;
+    let (counter, key) = found
+        .ok_or_else(|| Error::Captcha("no solution within the time and work limits".into()))?;
     let token = json!({
         "challenge": { "parameters": parameters, "signature": signature },
         "solution": {

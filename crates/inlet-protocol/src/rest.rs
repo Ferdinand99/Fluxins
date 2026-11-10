@@ -98,8 +98,9 @@ pub(crate) async fn send(
     let url = format!("{}{}", inner.api_base, req.path);
     let auth = match token {
         Some(t) => {
-            let mut v = HeaderValue::from_str(t.expose_secret())
-                .map_err(|_| Error::Decode("the token has characters a header cannot hold".into()))?;
+            let mut v = HeaderValue::from_str(t.expose_secret()).map_err(|_| {
+                Error::Decode("the token has characters a header cannot hold".into())
+            })?;
             v.set_sensitive(true);
             Some(v)
         }
@@ -156,7 +157,8 @@ pub(crate) async fn send(
                     .get("x-ratelimit-global")
                     .and_then(|v| v.to_str().ok())
                     == Some("true");
-            let wait = clamp_server_secs(retry_after, MAX_SERVER_WAIT).max(Duration::from_millis(1));
+            let wait =
+                clamp_server_secs(retry_after, MAX_SERVER_WAIT).max(Duration::from_millis(1));
             limiter.record_429(&route, wait, global);
             tracing::warn!(route = %route, ?wait, global, "rate limited by the instance");
             if global && token.is_some() {

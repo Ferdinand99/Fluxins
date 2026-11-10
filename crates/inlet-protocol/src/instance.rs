@@ -246,8 +246,10 @@ fn registrable_domain(url: &Url) -> Option<String> {
             let labels: Vec<&str> = d.split('.').collect();
             let take = if labels.len() >= 3
                 && labels[labels.len() - 1].len() == 2
-                && matches!(labels[labels.len() - 2], "co" | "com" | "net" | "org" | "ac" | "gov" | "edu")
-            {
+                && matches!(
+                    labels[labels.len() - 2],
+                    "co" | "com" | "net" | "org" | "ac" | "gov" | "edu"
+                ) {
                 3
             } else {
                 2
@@ -328,7 +330,14 @@ impl Instance {
         let (discovery, etag) = fetch(&discovery_http, &anon_limiter, &origin, None)
             .await?
             .ok_or_else(|| Error::Decode("304 without a cached document".into()))?;
-        Self::build(origin, discovery, etag, (http, discovery_http), info, anon_limiter)
+        Self::build(
+            origin,
+            discovery,
+            etag,
+            (http, discovery_http),
+            info,
+            anon_limiter,
+        )
     }
 
     /// Builds an instance from a discovery document cached earlier, without
@@ -374,13 +383,15 @@ impl Instance {
         let webapp = ep
             .webapp
             .as_deref()
-            .and_then(|w| match check_webapp(w, &origin_url, &info.trusted_webapp_hosts) {
-                Ok(u) => Some(u),
-                Err(e) => {
-                    tracing::warn!("ignoring webapp endpoint, using the origin: {e}");
-                    None
-                }
-            })
+            .and_then(
+                |w| match check_webapp(w, &origin_url, &info.trusted_webapp_hosts) {
+                    Ok(u) => Some(u),
+                    Err(e) => {
+                        tracing::warn!("ignoring webapp endpoint, using the origin: {e}");
+                        None
+                    }
+                },
+            )
             .unwrap_or_else(|| origin_url.clone());
 
         Ok(Instance {
@@ -406,7 +417,14 @@ impl Instance {
     /// token to the refreshed instance.
     pub async fn refresh(&self) -> Result<Instance> {
         let i = &self.inner;
-        match fetch(&i.discovery_http, &i.anon_limiter, &i.origin, i.etag.as_deref()).await? {
+        match fetch(
+            &i.discovery_http,
+            &i.anon_limiter,
+            &i.origin,
+            i.etag.as_deref(),
+        )
+        .await?
+        {
             None => Ok(self.clone()),
             Some((discovery, etag)) => Self::build(
                 i.origin.clone(),
@@ -495,14 +513,24 @@ impl Instance {
 
     /// Media proxy URL of a user avatar, or `None` when the user has no avatar.
     /// `size` is a power of two from 16 to 4096; Fluxer serves WebP.
-    pub fn avatar_url(&self, user_id: &str, avatar_hash: Option<&str>, size: u32) -> Option<String> {
+    pub fn avatar_url(
+        &self,
+        user_id: &str,
+        avatar_hash: Option<&str>,
+        size: u32,
+    ) -> Option<String> {
         let media = self.inner.media.as_deref()?;
         let hash = avatar_hash?;
         Some(format!("{media}/avatars/{user_id}/{hash}.webp?size={size}"))
     }
 
     /// Media proxy URL of a guild icon.
-    pub fn guild_icon_url(&self, guild_id: &str, icon_hash: Option<&str>, size: u32) -> Option<String> {
+    pub fn guild_icon_url(
+        &self,
+        guild_id: &str,
+        icon_hash: Option<&str>,
+        size: u32,
+    ) -> Option<String> {
         let media = self.inner.media.as_deref()?;
         let hash = icon_hash?;
         Some(format!("{media}/icons/{guild_id}/{hash}.webp?size={size}"))
@@ -582,7 +610,10 @@ mod tests {
             normalize_origin("http://127.0.0.1:8080").unwrap(),
             "http://127.0.0.1:8080"
         );
-        assert_eq!(normalize_origin("http://localhost:3000").unwrap(), "http://localhost:3000");
+        assert_eq!(
+            normalize_origin("http://localhost:3000").unwrap(),
+            "http://localhost:3000"
+        );
         assert!(normalize_origin("http://[::1]:3000").is_ok());
         assert!(normalize_origin("ftp://x").is_err());
     }
@@ -600,10 +631,34 @@ mod tests {
     #[test]
     fn insecure_api_or_gateway_is_refused() {
         let ok = "https://chat.example.org";
-        assert!(build(doc("http://chat.example.org/api", "wss://chat.example.org/gw", ok, ok)).is_err());
-        assert!(build(doc("https://chat.example.org/api", "ws://chat.example.org/gw", ok, ok)).is_err());
-        assert!(build(doc("https://chat.example.org/api", "https://chat.example.org/gw", ok, ok)).is_err());
-        assert!(build(doc("https://api.other.net/api", "wss://gw.other.net/", ok, ok)).is_ok());
+        assert!(build(doc(
+            "http://chat.example.org/api",
+            "wss://chat.example.org/gw",
+            ok,
+            ok
+        ))
+        .is_err());
+        assert!(build(doc(
+            "https://chat.example.org/api",
+            "ws://chat.example.org/gw",
+            ok,
+            ok
+        ))
+        .is_err());
+        assert!(build(doc(
+            "https://chat.example.org/api",
+            "https://chat.example.org/gw",
+            ok,
+            ok
+        ))
+        .is_err());
+        assert!(build(doc(
+            "https://api.other.net/api",
+            "wss://gw.other.net/",
+            ok,
+            ok
+        ))
+        .is_ok());
     }
 
     #[test]
@@ -633,7 +688,10 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(i.webapp(), "https://web.example.org/app");
-        assert_eq!(i.webapp_page("login?handoff=1"), "https://web.example.org/app/login?handoff=1");
+        assert_eq!(
+            i.webapp_page("login?handoff=1"),
+            "https://web.example.org/app/login?handoff=1"
+        );
         assert!(i.avatar_url("1", Some("h"), 64).is_some());
     }
 
@@ -661,13 +719,28 @@ mod tests {
     #[test]
     fn pins_detect_moved_endpoints() {
         let ok = "https://chat.example.org";
-        let a = build(doc("https://chat.example.org/api", "wss://chat.example.org/gw", ok, ok)).unwrap();
-        let b = build(doc("https://evil.example.net/api", "wss://chat.example.org/gw", ok, ok)).unwrap();
+        let a = build(doc(
+            "https://chat.example.org/api",
+            "wss://chat.example.org/gw",
+            ok,
+            ok,
+        ))
+        .unwrap();
+        let b = build(doc(
+            "https://evil.example.net/api",
+            "wss://chat.example.org/gw",
+            ok,
+            ok,
+        ))
+        .unwrap();
         let pins = a.pins();
         assert_eq!(pins.api, "https://chat.example.org");
         assert_eq!(pins.gateway, "wss://chat.example.org");
         assert!(a.verify_pins(&pins).is_ok());
-        assert!(matches!(b.verify_pins(&pins), Err(Error::EndpointsChanged { .. })));
+        assert!(matches!(
+            b.verify_pins(&pins),
+            Err(Error::EndpointsChanged { .. })
+        ));
     }
 
     #[test]

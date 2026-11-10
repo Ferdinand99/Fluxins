@@ -314,7 +314,9 @@ where
     match Value::deserialize(d)? {
         Value::String(s) => Ok(s),
         Value::Number(n) if n.is_u64() => Ok(n.to_string()),
-        other => Err(D::Error::custom(format!("expected a snowflake, got {other}"))),
+        other => Err(D::Error::custom(format!(
+            "expected a snowflake, got {other}"
+        ))),
     }
 }
 
@@ -340,19 +342,27 @@ where
         Value::Array(items) => lenient_list(items, std::any::type_name::<T>()),
         Value::Null => Vec::new(),
         other => {
-            tracing::warn!(what = std::any::type_name::<T>(), "expected a list, got {other}");
+            tracing::warn!(
+                what = std::any::type_name::<T>(),
+                "expected a list, got {other}"
+            );
             Vec::new()
         }
     })
 }
 
 /// Parses each element on its own, skipping (and logging) the ones that do not parse.
-pub(crate) fn lenient_list<T: serde::de::DeserializeOwned>(items: Vec<Value>, what: &str) -> Vec<T> {
+pub(crate) fn lenient_list<T: serde::de::DeserializeOwned>(
+    items: Vec<Value>,
+    what: &str,
+) -> Vec<T> {
     let mut out = Vec::with_capacity(items.len());
     for (index, item) in items.into_iter().enumerate() {
         match T::deserialize(item) {
             Ok(v) => out.push(v),
-            Err(e) => tracing::warn!(what, index, error = %e, "skipping an element that did not parse"),
+            Err(e) => {
+                tracing::warn!(what, index, error = %e, "skipping an element that did not parse")
+            }
         }
     }
     out
@@ -551,11 +561,15 @@ mod tests {
 
     #[test]
     fn snowflakes_as_numbers() {
-        let m: MessageDelete =
-            serde_json::from_value(serde_json::json!({"id": 123, "channel_id": "456", "guild_id": 789}))
-                .unwrap();
+        let m: MessageDelete = serde_json::from_value(
+            serde_json::json!({"id": 123, "channel_id": "456", "guild_id": 789}),
+        )
+        .unwrap();
         assert_eq!(m.id, "123");
         assert_eq!(m.guild_id.as_deref(), Some("789"));
-        assert!(serde_json::from_value::<MessageDelete>(serde_json::json!({"id": true, "channel_id": "1"})).is_err());
+        assert!(serde_json::from_value::<MessageDelete>(
+            serde_json::json!({"id": true, "channel_id": "1"})
+        )
+        .is_err());
     }
 }
