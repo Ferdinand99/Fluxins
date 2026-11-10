@@ -294,7 +294,12 @@ impl Inlet {
 
     /// A message of this account on its way (dimmed) or failed (red, with "Retry"),
     /// drawn like the account's other messages and grouped under them.
-    fn render_pending(&self, row: &PendingRow, compact: bool, cx: &mut Context<Self>) -> AnyElement {
+    fn render_pending(
+        &self,
+        row: &PendingRow,
+        compact: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let weak = cx.entity().downgrade();
         let ctx = RenderCtx {
             revealed: true,
@@ -328,7 +333,9 @@ impl Inlet {
                         .text_color(theme::link())
                         .cursor_pointer()
                         .child(t!("message-retry"))
-                        .on_click(cx.listener(move |this, _, _, cx| this.retry_pending(&nonce, cx))),
+                        .on_click(
+                            cx.listener(move |this, _, _, cx| this.retry_pending(&nonce, cx)),
+                        ),
                 )
         });
         let name = || {
@@ -339,7 +346,13 @@ impl Inlet {
                 .text_color(theme::text_strong())
                 .child(row.author.clone())
         };
-        let body = div().flex_1().min_w_0().flex().flex_col().child(text).children(failed);
+        let body = div()
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .child(text)
+            .children(failed);
         let main = if compact {
             div()
                 .flex()

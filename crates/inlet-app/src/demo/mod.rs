@@ -385,7 +385,11 @@ impl MockSession {
         self.page(channel_id, None)
     }
 
-    pub fn older_page(&mut self, channel_id: &str, before: MessageId) -> (MessagesPage, Vec<Message>) {
+    pub fn older_page(
+        &mut self,
+        channel_id: &str,
+        before: MessageId,
+    ) -> (MessagesPage, Vec<Message>) {
         self.page(channel_id, Some(before))
     }
 

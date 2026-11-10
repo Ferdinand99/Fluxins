@@ -157,10 +157,7 @@ impl Backend {
                     {
                         Ok(list) => {
                             let rendered = render(&list, &names);
-                            answer.page(
-                                MessagesPage::before(before_id, list, PAGE_SIZE),
-                                rendered,
-                            );
+                            answer.page(MessagesPage::before(before_id, list, PAGE_SIZE), rendered);
                         }
                         Err(err) => report(
                             &events,

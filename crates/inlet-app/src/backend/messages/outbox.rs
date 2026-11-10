@@ -28,9 +28,9 @@ impl Backend {
                         .await
                     {
                         Ok(message) => {
-                            let _ = events.unbounded_send(Ev::MessageCreated(
-                                parse::to_message(&message, &names),
-                            ));
+                            let _ = events.unbounded_send(Ev::MessageCreated(parse::to_message(
+                                &message, &names,
+                            )));
                         }
                         Err(err) => {
                             let failure = Failure::from(err);
