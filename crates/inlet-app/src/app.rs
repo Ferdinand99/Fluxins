@@ -212,6 +212,8 @@ impl Inlet {
         self.screen = Screen::SignIn;
         self.sign_in.busy = false;
         self.sign_in.handoff = None;
+        // The account's drafts go with it.
+        self.composer.sign_out();
         self.overlays.pending_link = None;
         self.guilds.clear();
         self.channels.clear();

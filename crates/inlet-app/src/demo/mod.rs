@@ -5,6 +5,7 @@
 //!
 //! One file per domain (`guilds`, `messages`, `social`); `scenes` picks what to show.
 
+pub mod composer;
 mod guilds;
 mod messages;
 pub mod scenes;
@@ -40,6 +41,8 @@ pub(crate) fn channel(
         parent_id: parent.map(Into::into),
         position,
         topic: (id == "c-general").then(|| "General chat \u{2014} be nice, have fun".to_string()),
+        // The development channel shows the slowmode countdown in the demo.
+        slowmode_secs: if id == "c-dev" { 10 } else { 0 },
     }
 }
 

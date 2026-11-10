@@ -82,6 +82,11 @@ pub fn to_channel(c: &p::Channel) -> Channel {
             .as_deref()
             .filter(|t| !t.trim().is_empty())
             .map(|t| model::snippet(t, 160)),
+        // Fluxer allows up to six hours; anything else is not a slowmode.
+        slowmode_secs: c
+            .rate_limit_per_user
+            .filter(|s| (1..=21_600).contains(s))
+            .map_or(0, |s| s as u32),
     }
 }
 
