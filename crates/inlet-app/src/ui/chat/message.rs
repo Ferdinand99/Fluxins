@@ -47,6 +47,8 @@ impl Inlet {
         let id = row.id;
         RenderCtx {
             revealed: row.revealed,
+            names: self.mention_names(&row.message, cx),
+            jumbo: !self.chat.view.compact,
             on_link: Rc::new({
                 let weak = weak.clone();
                 move |url, masked, _window, cx| {
@@ -303,6 +305,8 @@ impl Inlet {
         let weak = cx.entity().downgrade();
         let ctx = RenderCtx {
             revealed: true,
+            names: self.mention_names_in_open_channel(&row.blocks, cx),
+            jumbo: !compact,
             on_link: Rc::new(move |url, masked, _window, cx| {
                 let url = url.to_string();
                 let _ = weak.update(cx, |this, cx| this.open_link(&url, masked, cx));

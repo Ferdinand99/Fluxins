@@ -8,9 +8,10 @@
 //! instance. Demo IDs such as `c-general` are mapped to stable snowflakes
 //! ([`snowflake`]), and message IDs are made from the message's time.
 //!
-//! One file per domain (`guilds`, `messages`, `social`); `scenes` picks what to show.
+//! One file per domain (`guilds`, `messages`, `markdown`, `social`); `scenes` picks what to show.
 
 mod guilds;
+mod markdown;
 mod messages;
 pub mod scenes;
 mod social;

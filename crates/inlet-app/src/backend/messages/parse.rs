@@ -197,7 +197,7 @@ pub fn to_embed(v: &serde_json::Value, names: &Names) -> Option<Embed> {
         title: str_at(v, &["title"]).map(|t| model::snippet(t, 256)),
         url: str_at(v, &["url"]).map(str::to_string),
         description: str_at(v, &["description"])
-            .map(|d| crate::ui::markdown::parse_with(capped(d), names))
+            .map(|d| crate::ui::markdown::parse_embed_with(capped(d), names))
             .unwrap_or_default(),
         fields: Vec::new(),
         footer: str_at(v, &["footer", "text"]).map(|t| model::snippet(t, 256)),
@@ -209,7 +209,7 @@ pub fn to_embed(v: &serde_json::Value, names: &Names) -> Option<Embed> {
                 .map(|n| model::snippet(n, 256))
                 .unwrap_or_default();
             let value = str_at(f, &["value"])
-                .map(|t| crate::ui::markdown::parse_with(capped(t), names))
+                .map(|t| crate::ui::markdown::parse_embed_with(capped(t), names))
                 .unwrap_or_default();
             embed.fields.push(EmbedField { name, value });
         }

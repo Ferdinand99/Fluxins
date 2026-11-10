@@ -11,6 +11,8 @@
 //! - `chat-compact`: `chat-cozy` in compact mode.
 //! - `chat-system`: for `#system-messages`, every system message type.
 //! - `chat-replies`: for `#replies`, replies with loaded, deleted and missing originals.
+//! - `markdown-inline`, `markdown-blocks`, `markdown-code`: for `#development`, every
+//!   kind of markdown node (see `markdown.rs`).
 
 use std::collections::HashMap;
 
@@ -18,7 +20,8 @@ use inlet_protocol as p;
 use serde_json::{json, Value};
 
 use super::{
-    guilds, messages, snowflake, social, user, user_id, ME, ROLE_CONTRIBUTORS, ROLE_MODERATORS,
+    guilds, markdown, messages, snowflake, social, user, user_id, ME, ROLE_CONTRIBUTORS,
+    ROLE_MODERATORS,
 };
 use crate::backend::messages::Pending;
 use crate::model::{Channel, ChannelKind, Guild};
@@ -31,6 +34,9 @@ pub enum Scene {
     ChatCompact,
     ChatSystem,
     ChatReplies,
+    MarkdownInline,
+    MarkdownBlocks,
+    MarkdownCode,
 }
 
 impl Scene {
@@ -41,6 +47,9 @@ impl Scene {
             "chat-compact" => Scene::ChatCompact,
             "chat-system" => Scene::ChatSystem,
             "chat-replies" => Scene::ChatReplies,
+            "markdown-inline" => Scene::MarkdownInline,
+            "markdown-blocks" => Scene::MarkdownBlocks,
+            "markdown-code" => Scene::MarkdownCode,
             _ => return None,
         })
     }
@@ -170,6 +179,18 @@ pub fn data(scene: Scene) -> Data {
     let mut by_name = HashMap::new();
     messages::messages(&mut by_name);
     social::dm_messages(&mut by_name);
+    match scene {
+        Scene::MarkdownInline => {
+            by_name.insert(markdown::SCENE_CHANNEL.into(), markdown::inline());
+        }
+        Scene::MarkdownBlocks => {
+            by_name.insert(markdown::SCENE_CHANNEL.into(), markdown::blocks());
+        }
+        Scene::MarkdownCode => {
+            by_name.insert(markdown::SCENE_CHANNEL.into(), markdown::code());
+        }
+        _ => {}
+    }
 
     // Demo IDs become snowflakes everywhere.
     let guilds: Vec<Guild> = guilds::guilds()
@@ -250,6 +271,9 @@ mod tests {
             "chat-compact",
             "chat-system",
             "chat-replies",
+            "markdown-inline",
+            "markdown-blocks",
+            "markdown-code",
         ] {
             let scene = Scene::from_name(name).expect(name);
             let data = data(scene);

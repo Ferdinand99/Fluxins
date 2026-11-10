@@ -1357,6 +1357,9 @@ impl Inlet {
         if !changes.is_empty() || jump_over {
             self.after_changes(changes, false, cx);
             cx.notify();
+        } else if markdown::refresh_due(now_ms()) {
+            // A relative timestamp on screen shows a new label.
+            cx.notify();
         }
     }
 
