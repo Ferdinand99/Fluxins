@@ -291,6 +291,8 @@ struct RealActive {
     /// Restart bookkeeping; lives with the session so spacing survives restarts.
     policy: ReconnectPolicy,
     restart_timer: Option<AbortHandle>,
+    /// Notification settings writes still running; aborted when the session ends.
+    settings_writes: Vec<AbortHandle>,
 }
 
 /// A new sign-in waiting for "Continue".

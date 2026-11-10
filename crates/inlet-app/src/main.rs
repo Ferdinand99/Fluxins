@@ -42,6 +42,7 @@ fn main() {
         .init();
     gpui_platform::application().run(|cx: &mut App| {
         text_input::bind_keys(cx);
+        ui::notifications::bind_keys(cx);
         ui::composer::bind_keys(cx);
         assets::load_fonts(cx);
         // Fit small screens (CI runners have 1024x768): at most 90 % of the display.

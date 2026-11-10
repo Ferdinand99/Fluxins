@@ -26,6 +26,12 @@ pub enum Icon {
     CaretRight,
     SignOut,
     Info,
+    /// Notification settings (`bell`).
+    Bell,
+    /// Muted (`bell-slash`).
+    BellSlash,
+    /// A ticked box (`check-square`).
+    CheckSquare,
 }
 
 impl Icon {
@@ -41,6 +47,9 @@ impl Icon {
             Icon::CaretRight => include_bytes!("../assets/icons/caret-right.svg"),
             Icon::SignOut => include_bytes!("../assets/icons/sign-out.svg"),
             Icon::Info => include_bytes!("../assets/icons/info.svg"),
+            Icon::Bell => include_bytes!("../assets/icons/bell.svg"),
+            Icon::BellSlash => include_bytes!("../assets/icons/bell-slash.svg"),
+            Icon::CheckSquare => include_bytes!("../assets/icons/check-square.svg"),
         }
     }
 

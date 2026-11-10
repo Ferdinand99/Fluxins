@@ -54,7 +54,7 @@ zeroize = "1"
 [dev-dependencies]
 # gpui's test platform, for the composer's key handling tests.
 gpui = { workspace = true, features = ["test-support"] }
-# Mock server for the composer's send and retry tests.
+# Mock server for the acknowledgement, settings and composer send tests.
 wiremock = "0.6"
 # Reads the catalogue files in the i18n tests (same version fluent-bundle uses).
 fluent-syntax = "0.12"
