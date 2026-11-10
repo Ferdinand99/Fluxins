@@ -44,6 +44,7 @@ jobs:
           cp artifacts/inlet-windows-x86_64/inlet.exe release/inlet-windows-x86_64.exe
           cp artifacts/inlet-macos-aarch64/inlet-macos-aarch64.zip release/
           cp artifacts/inlet-linux-x86_64/inlet-linux-x86_64.tar.gz release/
+          cp LICENSE release/LICENSE
           # Third-party licence notices, if the repository carries them.
           for f in THIRD-PARTY-NOTICES*; do
             if [ -f "$f" ]; then cp "$f" release/; fi
