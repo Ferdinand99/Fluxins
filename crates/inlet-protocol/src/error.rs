@@ -35,10 +35,12 @@ impl std::fmt::Display for ApiError {
 
 /// Everything that can go wrong in this crate.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
-    /// Network or TLS failure, or a timeout.
+    /// Network or TLS failure, or a timeout. The URL is stripped, because a
+    /// query string can carry a ticket.
     #[error("network error: {0}")]
-    Http(#[from] reqwest::Error),
+    Http(reqwest::Error),
     /// The instance answered with an error.
     #[error("API error: {0}")]
     Api(Box<ApiError>),
@@ -67,6 +69,28 @@ pub enum Error {
     /// Solving the CAPTCHA failed or took too long.
     #[error("captcha could not be solved: {0}")]
     Captcha(String),
+    /// The instance now names a different API or gateway host than the one this
+    /// token was signed in with. The token is not sent there. Ask the person to
+    /// confirm the instance and sign in again.
+    #[error("the instance endpoints changed from {old} to {new}; sign in again")]
+    EndpointsChanged {
+        /// The pinned endpoints.
+        old: String,
+        /// What the instance says now.
+        new: String,
+    },
+    /// A response or gateway payload was larger than the limit.
+    #[error("response too large (over {limit} bytes)")]
+    TooLarge {
+        /// The limit in bytes.
+        limit: usize,
+    },
+}
+
+impl From<reqwest::Error> for Error {
+    fn from(e: reqwest::Error) -> Self {
+        Error::Http(e.without_url())
+    }
 }
 
 /// Result type of this crate.

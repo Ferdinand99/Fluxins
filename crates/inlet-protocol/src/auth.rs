@@ -23,7 +23,7 @@ use reqwest::Method;
 use serde_json::{json, Value};
 
 use crate::error::{ApiError, Error, Result};
-use crate::instance::Instance;
+use crate::instance::{EndpointPins, Instance};
 use crate::models::{Snowflake, User};
 use crate::rest::{send, Client, RawResponse, Request};
 use crate::token::Token;
@@ -36,6 +36,12 @@ const CAPTCHA_TIMEOUT: Duration = Duration::from_secs(60);
 pub struct Ticket(String);
 
 impl Ticket {
+    /// A ticket from a raw value, for tests.
+    #[doc(hidden)]
+    pub fn for_tests(value: &str) -> Ticket {
+        Ticket(value.to_owned())
+    }
+
     /// The raw value.
     pub fn expose_secret(&self) -> &str {
         &self.0
@@ -67,6 +73,7 @@ pub struct SignedIn {
 
 /// A second-factor method.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MfaMethod {
     /// Authenticator app code; use [`sign_in_totp`].
     Totp,
@@ -80,6 +87,7 @@ pub enum MfaMethod {
 
 /// What a sign-in step returned.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum SignInResult {
     /// Signed in.
     Ok(SignedIn),
@@ -95,7 +103,9 @@ pub enum SignInResult {
         /// Pass to [`poll_ip_authorization`].
         ticket: Ticket,
     },
-    /// A CAPTCHA was required and the solver's answer was not accepted. Use the browser handoff.
+    /// A CAPTCHA was required and could not be passed: the answer was not
+    /// accepted, the challenge was too hard or expired, or the algorithm is
+    /// unknown. Use the browser handoff.
     Captcha,
     /// The API refused (wrong password, invalid code, SSO required, suspended, ...).
     /// [`ApiError::field_code`] has codes like `INVALID_EMAIL_OR_PASSWORD` or `INVALID_CODE`.
@@ -114,11 +124,11 @@ fn signed_in_from(v: &Value) -> Option<SignedIn> {
     }
     Some(SignedIn {
         token: Token::new(token),
-        user_id: v
-            .get("user_id")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned(),
+        user_id: match v.get("user_id") {
+            Some(Value::String(s)) => s.clone(),
+            Some(Value::Number(n)) => n.to_string(),
+            _ => String::new(),
+        },
         user: v
             .get("user")
             .and_then(|u| serde_json::from_value(u.clone()).ok()),
@@ -159,7 +169,13 @@ async fn post_with_captcha(
                 }
                 solves += 1;
                 tracing::info!("solving the sign-in CAPTCHA");
-                captcha_token = Some(crate::altcha::solve(challenge, CAPTCHA_TIMEOUT).await?);
+                match crate::altcha::solve(challenge, CAPTCHA_TIMEOUT).await {
+                    Ok(t) => captcha_token = Some(t),
+                    Err(e) => {
+                        tracing::warn!("CAPTCHA not solved: {e}");
+                        return Ok((raw, true));
+                    }
+                }
                 continue;
             }
         }
@@ -241,6 +257,7 @@ pub async fn sign_in_totp(
 
 /// State of a sign-in waiting for the new-IP email link.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum IpAuthorization {
     /// Not yet. Poll again in a few seconds (limit: 60 per minute).
     Pending,
@@ -316,16 +333,24 @@ pub enum HandoffStatus {
     Expired,
 }
 
+/// How long a handoff code lives on the server.
+const HANDOFF_LIFETIME: Duration = Duration::from_secs(5 * 60);
+/// Failed polls in a row that [`Handoff::wait`] tolerates.
+const HANDOFF_MAX_FAILURES: u32 = 3;
+
 /// A pending browser sign-in ("desktop handoff", `/v1/auth/handoff/*`).
 ///
 /// 1. [`Handoff::start`], show [`Handoff::display_code`] and open [`Handoff::browser_url`].
 /// 2. Call [`Handoff::wait`] (or [`Handoff::poll`] on a timer) until it completes.
+/// 3. Show who signed in (`SignedIn::user`) before storing the token, so a
+///    person who saw the code cannot slip in their own account unnoticed.
 #[derive(Debug)]
 pub struct Handoff {
     instance: Instance,
     code: String,
     expires_at: String,
-    poll_secret: Option<Ticket>,
+    poll_secret: Ticket,
+    deadline: tokio::time::Instant,
 }
 
 impl Handoff {
@@ -354,6 +379,17 @@ impl Handoff {
             })
             .ok_or_else(|| Error::Decode("handoff initiate without a valid code".into()))?
             .to_owned();
+        // Only POST .../status with the poll secret returns the token.
+        let poll_secret = v
+            .get("poll_secret")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty() && s.len() <= 256)
+            .map(|s| Ticket(s.to_owned()))
+            .ok_or_else(|| {
+                Error::Decode(
+                    "the instance gave no handoff poll secret; it is too old for Inlet".into(),
+                )
+            })?;
         Ok(Handoff {
             instance: instance.clone(),
             code,
@@ -362,11 +398,8 @@ impl Handoff {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_owned(),
-            poll_secret: v
-                .get("poll_secret")
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-                .map(|s| Ticket(s.to_owned())),
+            poll_secret,
+            deadline: tokio::time::Instant::now() + HANDOFF_LIFETIME,
         })
     }
 
@@ -395,21 +428,18 @@ impl Handoff {
         &self.expires_at
     }
 
-    /// The page to open in the browser: `{webapp}/login?handoff=1`.
+    /// The page to open in the browser: `{webapp}/login?handoff=1`. The web app
+    /// URL is checked (https, on the instance's domain), so this is safe to hand
+    /// to the OS.
     pub fn browser_url(&self) -> String {
-        format!("{}/login?handoff=1", self.instance.webapp())
+        self.instance.webapp_page("login?handoff=1")
     }
 
-    /// Asks once. Uses `POST .../status` with the poll secret; only that form returns the token.
+    /// Asks once with `POST .../status` and the poll secret.
     pub async fn poll(&self) -> Result<HandoffStatus> {
         let path = format!("/auth/handoff/{}/status", self.code);
-        let raw = match &self.poll_secret {
-            Some(secret) => {
-                let body = json!({ "poll_secret": secret.expose_secret() });
-                anon(&self.instance, Method::POST, &path, Some(&body), true).await?
-            }
-            None => anon(&self.instance, Method::GET, &path, None, false).await?,
-        };
+        let body = json!({ "poll_secret": self.poll_secret.expose_secret() });
+        let raw = anon(&self.instance, Method::POST, &path, Some(&body), true).await?;
         if !raw.is_success() {
             return Err(Error::Api(Box::new(raw.api_error())));
         }
@@ -418,7 +448,11 @@ impl Handoff {
             match v.get("status").and_then(Value::as_str).unwrap_or("pending") {
                 "completed" => match signed_in_from(&v) {
                     Some(ok) => HandoffStatus::Completed(ok),
-                    None => HandoffStatus::Pending,
+                    None => {
+                        return Err(Error::Decode(
+                            "the handoff completed without a token".into(),
+                        ))
+                    }
                 },
                 "denied" => HandoffStatus::Denied,
                 "expired" => HandoffStatus::Expired,
@@ -427,23 +461,36 @@ impl Handoff {
         )
     }
 
-    /// Polls every `every` (at least one second) until the handoff is no longer pending.
+    /// Polls every `every` (at least one second) until the handoff is no longer
+    /// pending, or returns [`HandoffStatus::Expired`] when the 5-minute code
+    /// lifetime is over. Up to three network or server errors in a row are
+    /// retried with a growing pause; rate limits and other API refusals are returned.
     pub async fn wait(&self, every: Duration) -> Result<HandoffStatus> {
         let every = every.max(Duration::from_secs(1));
+        let mut failures = 0u32;
         loop {
-            match self.poll().await? {
-                HandoffStatus::Pending => tokio::time::sleep(every).await,
-                done => return Ok(done),
+            if tokio::time::Instant::now() >= self.deadline {
+                return Ok(HandoffStatus::Expired);
+            }
+            match self.poll().await {
+                Ok(HandoffStatus::Pending) => {
+                    failures = 0;
+                    tokio::time::sleep(every).await;
+                }
+                Ok(done) => return Ok(done),
+                Err(e) if is_transient(&e) && failures < HANDOFF_MAX_FAILURES => {
+                    failures += 1;
+                    tracing::warn!("handoff poll failed ({failures}): {e}");
+                    tokio::time::sleep(every * 2u32.pow(failures)).await;
+                }
+                Err(e) => return Err(e),
             }
         }
     }
 
     /// `DELETE /auth/handoff/{code}`.
     pub async fn cancel(self) -> Result<()> {
-        let Some(secret) = &self.poll_secret else {
-            return Ok(());
-        };
-        let body = json!({ "poll_secret": secret.expose_secret() });
+        let body = json!({ "poll_secret": self.poll_secret.expose_secret() });
         let path = format!("/auth/handoff/{}", self.code);
         let raw = anon(&self.instance, Method::DELETE, &path, Some(&body), true).await?;
         if raw.is_success() {
@@ -454,7 +501,20 @@ impl Handoff {
     }
 }
 
+fn is_transient(e: &Error) -> bool {
+    match e {
+        Error::Http(_) => true,
+        Error::Api(api) => api.status >= 500,
+        _ => false,
+    }
+}
+
 /// A signed-in session: the instance, the token and the REST client. Cheap to clone.
+///
+/// The session is bound to the API and gateway hosts of the instance it was
+/// created with ([`Session::pins`]). Store the pins next to the token and use
+/// [`Session::from_token_pinned`] on the next start, so a changed discovery
+/// document cannot send the token to another host.
 #[derive(Debug, Clone)]
 pub struct Session {
     client: Client,
@@ -462,16 +522,41 @@ pub struct Session {
 
 impl Session {
     /// A session from a stored token. Makes no request; call
-    /// [`Client::me`] to check that the token still works.
+    /// [`Client::me`] to check that the token still works. Trusts the
+    /// instance's current endpoints; prefer [`Session::from_token_pinned`].
     pub fn from_token(instance: Instance, token: Token) -> Session {
         Session {
             client: Client::new(instance, token),
         }
     }
 
+    /// A session from a stored token and the pins stored with it. Fails with
+    /// [`Error::EndpointsChanged`] when the instance now names other hosts; then
+    /// ask the person to sign in again and do not use the stored token.
+    pub fn from_token_pinned(
+        instance: Instance,
+        token: Token,
+        pins: &EndpointPins,
+    ) -> Result<Session> {
+        instance.verify_pins(pins)?;
+        Ok(Self::from_token(instance, token))
+    }
+
     /// A session from a finished sign-in.
     pub fn from_signed_in(instance: Instance, signed_in: SignedIn) -> Session {
-        Self::from_token(instance, signed_in.token)
+        Session {
+            client: Client::for_user(instance, signed_in.token.clone(), &signed_in.user_id),
+        }
+    }
+
+    /// The API and gateway hosts this session's token belongs to.
+    pub fn pins(&self) -> EndpointPins {
+        self.instance().pins()
+    }
+
+    /// Checks that a refreshed instance still uses this session's hosts.
+    pub fn check_endpoints(&self, refreshed: &Instance) -> Result<()> {
+        refreshed.verify_pins(&self.pins())
     }
 
     /// The REST client.
