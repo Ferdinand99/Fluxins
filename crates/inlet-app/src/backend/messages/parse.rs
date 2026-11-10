@@ -29,9 +29,21 @@ pub fn remember_channels(names: &SharedNames, list: &[Channel]) {
     }
 }
 
+/// User names kept for mentions; past this the first seen are forgotten (a mention of
+/// a forgotten user shows as an unknown mention until they post again).
+pub const MAX_USER_NAMES: usize = 5_000;
+
 pub fn remember_user(n: &mut Names, u: &p::User) {
-    n.users
-        .insert(u.id.clone(), model::clean_name(u.display_name()));
+    let name = model::clean_name(u.display_name());
+    if n.users.insert(u.id.clone(), name).is_none() {
+        n.user_order.push_back(u.id.clone());
+        while n.users.len() > MAX_USER_NAMES {
+            let Some(old) = n.user_order.pop_front() else {
+                break;
+            };
+            n.users.remove(&old);
+        }
+    }
 }
 
 /// Roles from a READY or GUILD_CREATE guild (raw JSON objects with `id` and `name`).
@@ -106,7 +118,6 @@ pub fn to_message(m: &p::Message, names: &SharedNames) -> Message {
     let mut out = Message {
         id: m.id.clone(),
         channel_id: m.channel_id.clone(),
-        author_id: m.author.id.clone(),
         author: model::clean_name(m.author.display_name()),
         author_username: model::clean_name(&m.author.username),
         author_bot: m.author.bot,
@@ -127,14 +138,6 @@ pub fn to_message(m: &p::Message, names: &SharedNames) -> Message {
                     .unwrap_or_default(),
             })
             .collect(),
-        mentions_me: snapshot
-            .me
-            .as_ref()
-            .is_some_and(|me| m.mentions.iter().any(|u| &u.id == me))
-            || m.extra
-                .get("mention_everyone")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
         embeds: m
             .embeds
             .iter()
@@ -237,11 +240,6 @@ pub fn to_embed(v: &serde_json::Value, names: &Names) -> Option<Embed> {
     (!empty).then_some(embed)
 }
 
-/// Snowflakes compare as numbers; a shorter string is older.
-pub fn snowflake_key(id: &str) -> (usize, &str) {
-    (id.len(), id)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,6 +268,22 @@ mod tests {
         }
         assert!(to_embed(&serde_json::json!({}), &names).is_none());
         assert!(to_embed(&serde_json::json!("x"), &names).is_none());
+    }
+
+    #[test]
+    fn user_names_are_capped_oldest_first() {
+        let mut n = Names::default();
+        for i in 0..(MAX_USER_NAMES as u64 + 1_000) {
+            let u: p::User =
+                serde_json::from_value(serde_json::json!({"id": i.to_string(), "username": "u"}))
+                    .unwrap();
+            remember_user(&mut n, &u);
+        }
+        assert_eq!(n.users.len(), MAX_USER_NAMES);
+        assert!(!n.users.contains_key("0"));
+        assert!(n
+            .users
+            .contains_key(&(MAX_USER_NAMES as u64 + 999).to_string()));
     }
 
     #[test]

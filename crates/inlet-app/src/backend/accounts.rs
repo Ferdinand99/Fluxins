@@ -586,7 +586,6 @@ impl Backend {
             .and_then(crate::theme::parse_hex);
         crate::theme::set_accent(accent);
         let names: SharedNames = Arc::default();
-        names.lock().unwrap().me = Some(connected.user_id.clone());
         let (gateway, forward) = self.spawn_gateway(gen, &session, &guilds, &cache, &names);
         let mut policy = ReconnectPolicy::default();
         policy.started(Instant::now());

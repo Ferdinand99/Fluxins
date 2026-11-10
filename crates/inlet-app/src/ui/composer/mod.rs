@@ -19,15 +19,14 @@ pub mod slowmode;
 mod status_row;
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::rc::Rc;
 
 use gpui::{prelude::*, App, Context, Entity, Subscription, Window};
-use inlet_editor::{Id, Resolve};
+use inlet_state::{AccountState, ChannelId};
 
 use crate::app::Inlet;
-use crate::backend::composer::{Cmd, Ev};
-use crate::model::Message;
+use crate::backend::composer::{Cmd, Ev, Outgoing};
+use crate::backend::messages;
 use crate::ui::sidebar::channel_list::channel_label;
 pub use editor::{bind_keys, ChannelContext, ComposerEvent, ComposerView, Shared};
 
@@ -88,46 +87,38 @@ impl ComposerState {
     }
 }
 
-/// Names of message authors, for the pills of a message being edited.
-struct AuthorNames(HashMap<u64, String>);
 
-impl Resolve for AuthorNames {
-    fn user(&self, id: Id) -> Option<String> {
-        self.0.get(&id.0).cloned()
-    }
-    fn role(&self, _: Id) -> Option<String> {
-        None
-    }
-    fn channel(&self, _: Id) -> Option<String> {
-        None
+/// The pending row a send shows in the message list until the server took it.
+pub fn pending_of(message: &Outgoing) -> messages::Pending {
+    messages::Pending {
+        channel_id: message.channel_id.clone(),
+        nonce: message.nonce.clone(),
+        text: message.content.clone(),
+        failed: None,
     }
 }
 
-/// Up in an empty composer: opens the account's newest message among `shown` (oldest
-/// first) for editing. This is the one place that reads the message list for it.
-pub(crate) fn edit_last<'a>(
+/// Up in an empty composer: opens the account's newest message in `channel` for editing,
+/// read from the account state's window (the message list's source).
+pub(crate) fn edit_last(
     view: &Entity<ComposerView>,
-    shown: impl DoubleEndedIterator<Item = &'a Message> + Clone,
-    me: &str,
+    account: &Entity<AccountState>,
+    channel: ChannelId,
     window: &mut Window,
     cx: &mut App,
 ) {
-    let Some(message) = edit_inline::last_editable(shown.clone(), me).cloned() else {
+    let state = account.read(cx);
+    let Some(target) = edit_inline::last_own(state, channel) else {
         return;
     };
-    let names = AuthorNames(
-        shown
-            .filter_map(|m| Some((m.author_id.parse().ok()?, m.author.clone())))
-            .collect(),
-    );
-    let target = edit_inline::EditTarget {
-        message_id: message.id,
-        channel_id: message.channel_id,
-        content: message.content,
-        // Whether the original reply notified its author is not in the list's model
-        // yet; unknown keeps the author from being added by the edit.
-        replied_user: None,
+    let guild = state.channels().guild_of(channel);
+    // The labels are worked out now; the edit box keeps them.
+    let draft = {
+        let names = edit_inline::StateNames { state, guild };
+        let buffer = inlet_editor::Buffer::from_wire(&target.content, &names);
+        drafts::Draft::of(&buffer)
     };
+    let names = draft.unwrap_or_default();
     view.update(cx, |v, cx| v.start_edit(target, &names, window, cx));
 }
 
@@ -156,9 +147,11 @@ impl Inlet {
             },
             slowmode_secs: channel.map_or(0, |c| c.slowmode_secs),
         };
-        self.composer
-            .view
-            .update(cx, |v, cx| v.set_channel(ctx, window, cx));
+        let account = self.account.as_ref().map(Entity::downgrade);
+        self.composer.view.update(cx, |v, cx| {
+            v.set_channel(ctx, window, cx);
+            v.set_account(account, cx);
+        });
     }
 
     fn on_composer_view_event(
@@ -168,9 +161,10 @@ impl Inlet {
         cx: &mut Context<Self>,
     ) {
         match event {
-            ComposerEvent::Send(message) => self.backend.send(Cmd::Send(message)),
-            ComposerEvent::SendUnlessSent(message) => {
-                self.backend.send(Cmd::SendUnlessSent(message))
+            ComposerEvent::Send(message) => {
+                // The row shows "sending" at once; the backend reports the outcome to it.
+                self.on_messages_event(messages::Ev::Pending(pending_of(&message)), window, cx);
+                self.backend.send(Cmd::Send(message));
             }
             ComposerEvent::Edit {
                 channel_id,
@@ -184,7 +178,6 @@ impl Inlet {
                 mentions,
             }),
             ComposerEvent::Typing { channel_id } => self.backend.send(Cmd::Typing { channel_id }),
-            ComposerEvent::Directory { guild_id } => self.backend.send(Cmd::Directory { guild_id }),
             ComposerEvent::SearchMembers {
                 guild_id,
                 query,
@@ -204,11 +197,21 @@ impl Inlet {
                 if self.selected_channel.as_ref() != Some(&channel_id) {
                     return;
                 }
-                let me = self.composer.user_id.clone().unwrap_or_default();
-                let shown = self.chat.messages.iter().map(|m| &m.message);
-                edit_last(&self.composer.view, shown, &me, window, cx);
+                let (Some(account), Some(channel)) =
+                    (self.account.clone(), ChannelId::parse(&channel_id))
+                else {
+                    return;
+                };
+                edit_last(&self.composer.view, &account, channel, window, cx);
             }
         }
+    }
+
+    /// Retry in the message list sends again: the composer's slowmode counts it.
+    pub(crate) fn composer_resent(&mut self, channel_id: &str, cx: &mut Context<Self>) {
+        self.composer
+            .view
+            .update(cx, |v, cx| v.on_resend(channel_id, cx));
     }
 
     pub(crate) fn render_composer(&self) -> impl IntoElement {
@@ -241,27 +244,90 @@ impl Inlet {
                     v.set_session(max_message_length, file, window, cx)
                 });
             }
-            Ev::Sent { nonce } => view.update(cx, |v, cx| v.on_sent(&nonce, cx)),
-            Ev::SendFailed {
-                nonce,
-                reason,
-                retry_after_secs,
-                ambiguous,
-            } => view.update(cx, |v, cx| {
-                v.on_send_failed(&nonce, reason, retry_after_secs, ambiguous, cx)
-            }),
+            Ev::SlowmodeWait { channel_id, secs } => {
+                view.update(cx, |v, cx| v.on_slowmode_wait(&channel_id, secs, cx))
+            }
             Ev::DirectMessageFailed { nonce, reason } => view.update(cx, |v, cx| {
                 v.on_direct_message_failed(&nonce, reason, window, cx)
             }),
-            Ev::EditFailed { reason } => view.update(cx, |v, cx| v.on_edit_failed(reason, cx)),
-            Ev::Directory {
-                guild_id,
-                directory,
-            } => view.update(cx, |v, cx| v.on_directory(guild_id, directory, cx)),
+            Ev::Edited { message_id } => {
+                view.update(cx, |v, cx| v.on_edited(&message_id, window, cx))
+            }
+            Ev::EditFailed { message_id, reason } => {
+                view.update(cx, |v, cx| v.on_edit_failed(&message_id, reason, cx))
+            }
             Ev::Members { guild_id, members } => {
                 view.update(cx, |v, cx| v.on_members(guild_id, members, cx))
             }
             Ev::Notice(text) => self.chat.notice = Some(text),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::composer::Mentions;
+    use crate::ui::chat::messages::{MessageView, Row};
+
+    fn outgoing() -> Outgoing {
+        Outgoing {
+            channel_id: "301".into(),
+            nonce: "777".into(),
+            content: "hello".into(),
+            mentions: Mentions::default(),
+            reply_to: None,
+            silent: false,
+        }
+    }
+
+    fn pending_rows(view: &mut MessageView, state: &AccountState) -> Vec<(String, Option<String>)> {
+        let ch = ChannelId::parse("301").unwrap();
+        view.build_rows(state, ch)
+            .into_iter()
+            .filter_map(|r| match r {
+                Row::Pending(p) => Some((p.nonce.clone(), p.failed.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_send_shows_a_pending_row_until_the_server_took_it() {
+        let (state, _) = edit_inline::tests::state_with(serde_json::json!([]));
+        let mut view = MessageView::new();
+        // What the app does for the composer's send.
+        view.upsert_pending(pending_of(&outgoing()));
+        assert_eq!(pending_rows(&mut view, &state), [("777".to_owned(), None)]);
+        // The backend's `Sent` with the nonce.
+        assert!(view.sent("777"));
+        assert!(pending_rows(&mut view, &state).is_empty());
+    }
+
+    #[test]
+    fn a_failed_send_offers_retry_with_the_same_nonce() {
+        let (state, _) = edit_inline::tests::state_with(serde_json::json!([]));
+        let mut view = MessageView::new();
+        view.upsert_pending(pending_of(&outgoing()));
+        // The backend reports the failure on the same row.
+        let mut failed = pending_of(&outgoing());
+        failed.failed = Some("offline".into());
+        view.upsert_pending(failed);
+        assert_eq!(
+            pending_rows(&mut view, &state),
+            [("777".to_owned(), Some("offline".to_owned()))],
+            "the row shows the reason (and Retry)"
+        );
+        match view.retry("777") {
+            Some(messages::Cmd::Resend {
+                channel_id, nonce, ..
+            }) => {
+                assert_eq!(channel_id, "301");
+                assert_eq!(nonce, "777", "the first nonce, so the server can drop a copy");
+            }
+            _ => panic!("Retry sends the message again"),
+        }
+        assert_eq!(pending_rows(&mut view, &state), [("777".to_owned(), None)]);
+        assert!(view.retry("777").is_none(), "only a failed row retries");
     }
 }

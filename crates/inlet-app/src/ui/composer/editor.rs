@@ -16,11 +16,12 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     actions, div, prelude::*, px, App, Context, Entity, EntityInputHandler, EventEmitter,
-    FocusHandle, Focusable, KeyBinding, Subscription, Task, Window,
+    FocusHandle, Focusable, KeyBinding, Subscription, Task, WeakEntity, Window,
 };
 use inlet_editor::actions::{Down, Submit, Up};
 use inlet_editor::{Editor, EditorEvent, EditorStyle, Trigger};
 use inlet_protocol as p;
+use inlet_state::{AccountState, ChannelId, GuildId};
 
 use super::autocomplete::{self, Candidate, Pick, Section, Sources};
 use super::commands::{self, Parsed};
@@ -36,17 +37,13 @@ actions!(inlet_composer, [AcceptCompletion, Cancel]);
 /// The key context of the composer, around the editor's own.
 pub const KEY_CONTEXT: &str = "inlet_composer";
 
-/// Guilds whose autocomplete data is kept.
-const MAX_DIRECTORIES: usize = 32;
-/// Sends shown as sending or failed at most.
-const MAX_PENDING: usize = 20;
+/// Guilds whose searched members are kept.
+const MAX_GUILDS: usize = 32;
 /// How often the UI tells the backend the person is typing (the protocol sends at most
 /// one request per channel every 8 s).
 const TYPING_EVERY: Duration = Duration::from_secs(1);
 /// Wait after the last key before a member search goes out.
 const SEARCH_DELAY: Duration = Duration::from_millis(250);
-/// How long the server recognises a nonce (Fluxer keeps it five minutes).
-const NONCE_MEMORY_MS: u64 = 5 * 60 * 1000;
 /// Wait after the last change before drafts are written to disk.
 const SAVE_DELAY: Duration = Duration::from_secs(1);
 
@@ -83,9 +80,6 @@ pub enum ComposerEvent {
     Typing {
         channel_id: String,
     },
-    Directory {
-        guild_id: String,
-    },
     SearchMembers {
         guild_id: String,
         query: String,
@@ -104,8 +98,6 @@ pub enum ComposerEvent {
     EditLast {
         channel_id: String,
     },
-    /// A retry long after an unclear failure: send only if the message is not there.
-    SendUnlessSent(Outgoing),
 }
 
 /// State the app shares with the composer: the drafts survive the view, and sign-out
@@ -123,18 +115,6 @@ impl Shared {
     }
 }
 
-/// A message on its way, or one the server refused.
-#[derive(Clone, Debug)]
-pub struct PendingSend {
-    pub outgoing: Outgoing,
-    /// Why it failed; `None` while it is being sent.
-    pub failed: Option<String>,
-    /// The failed request may have reached the server.
-    pub ambiguous: bool,
-    /// When it was first sent ([`ComposerView::now_ms`]).
-    pub first_sent_ms: u64,
-}
-
 /// The open autocomplete list.
 pub struct AutocompleteState {
     pub section: Section,
@@ -150,7 +130,11 @@ pub struct ComposerView {
     pub(super) channel: Option<ChannelContext>,
     pub(super) shared: Rc<RefCell<Shared>>,
     seen_generation: u64,
-    directories: HashMap<String, Directory>,
+    /// The account state on the UI thread: roles, channels, emoji and rights.
+    account: Option<WeakEntity<AccountState>>,
+    /// Autocomplete data of the open channel, from the account state.
+    pub(super) directory: Option<(String, Directory)>,
+    /// Members per guild: from the account state and from searches.
     members: HashMap<String, Vec<Person>>,
     pub(super) autocomplete: Option<AutocompleteState>,
     /// The trigger start the person closed the list at; it stays closed there.
@@ -158,7 +142,6 @@ pub struct ComposerView {
     pub(super) reply: Option<Reply>,
     pub(super) edit: Option<InlineEdit>,
     pub(super) slowmode: Slowmode,
-    pub(super) pending: Vec<PendingSend>,
     /// A sentence under the box (too long, a command that needs a guild).
     pub(super) error: Option<String>,
     clock: Instant,
@@ -223,14 +206,14 @@ impl ComposerView {
             channel: None,
             shared,
             seen_generation,
-            directories: HashMap::new(),
+            account: None,
+            directory: None,
             members: HashMap::new(),
             autocomplete: None,
             dismissed_at: None,
             reply: None,
             edit: None,
             slowmode: Slowmode::default(),
-            pending: Vec::new(),
             error: None,
             clock: Instant::now(),
             skew_ms: 0,
@@ -277,17 +260,39 @@ impl ComposerView {
         self.clock.elapsed().as_millis() as u64 + self.skew_ms
     }
 
-    /// Sends and failed sends of a channel, oldest first (for the message list).
-    #[allow(dead_code)] // read by the message list once it shows pending messages
-    pub fn pending<'a>(&'a self, channel_id: &'a str) -> impl Iterator<Item = &'a PendingSend> {
-        self.pending
-            .iter()
-            .filter(move |p| p.outgoing.channel_id == channel_id)
+    pub(super) fn directory(&self) -> Option<&Directory> {
+        let (channel, directory) = self.directory.as_ref()?;
+        (Some(channel) == self.channel.as_ref().map(|c| &c.channel_id)).then_some(directory)
     }
 
-    pub(super) fn directory(&self) -> Option<&Directory> {
-        let guild = self.channel.as_ref()?.guild_id.as_ref()?;
-        self.directories.get(guild)
+    /// The account state to read roles, channels, emoji and rights from.
+    pub fn set_account(&mut self, account: Option<WeakEntity<AccountState>>, cx: &mut Context<Self>) {
+        self.account = account;
+        self.refresh_directory(cx);
+    }
+
+    /// Reads the open channel's autocomplete data and rights from the account state.
+    pub(super) fn refresh_directory(&mut self, cx: &mut Context<Self>) {
+        let account = self.account.as_ref().and_then(WeakEntity::upgrade);
+        let ids = self.channel.as_ref().and_then(|ch| {
+            let guild = ch.guild_id.as_deref()?;
+            Some((
+                guild.to_owned(),
+                ch.channel_id.clone(),
+                GuildId::parse(guild)?,
+                ChannelId::parse(&ch.channel_id)?,
+            ))
+        });
+        let (Some(account), Some((guild, channel, g, c))) = (account, ids) else {
+            self.directory = None;
+            return;
+        };
+        let (directory, members) = autocomplete::from_account_state(account.read(cx), g, c);
+        if self.members.len() >= MAX_GUILDS && !self.members.contains_key(&guild) {
+            self.members.clear();
+        }
+        autocomplete::remember_members(self.members.entry(guild).or_default(), members);
+        self.directory = Some((channel, directory));
     }
 
     pub(super) fn known_members(&self) -> &[Person] {
@@ -338,14 +343,13 @@ impl ComposerView {
         }
         self.seen_generation = generation;
         self.channel = None;
-        self.directories.clear();
+        self.directory = None;
         self.members.clear();
         self.autocomplete = None;
         self.dismissed_at = None;
         self.reply = None;
         self.edit = None;
         self.slowmode.clear();
-        self.pending.clear();
         self.error = None;
         self.last_search = None;
         self.search_task = None;
@@ -367,6 +371,7 @@ impl ComposerView {
             self.editor
                 .update(cx, |e, cx| e.set_placeholder(ctx.placeholder.clone(), cx));
             self.channel = Some(ctx);
+            self.refresh_directory(cx);
             self.start_ticker(cx);
             cx.notify();
             return;
@@ -386,10 +391,8 @@ impl ComposerView {
             e.set_placeholder(ctx.placeholder.clone(), cx);
         });
         self.quiet_text = Some(self.editor.read(cx).buffer().text().to_owned());
-        if let Some(guild_id) = ctx.guild_id.clone() {
-            cx.emit(ComposerEvent::Directory { guild_id });
-        }
         self.channel = Some(ctx);
+        self.refresh_directory(cx);
         self.start_ticker(cx);
         window.focus(&self.editor.focus_handle(cx), cx);
         cx.notify();
@@ -490,6 +493,10 @@ impl ComposerView {
             return;
         }
         self.dismissed_at = None;
+        if self.autocomplete.is_none() {
+            // A list opens: take the account state as it is now.
+            self.refresh_directory(cx);
+        }
         let guild = self.channel.as_ref().and_then(|c| c.guild_id.clone());
         if let (Trigger::Mention(q), Some(g)) = (&trigger, &guild) {
             self.search_members(g.clone(), q.clone(), cx);
@@ -641,7 +648,8 @@ impl ComposerView {
         }
         if let Some(open) = self.autocomplete.take() {
             self.dismissed_at = Some(open.start);
-        } else if self.edit.is_some() {
+        } else if self.edit.as_ref().is_some_and(|e| !e.saving) {
+            // A saved edit stays until the server answered, so its text is not lost.
             self.cancel_edit(window, cx);
         } else if self.reply.is_some() {
             self.reply = None;
@@ -711,6 +719,7 @@ impl ComposerView {
                 return;
             }
             Parsed::Saved => {
+                // Deviation: `/saved` needs the saved media picker, which is not built yet.
                 self.error = Some(t!("composer-saved-not-yet"));
                 return;
             }
@@ -737,15 +746,7 @@ impl ComposerView {
             reply_to: reply.map(|r| r.message_id),
             silent,
         };
-        if self.pending.len() >= MAX_PENDING {
-            self.pending.remove(0);
-        }
-        self.pending.push(PendingSend {
-            outgoing: outgoing.clone(),
-            failed: None,
-            ambiguous: false,
-            first_sent_ms: self.now_ms(),
-        });
+        // The app shows it in the message list as pending (by its nonce) and sends it.
         cx.emit(ComposerEvent::Send(outgoing));
         self.count_send(&ch, cx);
         self.sent(window, cx);
@@ -772,40 +773,12 @@ impl ComposerView {
         cx.notify();
     }
 
-    /// Sends a failed message again, with the same nonce.
-    pub(super) fn retry(&mut self, nonce: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if self.slowmode_left() > 0 {
-            window.play_system_bell();
-            return;
-        }
-        let now = self.now_ms();
-        let Some(p) = self
-            .pending
-            .iter_mut()
-            .find(|p| p.outgoing.nonce == nonce && p.failed.is_some())
-        else {
-            return;
-        };
-        p.failed = None;
-        let outgoing = p.outgoing.clone();
-        // The server knows a nonce only for a few minutes. After an unclear failure
-        // older than that, the message may exist: look for it before sending again.
-        let unclear = p.ambiguous && now.saturating_sub(p.first_sent_ms) > NONCE_MEMORY_MS;
-        p.ambiguous = false;
-        let channel = outgoing.channel_id.clone();
-        if unclear {
-            cx.emit(ComposerEvent::SendUnlessSent(outgoing));
-        } else {
-            cx.emit(ComposerEvent::Send(outgoing));
-        }
-        if let Some(ch) = self.channel.clone().filter(|c| c.channel_id == channel) {
+    /// A message of `channel_id` goes out again (Retry in the message list): the
+    /// slowmode countdown starts again.
+    pub fn on_resend(&mut self, channel_id: &str, cx: &mut Context<Self>) {
+        if let Some(ch) = self.channel.clone().filter(|c| c.channel_id == channel_id) {
             self.count_send(&ch, cx);
         }
-        cx.notify();
-    }
-
-    pub(super) fn discard(&mut self, nonce: &str, cx: &mut Context<Self>) {
-        self.pending.retain(|p| p.outgoing.nonce != nonce);
         cx.notify();
     }
 
@@ -836,43 +809,16 @@ impl ComposerView {
 
     // --- answers from the backend ---------------------------------------------------------
 
-    pub fn on_sent(&mut self, nonce: &str, cx: &mut Context<Self>) {
-        self.pending.retain(|p| p.outgoing.nonce != nonce);
-        cx.notify();
-    }
-
-    pub fn on_send_failed(
-        &mut self,
-        nonce: &str,
-        reason: String,
-        retry_after_secs: Option<u64>,
-        ambiguous: bool,
-        cx: &mut Context<Self>,
-    ) {
+    /// The server refused a send and asked to wait: the countdown takes it.
+    pub fn on_slowmode_wait(&mut self, channel_id: &str, secs: u64, cx: &mut Context<Self>) {
         let now = self.now_ms();
-        if let Some(p) = self.pending.iter_mut().find(|p| p.outgoing.nonce == nonce) {
-            p.failed = Some(reason);
-            p.ambiguous = ambiguous;
-            if let Some(secs) = retry_after_secs {
-                let channel = p.outgoing.channel_id.clone();
-                self.slowmode.server_wait(&channel, secs, now);
-            }
-        }
+        self.slowmode.server_wait(channel_id, secs, now);
         self.start_ticker(cx);
         cx.notify();
     }
 
-    pub fn on_directory(&mut self, guild_id: String, directory: Directory, cx: &mut Context<Self>) {
-        if self.directories.len() >= MAX_DIRECTORIES && !self.directories.contains_key(&guild_id) {
-            self.directories.clear();
-        }
-        self.directories.insert(guild_id, directory);
-        self.update_autocomplete(cx);
-        cx.notify();
-    }
-
     pub fn on_members(&mut self, guild_id: String, members: Vec<Person>, cx: &mut Context<Self>) {
-        if self.members.len() >= MAX_DIRECTORIES && !self.members.contains_key(&guild_id) {
+        if self.members.len() >= MAX_GUILDS && !self.members.contains_key(&guild_id) {
             self.members.clear();
         }
         autocomplete::remember_members(self.members.entry(guild_id).or_default(), members);
@@ -900,10 +846,7 @@ impl ComposerView {
         cx.notify();
     }
 
-    pub fn on_edit_failed(&mut self, reason: String, cx: &mut Context<Self>) {
-        self.error = Some(t!("composer-edit-failed", error = reason));
-        cx.notify();
-    }
+
 }
 
 impl Render for ComposerView {
@@ -1057,39 +1000,17 @@ mod tests {
         })
     }
 
-    #[gpui::test]
-    fn up_arrow_edits_my_last_message_only(cx: &mut TestAppContext) {
-        use super::super::edit_inline::tests::message;
-        let (host, view, cx) = host(cx);
-        open(&view, "1", cx);
-        // With text in the composer, Up moves the caret and edits nothing.
-        type_text(&view, "draft", cx);
-        cx.simulate_keystrokes("up");
-        assert_eq!(edit_requests(&host, cx), 0);
-        view.update_in(cx, |v, window, cx| {
-            v.editor.update(cx, |e, cx| e.clear(window, cx))
-        });
-        // Empty: Up asks for the last own message.
-        cx.simulate_keystrokes("up");
-        assert_eq!(edit_requests(&host, cx), 1);
-        // The app's handler opens the newest message of the account, never someone
-        // else's, even when theirs are newer.
-        let mut mine = message("10", "me");
-        mine.content = "old <@5>".into();
-        let list = [message("9", "me"), mine, message("11", "other")];
-        cx.update(|window, cx| {
-            crate::ui::composer::edit_last(&view, list.iter(), "me", window, cx)
-        });
-        let editing = view.read_with(cx, |v, _| v.edit.as_ref().map(|e| e.message_id.clone()));
-        assert_eq!(editing.as_deref(), Some("10"));
-        let edit_editor = view.read_with(cx, |v, _| v.edit.as_ref().map(|e| e.editor.clone()));
-        edit_editor
-            .expect("an edit is open")
-            .update_in(cx, |e, window, cx| {
-                e.replace_text_in_range(None, " new", window, cx)
-            });
-        cx.simulate_keystrokes("enter");
-        let edits: Vec<_> = host.read_with(cx, |h, _| {
+    /// The account state of `edit_inline`'s tests, as the app holds it.
+    fn account(
+        messages: serde_json::Value,
+        cx: &mut VisualTestContext,
+    ) -> (Entity<AccountState>, ChannelId) {
+        let (state, ch) = super::super::edit_inline::tests::state_with(messages);
+        (cx.update(|_, cx| cx.new(|_| state)), ch)
+    }
+
+    fn edits(host: &Entity<Host>, cx: &mut VisualTestContext) -> Vec<(String, String, Mentions)> {
+        host.read_with(cx, |h, _| {
             h.events
                 .iter()
                 .filter_map(|e| match e {
@@ -1102,25 +1023,60 @@ mod tests {
                     _ => None,
                 })
                 .collect()
+        })
+    }
+
+    #[gpui::test]
+    fn up_arrow_edits_my_last_message_only(cx: &mut TestAppContext) {
+        use super::super::edit_inline::tests::message;
+        let (host, view, cx) = host(cx);
+        open(&view, "301", cx);
+        // With text in the composer, Up moves the caret and edits nothing.
+        type_text(&view, "draft", cx);
+        cx.simulate_keystrokes("up");
+        assert_eq!(edit_requests(&host, cx), 0);
+        view.update_in(cx, |v, window, cx| {
+            v.editor.update(cx, |e, cx| e.clear(window, cx))
         });
-        assert_eq!(edits.len(), 1);
-        assert_eq!(edits[0].0, "10");
-        assert_eq!(edits[0].1, "old <@5> new");
-        assert_eq!(
-            edits[0].2.users,
-            [5],
-            "the edit carries allowed_mentions too"
+        // Empty: Up asks for the last own message.
+        cx.simulate_keystrokes("up");
+        assert_eq!(edit_requests(&host, cx), 1);
+        // The app's handler opens the newest message of the account (10) from the account
+        // state, never someone else's, even when theirs is newer.
+        let (account, ch) = account(
+            serde_json::json!([
+                message(3, "10", "older"),
+                message(4, "10", "old <@5>"),
+                message(5, "20", "theirs"),
+            ]),
+            cx,
         );
+        cx.update(|window, cx| crate::ui::composer::edit_last(&view, &account, ch, window, cx));
+        let mine = (4u64 << 22).to_string();
+        let editing = view.read_with(cx, |v, _| v.edit.as_ref().map(|e| e.message_id.clone()));
+        assert_eq!(editing.as_deref(), Some(mine.as_str()));
+        let edit_editor = view.read_with(cx, |v, _| v.edit.as_ref().map(|e| e.editor.clone()));
+        edit_editor
+            .expect("an edit is open")
+            .update_in(cx, |e, window, cx| {
+                e.replace_text_in_range(None, " new", window, cx)
+            });
+        cx.simulate_keystrokes("enter");
+        let edits = edits(&host, cx);
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].0, mine);
+        assert_eq!(edits[0].1, "old <@5> new");
+        assert_eq!(edits[0].2.users, [5], "the edit carries allowed_mentions too");
         assert_eq!(
             edits[0].2.replied_user,
             Some(false),
             "an edit never adds the replied author"
         );
+        assert!(sends(&host, cx).is_empty(), "saving an edit sends no message");
+        // The box stays until the server took the edit.
+        assert!(view.read_with(cx, |v, _| v.edit.as_ref().is_some_and(|e| e.saving)));
+        view.update_in(cx, |v, window, cx| v.on_edited(&mine, window, cx));
         assert!(view.read_with(cx, |v, _| v.edit.is_none()));
-        assert!(
-            sends(&host, cx).is_empty(),
-            "saving an edit sends no message"
-        );
     }
 
     #[gpui::test]
@@ -1312,42 +1268,37 @@ mod tests {
     }
 
     #[gpui::test]
-    fn a_late_retry_after_an_unclear_failure_looks_first(cx: &mut TestAppContext) {
+    fn a_refused_edit_stays_open_with_its_text(cx: &mut TestAppContext) {
+        use super::super::edit_inline::tests::message;
         let (host, view, cx) = host(cx);
-        open(&view, "1", cx);
-        type_text(&view, "hello", cx);
+        open(&view, "301", cx);
+        let (account, ch) = account(serde_json::json!([message(4, "10", "typo")]), cx);
+        cx.update(|window, cx| crate::ui::composer::edit_last(&view, &account, ch, window, cx));
+        let editor = view
+            .read_with(cx, |v, _| v.edit.as_ref().map(|e| e.editor.clone()))
+            .expect("an edit is open");
+        editor.update_in(cx, |e, window, cx| e.replace_text_in_range(None, "s", window, cx));
         cx.simulate_keystrokes("enter");
-        let nonce = sends(&host, cx)[0].nonce.clone();
-        let unless = |host: &Entity<Host>, cx: &mut VisualTestContext| {
-            host.read_with(cx, |h, _| {
-                h.events
-                    .iter()
-                    .filter(|e| matches!(e, ComposerEvent::SendUnlessSent(_)))
-                    .count()
-            })
-        };
-        // A clear refusal is simply sent again.
-        view.update(cx, |v, cx| {
-            v.on_send_failed(&nonce, "no".into(), None, false, cx)
+        assert_eq!(edits(&host, cx).len(), 1);
+        // Escape while the server has not answered keeps the text.
+        cx.simulate_keystrokes("escape");
+        assert!(view.read_with(cx, |v, _| v.edit.is_some()));
+        let id = (4u64 << 22).to_string();
+        view.update(cx, |v, cx| v.on_edit_failed(&id, "too fast".into(), cx));
+        let (open_edit, text, error) = view.read_with(cx, |v, cx| {
+            (
+                v.edit.as_ref().is_some_and(|e| !e.saving),
+                v.edit
+                    .as_ref()
+                    .map(|e| e.editor.read(cx).buffer().text().to_owned()),
+                v.error.clone(),
+            )
         });
-        view.update(cx, |v, _| v.skew_ms += 600_000);
-        view.update_in(cx, |v, window, cx| v.retry(&nonce, window, cx));
-        assert_eq!(sends(&host, cx).len(), 2);
-        assert_eq!(unless(&host, cx), 0);
-        // An unclear one, retried right away, keeps the nonce and sends.
-        view.update(cx, |v, cx| {
-            v.pending[0].first_sent_ms = v.now_ms();
-            v.on_send_failed(&nonce, "timeout".into(), None, true, cx)
-        });
-        view.update_in(cx, |v, window, cx| v.retry(&nonce, window, cx));
-        assert_eq!(sends(&host, cx).len(), 3);
-        // An unclear one, retried after the server forgot the nonce: look first.
-        view.update(cx, |v, cx| {
-            v.on_send_failed(&nonce, "timeout".into(), None, true, cx)
-        });
-        view.update(cx, |v, _| v.skew_ms += 301_000);
-        view.update_in(cx, |v, window, cx| v.retry(&nonce, window, cx));
-        assert_eq!(sends(&host, cx).len(), 3);
-        assert_eq!(unless(&host, cx), 1);
+        assert!(open_edit, "the edit is open again for another try");
+        assert_eq!(text.as_deref(), Some("typos"));
+        assert!(error.is_some_and(|e| e.contains("too fast")));
+        // Enter sends it again.
+        cx.simulate_keystrokes("enter");
+        assert_eq!(edits(&host, cx).len(), 2);
     }
 }

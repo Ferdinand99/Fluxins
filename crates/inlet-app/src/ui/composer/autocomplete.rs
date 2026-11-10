@@ -85,6 +85,8 @@ fn rank(haystack: &str, q: &str) -> Option<u8> {
 
 fn mentions(query: &str, src: &Sources) -> Vec<Candidate> {
     if !src.in_guild {
+        // Deviation: Fluxer offers the recipients in direct messages; the account state
+        // does not hold them for the composer yet, so DMs get no mention rows.
         return Vec::new();
     }
     let q = query.to_lowercase();
@@ -239,9 +241,6 @@ pub fn remember_members(known: &mut Vec<Person>, found: Vec<Person>) {
 
 /// The same data from an [`AccountState`]: members it holds, roles, text
 /// channels the account can see, custom emoji, and the account's rights in `channel`.
-// Used once the app keeps an account state per account; until then the backend fills
-// the directory from the server.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn from_account_state(
     state: &AccountState,
     guild: GuildId,

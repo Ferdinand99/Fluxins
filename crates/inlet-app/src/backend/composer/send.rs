@@ -13,7 +13,8 @@ use reqwest::Method;
 use serde_json::{json, Value};
 
 use super::Ev;
-use crate::backend::messages::{self, parse};
+use super::State;
+use crate::backend::messages;
 use crate::backend::session::{Failure, FailureKind};
 use crate::backend::{Active, Backend, Internal, Ui};
 
@@ -120,7 +121,6 @@ pub fn snowflake(s: &str) -> Option<&str> {
 }
 
 /// A snowflake as a number, for pills.
-#[cfg_attr(not(test), allow(dead_code))] // used by the account-state source
 pub fn snowflake_u64(s: &str) -> Option<u64> {
     snowflake(s)?.parse().ok()
 }
@@ -166,24 +166,31 @@ fn failed(
     })
 }
 
-/// The one place the composer hands a sent or edited message to the message list.
-fn show_in_list(events: &Ui, names: &parse::SharedNames, m: &p::Message, edited: bool) {
-    let shown = parse::to_message(m, names);
-    let _ = if edited {
-        events.unbounded_send(messages::Ev::MessageUpdated(shown))
-    } else {
-        events.unbounded_send(messages::Ev::MessageCreated(shown))
-    };
+/// A send failed: the message list's row shows why (with Retry), and a wait the server
+/// asked for goes to the composer's slowmode countdown.
+fn report_failure(events: &Ui, message: &Outgoing, e: SendError) {
+    if let Some(secs) = e.retry_after_secs {
+        let _ = events.unbounded_send(Ev::SlowmodeWait {
+            channel_id: message.channel_id.clone(),
+            secs,
+        });
+    }
+    let _ = events.unbounded_send(messages::Ev::Pending(messages::Pending {
+        channel_id: message.channel_id.clone(),
+        nonce: message.nonce.clone(),
+        text: message.content.clone(),
+        failed: Some(e.reason),
+    }));
 }
 
 /// The session's parts a send task needs.
 #[derive(Clone)]
 struct Ctx {
     session: p::Session,
-    names: parse::SharedNames,
     events: Ui,
     internal: tokio::sync::mpsc::UnboundedSender<Internal>,
     gen: u64,
+    state: State,
 }
 
 impl Ctx {
@@ -195,30 +202,29 @@ impl Ctx {
             Err(e) => Err(e.into()),
         };
         match result {
-            Ok(sent) => {
-                show_in_list(&self.events, &self.names, &sent, false);
-                Ok(())
-            }
+            // The gateway's MESSAGE_CREATE brings the message into the list.
+            Ok(_) => Ok(()),
             Err(err) => Err(failed(&self.internal, self.gen, err)),
         }
     }
 
-    /// Posts `message` and reports `Sent` or `SendFailed` with its nonce.
+    /// The server took the message: its pending row goes.
+    fn sent(&self, nonce: String) {
+        self.state.forget_send(self.gen, &nonce);
+        let _ = self.events.unbounded_send(messages::Ev::Sent { nonce });
+    }
+
+    fn failed(&self, message: &Outgoing, e: SendError) {
+        self.state
+            .mark_failed(self.gen, &message.nonce, e.ambiguous);
+        report_failure(&self.events, message, e);
+    }
+
+    /// Posts `message` and reports the outcome to the message list.
     async fn post_and_report(&self, message: Outgoing) {
         match self.post(&message).await {
-            Ok(()) => {
-                let _ = self.events.unbounded_send(Ev::Sent {
-                    nonce: message.nonce,
-                });
-            }
-            Err(Some(e)) => {
-                let _ = self.events.unbounded_send(Ev::SendFailed {
-                    nonce: message.nonce,
-                    reason: e.reason,
-                    retry_after_secs: e.retry_after_secs,
-                    ambiguous: e.ambiguous,
-                });
-            }
+            Ok(()) => self.sent(message.nonce),
+            Err(Some(e)) => self.failed(&message, e),
             Err(None) => {}
         }
     }
@@ -237,6 +243,20 @@ impl Ctx {
             Err(err) => Err(failed(&self.internal, self.gen, err)),
         }
     }
+
+    /// A retry long after an unclear failure: the server only recognises a nonce for a
+    /// few minutes, so first look whether the message arrived; send it only if not.
+    async fn send_unless_sent(&self, message: Outgoing) {
+        match self.already_sent(&message).await {
+            Ok(true) => self.sent(message.nonce),
+            Ok(false) => self.post_and_report(message).await,
+            Err(Some(mut e)) => {
+                e.ambiguous = true;
+                self.failed(&message, e);
+            }
+            Err(None) => {}
+        }
+    }
 }
 
 impl Backend {
@@ -244,10 +264,10 @@ impl Backend {
         match &self.active {
             Some(Active::Real(r)) => Some(Ctx {
                 session: r.session.clone(),
-                names: r.names.clone(),
                 events: self.events.clone(),
                 internal: self.internal.clone(),
                 gen: r.gen,
+                state: self.composer.clone(),
             }),
             _ => None,
         }
@@ -260,7 +280,7 @@ impl Backend {
             #[cfg(feature = "demo")]
             Some(Active::Demo(_)) => self.emit(Ev::Session {
                 token,
-                user_id: crate::demo::composer::DEMO_USER_ID.into(),
+                user_id: crate::demo::composer::demo_user_id(),
                 max_message_length: 2000,
             }),
             Some(Active::Real(r)) => {
@@ -306,15 +326,15 @@ impl Backend {
         }
     }
 
+    /// Sends a message. The UI has shown it as pending; the outcome goes to that row.
     pub(super) fn send(&mut self, message: Outgoing) {
         #[cfg(feature = "demo")]
         if let Some(Active::Demo(m)) = &mut self.active {
-            let nonce = message.nonce.clone();
-            m.send(message.channel_id, message.content);
-            let _ = self.events.unbounded_send(Ev::Sent { nonce });
+            m.resend(message.channel_id, message.nonce, message.content);
             return;
         }
         if let Some(ctx) = self.send_ctx() {
+            ctx.state.remember_send(ctx.gen, &message);
             self.spawn_guarded(
                 "send",
                 None,
@@ -323,30 +343,41 @@ impl Backend {
         }
     }
 
-    /// A retry long after an unclear failure: the server only recognises a nonce for a
-    /// few minutes, so first look whether the message arrived; send it only if not.
-    pub(super) fn send_unless_sent(&mut self, message: Outgoing) {
+    /// Retry of a failed message from the message list, with its first nonce. The
+    /// message goes out as it was first sent (mentions, reply, `@silent`). A retry more
+    /// than five minutes after an unclear failure first looks whether it arrived.
+    pub(in crate::backend) fn composer_resend(
+        &mut self,
+        channel_id: String,
+        nonce: String,
+        text: String,
+    ) {
+        #[cfg(feature = "demo")]
+        if let Some(Active::Demo(m)) = &mut self.active {
+            m.resend(channel_id, nonce, text);
+            return;
+        }
         let Some(ctx) = self.send_ctx() else {
-            self.send(message);
             return;
         };
-        self.spawn_guarded("send unless sent", None, async move {
-            match ctx.already_sent(&message).await {
-                Ok(true) => {
-                    let _ = ctx.events.unbounded_send(Ev::Sent {
-                        nonce: message.nonce,
-                    });
-                }
-                Ok(false) => ctx.post_and_report(message).await,
-                Err(Some(e)) => {
-                    let _ = ctx.events.unbounded_send(Ev::SendFailed {
-                        nonce: message.nonce,
-                        reason: e.reason,
-                        retry_after_secs: e.retry_after_secs,
-                        ambiguous: true,
-                    });
-                }
-                Err(None) => {}
+        let (message, unclear) = ctx.state.retry_of(ctx.gen, &nonce).unwrap_or_else(|| {
+            // Not sent from this session's composer: nothing it says may notify anyone.
+            let message = Outgoing {
+                channel_id,
+                nonce,
+                content: text,
+                mentions: Mentions::default(),
+                reply_to: None,
+                silent: false,
+            };
+            (message, false)
+        });
+        ctx.state.remember_send(ctx.gen, &message);
+        self.spawn_guarded("resend", None, async move {
+            if unclear {
+                ctx.send_unless_sent(message).await
+            } else {
+                ctx.post_and_report(message).await
             }
         });
     }
@@ -361,6 +392,7 @@ impl Backend {
         #[cfg(feature = "demo")]
         if let Some(Active::Demo(m)) = &mut self.active {
             m.edit(&channel_id, &message_id, &content);
+            self.emit(Ev::Edited { message_id });
             return;
         }
         let Some(ctx) = self.send_ctx() else {
@@ -377,12 +409,16 @@ impl Backend {
                 Err(e) => Err(e.into()),
             };
             match result {
-                Ok(edited) => show_in_list(&ctx.events, &ctx.names, &edited, true),
+                // The gateway's MESSAGE_UPDATE brings the new text into the list.
+                Ok(_) => {
+                    let _ = ctx.events.unbounded_send(Ev::Edited { message_id });
+                }
                 Err(err) => {
                     if let Some(e) = failed(&ctx.internal, ctx.gen, err) {
-                        let _ = ctx
-                            .events
-                            .unbounded_send(Ev::EditFailed { reason: e.reason });
+                        let _ = ctx.events.unbounded_send(Ev::EditFailed {
+                            message_id,
+                            reason: e.reason,
+                        });
                     }
                 }
             }

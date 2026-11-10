@@ -2,11 +2,7 @@
 
 composer-placeholder-empty = Message
 composer-placeholder = Message { $channel }
-error-send = Could not send: { $error }
 composer-too-long = The message cannot be longer than { $max } characters.
-composer-sending = Sending…
-composer-retry = Retry
-composer-discard = Discard
 
 ## Autocomplete headings and command descriptions
 

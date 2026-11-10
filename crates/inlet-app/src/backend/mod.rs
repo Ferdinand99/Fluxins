@@ -332,6 +332,8 @@ struct Backend {
     open_channel: Option<AbortHandle>,
     /// The composer's cache: account ID, message length limit, autocomplete data.
     composer: composer::State,
+    /// The request for older messages of the open channel.
+    older: messages::OlderPages,
 }
 
 impl Backend {
@@ -352,6 +354,7 @@ impl Backend {
             open_guild: None,
             open_channel: None,
             composer: Default::default(),
+            older: Default::default(),
         }
     }
 

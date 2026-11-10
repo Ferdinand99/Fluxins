@@ -14,7 +14,6 @@ use gpui::{
 
 use crate::app::{Inlet, Screen};
 use crate::backend::accounts::{Cmd, Ev, DEFAULT_INSTANCE};
-use crate::backend::messages;
 use crate::text_input::{InputEvent, TextInput};
 use crate::theme;
 
@@ -190,8 +189,10 @@ impl Inlet {
                 // Demo screenshots (CI): open a guild and channel straight away.
                 #[cfg(feature = "demo")]
                 if let Ok(guild) = std::env::var("INLET_DEMO_GUILD") {
-                    self.select_guild(Some(guild), cx);
-                    self.demo_channel = std::env::var("INLET_DEMO_CHANNEL").ok();
+                    self.select_guild(Some(crate::demo::snowflake(&guild)), cx);
+                    self.demo_channel = std::env::var("INLET_DEMO_CHANNEL")
+                        .ok()
+                        .map(|c| crate::demo::snowflake(&c));
                 }
             }
             Ev::SessionEnded(message) => {
@@ -204,11 +205,8 @@ impl Inlet {
                 self.composer.sign_out();
                 self.reset_main();
             }
-            Ev::Reconnected => {
-                if let Some(channel_id) = self.selected_channel.clone() {
-                    self.backend.send(messages::Cmd::OpenChannel { channel_id });
-                }
-            }
+            // The messages domain loads the open channel again on every READY.
+            Ev::Reconnected => {}
             Ev::Status(status) => {
                 if status == t!("status-connected") {
                     self.chat.gateway_down = None;

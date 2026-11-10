@@ -11,9 +11,9 @@
 //!   UI asks at most once a second;
 //! - a Retry more than five minutes after an unclear failure first reads the channel's 50
 //!   newest messages (one `GET`) and sends only if the nonce is not among them;
-//! - autocomplete: `GET` roles, own member, custom emoji and channels, at most once per
-//!   guild every ten minutes, and only for a guild whose channel the person opened; member
-//!   search goes over the gateway (op 8), which the protocol caps at 10 per 10 s.
+//! - autocomplete reads roles, channels, emoji and rights from the account state (no
+//!   request); member search goes over the gateway (op 8), which the protocol caps at 10
+//!   per 10 s.
 
 mod directory;
 mod gif;
@@ -32,10 +32,6 @@ pub enum Cmd {
     Session { token: u64 },
     /// Send a message.
     Send(Outgoing),
-    /// Retry a send that failed in a way that may have reached the server, long enough
-    /// ago that the server no longer recognises the nonce: send it only if the channel's
-    /// newest messages do not hold it.
-    SendUnlessSent(Outgoing),
     /// New text for one of the account's messages.
     Edit {
         channel_id: String,
@@ -45,8 +41,6 @@ pub enum Cmd {
     },
     /// The person is typing in this channel.
     Typing { channel_id: String },
-    /// Roles, channels and custom emoji of a guild, for autocomplete.
-    Directory { guild_id: String },
     /// Members whose name starts with `query`. Answered with [`Ev::Members`].
     SearchMembers {
         guild_id: String,
@@ -70,25 +64,15 @@ pub enum Ev {
         /// The instance's limit for this account, in UTF-16 code units.
         max_message_length: usize,
     },
-    /// The server took the message with this nonce.
-    Sent { nonce: String },
-    /// The message with this nonce was not sent. It can be sent again with the same nonce.
-    SendFailed {
-        nonce: String,
-        reason: String,
-        /// The server asked to wait this long (slowmode or a rate limit).
-        retry_after_secs: Option<u64>,
-        /// The request may have reached the server; the message may exist.
-        ambiguous: bool,
-    },
+    /// A send was refused with a wait (slowmode or a rate limit); the countdown takes it.
+    /// The message list shows the failed message itself.
+    SlowmodeWait { channel_id: String, secs: u64 },
     /// A `/msg` was not delivered.
     DirectMessageFailed { nonce: String, reason: String },
-    /// An edit was refused (a saved edit shows up as `MessageUpdated`).
-    EditFailed { reason: String },
-    Directory {
-        guild_id: String,
-        directory: Directory,
-    },
+    /// The server took an edit (the gateway brings the new text to the list).
+    Edited { message_id: String },
+    /// An edit was refused.
+    EditFailed { message_id: String, reason: String },
     Members {
         guild_id: String,
         members: Vec<Person>,
@@ -101,7 +85,6 @@ pub(super) fn handle(backend: &mut Backend, cmd: Cmd) {
     match cmd {
         Cmd::Session { token } => backend.composer_session(token),
         Cmd::Send(message) => backend.send(message),
-        Cmd::SendUnlessSent(message) => backend.send_unless_sent(message),
         Cmd::Edit {
             channel_id,
             message_id,
@@ -109,7 +92,6 @@ pub(super) fn handle(backend: &mut Backend, cmd: Cmd) {
             mentions,
         } => backend.edit(channel_id, message_id, content, mentions),
         Cmd::Typing { channel_id } => backend.typing(channel_id),
-        Cmd::Directory { guild_id } => backend.directory(guild_id),
         Cmd::SearchMembers {
             guild_id,
             query,
