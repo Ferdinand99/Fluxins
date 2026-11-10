@@ -334,11 +334,19 @@ fn push_inline(node: &Node, inline: &mut Inline) {
             }
             let label = match kind {
                 MentionKind::User { id } => {
-                    format!("@{}", lookup(|n| n.users.get(id).cloned()).unwrap_or_else(|| "unknown-user".into()))
+                    format!(
+                        "@{}",
+                        lookup(|n| n.users.get(id).cloned())
+                            .unwrap_or_else(|| "unknown-user".into())
+                    )
                 }
                 MentionKind::Channel { .. } => unreachable!("handled above"),
                 MentionKind::Role { id } => {
-                    format!("@{}", lookup(|n| n.roles.get(id).cloned()).unwrap_or_else(|| "unknown-role".into()))
+                    format!(
+                        "@{}",
+                        lookup(|n| n.roles.get(id).cloned())
+                            .unwrap_or_else(|| "unknown-role".into())
+                    )
                 }
                 MentionKind::Command { name, .. } => format!("/{name}"),
                 MentionKind::GuildNavigation { .. } => "#navigation".into(),
@@ -720,14 +728,25 @@ mod tests {
     #[test]
     fn mentions_resolve_to_names() {
         let mut names = Names::default();
-        names.channels.insert("1559859109744869376".into(), "general".into());
+        names
+            .channels
+            .insert("1559859109744869376".into(), "general".into());
         names.users.insert("42".into(), "ada".into());
         names.roles.insert("7".into(), "Mods".into());
-        let blocks = parse_with("see <#1559859109744869376> <@42> <@!42> <@&7> <#999> <@1>", &names);
+        let blocks = parse_with(
+            "see <#1559859109744869376> <@42> <@!42> <@&7> <#999> <@1>",
+            &names,
+        );
         let inline = first_inline(&blocks);
-        assert_eq!(inline.text, "see #general @ada @ada @Mods #unknown-channel @unknown-user");
+        assert_eq!(
+            inline.text,
+            "see #general @ada @ada @Mods #unknown-channel @unknown-user"
+        );
         assert_eq!(inline.links.len(), 1);
-        assert_eq!(inline.links[0].url, format!("{CHANNEL_LINK}1559859109744869376"));
+        assert_eq!(
+            inline.links[0].url,
+            format!("{CHANNEL_LINK}1559859109744869376")
+        );
         // Names do not leak into the next parse.
         let plain = parse("<#1559859109744869376>");
         assert_eq!(first_inline(&plain).text, "#unknown-channel");

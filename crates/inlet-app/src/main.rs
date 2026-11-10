@@ -1044,71 +1044,93 @@ impl Inlet {
                     .flex()
                     .flex_col()
                     .gap(px(2.))
-                    .children(self.channels.iter().filter(|c| {
-                        // Folded categories hide their channels, except the open one.
-                        c.kind == ChannelKind::Category
-                            || c.parent_id.as_ref().is_none_or(|p| !self.collapsed.contains(p))
-                            || selected.as_deref() == Some(c.id.as_str())
-                    }).map(|c| {
-                        if c.kind == ChannelKind::Category {
-                            let folded = self.collapsed.contains(&c.id);
-                            let cat = c.id.clone();
-                            return div()
-                                .id(SharedString::from(format!("ch-{}", c.id)))
-                                .flex_none()
-                                .pt_4()
-                                .px_1()
-                                .flex()
-                                .flex_row()
-                                .gap_1()
-                                .cursor_pointer()
-                                .text_size(px(14.))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(theme::text_muted())
-                                .hover(|s| s.text_color(theme::text()))
-                                .child(if folded { "\u{25B8}" } else { "\u{25BE}" })
-                                .child(c.name.clone())
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    if !this.collapsed.remove(&cat) {
-                                        this.collapsed.insert(cat.clone());
-                                    }
-                                    cx.notify();
-                                }));
-                        }
-                        let active = selected.as_deref() == Some(c.id.as_str());
-                        let messageable = c.is_messageable();
-                        let id = c.id.clone();
-                        div()
-                            .id(SharedString::from(format!("ch-{}", c.id)))
-                            // Rows must not shrink: a scrolling flex column shrinks its
-                            // children when the list is taller than the view, and
-                            // `overflow_hidden` lets a row shrink to nothing.
-                            .flex_none()
-                            .px_2()
-                            .py(px(5.))
-                            .rounded_md()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_2()
-                            .whitespace_nowrap()
-                            .overflow_hidden()
-                            .text_color(if active {
-                                theme::text_strong()
-                            } else {
-                                theme::text_muted()
+                    .children(
+                        self.channels
+                            .iter()
+                            .filter(|c| {
+                                // Folded categories hide their channels, except the open one.
+                                c.kind == ChannelKind::Category
+                                    || c.parent_id
+                                        .as_ref()
+                                        .is_none_or(|p| !self.collapsed.contains(p))
+                                    || selected.as_deref() == Some(c.id.as_str())
                             })
-                            .when(active, |d| d.bg(theme::selected_bg()))
-                            .when(messageable, |d| {
-                                d.cursor_pointer()
-                                    .hover(|s| s.bg(theme::hover_bg()).text_color(theme::text()))
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.select_channel(id.clone(), window, cx)
-                                    }))
-                            })
-                            .child(div().flex_none().w(px(18.)).text_color(theme::text_muted()).child(channel_icon(c.kind)))
-                            .child(div().flex_1().min_w_0().overflow_hidden().text_ellipsis().child(c.name.clone()))
-                    })),
+                            .map(|c| {
+                                if c.kind == ChannelKind::Category {
+                                    let folded = self.collapsed.contains(&c.id);
+                                    let cat = c.id.clone();
+                                    return div()
+                                        .id(SharedString::from(format!("ch-{}", c.id)))
+                                        .flex_none()
+                                        .pt_4()
+                                        .px_1()
+                                        .flex()
+                                        .flex_row()
+                                        .gap_1()
+                                        .cursor_pointer()
+                                        .text_size(px(14.))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(theme::text_muted())
+                                        .hover(|s| s.text_color(theme::text()))
+                                        .child(if folded { "\u{25B8}" } else { "\u{25BE}" })
+                                        .child(c.name.clone())
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            if !this.collapsed.remove(&cat) {
+                                                this.collapsed.insert(cat.clone());
+                                            }
+                                            cx.notify();
+                                        }));
+                                }
+                                let active = selected.as_deref() == Some(c.id.as_str());
+                                let messageable = c.is_messageable();
+                                let id = c.id.clone();
+                                div()
+                                    .id(SharedString::from(format!("ch-{}", c.id)))
+                                    // Rows must not shrink: a scrolling flex column shrinks its
+                                    // children when the list is taller than the view, and
+                                    // `overflow_hidden` lets a row shrink to nothing.
+                                    .flex_none()
+                                    .px_2()
+                                    .py(px(5.))
+                                    .rounded_md()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_2()
+                                    .whitespace_nowrap()
+                                    .overflow_hidden()
+                                    .text_color(if active {
+                                        theme::text_strong()
+                                    } else {
+                                        theme::text_muted()
+                                    })
+                                    .when(active, |d| d.bg(theme::selected_bg()))
+                                    .when(messageable, |d| {
+                                        d.cursor_pointer()
+                                            .hover(|s| {
+                                                s.bg(theme::hover_bg()).text_color(theme::text())
+                                            })
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.select_channel(id.clone(), window, cx)
+                                            }))
+                                    })
+                                    .child(
+                                        div()
+                                            .flex_none()
+                                            .w(px(18.))
+                                            .text_color(theme::text_muted())
+                                            .child(channel_icon(c.kind)),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .overflow_hidden()
+                                            .text_ellipsis()
+                                            .child(c.name.clone()),
+                                    )
+                            }),
+                    ),
             )
             .child(
                 div()
@@ -1211,7 +1233,12 @@ impl Inlet {
             body = body.child(render_embed(&format!("m{}-e{i}", m.id), e, &ctx, cx));
         }
         if m.is_empty() {
-            body = body.child(div().text_size(px(14.)).text_color(theme::text_muted()).child("(no text)"));
+            body = body.child(
+                div()
+                    .text_size(px(14.))
+                    .text_color(theme::text_muted())
+                    .child("(no text)"),
+            );
         }
         for (i, a) in m.attachments.iter().enumerate() {
             let url = a.url.clone();
@@ -1278,11 +1305,17 @@ impl Inlet {
                 .whitespace_nowrap()
                 .overflow_hidden()
                 .child("\u{21B1}")
-                .child(div().font_weight(FontWeight::SEMIBOLD).child(r.author.clone()))
+                .child(
+                    div()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(r.author.clone()),
+                )
                 .child(r.snippet.clone())
         });
         let new_day = match m.day() {
-            Some(day) => ix == 0 || self.messages.get(ix - 1).and_then(|p| p.message.day()) != Some(day),
+            Some(day) => {
+                ix == 0 || self.messages.get(ix - 1).and_then(|p| p.message.day()) != Some(day)
+            }
             None => false,
         };
         let separator = m.day().filter(|_| new_day).map(|day| {
@@ -1576,8 +1609,16 @@ fn channel_label(c: &Channel) -> String {
 }
 
 /// Draws an embed: colour bar, author, title, description, fields, footer, media links.
-fn render_embed(id: &str, e: &model::Embed, ctx: &RenderCtx, cx: &mut Context<Inlet>) -> AnyElement {
-    let bar = e.color.map(|c| gpui::rgb(c).into()).unwrap_or(theme::brand());
+fn render_embed(
+    id: &str,
+    e: &model::Embed,
+    ctx: &RenderCtx,
+    cx: &mut Context<Inlet>,
+) -> AnyElement {
+    let bar = e
+        .color
+        .map(|c| gpui::rgb(c).into())
+        .unwrap_or(theme::brand());
     let mut content = div()
         .flex()
         .flex_col()
@@ -1588,22 +1629,37 @@ fn render_embed(id: &str, e: &model::Embed, ctx: &RenderCtx, cx: &mut Context<In
         .flex_1()
         .min_w_0();
     if let Some(author) = &e.author {
-        content = content.child(div().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).child(author.clone()));
+        content = content.child(
+            div()
+                .text_size(px(13.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(author.clone()),
+        );
     }
     if let Some(title) = &e.title {
         let link = e.url.clone().filter(|u| markdown::openable(u).is_some());
         let mut t = div()
             .id(SharedString::from(format!("{id}-title")))
             .font_weight(FontWeight::BOLD)
-            .text_color(if link.is_some() { theme::link() } else { theme::text_strong() })
+            .text_color(if link.is_some() {
+                theme::link()
+            } else {
+                theme::text_strong()
+            })
             .child(title.clone());
         if let Some(url) = link {
-            t = t.cursor_pointer().on_click(cx.listener(move |this, _, _, cx| this.open_link(&url, true, cx)));
+            t = t
+                .cursor_pointer()
+                .on_click(cx.listener(move |this, _, _, cx| this.open_link(&url, true, cx)));
         }
         content = content.child(t);
     }
     if !e.description.is_empty() {
-        content = content.child(div().text_size(px(14.)).child(markdown::render(&format!("{id}-d"), &e.description, ctx)));
+        content = content.child(div().text_size(px(14.)).child(markdown::render(
+            &format!("{id}-d"),
+            &e.description,
+            ctx,
+        )));
     }
     for (i, f) in e.fields.iter().enumerate() {
         content = content.child(
@@ -1612,7 +1668,12 @@ fn render_embed(id: &str, e: &model::Embed, ctx: &RenderCtx, cx: &mut Context<In
                 .flex()
                 .flex_col()
                 .text_size(px(14.))
-                .child(div().font_weight(FontWeight::SEMIBOLD).text_color(theme::text_strong()).child(f.name.clone()))
+                .child(
+                    div()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme::text_strong())
+                        .child(f.name.clone()),
+                )
                 .child(markdown::render(&format!("{id}-f{i}"), &f.value, ctx)),
         );
     }
@@ -1624,12 +1685,22 @@ fn render_embed(id: &str, e: &model::Embed, ctx: &RenderCtx, cx: &mut Context<In
                 .text_size(px(13.))
                 .text_color(theme::link())
                 .cursor_pointer()
-                .child(format!("{}: {}", a.filename, markdown::link_target_label(&a.url)))
+                .child(format!(
+                    "{}: {}",
+                    a.filename,
+                    markdown::link_target_label(&a.url)
+                ))
                 .on_click(cx.listener(move |this, _, _, cx| this.open_link(&url, false, cx))),
         );
     }
     if let Some(footer) = &e.footer {
-        content = content.child(div().pt_1().text_size(px(12.)).text_color(theme::text_muted()).child(footer.clone()));
+        content = content.child(
+            div()
+                .pt_1()
+                .text_size(px(12.))
+                .text_color(theme::text_muted())
+                .child(footer.clone()),
+        );
     }
     div()
         .mt_1()
@@ -1689,7 +1760,11 @@ impl Focusable for Inlet {
 impl Render for Inlet {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if let Some(channel_id) = self.pending_channel_jump.take() {
-            if self.channels.iter().any(|c| c.id == channel_id && c.is_messageable()) {
+            if self
+                .channels
+                .iter()
+                .any(|c| c.id == channel_id && c.is_messageable())
+            {
                 self.select_channel(channel_id, window, cx);
             } else {
                 self.notice = Some("That channel is not in the list on screen.".into());

@@ -13,7 +13,9 @@ use inlet_protocol as p;
 use inlet_protocol::models::channel_type;
 
 use crate::backend::{Event, Ui};
-use crate::model::{self, Attachment, Channel, ChannelKind, Embed, EmbedField, Guild, Message, Names, Reply};
+use crate::model::{
+    self, Attachment, Channel, ChannelKind, Embed, EmbedField, Guild, Message, Names, Reply,
+};
 use crate::token_store;
 
 /// How long the start-up checks may take before Inlet treats the instance as unreachable.
@@ -37,14 +39,18 @@ pub fn remember_channels(names: &SharedNames, list: &[Channel]) {
 }
 
 fn remember_user(n: &mut Names, u: &p::User) {
-    n.users.insert(u.id.clone(), model::clean_name(u.display_name()));
+    n.users
+        .insert(u.id.clone(), model::clean_name(u.display_name()));
 }
 
 /// Roles from a READY or GUILD_CREATE guild (raw JSON objects with `id` and `name`).
 pub fn remember_roles(names: &SharedNames, roles: &[serde_json::Value]) {
     let mut n = names.lock().unwrap();
     for r in roles {
-        if let (Some(id), Some(name)) = (r.get("id").and_then(|v| v.as_str()), r.get("name").and_then(|v| v.as_str())) {
+        if let (Some(id), Some(name)) = (
+            r.get("id").and_then(|v| v.as_str()),
+            r.get("name").and_then(|v| v.as_str()),
+        ) {
             n.roles.insert(id.to_string(), model::clean_name(name));
         }
     }
@@ -296,7 +302,11 @@ pub fn to_channel(c: &p::Channel) -> Channel {
         kind: channel_kind(c.kind),
         parent_id: c.parent_id.clone(),
         position: c.position.unwrap_or(0),
-        topic: c.topic.as_deref().filter(|t| !t.trim().is_empty()).map(|t| model::snippet(t, 160)),
+        topic: c
+            .topic
+            .as_deref()
+            .filter(|t| !t.trim().is_empty())
+            .map(|t| model::snippet(t, 160)),
     }
 }
 
@@ -337,7 +347,12 @@ pub fn to_message(m: &p::Message, names: &SharedNames) -> Message {
                     .unwrap_or_default(),
             })
             .collect(),
-        embeds: m.embeds.iter().filter_map(|e| to_embed(e, &snapshot)).take(10).collect(),
+        embeds: m
+            .embeds
+            .iter()
+            .filter_map(|e| to_embed(e, &snapshot))
+            .take(10)
+            .collect(),
         reply,
         edited: m.edited_timestamp.is_some(),
     };
@@ -358,7 +373,10 @@ fn to_reply(v: &serde_json::Value) -> Option<Reply> {
     } else {
         model::snippet(content, 90)
     };
-    Some(Reply { author: model::clean_name(name), snippet })
+    Some(Reply {
+        author: model::clean_name(name),
+        snippet,
+    })
 }
 
 fn str_at<'a>(v: &'a serde_json::Value, path: &[&str]) -> Option<&'a str> {
@@ -385,7 +403,10 @@ pub fn to_embed(v: &serde_json::Value, names: &Names) -> Option<Embed> {
         return None;
     }
     let mut embed = Embed {
-        color: v.get("color").and_then(|c| c.as_u64()).map(|c| (c & 0xFF_FF_FF) as u32),
+        color: v
+            .get("color")
+            .and_then(|c| c.as_u64())
+            .map(|c| (c & 0xFF_FF_FF) as u32),
         author: str_at(v, &["author", "name"]).map(model::clean_name),
         title: str_at(v, &["title"]).map(|t| model::snippet(t, 256)),
         url: str_at(v, &["url"]).map(str::to_string),
@@ -398,16 +419,25 @@ pub fn to_embed(v: &serde_json::Value, names: &Names) -> Option<Embed> {
     };
     if let Some(fields) = v.get("fields").and_then(|f| f.as_array()) {
         for f in fields.iter().take(25) {
-            let name = str_at(f, &["name"]).map(|n| model::snippet(n, 256)).unwrap_or_default();
+            let name = str_at(f, &["name"])
+                .map(|n| model::snippet(n, 256))
+                .unwrap_or_default();
             let value = str_at(f, &["value"])
                 .map(|t| crate::markdown::parse_with(capped(t), names))
                 .unwrap_or_default();
             embed.fields.push(EmbedField { name, value });
         }
     }
-    for (key, label) in [("image", "Image"), ("thumbnail", "Thumbnail"), ("video", "Video")] {
+    for (key, label) in [
+        ("image", "Image"),
+        ("thumbnail", "Thumbnail"),
+        ("video", "Video"),
+    ] {
         if let Some(url) = str_at(v, &[key, "url"]) {
-            embed.media.push(Attachment { filename: label.into(), url: url.to_string() });
+            embed.media.push(Attachment {
+                filename: label.into(),
+                url: url.to_string(),
+            });
         }
     }
     let empty = embed.title.is_none()

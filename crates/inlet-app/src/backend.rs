@@ -23,7 +23,7 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender as
 use tokio::task::AbortHandle;
 
 use crate::model::{Channel, Guild, Message};
-use crate::real::{self, ChannelCache, SharedNames, Credential, Failure, FailureKind, GatewayEnd};
+use crate::real::{self, ChannelCache, Credential, Failure, FailureKind, GatewayEnd, SharedNames};
 use crate::reconnect::{Decision, ReconnectPolicy, Stop};
 use crate::token_store;
 
@@ -1002,7 +1002,8 @@ impl Backend {
         };
         r.forward.abort();
         r.gateway.close();
-        let (gateway, forward) = self.spawn_gateway(r.gen, &r.session, &r.guilds, &r.cache, &r.names);
+        let (gateway, forward) =
+            self.spawn_gateway(r.gen, &r.session, &r.guilds, &r.cache, &r.names);
         // A new gateway handle does not know the guild on screen yet.
         if let Some(guild) = &r.active_guild {
             gateway.set_guild_active(guild, true);
@@ -1293,8 +1294,9 @@ impl Backend {
                         .await
                     {
                         Ok(message) => {
-                            let _ = events
-                                .unbounded_send(Event::MessageCreated(real::to_message(&message, &names)));
+                            let _ = events.unbounded_send(Event::MessageCreated(real::to_message(
+                                &message, &names,
+                            )));
                         }
                         Err(err) => report(&events, &internal, gen, "Could not send: ", err),
                     }

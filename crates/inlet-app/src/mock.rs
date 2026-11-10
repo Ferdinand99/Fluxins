@@ -8,7 +8,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::backend::{Event, Ui};
-use crate::model::{Attachment, Channel, ChannelKind, Embed, EmbedField, Guild, Message, Names, Reply};
+use crate::model::{
+    Attachment, Channel, ChannelKind, Embed, EmbedField, Guild, Message, Names, Reply,
+};
 
 pub struct MockSession {
     events: Ui,
@@ -46,7 +48,13 @@ fn demo_names() -> Names {
     n
 }
 
-fn embed(color: u32, title: &str, description: &str, fields: &[(&str, &str)], footer: Option<&str>) -> Embed {
+fn embed(
+    color: u32,
+    title: &str,
+    description: &str,
+    fields: &[(&str, &str)],
+    footer: Option<&str>,
+) -> Embed {
     let names = demo_names();
     Embed {
         color: Some(color),
@@ -97,7 +105,11 @@ const DEMO_DAY_MS: i64 = 1_794_268_800_000;
 
 fn label(ms: i64) -> String {
     chrono::DateTime::from_timestamp_millis(ms)
-        .map(|t| t.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string())
+        .map(|t| {
+            t.with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M")
+                .to_string()
+        })
         .unwrap_or_default()
 }
 
