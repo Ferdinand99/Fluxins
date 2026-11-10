@@ -84,6 +84,8 @@ pub struct TextInput {
     content: SharedString,
     placeholder: SharedString,
     masked: bool,
+    /// Drawn as the message composer (58 px box, 8 px radius) instead of a form field.
+    composer: bool,
     max_chars: usize,
     selected_range: Range<usize>,
     selection_reversed: bool,
@@ -102,6 +104,7 @@ impl TextInput {
             content: SharedString::default(),
             placeholder: placeholder.into(),
             masked: false,
+            composer: false,
             max_chars: 4_000,
             selected_range: 0..0,
             selection_reversed: false,
@@ -114,6 +117,11 @@ impl TextInput {
 
     pub fn masked(mut self) -> Self {
         self.masked = true;
+        self
+    }
+
+    pub fn composer(mut self) -> Self {
+        self.composer = true;
         self
     }
 
@@ -628,7 +636,7 @@ impl Element for TextElement {
         let style = window.text_style();
 
         let (display_text, text_color) = if input.content.is_empty() {
-            (input.placeholder.clone(), theme::text_muted())
+            (input.placeholder.clone(), theme::text_tertiary())
         } else {
             (input.display_text(), style.color)
         };
@@ -686,7 +694,7 @@ impl Element for TextElement {
                         point(bounds.left() + cursor_pos, bounds.top()),
                         size(px(2.), bounds.bottom() - bounds.top()),
                     ),
-                    theme::accent(),
+                    theme::text_strong(),
                 )),
             )
         } else {
@@ -783,19 +791,29 @@ impl Render for TextInput {
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .w_full()
-            .px_3()
-            .py_2()
-            .rounded_md()
-            .bg(theme::input_bg())
-            .border_1()
-            .border_color(if focused {
-                theme::accent()
-            } else {
-                theme::input_border()
+            .when(self.composer, |d| {
+                d.h(px(58.))
+                    .items_center()
+                    .px_4()
+                    .rounded(px(8.))
+                    .border_1()
+                    .border_color(theme::ring())
             })
+            .when(!self.composer, |d| {
+                d.px_3()
+                    .py(px(10.))
+                    .rounded(px(6.))
+                    .border_1()
+                    .border_color(if focused {
+                        theme::focus_ring()
+                    } else {
+                        theme::ring()
+                    })
+            })
+            .bg(theme::bg_textarea())
             .text_color(theme::text())
-            .text_size(px(15.))
-            .line_height(px(20.))
+            .text_size(px(16.))
+            .line_height(px(22.))
             .overflow_hidden()
             .child(TextElement { input: cx.entity() })
     }

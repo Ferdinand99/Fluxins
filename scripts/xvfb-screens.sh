@@ -28,7 +28,7 @@ kill $pid; wait $pid 2>/dev/null
 
 # 2. Demo data. Navigation uses INLET_DEMO_GUILD/INLET_DEMO_CHANNEL (demo builds only)
 #    instead of clicks, so layout changes do not break the script.
-INLET_DEMO=1 INLET_DEMO_LIVE_SECS=4 INLET_DEMO_GUILD=g1 INLET_DEMO_CHANNEL=c-general "$bin" >"$out/demo.log" 2>&1 &
+INLET_DEMO=1 INLET_DEMO_LIVE_SECS=4 INLET_DEMO_GUILD=g1 INLET_DEMO_CHANNEL=c-general INLET_DEMO_ACCENT="#ff7e00" "$bin" >"$out/demo.log" 2>&1 &
 pid=$!
 sleep 6
 shot 02-general
