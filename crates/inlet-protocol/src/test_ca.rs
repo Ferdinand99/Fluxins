@@ -26,7 +26,7 @@ fn certificates() -> Vec<CertificateDer<'static>> {
             return Vec::new();
         }
     };
-    CertificateDer::pem_slice_iter(&pem)
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(&pem)
         .filter_map(|c| match c {
             Ok(c) => Some(c),
             Err(e) => {
@@ -34,7 +34,23 @@ fn certificates() -> Vec<CertificateDer<'static>> {
                 None
             }
         })
-        .collect()
+        .collect();
+    if !certs.is_empty() {
+        warn_once(certs.len());
+    }
+    certs
+}
+
+/// Says once per process, loudly, that a test CA is trusted, so a binary
+/// built with the feature cannot go unnoticed.
+fn warn_once(count: usize) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        tracing::warn!(
+            certificates = count,
+            "TEST BUILD: trusting an extra root CA from {ENV}; never use this binary for real accounts"
+        );
+    });
 }
 
 /// Adds the extra roots to a reqwest client.

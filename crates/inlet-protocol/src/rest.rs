@@ -298,7 +298,12 @@ impl Client {
         raw.json()
     }
 
-    async fn raw(&self, method: Method, path: &str, body: Option<&Value>) -> Result<RawResponse> {
+    pub(crate) async fn raw(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&Value>,
+    ) -> Result<RawResponse> {
         let limiter = self.rate_limiter();
         let raw = send(
             &self.instance,
@@ -319,7 +324,11 @@ impl Client {
         Ok(raw)
     }
 
-    async fn get_list<T: DeserializeOwned>(&self, path: &str, what: &str) -> Result<Vec<T>> {
+    pub(crate) async fn get_list<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        what: &str,
+    ) -> Result<Vec<T>> {
         self.raw(Method::GET, path, None).await?.list(what)
     }
 
@@ -484,11 +493,12 @@ impl Client {
     /// `POST /channels/{id}/messages` with replies, stickers, flags and mention
     /// control. See [`OutgoingMessage`].
     pub async fn send(&self, channel_id: &str, message: &OutgoingMessage) -> Result<Message> {
+        let body = message.to_json(None)?;
         self.rate_limiter().coalesce.reset_typing(channel_id);
         self.raw(
             Method::POST,
             &format!("/channels/{}/messages", id(channel_id)?),
-            Some(&message.to_json(None)),
+            Some(&body),
         )
         .await?
         .json()
@@ -517,7 +527,7 @@ impl Client {
     ) -> Result<Message> {
         let edit = MessageEdit {
             content: Some(content.to_owned()),
-            flags: None,
+            ..MessageEdit::default()
         };
         self.edit_message_with(channel_id, message_id, &edit).await
     }
@@ -532,7 +542,7 @@ impl Client {
         self.raw(
             Method::PATCH,
             &format!("/channels/{}/messages/{}", id(channel_id)?, id(message_id)?),
-            Some(&edit.to_json()),
+            Some(&edit.to_json()?),
         )
         .await?
         .json()
@@ -989,8 +999,9 @@ impl Client {
         if total > limits.max_total_size {
             return Err(too_large(limits.max_total_size));
         }
+        let json = message.to_json(None)?;
         self.rate_limiter().coalesce.reset_typing(channel_id);
-        let body = crate::upload::Multipart::message(message.to_json(None), files, progress);
+        let body = crate::upload::Multipart::message(json, files, progress);
         self.raw_upload(&format!("/channels/{channel_id}/messages"), &body)
             .await?
             .json()
@@ -1041,7 +1052,7 @@ fn percent_encode_all(s: &str) -> String {
 /// A snowflake ID (or `@me`) for a path or query, or [`Error::InvalidInput`].
 /// IDs come from the server and the UI; anything else (`..`, `/`, `?`) could
 /// make the request hit another route.
-fn id(value: &str) -> Result<&str> {
+pub(crate) fn id(value: &str) -> Result<&str> {
     if value == "@me" || crate::media::is_snowflake(value) {
         Ok(value)
     } else {
@@ -1049,8 +1060,19 @@ fn id(value: &str) -> Result<&str> {
     }
 }
 
+/// A snowflake ID (not `@me`) for a path, query or body where only a real
+/// ID makes sense (message, channel, thread or tag IDs), or
+/// [`Error::InvalidInput`].
+pub(crate) fn snowflake(value: &str) -> Result<&str> {
+    if crate::media::is_snowflake(value) {
+        Ok(value)
+    } else {
+        Err(Error::InvalidInput("an ID is not a snowflake".into()))
+    }
+}
+
 /// Percent-encodes a query value.
-fn enc_query(segment: &str) -> String {
+pub(crate) fn enc_query(segment: &str) -> String {
     url::form_urlencoded::byte_serialize(segment.as_bytes()).collect()
 }
 
