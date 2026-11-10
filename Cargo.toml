@@ -1,0 +1,10 @@
+[workspace]
+resolver = "2"
+members = ["crates/fluxins-protocol", "crates/fluxins-app"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/Ferdinand99/Fluxins"
+rust-version = "1.88"
