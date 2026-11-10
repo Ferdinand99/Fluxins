@@ -166,6 +166,8 @@ pub enum Credential {
 /// A checked session: the token works and the guild list is loaded.
 pub struct Connected {
     pub session: p::Session,
+    /// The signed-in account's ID.
+    pub user_id: String,
     /// Display name.
     pub username: String,
     /// Account name (`username`), shown when confirming a new sign-in.
@@ -198,6 +200,7 @@ pub async fn connect(instance: p::Instance, credential: Credential) -> Result<Co
             })
             .collect();
         Ok(Connected {
+            user_id: me.id.clone(),
             username: model::clean_name(me.display_name()),
             account: model::clean_name(&me.username),
             guilds,
@@ -273,9 +276,8 @@ pub async fn revoke(session: &p::Session) -> bool {
 
 fn channel_kind(kind: i64) -> ChannelKind {
     match kind {
-        channel_type::GUILD_TEXT
-        | channel_type::GUILD_ANNOUNCEMENT
-        | channel_type::PERSONAL_NOTES => ChannelKind::Text,
+        channel_type::GUILD_TEXT | channel_type::PERSONAL_NOTES => ChannelKind::Text,
+        channel_type::GUILD_ANNOUNCEMENT => ChannelKind::Announcement,
         channel_type::GUILD_VOICE => ChannelKind::Voice,
         channel_type::GUILD_CATEGORY => ChannelKind::Category,
         channel_type::DM => ChannelKind::Dm,
@@ -347,6 +349,14 @@ pub fn to_message(m: &p::Message, names: &SharedNames) -> Message {
                     .unwrap_or_default(),
             })
             .collect(),
+        mentions_me: snapshot
+            .me
+            .as_ref()
+            .is_some_and(|me| m.mentions.iter().any(|u| &u.id == me))
+            || m.extra
+                .get("mention_everyone")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
         embeds: m
             .embeds
             .iter()

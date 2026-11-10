@@ -94,6 +94,7 @@ fn msg(id: u64, channel_id: &str, author: &str, time: &str, content: &str) -> Me
         attachments: vec![],
         embeds: vec![],
         reply: None,
+        mentions_me: content.contains("<@2001>"),
         edited: false,
     };
     m.parse_with(&demo_names());
@@ -107,7 +108,7 @@ fn label(ms: i64) -> String {
     chrono::DateTime::from_timestamp_millis(ms)
         .map(|t| {
             t.with_timezone(&chrono::Local)
-                .format("%Y-%m-%d %H:%M")
+                .format("%d/%m/%Y, %H:%M")
                 .to_string()
         })
         .unwrap_or_default()
@@ -121,7 +122,7 @@ fn live(id: u64, channel_id: &str, author: &str, content: &str) -> Message {
 }
 
 fn now() -> String {
-    chrono::Local::now().format("%Y-%m-%d %H:%M").to_string()
+    chrono::Local::now().format("%d/%m/%Y, %H:%M").to_string()
 }
 
 impl MockSession {
@@ -154,7 +155,7 @@ impl MockSession {
                 channel("c-music", "\u{1F50A} Music", ChannelKind::Voice, Some("c-voice"), 1),
                 // Names like real servers have: emoji, very long names, non-Latin text.
                 channel("c-community", "Community \u{1F30D}", ChannelKind::Category, None, 3),
-                channel("c-ann", "\u{1F389}-announcements", ChannelKind::Text, Some("c-community"), 0),
+                channel("c-ann", "\u{1F389}-announcements", ChannelKind::Announcement, Some("c-community"), 0),
                 channel(
                     "c-rules",
                     "\u{1F4DC}-rules-and-information-for-everyone-who-joins-the-server-please-read",

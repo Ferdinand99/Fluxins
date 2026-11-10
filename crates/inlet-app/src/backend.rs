@@ -525,6 +525,12 @@ impl Backend {
     fn restore(&mut self) {
         #[cfg(feature = "demo")]
         if std::env::var_os("INLET_DEMO").is_some() {
+            // Lets screenshots show an instance accent, as on a branded instance.
+            crate::theme::set_accent(
+                std::env::var("INLET_DEMO_ACCENT")
+                    .ok()
+                    .and_then(|c| crate::theme::parse_hex(&c)),
+            );
             self.active = Some(Active::Demo(crate::mock::MockSession::start(
                 self.events.clone(),
             )));
@@ -864,7 +870,18 @@ impl Backend {
         let instance = session.instance().origin().to_string();
         let guilds = Arc::new(Mutex::new(connected.guilds.clone()));
         let cache: ChannelCache = Arc::default();
+        // Instance branding: its accent colour, as Fluxer's own client applies it.
+        let accent = session
+            .instance()
+            .discovery()
+            .app_public
+            .get("branding")
+            .and_then(|b| b.get("theme_color"))
+            .and_then(|c| c.as_str())
+            .and_then(crate::theme::parse_hex);
+        crate::theme::set_accent(accent);
         let names: SharedNames = Arc::default();
+        names.lock().unwrap().me = Some(connected.user_id.clone());
         let (gateway, forward) = self.spawn_gateway(gen, &session, &guilds, &cache, &names);
         let mut policy = ReconnectPolicy::default();
         policy.started(Instant::now());
@@ -1104,6 +1121,7 @@ impl Backend {
             t.abort();
         }
         let active = self.active.take();
+        crate::theme::set_accent(None);
         self.emit(Event::SignedOut);
         let events = self.events.clone();
         // A keychain write still running must finish first, or it could store the token

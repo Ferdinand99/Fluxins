@@ -29,6 +29,7 @@ impl Guild {
             .split_whitespace()
             .filter_map(|w| w.chars().next())
             .take(3)
+            .flat_map(char::to_uppercase)
             .collect();
         if s.is_empty() {
             "?".into()
@@ -41,6 +42,7 @@ impl Guild {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChannelKind {
     Text,
+    Announcement,
     Voice,
     Category,
     Dm,
@@ -62,6 +64,8 @@ pub struct Channel {
 /// Names for resolving mentions (`<#id>`, `<@id>`, `<@&id>`) while parsing.
 #[derive(Clone, Debug, Default)]
 pub struct Names {
+    /// The signed-in account, to mark messages that mention it.
+    pub me: Option<String>,
     pub channels: HashMap<String, String>,
     pub users: HashMap<String, String>,
     pub roles: HashMap<String, String>,
@@ -101,7 +105,7 @@ impl Channel {
     pub fn is_messageable(&self) -> bool {
         matches!(
             self.kind,
-            ChannelKind::Text | ChannelKind::Dm | ChannelKind::GroupDm
+            ChannelKind::Text | ChannelKind::Announcement | ChannelKind::Dm | ChannelKind::GroupDm
         )
     }
 }
@@ -135,6 +139,8 @@ pub struct Message {
     pub attachments: Vec<Attachment>,
     pub embeds: Vec<Embed>,
     pub reply: Option<Reply>,
+    /// The message mentions the signed-in account (or everyone).
+    pub mentions_me: bool,
     pub edited: bool,
 }
 
@@ -275,7 +281,7 @@ pub fn timestamp(rfc3339: &str) -> (i64, String) {
         Ok(t) => (
             t.timestamp_millis(),
             t.with_timezone(&chrono::Local)
-                .format("%Y-%m-%d %H:%M")
+                .format("%d/%m/%Y, %H:%M")
                 .to_string(),
         ),
         Err(_) => (0, clean_name(rfc3339)),
@@ -313,6 +319,7 @@ mod tests {
             attachments: vec![],
             embeds: vec![],
             reply: None,
+            mentions_me: false,
             edited: false,
         }
     }
