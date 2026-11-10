@@ -22,6 +22,10 @@ fn entry(instance: &str) -> Result<keyring::Entry> {
 struct Blob {
     token: String,
     pins: Option<inlet_protocol::EndpointPins>,
+    /// The token was pasted (it belongs to another client): never sign it out on the
+    /// server, only forget it. Entries written before this field count as not pasted.
+    #[serde(default)]
+    pasted: bool,
 }
 
 /// A stored session: the token (wiped from memory on drop) and its endpoint pins.
@@ -29,19 +33,47 @@ pub struct StoredSession {
     pub token: inlet_protocol::Token,
     /// `None` for an entry written before pinning existed.
     pub pins: Option<inlet_protocol::EndpointPins>,
+    /// See [`Blob::pasted`].
+    pub pasted: bool,
+}
+
+fn encode(
+    token: &inlet_protocol::Token,
+    pins: &inlet_protocol::EndpointPins,
+    pasted: bool,
+) -> Result<Zeroizing<String>> {
+    let blob = Blob {
+        token: token.expose_secret().to_string(),
+        pins: Some(pins.clone()),
+        pasted,
+    };
+    let json = Zeroizing::new(serde_json::to_string(&blob).context("encode the session")?);
+    drop(Zeroizing::new(blob.token));
+    Ok(json)
+}
+
+fn decode(raw: &str) -> StoredSession {
+    match serde_json::from_str::<Blob>(raw) {
+        Ok(blob) => StoredSession {
+            pins: blob.pins,
+            pasted: blob.pasted,
+            token: inlet_protocol::Token::new(blob.token),
+        },
+        Err(_) => StoredSession {
+            token: inlet_protocol::Token::new(raw.trim().to_string()),
+            pins: None,
+            pasted: false,
+        },
+    }
 }
 
 pub fn save_session(
     instance: &str,
     token: &inlet_protocol::Token,
     pins: &inlet_protocol::EndpointPins,
+    pasted: bool,
 ) -> Result<()> {
-    let blob = Blob {
-        token: token.expose_secret().to_string(),
-        pins: Some(pins.clone()),
-    };
-    let json = Zeroizing::new(serde_json::to_string(&blob).context("encode the session")?);
-    drop(Zeroizing::new(blob.token));
+    let json = encode(token, pins, pasted)?;
     entry(instance)?
         .set_password(&json)
         .context("store the token")
@@ -53,16 +85,7 @@ pub fn load_session(instance: &str) -> Result<Option<StoredSession>> {
         Err(keyring::Error::NoEntry) => return Ok(None),
         Err(err) => return Err(err).context("read the token"),
     };
-    Ok(Some(match serde_json::from_str::<Blob>(&raw) {
-        Ok(blob) => StoredSession {
-            pins: blob.pins,
-            token: inlet_protocol::Token::new(blob.token),
-        },
-        Err(_) => StoredSession {
-            token: inlet_protocol::Token::new(raw.trim().to_string()),
-            pins: None,
-        },
-    }))
+    Ok(Some(decode(&raw)))
 }
 
 pub fn delete_token(instance: &str) -> Result<()> {
@@ -112,4 +135,38 @@ pub fn client_info() -> inlet_protocol::ClientInfo {
         }
     }
     info
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pins() -> inlet_protocol::EndpointPins {
+        inlet_protocol::EndpointPins {
+            api: "https://fluxer.example".into(),
+            gateway: "wss://fluxer.example".into(),
+        }
+    }
+
+    #[test]
+    fn pasted_flag_round_trips() {
+        let token = inlet_protocol::Token::new("secret");
+        for pasted in [true, false] {
+            let stored = decode(&encode(&token, &pins(), pasted).unwrap());
+            assert_eq!(stored.pasted, pasted);
+            assert_eq!(stored.token.expose_secret(), "secret");
+            assert_eq!(stored.pins, Some(pins()));
+        }
+    }
+
+    #[test]
+    fn old_entries_count_as_not_pasted() {
+        let old = r#"{"token":"secret","pins":{"api":"https://fluxer.example","gateway":"wss://fluxer.example"}}"#;
+        let stored = decode(old);
+        assert!(!stored.pasted);
+        assert_eq!(stored.pins, Some(pins()));
+        let bare = decode("bare-token");
+        assert!(!bare.pasted);
+        assert!(bare.pins.is_none());
+    }
 }

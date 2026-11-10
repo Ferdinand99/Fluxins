@@ -305,6 +305,8 @@ pub fn backoff_secs(failures: u32) -> u64 {
 
 struct RealActive {
     gen: u64,
+    /// The token was pasted: sign-out only forgets it.
+    pasted: bool,
     session: p::Session,
     gateway: p::GatewayHandle,
     forward: AbortHandle,
@@ -463,7 +465,7 @@ impl Backend {
             }
             Command::ConfirmAccount => {
                 if let Some(pending) = self.pending_confirm.take() {
-                    self.install(pending.connected, true);
+                    self.install(pending.connected, true, !pending.from_handoff);
                 }
             }
             Command::RejectAccount => {
@@ -556,9 +558,9 @@ impl Backend {
                             .into(),
                     ));
                 }
-                Some((instance, Some(token_store::StoredSession { token, pins: Some(pins) }))) => {
+                Some((instance, Some(token_store::StoredSession { token, pins: Some(pins), pasted }))) => {
                     let _ = events.unbounded_send(Event::Starting { instance: instance.clone() });
-                    let credential = Credential::Stored { token, pins };
+                    let credential = Credential::Stored { token, pins, pasted };
                     let result = connect_task(&instance, None, credential.clone()).await;
                     let _ = internal.send(Internal::Connected {
                         attempt,
@@ -693,7 +695,10 @@ impl Backend {
                             from_handoff,
                         });
                     }
-                    Ok(connected) => self.install(connected, false),
+                    Ok(connected) => {
+                        let pasted = credential.is_pasted();
+                        self.install(connected, false, pasted)
+                    }
                     Err(failure) => self.connect_failed(failure, mode, instance, credential),
                 }
             }
@@ -847,7 +852,7 @@ impl Backend {
     /// Makes a checked session the active one: starts the gateway and, for a confirmed
     /// new sign-in, stores the token with its endpoint pins, ending an older stored token
     /// for the same instance.
-    fn install(&mut self, connected: real::Connected, save: bool) {
+    fn install(&mut self, connected: real::Connected, save: bool, pasted: bool) {
         if let Some(Active::Real(old)) = self.active.take() {
             self.teardown(&old);
         }
@@ -877,11 +882,13 @@ impl Backend {
             self.saving = Some(tokio::spawn(async move {
                 let inst = instance.clone();
                 let stored = tokio::task::spawn_blocking(move || {
+                    // An older pasted token is only forgotten (overwritten), never revoked.
                     let old = token_store::load_session(&inst)
                         .ok()
                         .flatten()
+                        .filter(|s| should_revoke(s.pasted))
                         .and_then(|s| Some((s.token, s.pins?)));
-                    let saved = token_store::save_session(&inst, &token, &pins);
+                    let saved = token_store::save_session(&inst, &token, &pins, pasted);
                     if saved.is_ok() {
                         token_store::set_last_instance(&inst);
                     }
@@ -911,6 +918,7 @@ impl Backend {
 
         self.active = Some(Active::Real(RealActive {
             gen,
+            pasted,
             session,
             gateway,
             forward,
@@ -1049,9 +1057,13 @@ impl Backend {
                 return;
             };
             let mut told_server = false;
-            if let Some(token_store::StoredSession {
+            let mut forgotten_only = false;
+            if let Some(token_store::StoredSession { pasted: true, .. }) = &stored {
+                forgotten_only = true;
+            } else if let Some(token_store::StoredSession {
                 token,
                 pins: Some(pins),
+                ..
             }) = stored
             {
                 if let Ok(inst) = real::discover(&instance).await {
@@ -1068,7 +1080,11 @@ impl Backend {
             let _ = events.unbounded_send(Event::NeedsSignIn {
                 instance: Some(instance),
             });
-            notice_sign_out(&events, told_server, deleted);
+            if forgotten_only {
+                notice_forgotten(&events, deleted);
+            } else {
+                notice_sign_out(&events, told_server, deleted);
+            }
         });
     }
 
@@ -1094,9 +1110,21 @@ impl Backend {
                 // cannot be read as "the session ended" (the generation also changed).
                 self.teardown(&r);
                 let session = r.session.clone();
+                let pasted = r.pasted;
                 self.spawn_guarded("sign out", None, async move {
                     if let Some(saving) = saving {
                         let _ = saving.await;
+                    }
+                    if !should_revoke(pasted) {
+                        let instance = session.instance().origin().to_string();
+                        let deleted = tokio::task::spawn_blocking(move || {
+                            token_store::delete_token(&instance)
+                        })
+                        .await
+                        .map(|r| r.is_ok())
+                        .unwrap_or(false);
+                        notice_forgotten(&events, deleted);
+                        return;
                     }
                     let told_server = real::revoke(&session).await;
                     let instance = session.instance().origin().to_string();
@@ -1117,9 +1145,19 @@ impl Backend {
                             let _ = saving.await;
                         }
                         let instance = off.instance.clone();
+                        if off.credential.is_pasted() {
+                            let deleted = tokio::task::spawn_blocking(move || {
+                                token_store::delete_token(&instance)
+                            })
+                            .await
+                            .map(|r| r.is_ok())
+                            .unwrap_or(false);
+                            notice_forgotten(&events, deleted);
+                            return;
+                        }
                         let told_server = match real::discover(&off.instance).await {
                             Ok(inst) => match &off.credential {
-                                Credential::Stored { token, pins } => {
+                                Credential::Stored { token, pins, .. } => {
                                     match p::Session::from_token_pinned(inst, token.clone(), pins) {
                                         Ok(session) => real::revoke(&session).await,
                                         Err(_) => false,
@@ -1285,6 +1323,22 @@ fn report(events: &Ui, internal: &TokioSender<Internal>, gen: u64, prefix: &str,
     }
 }
 
+/// Whether signing out may end a token on the server. A pasted token belongs to another
+/// client and is only forgotten here.
+pub fn should_revoke(pasted: bool) -> bool {
+    !pasted
+}
+
+fn notice_forgotten(events: &Ui, deleted: bool) {
+    let mut text = String::from(
+        "The pasted token was only forgotten here. The app it came from stays signed in.",
+    );
+    if !deleted {
+        text.push_str(" The token could not be removed from the system keychain.");
+    }
+    let _ = events.unbounded_send(Event::Notice(text));
+}
+
 fn notice_sign_out(events: &Ui, told_server: bool, deleted: bool) {
     let mut parts = Vec::new();
     if !told_server {
@@ -1303,6 +1357,29 @@ fn notice_sign_out(events: &Ui, told_server: bool, deleted: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pasted_tokens_are_never_revoked() {
+        assert!(!should_revoke(true));
+        assert!(should_revoke(false));
+        let pins = p::EndpointPins {
+            api: "https://fluxer.example".into(),
+            gateway: "wss://fluxer.example".into(),
+        };
+        let stored_pasted = Credential::Stored {
+            token: p::Token::new("t"),
+            pins: pins.clone(),
+            pasted: true,
+        };
+        let stored_issued = Credential::Stored {
+            token: p::Token::new("t"),
+            pins,
+            pasted: false,
+        };
+        assert!(stored_pasted.is_pasted());
+        assert!(!stored_issued.is_pasted());
+        assert!(Credential::Pasted(p::Token::new("t")).is_pasted());
+    }
 
     #[test]
     fn repeated_errors_are_coalesced() {

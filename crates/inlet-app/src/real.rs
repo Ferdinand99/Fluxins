@@ -121,6 +121,8 @@ pub enum Credential {
     Stored {
         token: p::Token,
         pins: p::EndpointPins,
+        /// Pasted by the person: never signed out on the server, only forgotten.
+        pasted: bool,
     },
     /// A finished browser sign-in.
     SignedIn(p::SignedIn),
@@ -143,7 +145,7 @@ pub struct Connected {
 pub async fn connect(instance: p::Instance, credential: Credential) -> Result<Connected, Failure> {
     let session = match credential {
         // A stored token is only ever used with the hosts it was issued for.
-        Credential::Stored { token, pins } => {
+        Credential::Stored { token, pins, .. } => {
             p::Session::from_token_pinned(instance, token, &pins)?
         }
         // A pasted token has no pins yet; it is pinned to this instance when saved.
@@ -491,4 +493,15 @@ pub async fn forward_gateway(
         }
     }
     GatewayEnd::ChannelClosed
+}
+
+impl Credential {
+    /// The token came from the paste field. Inlet may only forget such a token: it
+    /// belongs to another client, which must stay signed in.
+    pub fn is_pasted(&self) -> bool {
+        matches!(
+            self,
+            Credential::Pasted(_) | Credential::Stored { pasted: true, .. }
+        )
+    }
 }
