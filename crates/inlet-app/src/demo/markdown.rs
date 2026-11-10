@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Demo messages for `#development` that show every kind of node Fluxer's markdown
-//! parser makes. Three scenes split them so each fits on one screen:
+//! parser makes. Four scenes split them so each fits on one screen:
 //!
 //! - `markdown-inline`: styles, links, mention pills (user, role, channel, everyone,
 //!   here, unknown), timestamps, Unicode and custom emoji, jumbo emoji, spoilers.
-//! - `markdown-blocks`: headings, subtext, lists, quotes, alerts.
+//! - `markdown-blocks`: headings, subtext, lists, a quote.
+//! - `markdown-alerts`: the five alert kinds.
 //! - `markdown-code`: a table, code blocks with highlighting, maths, and a spoiler
 //!   around blocks.
 
@@ -84,7 +85,26 @@ pub fn blocks() -> Vec<p::Message> {
             CHANNEL,
             "linus",
             "11:01",
-            "> A quote\n> over two lines\n\n> [!NOTE]\n> Useful information.\n\n> [!WARNING]\n> Careful here.",
+            "> A quote\n> over two lines",
+        ),
+    ]
+}
+
+pub fn alerts() -> Vec<p::Message> {
+    vec![
+        msg(
+            16,
+            CHANNEL,
+            "linus",
+            "11:05",
+            "> [!NOTE]\n> Useful information.\n\n> [!TIP]\n> A helpful hint.\n\n> [!IMPORTANT]\n> Read this first.",
+        ),
+        msg(
+            17,
+            CHANNEL,
+            "grace",
+            "11:06",
+            "> [!WARNING]\n> Careful here.\n\n> [!CAUTION]\n> This cannot be undone.",
         ),
     ]
 }

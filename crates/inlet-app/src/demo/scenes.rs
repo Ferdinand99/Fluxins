@@ -11,8 +11,8 @@
 //! - `chat-compact`: `chat-cozy` in compact mode.
 //! - `chat-system`: for `#system-messages`, every system message type.
 //! - `chat-replies`: for `#replies`, replies with loaded, deleted and missing originals.
-//! - `markdown-inline`, `markdown-blocks`, `markdown-code`: for `#development`, every
-//!   kind of markdown node (see `markdown.rs`).
+//! - `markdown-inline`, `markdown-blocks`, `markdown-alerts`, `markdown-code`: for
+//!   `#development`, every kind of markdown node (see `markdown.rs`).
 
 use std::collections::HashMap;
 
@@ -36,6 +36,7 @@ pub enum Scene {
     ChatReplies,
     MarkdownInline,
     MarkdownBlocks,
+    MarkdownAlerts,
     MarkdownCode,
 }
 
@@ -49,6 +50,7 @@ impl Scene {
             "chat-replies" => Scene::ChatReplies,
             "markdown-inline" => Scene::MarkdownInline,
             "markdown-blocks" => Scene::MarkdownBlocks,
+            "markdown-alerts" => Scene::MarkdownAlerts,
             "markdown-code" => Scene::MarkdownCode,
             _ => return None,
         })
@@ -186,6 +188,9 @@ pub fn data(scene: Scene) -> Data {
         Scene::MarkdownBlocks => {
             by_name.insert(markdown::SCENE_CHANNEL.into(), markdown::blocks());
         }
+        Scene::MarkdownAlerts => {
+            by_name.insert(markdown::SCENE_CHANNEL.into(), markdown::alerts());
+        }
         Scene::MarkdownCode => {
             by_name.insert(markdown::SCENE_CHANNEL.into(), markdown::code());
         }
@@ -273,6 +278,7 @@ mod tests {
             "chat-replies",
             "markdown-inline",
             "markdown-blocks",
+            "markdown-alerts",
             "markdown-code",
         ] {
             let scene = Scene::from_name(name).expect(name);
