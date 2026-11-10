@@ -68,8 +68,16 @@ const MAX_PENDING: usize = 4_096;
 const MAX_QUEUED: usize = 64;
 /// Capacity of the command channel.
 const COMMAND_BUFFER: usize = 256;
-/// Guilds per Lazy Request when replaying subscriptions (keeps payloads under 16 KiB).
-const LAZY_CHUNK: usize = 50;
+/// Active guilds remembered for replay (the UI shows one at a time). They go
+/// out in a single Lazy Request, which stays well under the 16 KiB limit.
+const MAX_ACTIVE_GUILDS: usize = 50;
+/// Fluxer runs at most 4 bounded commands (op 8, 14, 15, 16, 28) at once per
+/// socket and drops the rest silently: send at most this many per window.
+const BOUNDED_PER_WINDOW: usize = 4;
+const BOUNDED_WINDOW: Duration = Duration::from_secs(1);
+/// Fluxer accepts 5 Presence Updates per 20 s and drops the rest.
+const PRESENCE_PER_WINDOW: usize = 5;
+const PRESENCE_WINDOW: Duration = Duration::from_secs(20);
 /// Allowed `heartbeat_interval` range.
 const HEARTBEAT_MIN: Duration = Duration::from_secs(1);
 const HEARTBEAT_MAX: Duration = Duration::from_secs(120);
@@ -112,7 +120,11 @@ pub struct GatewayOptions {
     pub backoff_base: Duration,
     /// Longest reconnect delay.
     pub backoff_max: Duration,
-    /// Capacity of the event channel. When full, the task stops reading (but keeps heartbeating).
+    /// Capacity of the event channel. When it is full, the task keeps reading
+    /// and heartbeating and holds up to 4,096 more events in memory; past that
+    /// it drops the socket and resumes once the receiver has caught up (the
+    /// server replays what was missed). Read the receiver promptly: with large
+    /// messages the held events can take a lot of memory.
     pub event_buffer: usize,
     /// Largest gateway message accepted, compressed or not (default 32 MiB).
     pub max_message_size: usize,
@@ -563,9 +575,12 @@ impl Task {
     fn remember(&mut self, cmd: Command) {
         match cmd {
             Command::GuildActive(g, true) => {
-                if self.active_guilds.len() < 1_000 || self.active_guilds.contains_key(&g) {
-                    self.active_guilds.insert(g, true);
+                if !self.active_guilds.contains_key(&g)
+                    && self.active_guilds.len() >= MAX_ACTIVE_GUILDS
+                {
+                    self.active_guilds.pop_first();
                 }
+                self.active_guilds.insert(g, true);
             }
             Command::GuildActive(g, false) => {
                 self.active_guilds.remove(&g);
@@ -602,8 +617,8 @@ impl Task {
             .iter()
             .map(|(g, a)| (g.clone(), *a))
             .collect();
-        for chunk in active.chunks(LAZY_CHUNK) {
-            out.push(lazy_request(chunk.iter().map(|(g, a)| (g.as_str(), *a))));
+        if !active.is_empty() {
+            out.push(lazy_request(active.iter().map(|(g, a)| (g.as_str(), *a))));
         }
         if let Some(s) = &self.status {
             out.push(presence(s));
@@ -711,6 +726,7 @@ impl Task {
         tokio::pin!(ready_deadline);
         let mut acked = true;
         let mut connected_at: Option<Instant> = None;
+        let mut pacer = Pacer::default();
 
         loop {
             let stable = connected_at.is_some_and(|t| t.elapsed() >= STABLE_AFTER);
@@ -720,7 +736,13 @@ impl Task {
                 stable,
                 min_delay,
             };
+            let wake = pacer.next_wakeup();
             tokio::select! {
+                _ = tokio::time::sleep_until(wake.unwrap_or_else(|| Instant::now() + HEARTBEAT_MAX)), if wake.is_some() => {
+                    if let Err(e) = flush(&mut ws, &mut codec, &mut pacer, self.status.as_deref()).await {
+                        return reconnect(e, false, Duration::ZERO);
+                    }
+                }
                 _ = &mut heartbeat => {
                     if !acked {
                         let _ = close(&mut ws, 4000).await;
@@ -754,9 +776,10 @@ impl Task {
                 cmd = self.commands.recv() => match cmd {
                     Some(c) if connected_at.is_some() => {
                         if let Some(payload) = self.live(c) {
-                            if let Err(e) = send_payload(&mut ws, &mut codec, &payload).await {
-                                return reconnect(e, false, Duration::ZERO);
-                            }
+                            pacer.push(payload);
+                        }
+                        if let Err(e) = flush(&mut ws, &mut codec, &mut pacer, self.status.as_deref()).await {
+                            return reconnect(e, false, Duration::ZERO);
                         }
                     }
                     // Commands before READY close the socket with 4003: keep them.
@@ -803,10 +826,12 @@ impl Task {
                                 return reconnect("the event receiver is too slow".into(), false, Duration::ZERO);
                             }
                             if ready_now {
+                                pacer = Pacer::default();
                                 for p in self.replay() {
-                                    if let Err(e) = send_payload(&mut ws, &mut codec, &p).await {
-                                        return reconnect(e, false, Duration::ZERO);
-                                    }
+                                    pacer.push(p);
+                                }
+                                if let Err(e) = flush(&mut ws, &mut codec, &mut pacer, self.status.as_deref()).await {
+                                    return reconnect(e, false, Duration::ZERO);
                                 }
                             }
                         }
@@ -909,6 +934,102 @@ impl Task {
             _ => reconnect(false, Duration::ZERO),
         }
     }
+}
+
+/// Paces outgoing commands to Fluxer's per-socket limits (see the constants).
+#[derive(Default)]
+struct Pacer {
+    /// Commands waiting, in order.
+    outbox: VecDeque<Value>,
+    bounded_sent: VecDeque<Instant>,
+    presence_sent: VecDeque<Instant>,
+    /// A Presence Update is wanted; the latest status is sent when allowed.
+    presence_due: bool,
+}
+
+fn is_bounded(payload: &Value) -> bool {
+    matches!(
+        payload.get("op").and_then(Value::as_u64),
+        Some(8 | 14 | 15 | 16 | 28)
+    )
+}
+
+fn prune(sent: &mut VecDeque<Instant>, window: Duration, now: Instant) {
+    while sent
+        .front()
+        .is_some_and(|t| now.saturating_duration_since(*t) >= window)
+    {
+        sent.pop_front();
+    }
+}
+
+impl Pacer {
+    fn push(&mut self, payload: Value) {
+        if payload.get("op").and_then(Value::as_u64) == Some(3) {
+            // Coalesced: only the latest status matters.
+            self.presence_due = true;
+            return;
+        }
+        if self.outbox.len() >= MAX_QUEUED {
+            tracing::warn!("gateway outbox full; dropping the oldest command");
+            self.outbox.pop_front();
+        }
+        self.outbox.push_back(payload);
+    }
+
+    /// Takes every payload that may go out now.
+    fn take_ready(&mut self, status: Option<&str>) -> Vec<Value> {
+        let now = Instant::now();
+        prune(&mut self.bounded_sent, BOUNDED_WINDOW, now);
+        prune(&mut self.presence_sent, PRESENCE_WINDOW, now);
+        let mut out = Vec::new();
+        while let Some(front) = self.outbox.front() {
+            if is_bounded(front) {
+                if self.bounded_sent.len() >= BOUNDED_PER_WINDOW {
+                    break;
+                }
+                self.bounded_sent.push_back(now);
+            }
+            out.extend(self.outbox.pop_front());
+        }
+        if self.presence_due && self.presence_sent.len() < PRESENCE_PER_WINDOW {
+            if let Some(s) = status {
+                out.push(presence(s));
+                self.presence_sent.push_back(now);
+            }
+            self.presence_due = false;
+        }
+        out
+    }
+
+    /// When something waiting may go out, if anything waits.
+    fn next_wakeup(&self) -> Option<Instant> {
+        let bounded = self
+            .outbox
+            .front()
+            .filter(|_| self.bounded_sent.len() >= BOUNDED_PER_WINDOW)
+            .and_then(|_| self.bounded_sent.front())
+            .map(|t| *t + BOUNDED_WINDOW);
+        let presence = (self.presence_due && self.presence_sent.len() >= PRESENCE_PER_WINDOW)
+            .then(|| self.presence_sent.front().map(|t| *t + PRESENCE_WINDOW))
+            .flatten();
+        match (bounded, presence) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+}
+
+async fn flush(
+    ws: &mut Ws,
+    codec: &mut Option<ZstdStream>,
+    pacer: &mut Pacer,
+    status: Option<&str>,
+) -> Result<(), String> {
+    for payload in pacer.take_ready(status) {
+        send_payload(ws, codec, &payload).await?;
+    }
+    Ok(())
 }
 
 fn lazy_request<'a>(guilds: impl Iterator<Item = (&'a str, bool)>) -> Value {
@@ -1043,13 +1164,48 @@ mod tests {
     }
 
     #[test]
-    fn lazy_requests_are_chunked() {
-        let guilds: Vec<(String, bool)> = (0..120).map(|i| (format!("{i}"), true)).collect();
-        let chunks: Vec<Value> = guilds
-            .chunks(LAZY_CHUNK)
-            .map(|c| lazy_request(c.iter().map(|(g, a)| (g.as_str(), *a))))
+    fn replayed_lazy_request_fits_one_payload() {
+        let guilds: Vec<(String, bool)> = (0..MAX_ACTIVE_GUILDS)
+            .map(|i| (format!("{}", 1_189_375_284_394_692_608u64 + i as u64), true))
             .collect();
-        assert_eq!(chunks.len(), 3);
-        assert!(chunks.iter().all(|c| c.to_string().len() < 16_384));
+        let payload = lazy_request(guilds.iter().map(|(g, a)| (g.as_str(), *a)));
+        assert!(payload.to_string().len() < 16_384);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pacer_limits_bounded_commands_and_presence() {
+        let mut pacer = Pacer::default();
+        for i in 0..10 {
+            pacer.push(lazy_request(std::iter::once((
+                format!("{i}").as_str(),
+                true,
+            ))));
+        }
+        for _ in 0..7 {
+            pacer.push(presence("idle"));
+        }
+        let first = pacer.take_ready(Some("idle"));
+        // 4 lazy requests and one coalesced presence update.
+        assert_eq!(first.iter().filter(|p| p["op"] == 14).count(), 4);
+        assert_eq!(first.iter().filter(|p| p["op"] == 3).count(), 1);
+        let wake = pacer.next_wakeup().expect("more waiting");
+        assert!(wake - Instant::now() <= BOUNDED_WINDOW);
+        tokio::time::advance(BOUNDED_WINDOW).await;
+        assert_eq!(pacer.take_ready(Some("idle")).len(), 4);
+        tokio::time::advance(BOUNDED_WINDOW).await;
+        assert_eq!(pacer.take_ready(Some("idle")).len(), 2);
+        assert!(pacer.next_wakeup().is_none());
+
+        // Presence: at most 5 per 20 s.
+        let mut sent = 0;
+        for _ in 0..8 {
+            pacer.push(presence("dnd"));
+            sent += pacer.take_ready(Some("dnd")).len();
+        }
+        // One went out above, so four more fit in this window.
+        assert_eq!(sent, 4);
+        let wake = pacer.next_wakeup().expect("presence waiting");
+        tokio::time::advance(wake - Instant::now()).await;
+        assert_eq!(pacer.take_ready(Some("dnd")).len(), 1);
     }
 }

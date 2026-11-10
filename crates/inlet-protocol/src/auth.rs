@@ -521,13 +521,26 @@ pub struct Session {
 }
 
 impl Session {
-    /// A session from a stored token. Makes no request; call
-    /// [`Client::me`] to check that the token still works. Trusts the
-    /// instance's current endpoints; prefer [`Session::from_token_pinned`].
-    pub fn from_token(instance: Instance, token: Token) -> Session {
+    /// A session from a stored token **without** endpoint pinning. It trusts
+    /// whatever API and gateway hosts the instance names right now, so a
+    /// changed discovery document can send the token elsewhere. Prefer
+    /// [`Session::from_token_pinned`] with the pins stored next to the token;
+    /// use this only for a token that has no pins yet (for example one pasted
+    /// by hand), and store [`Session::pins`] right after.
+    ///
+    /// Makes no request; call [`Client::me`] to check that the token works.
+    pub fn from_token_unpinned(instance: Instance, token: Token) -> Session {
         Session {
             client: Client::new(instance, token),
         }
+    }
+
+    /// Old name of [`Session::from_token_unpinned`].
+    #[deprecated(
+        note = "use `from_token_pinned`, or `from_token_unpinned` for a token without pins"
+    )]
+    pub fn from_token(instance: Instance, token: Token) -> Session {
+        Self::from_token_unpinned(instance, token)
     }
 
     /// A session from a stored token and the pins stored with it. Fails with
@@ -539,7 +552,7 @@ impl Session {
         pins: &EndpointPins,
     ) -> Result<Session> {
         instance.verify_pins(pins)?;
-        Ok(Self::from_token(instance, token))
+        Ok(Self::from_token_unpinned(instance, token))
     }
 
     /// A session from a finished sign-in.

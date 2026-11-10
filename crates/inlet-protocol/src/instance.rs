@@ -236,25 +236,15 @@ pub(crate) fn require_scheme(raw: &str, secure: &str, insecure: &str, what: &str
     }
 }
 
-/// The registrable domain of a host, by a simple rule: the last two labels, or
-/// three when the second-level label is a short public suffix like `co.uk`.
+/// The registrable domain of a host by the Public Suffix List (including the
+/// private section, so `alice.github.io` and `bob.github.io` differ). A host
+/// that is itself a public suffix, or has no known suffix, is returned whole.
 /// IP addresses are returned unchanged.
 fn registrable_domain(url: &Url) -> Option<String> {
     match url.host()? {
         url::Host::Domain(d) => {
             let d = d.trim_end_matches('.').to_ascii_lowercase();
-            let labels: Vec<&str> = d.split('.').collect();
-            let take = if labels.len() >= 3
-                && labels[labels.len() - 1].len() == 2
-                && matches!(
-                    labels[labels.len() - 2],
-                    "co" | "com" | "net" | "org" | "ac" | "gov" | "edu"
-                ) {
-                3
-            } else {
-                2
-            };
-            Some(labels[labels.len().saturating_sub(take)..].join("."))
+            Some(psl::domain_str(&d).map_or_else(|| d.clone(), str::to_owned))
         }
         other => Some(other.to_string()),
     }
@@ -748,6 +738,12 @@ mod tests {
         let d = |s: &str| registrable_domain(&Url::parse(s).unwrap()).unwrap();
         assert_eq!(d("https://web.fluxer.app"), "fluxer.app");
         assert_eq!(d("https://a.b.example.co.uk"), "example.co.uk");
+        // Shared hosting suffixes: other customers are other domains.
+        assert_eq!(d("https://alice.github.io"), "alice.github.io");
+        assert_ne!(d("https://alice.github.io"), d("https://bob.github.io"));
+        assert_ne!(d("https://a.duckdns.org"), d("https://b.duckdns.org"));
+        assert_ne!(d("https://a.pages.dev"), d("https://b.pages.dev"));
+        assert_eq!(d("https://localhost"), "localhost");
         assert_eq!(d("http://127.0.0.1:9"), "127.0.0.1");
     }
 

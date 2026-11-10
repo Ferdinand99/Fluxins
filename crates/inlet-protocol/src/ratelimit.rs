@@ -14,8 +14,10 @@
 //! - per-route waits from `X-RateLimit-Remaining`/`X-RateLimit-Reset-After`
 //!   and from the `retry_after` of a route 429.
 //!
-//! Limiters live in a process-wide registry for the life of the process, so a
-//! new `Client` for the same account gets the same limiter, with its pauses.
+//! Limiters live in a process-wide registry, so a new `Client` for the same
+//! account gets the same limiter, with its pauses. An entry is dropped only
+//! when no client holds it, it has been idle for 10 minutes, and no global
+//! pause is running.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -106,6 +108,8 @@ struct State {
     recent: VecDeque<Instant>,
     global_until: Option<Instant>,
     routes: HashMap<String, RouteState>,
+    /// Last time a request went through, for registry eviction.
+    last_used: Instant,
 }
 
 /// One account's limiter. Shared behind an [`Arc`].
@@ -128,6 +132,25 @@ pub(crate) enum LimiterKey {
 
 type Registry = Mutex<HashMap<LimiterKey, Arc<RateLimiter>>>;
 
+/// A registry entry no client holds is dropped after this much idle time
+/// (unless a global pause is still running).
+pub(crate) const REGISTRY_IDLE: Duration = Duration::from_secs(10 * 60);
+
+/// Drops limiters that no client holds, that have been idle for `idle`, and
+/// that have no global pause running.
+pub(crate) fn evict_idle(map: &mut HashMap<LimiterKey, Arc<RateLimiter>>, idle: Duration) {
+    let now = Instant::now();
+    // One limiter can sit under two keys (token and user); count those references.
+    let mut held_by_registry: HashMap<*const RateLimiter, usize> = HashMap::new();
+    for l in map.values() {
+        *held_by_registry.entry(Arc::as_ptr(l)).or_default() += 1;
+    }
+    map.retain(|_, l| {
+        let registry_refs = held_by_registry.get(&Arc::as_ptr(l)).copied().unwrap_or(0);
+        Arc::strong_count(l) > registry_refs || !l.is_idle(idle, now)
+    });
+}
+
 fn registry() -> &'static Registry {
     static REGISTRY: OnceLock<Registry> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
@@ -146,6 +169,7 @@ impl RateLimiter {
                 recent: VecDeque::new(),
                 global_until: None,
                 routes: HashMap::new(),
+                last_used: Instant::now(),
             }),
         }
     }
@@ -153,6 +177,7 @@ impl RateLimiter {
     /// The registry's limiter for `key`, created with `config` if there is none.
     pub(crate) fn shared(key: LimiterKey, config: RateLimitConfig) -> Arc<Self> {
         let mut map = registry().lock().unwrap_or_else(|e| e.into_inner());
+        evict_idle(&mut map, REGISTRY_IDLE);
         map.entry(key)
             .or_insert_with(|| Arc::new(Self::new(config)))
             .clone()
@@ -179,25 +204,26 @@ impl RateLimiter {
 
     /// Waits until a request on `route` may start, then takes one slot.
     pub async fn acquire(&self, route: &str) {
-        // Route waits first, outside the global queue, so a busy route does not
-        // hold up requests on other routes.
-        loop {
-            let wait = {
-                let state = self.lock();
-                route_wait(&state, route, Instant::now())
-            };
-            match wait {
-                Some(d) => sleep(d).await,
-                None => break,
+        'outer: loop {
+            // Route waits happen outside the global queue, so a busy route
+            // never holds up requests on other routes.
+            loop {
+                let wait = {
+                    let state = self.lock();
+                    route_wait(&state, route, Instant::now())
+                };
+                match wait {
+                    Some(d) => sleep(d).await,
+                    None => break,
+                }
             }
-        }
 
-        let _turn = self.queue.lock().await;
-        loop {
-            let wait =
-                {
+            let turn = self.queue.lock().await;
+            loop {
+                let wait = {
                     let mut state = self.lock();
                     let now = Instant::now();
+                    state.last_used = now;
                     self.refill(&mut state, now);
                     while state.recent.front().is_some_and(|t| {
                         now.saturating_duration_since(*t) >= Duration::from_secs(1)
@@ -206,9 +232,12 @@ impl RateLimiter {
                     }
                     if let Some(until) = state.global_until.filter(|u| *u > now) {
                         until - now
-                    } else if let Some(d) = route_wait(&state, route, now) {
-                        // A route 429 can arrive while this caller waits in the queue.
-                        d
+                    } else if route_wait(&state, route, now).is_some() {
+                        // A route 429 arrived while this caller was queued:
+                        // give up the turn and wait outside the queue.
+                        drop(state);
+                        drop(turn);
+                        continue 'outer;
                     } else if state.recent.len() >= HARD_CAP_PER_SECOND as usize {
                         let oldest = state.recent.front().copied().unwrap_or(now);
                         (oldest + Duration::from_secs(1)).saturating_duration_since(now)
@@ -225,8 +254,17 @@ impl RateLimiter {
                         Duration::from_secs_f64((1.0 - state.tokens) / self.config.rate_per_sec)
                     }
                 };
-            sleep(wait.max(Duration::from_millis(1))).await;
+                // Only global waits (pause, cap, token refill) happen in the queue.
+                sleep(wait.max(Duration::from_millis(1))).await;
+            }
         }
+    }
+
+    /// Whether nothing used this limiter for `idle` and no global pause is running.
+    fn is_idle(&self, idle: Duration, now: Instant) -> bool {
+        let state = self.lock();
+        now.saturating_duration_since(state.last_used) >= idle
+            && state.global_until.is_none_or(|u| u <= now)
     }
 
     fn refill(&self, state: &mut State, now: Instant) {
@@ -439,6 +477,89 @@ mod tests {
         limiter.record_429("GET /a", Duration::from_secs(4), false);
         let waited = task.await.unwrap();
         assert!(waited >= Duration::from_secs(4), "{waited:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn queued_route_block_does_not_stall_other_routes() {
+        let limiter = Arc::new(RateLimiter::new(RateLimitConfig {
+            rate_per_sec: 1.0,
+            burst: 1,
+        }));
+        limiter.acquire("POST /a").await;
+        // A second call on route A waits in the queue for a token...
+        let la = limiter.clone();
+        let a = tokio::spawn(async move {
+            let start = Instant::now();
+            la.acquire("POST /a").await;
+            Instant::now() - start
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // ...when route A gets a 60 s 429.
+        limiter.record_429("POST /a", Duration::from_secs(60), false);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // A call on route B must not wait behind it.
+        let lb = limiter.clone();
+        let b = tokio::spawn(async move {
+            let start = Instant::now();
+            lb.acquire("GET /b").await;
+            Instant::now() - start
+        });
+        let waited_b = b.await.unwrap();
+        assert!(
+            waited_b < Duration::from_secs(2),
+            "route B waited {waited_b:?}"
+        );
+        let waited_a = a.await.unwrap();
+        assert!(
+            waited_a >= Duration::from_secs(60),
+            "route A waited {waited_a:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_registry_entries_are_evicted() {
+        let mut map: HashMap<LimiterKey, Arc<RateLimiter>> = HashMap::new();
+        let key = |n: u8| LimiterKey::Token("https://evict".into(), [n; 32]);
+        let held = Arc::new(RateLimiter::new(RateLimitConfig::default()));
+        map.insert(key(1), held.clone());
+        map.insert(
+            key(2),
+            Arc::new(RateLimiter::new(RateLimitConfig::default())),
+        );
+        let paused = Arc::new(RateLimiter::new(RateLimitConfig::default()));
+        paused.record_429("GET /x", MAX_SERVER_WAIT, true);
+        map.insert(key(3), paused);
+        // The same limiter under a token key and a user key, held by nobody else.
+        let shared = Arc::new(RateLimiter::new(RateLimitConfig::default()));
+        map.insert(key(4), shared.clone());
+        map.insert(LimiterKey::User("https://evict".into(), "9".into()), shared);
+
+        evict_idle(&mut map, REGISTRY_IDLE);
+        assert_eq!(map.len(), 5, "nothing is idle yet");
+
+        tokio::time::advance(Duration::from_secs(11 * 60)).await;
+        evict_idle(&mut map, REGISTRY_IDLE);
+        // Kept: the one a client holds. Dropped: the idle ones (the pause ended after 300 s).
+        assert!(map.contains_key(&key(1)));
+        assert_eq!(map.len(), 1, "{:?}", map.keys().collect::<Vec<_>>());
+        drop(held);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn running_global_pause_keeps_the_entry() {
+        let mut map: HashMap<LimiterKey, Arc<RateLimiter>> = HashMap::new();
+        let key = LimiterKey::Token("https://pause".into(), [1; 32]);
+        let l = Arc::new(RateLimiter::new(RateLimitConfig::default()));
+        map.insert(key.clone(), l.clone());
+        drop(l);
+        // Idle for longer than the threshold, but the pause still runs.
+        evict_idle(&mut map, Duration::ZERO);
+        assert!(map.is_empty());
+        let l = Arc::new(RateLimiter::new(RateLimitConfig::default()));
+        l.record_429("GET /x", MAX_SERVER_WAIT, true);
+        map.insert(key.clone(), l);
+        evict_idle(&mut map, Duration::ZERO);
+        assert!(map.contains_key(&key));
     }
 
     #[tokio::test(start_paused = true)]
