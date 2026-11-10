@@ -15,9 +15,16 @@ pub struct Typing {
 
 impl Typing {
     /// Records that `user` started typing at `now_ms`. Returns whether the
-    /// list of typing users changed (a refresh of a running entry does not).
-    pub(crate) fn start(&mut self, channel: ChannelId, user: UserId, now_ms: i64) -> bool {
+    /// list of typing users changed (a refresh of a running entry does not),
+    /// and a channel whose entries were dropped to make room.
+    pub(crate) fn start(
+        &mut self,
+        channel: ChannelId,
+        user: UserId,
+        now_ms: i64,
+    ) -> (bool, Option<ChannelId>) {
         let expires = now_ms.saturating_add(TYPING_EXPIRY_MS);
+        let mut evicted = None;
         if !self.by_channel.contains_key(&channel) && self.by_channel.len() >= MAX_TYPING_CHANNELS {
             // Make room by dropping the channel whose entries end first.
             let oldest = self
@@ -27,6 +34,7 @@ impl Typing {
                 .map(|(id, _)| *id);
             if let Some(id) = oldest {
                 self.by_channel.remove(&id);
+                evicted = Some(id);
             }
         }
         let users = self.by_channel.entry(channel).or_default();
@@ -42,7 +50,7 @@ impl Typing {
         }
         let e = users.entry(user).or_insert(expires);
         *e = (*e).max(expires);
-        new
+        (new, evicted)
     }
 
     /// Removes `user` from `channel` (their message arrived).

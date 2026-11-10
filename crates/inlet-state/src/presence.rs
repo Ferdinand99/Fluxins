@@ -39,11 +39,12 @@ impl Presences {
             return self.by_user.remove(&id).is_some();
         }
         // Keep only what the UI shows; the user object lives in the user cache.
-        let slim = Presence {
+        let mut slim = Presence {
             user: None,
             guild_id: None,
             ..p.clone()
         };
+        crate::size::cap_presence(&mut slim);
         if self.by_user.get(&id) == Some(&slim) {
             return false;
         }

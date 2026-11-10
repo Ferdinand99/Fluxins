@@ -10,6 +10,9 @@ use crate::ids::{ChannelId, GuildId};
 use crate::members::Members;
 use crate::roles::Roles;
 
+/// Fluxer's `LARGE_GUILD_THRESHOLD` (members).
+pub const LARGE_GUILD_THRESHOLD: u64 = 250;
+
 /// What the account knows about one guild.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GuildState {
@@ -43,6 +46,8 @@ pub struct GuildState {
     pub(crate) guild_perms: u64,
     /// Whether the account's timeout was running at the last recompute.
     pub(crate) timed_out: bool,
+    /// [`GuildState::joined_at_ms`], parsed when the member or guild changes.
+    pub(crate) joined_at: Option<i64>,
 }
 
 impl GuildState {
@@ -63,7 +68,23 @@ impl GuildState {
             perms: BTreeMap::new(),
             guild_perms: 0,
             timed_out: false,
+            joined_at: None,
         }
+    }
+
+    /// Re-parses what is cached from the guild record and own member.
+    pub(crate) fn refresh_cached(&mut self) {
+        self.joined_at = self
+            .members
+            .me()
+            .and_then(|m| m.joined_at.as_deref())
+            .or_else(|| {
+                self.properties
+                    .as_ref()
+                    .and_then(|p| p.extra.get("joined_at"))
+                    .and_then(serde_json::Value::as_str)
+            })
+            .and_then(parse_timestamp_ms);
     }
 
     /// The guild's name, or an empty string while unknown.
@@ -76,28 +97,35 @@ impl GuildState {
         self.properties.as_ref().and_then(|p| p.owner_id.as_deref())
     }
 
-    /// The guild's default notification level (`default_message_notifications`).
+    /// Fluxer's `isLargeGuild`: more than 250 members, or one of the large-guild features.
+    pub fn is_large(&self) -> bool {
+        let featured = self.properties.as_ref().is_some_and(|p| {
+            p.features
+                .iter()
+                .any(|f| f == "LARGE_GUILD_OVERRIDE" || f == "VERY_LARGE_GUILD")
+        });
+        featured || self.member_count.is_some_and(|n| n > LARGE_GUILD_THRESHOLD)
+    }
+
+    /// The guild's notification level for members who did not choose one
+    /// (Fluxer's `effectiveMessageNotifications`): only mentions in a large
+    /// guild, otherwise `default_message_notifications`.
     pub fn default_notifications(&self) -> i64 {
+        use crate::guild_settings::notifications::{ALL_MESSAGES, ONLY_MENTIONS};
+        if self.member_count.is_some() && self.is_large() {
+            return ONLY_MENTIONS;
+        }
         self.properties
             .as_ref()
             .and_then(|p| p.extra.get("default_message_notifications"))
             .and_then(serde_json::Value::as_i64)
-            .unwrap_or(crate::guild_settings::notifications::ALL_MESSAGES)
+            .unwrap_or(ALL_MESSAGES)
     }
 
     /// When the account joined, in Unix milliseconds: the account's member
     /// `joined_at`, or the guild's `joined_at`.
     pub fn joined_at_ms(&self) -> Option<i64> {
-        self.members
-            .me()
-            .and_then(|m| m.joined_at.as_deref())
-            .or_else(|| {
-                self.properties
-                    .as_ref()
-                    .and_then(|p| p.extra.get("joined_at"))
-                    .and_then(serde_json::Value::as_str)
-            })
-            .and_then(parse_timestamp_ms)
+        self.joined_at
     }
 
     /// Whether the roles are loaded (permissions fail closed until they are).

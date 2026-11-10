@@ -22,10 +22,11 @@ impl Roles {
     }
 
     /// Adds or replaces one role. Returns whether anything changed.
-    pub(crate) fn upsert(&mut self, role: Role) -> bool {
+    pub(crate) fn upsert(&mut self, mut role: Role) -> bool {
         let Some(id) = RoleId::parse(&role.id) else {
             return false;
         };
+        crate::size::cap_role(&mut role);
         match self.position(id) {
             Ok(i) if self.list[i] == role => false,
             Ok(i) => {

@@ -10,7 +10,9 @@ use common::*;
 use inlet_protocol::permissions::*;
 use inlet_protocol::{Dispatch, PermissionContext};
 use inlet_state::limits::*;
-use inlet_state::{AccountState, ChannelId, GuildId, MessageId, MessagesPage, Permissions};
+use inlet_state::{
+    AccountState, AckKind, ChannelId, GuildId, MessageId, MessagesPage, Permissions,
+};
 use serde_json::{json, Value};
 
 struct Rng(u64);
@@ -47,7 +49,8 @@ const ROLES: &[&str] = &["100", "101", "7", "8", "9"];
 enum Op {
     Event(Dispatch),
     Page(ChannelId, MessagesPage),
-    Read(ChannelId, Option<MessageId>),
+    Read(ChannelId, Option<MessageId>, AckKind),
+    Load(ChannelId),
     Tick(i64),
 }
 
@@ -98,7 +101,12 @@ fn channel_json(r: &mut Rng, id: &str) -> Value {
     };
     let mut c = json!({"id": id, "type": kind, "position": r.below(5), "permission_overwrites": overwrites(r)});
     if let Some(g) = guild {
-        c["guild_id"] = json!(if r.chance(90) { g } else { "100" });
+        // Sometimes the wrong guild, sometimes none (an update may omit it).
+        match r.below(20) {
+            0 => {}
+            1 => c["guild_id"] = json!("100"),
+            _ => c["guild_id"] = json!(g),
+        }
         c["parent_id"] = json!(if id == "303" { "301" } else { "300" });
     }
     if r.chance(50) {
@@ -147,6 +155,10 @@ fn message_value(r: &mut Rng, channel: &str) -> Value {
     if r.chance(10) {
         extra["edited_timestamp"] = json!(iso(JOINED_MS + r.below(3600) * 1000));
     }
+    if r.chance(15) {
+        let roles: Vec<&str> = ROLES.iter().copied().filter(|_| r.chance(30)).collect();
+        extra["member"] = json!({"roles": roles, "nick": format!("n{}", r.below(3))});
+    }
     message_json(id, channel, author, extra)
 }
 
@@ -183,7 +195,7 @@ fn op(r: &mut Rng) -> Op {
     let user = r.pick(USERS);
     let msg = mid(r.below(60), r.below(3)).to_string();
     let event = |name: &str, data: Value| Op::Event(d(name, data));
-    match r.below(30) {
+    match r.below(37) {
         0..=4 => event("MESSAGE_CREATE", message_value(r, channel)),
         5 => event("MESSAGE_UPDATE", message_value(r, channel)),
         6 => event("MESSAGE_DELETE", json!({"id": msg, "channel_id": channel})),
@@ -191,10 +203,13 @@ fn op(r: &mut Rng) -> Op {
             "MESSAGE_DELETE_BULK",
             json!({"ids": [msg, mid(r.below(60), 0).to_string()], "channel_id": channel}),
         ),
-        8 => event(
-            "TYPING_START",
-            json!({"channel_id": channel, "user_id": user, "timestamp": 1}),
-        ),
+        8 => {
+            let mut t = json!({"channel_id": channel, "user_id": user, "timestamp": 1});
+            if r.chance(40) {
+                t["member"] = member_json(r, guild, user);
+            }
+            event("TYPING_START", t)
+        }
         9 => event(
             "MESSAGE_ACK",
             json!({"channel_id": channel, "message_id": msg,
@@ -292,9 +307,65 @@ fn op(r: &mut Rng) -> Op {
                 },
             )
         }
-        27 => Op::Read(
-            ChannelId::parse(channel).unwrap(),
-            r.chance(50).then(|| mid(r.below(60), r.below(3))),
+        27 => {
+            let kind = if r.chance(50) {
+                AckKind::Explicit
+            } else {
+                AckKind::Automatic
+            };
+            Op::Read(
+                ChannelId::parse(channel).unwrap(),
+                r.chance(50).then(|| mid(r.below(60), r.below(3))),
+                kind,
+            )
+        }
+        30 => Op::Load(ChannelId::parse(channel).unwrap()),
+        31 => event(
+            "GUILD_UPDATE",
+            json!({"id": guild, "name": "g", "owner_id": r.pick(&["1", ME]), "mfa_level": r.below(2),
+                   "visiting": r.chance(5)}),
+        ),
+        32 => event(
+            "USER_UPDATE",
+            json!({"id": r.pick(&[ME, ME, OTHER]), "username": "me", "mfa_enabled": r.chance(50)}),
+        ),
+        33 => {
+            let roles: Vec<Value> = (0..r.below(3))
+                .map(|_| role(r.pick(ROLES), perms(r), r.below(5) as i64))
+                .collect();
+            event(
+                "GUILD_ROLE_UPDATE_BULK",
+                json!({"guild_id": guild, "roles": roles}),
+            )
+        }
+        34 => {
+            let mut channels = vec![];
+            for _ in 0..r.below(3) {
+                let c = r.pick(CHANNELS);
+                let mut v = channel_json(r, c);
+                if let Some(o) = v.as_object_mut() {
+                    o.remove("guild_id");
+                }
+                channels.push(v);
+            }
+            let bulk_guild = if r.chance(80) {
+                json!(guild)
+            } else {
+                Value::Null
+            };
+            event(
+                "CHANNEL_UPDATE_BULK",
+                json!({"guild_id": bulk_guild, "channels": channels}),
+            )
+        }
+        35 => event(
+            "MESSAGE_CREATE",
+            message_json(
+                mid(r.below(60), r.below(3)),
+                channel,
+                user,
+                json!({"member": {"roles": [r.pick(ROLES)], "nick": "attached"}}),
+            ),
         ),
         28 => Op::Tick(JOINED_MS as i64 + r.below(4 * 3600) as i64 * 1000),
         _ => event(
@@ -314,8 +385,11 @@ fn run(s: &mut AccountState, op: &Op) {
         Op::Page(c, p) => {
             s.apply_messages(*c, p.clone());
         }
-        Op::Read(c, m) => {
-            s.mark_read(*c, *m);
+        Op::Read(c, m, k) => {
+            s.mark_read(*c, *m, *k);
+        }
+        Op::Load(c) => {
+            s.begin_load(*c);
         }
         Op::Tick(t) => {
             s.tick(*t);
@@ -352,7 +426,10 @@ fn expected_permissions(s: &AccountState, g: GuildId, c: ChannelId) -> u64 {
             && !s.me().mfa_enabled(),
     };
     let parent = if channel.is_thread() {
-        s.channels().parent_of(c).and_then(|p| s.channel(p))
+        s.channels()
+            .parent_of(c)
+            .filter(|p| s.channels().guild_of(*p) == Some(g))
+            .and_then(|p| s.channel(p))
     } else {
         None
     };
@@ -418,8 +495,26 @@ fn check_invariants(s: &AccountState, seed: u64, step: usize) {
                 "{at}: channel {c} in the wrong guild"
             );
         }
-        let _ = s.guild_unread(g.id);
+        // The guild badge is the sum of its viewable text channels' mentions.
+        let gu = s.guild_unread(g.id);
+        if !g.visiting {
+            let sum: u32 = g
+                .channels
+                .iter()
+                .filter(|c| {
+                    s.channel(**c)
+                        .is_some_and(|ch| inlet_state::channels::is_guild_text_based(ch.kind))
+                        && s.permissions(g.id, **c).can_view()
+                })
+                .map(|c| s.unread(*c).mentions)
+                .sum();
+            assert_eq!(gu.mentions, sum, "{at}: guild badge");
+        } else {
+            assert!(!gu.unread && gu.mentions == 0, "{at}");
+        }
     }
+    let members: usize = s.guilds().map(|g| g.members.others_len()).sum();
+    assert!(members <= MAX_MEMBERS_TOTAL, "{at}");
     let _ = s.private_unread();
     assert!(s.presences().len() <= MAX_PRESENCES, "{at}");
 }
@@ -429,13 +524,156 @@ fn ops(seed: u64, n: usize) -> Vec<Op> {
     (0..n).map(|_| op(&mut r)).collect()
 }
 
+fn acks(s: &AccountState) -> Vec<(ChannelId, Option<MessageId>)> {
+    CHANNELS
+        .iter()
+        .filter_map(|c| {
+            let c = ChannelId::parse(c)?;
+            Some((c, s.read_state(c)?.ack_message_id))
+        })
+        .collect()
+}
+
+/// Read-state rules that hold across one operation.
+fn check_read_state(
+    before: &[(ChannelId, Option<MessageId>)],
+    s: &AccountState,
+    op: &Op,
+    at: &str,
+) {
+    let resets = matches!(op, Op::Event(Dispatch::Ready(_)))
+        || matches!(op, Op::Event(Dispatch::MessageAck(a)) if a.manual);
+    if !resets {
+        for (c, ack) in before {
+            if let Some(after) = s.read_state(*c) {
+                assert!(after.ack_message_id >= *ack, "{at}: ack of {c} moved back");
+            }
+        }
+    }
+    if let Op::Read(c, None, AckKind::Explicit) = op {
+        assert!(
+            !s.unread(*c).unread,
+            "{at}: {c} still unread after mark_read"
+        );
+    }
+}
+
 #[test]
 fn random_sequences_keep_invariants_and_never_panic() {
     for seed in 0..400 {
         let mut s = state();
         for (i, o) in ops(seed, 250).iter().enumerate() {
+            let before = acks(&s);
             run(&mut s, o);
+            let at = format!("seed {seed} step {i}");
+            check_read_state(&before, &s, o, &at);
             check_invariants(&s, seed, i);
+        }
+    }
+}
+
+/// A server timeline for one channel: the window must end up equal to the
+/// server's messages whatever happens while the newest page is in flight.
+#[test]
+fn pages_and_live_events_converge_on_the_server_state() {
+    for seed in 5000..5300 {
+        let mut r = Rng::new(seed);
+        let mut s = state();
+        let c = ch(GENERAL);
+        // The server's messages: id -> content.
+        let mut server: std::collections::BTreeMap<u64, String> = Default::default();
+        let mut next = 0u64;
+        let new_id = |n: &mut u64| {
+            *n += 1;
+            mid(*n, 0)
+        };
+        for _ in 0..r.below(30) {
+            server.insert(new_id(&mut next).0, "v0".into());
+        }
+        let snapshot =
+            |server: &std::collections::BTreeMap<u64, String>| -> Vec<inlet_protocol::Message> {
+                server
+                    .iter()
+                    .rev()
+                    .take(50)
+                    .map(|(id, text)| {
+                        serde_json::from_value(message_json(
+                            MessageId(*id),
+                            GENERAL,
+                            OTHER,
+                            json!({"content": text}),
+                        ))
+                        .unwrap()
+                    })
+                    .collect()
+            };
+        let stale = r.chance(50);
+        if stale {
+            // A loaded window, then a reconnect.
+            s.apply_messages(c, MessagesPage::latest(snapshot(&server), 50));
+            s.apply(&Dispatch::Ready(Box::new(ready())));
+        } else {
+            s.begin_load(c);
+        }
+        // The page is read now, before the live events.
+        let page = snapshot(&server);
+        let mut edits = 0u64;
+        for _ in 0..r.below(40) {
+            match r.below(3) {
+                0 => {
+                    let id = new_id(&mut next);
+                    server.insert(id.0, "v0".into());
+                    s.apply(&create(id, GENERAL, OTHER, json!({"content": "v0"})));
+                }
+                1 if !server.is_empty() => {
+                    let k = *server
+                        .keys()
+                        .nth(r.below(server.len() as u64) as usize)
+                        .unwrap();
+                    server.remove(&k);
+                    s.apply(&d(
+                        "MESSAGE_DELETE",
+                        json!({"id": k.to_string(), "channel_id": GENERAL}),
+                    ));
+                }
+                _ if !server.is_empty() => {
+                    let k = *server
+                        .keys()
+                        .nth(r.below(server.len() as u64) as usize)
+                        .unwrap();
+                    edits += 1;
+                    let text = format!("v{edits}");
+                    server.insert(k, text.clone());
+                    s.apply(&d(
+                        "MESSAGE_UPDATE",
+                        message_json(
+                            MessageId(k),
+                            GENERAL,
+                            OTHER,
+                            json!({"content": text, "edited_timestamp": iso(JOINED_MS + edits * 1000)}),
+                        ),
+                    ));
+                }
+                _ => {}
+            }
+        }
+        s.apply_messages(c, MessagesPage::latest(page, 50));
+        let w = s.messages(c).unwrap();
+        assert!(w.has_newest(), "seed {seed}");
+        let got: Vec<(u64, String)> = w
+            .iter()
+            .map(|m| (MessageId::parse(&m.id).unwrap().0, m.content.clone()))
+            .collect();
+        // The window holds the newest messages the server has (older ones
+        // than the page reached may be missing; none may be extra).
+        let want: Vec<(u64, String)> = server
+            .iter()
+            .filter(|(id, _)| got.first().is_some_and(|(first, _)| **id >= *first))
+            .map(|(id, t)| (*id, t.clone()))
+            .collect();
+        assert_eq!(got, want, "seed {seed} (stale {stale})");
+        if let Some((newest, _)) = server.iter().next_back() {
+            assert_eq!(got.last().map(|(id, _)| *id), Some(*newest), "seed {seed}");
         }
     }
 }

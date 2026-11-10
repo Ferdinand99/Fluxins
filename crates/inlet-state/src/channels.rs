@@ -34,44 +34,62 @@ pub fn is_private(kind: i64) -> bool {
     matches!(kind, DM | GROUP_DM | PERSONAL_NOTES)
 }
 
+/// A stored channel with its guild and parent parsed once.
+#[derive(Debug, Clone, PartialEq)]
+struct Entry {
+    channel: Channel,
+    guild: Option<GuildId>,
+    parent: Option<ChannelId>,
+}
+
 /// Every channel the account knows, by ID.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Channels {
-    by_id: BTreeMap<ChannelId, Channel>,
+    by_id: BTreeMap<ChannelId, Entry>,
     private: BTreeSet<ChannelId>,
 }
 
 impl Channels {
     /// A channel.
     pub fn get(&self, id: ChannelId) -> Option<&Channel> {
-        self.by_id.get(&id)
+        self.by_id.get(&id).map(|e| &e.channel)
     }
 
+    /// Changes fields that are not the guild or the parent.
     pub(crate) fn get_mut(&mut self, id: ChannelId) -> Option<&mut Channel> {
-        self.by_id.get_mut(&id)
+        self.by_id.get_mut(&id).map(|e| &mut e.channel)
     }
 
     /// The guild a known channel belongs to.
     pub fn guild_of(&self, id: ChannelId) -> Option<GuildId> {
-        GuildId::parse_opt(self.get(id)?.guild_id.as_deref())
+        self.by_id.get(&id)?.guild
     }
 
     /// The parent (category, or a thread's channel).
     pub fn parent_of(&self, id: ChannelId) -> Option<ChannelId> {
-        ChannelId::parse_opt(self.get(id)?.parent_id.as_deref())
+        self.by_id.get(&id)?.parent
     }
 
     /// Stores a channel. Returns whether anything changed.
     pub(crate) fn insert(&mut self, id: ChannelId, channel: Channel) -> bool {
-        if channel.guild_id.is_none() {
+        let guild = GuildId::parse_opt(channel.guild_id.as_deref());
+        if guild.is_none() {
             self.private.insert(id);
         } else {
             self.private.remove(&id);
         }
         match self.by_id.get(&id) {
-            Some(old) if *old == channel => false,
+            Some(old) if old.channel == channel => false,
             _ => {
-                self.by_id.insert(id, channel);
+                let parent = ChannelId::parse_opt(channel.parent_id.as_deref());
+                self.by_id.insert(
+                    id,
+                    Entry {
+                        channel,
+                        guild,
+                        parent,
+                    },
+                );
                 true
             }
         }
@@ -79,14 +97,14 @@ impl Channels {
 
     pub(crate) fn remove(&mut self, id: ChannelId) -> Option<Channel> {
         self.private.remove(&id);
-        self.by_id.remove(&id)
+        self.by_id.remove(&id).map(|e| e.channel)
     }
 
     /// Direct messages, group DMs and notes, in ID order.
     pub fn private(&self) -> impl Iterator<Item = (ChannelId, &Channel)> {
         self.private
             .iter()
-            .filter_map(|id| self.by_id.get(id).map(|c| (*id, c)))
+            .filter_map(|id| self.get(*id).map(|c| (*id, c)))
     }
 
     /// Number of private channels.

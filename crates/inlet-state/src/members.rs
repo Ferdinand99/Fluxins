@@ -33,6 +33,7 @@ impl Members {
         let mut member = member.clone();
         member.extra.remove("presence");
         member.extra.remove("guild_id");
+        crate::size::cap_member(&mut member, id == me);
         if id == me {
             if self.me.as_ref() == Some(&member) {
                 return false;
@@ -46,6 +47,29 @@ impl Members {
         }
         self.others.insert(id, member);
         true
+    }
+
+    /// Stores a member only when none is cached for the user (Fluxer's
+    /// `hydrateIfMissing`, for the `member` on messages and typing): such a
+    /// copy may be older than the cached one.
+    pub(crate) fn insert_if_missing(&mut self, member: &GuildMember, me: UserId) -> bool {
+        let Some(id) = member.user_id().and_then(UserId::parse) else {
+            return false;
+        };
+        if self.get(id, me).is_some() {
+            return false;
+        }
+        self.upsert(member, me)
+    }
+
+    /// Evicts the least recently used cached member (never the account's own).
+    pub(crate) fn evict_oldest(&mut self) -> bool {
+        self.others.pop_oldest().is_some()
+    }
+
+    /// Number of cached members other than the account.
+    pub fn others_len(&self) -> usize {
+        self.others.len()
     }
 
     /// Removes a member. Returns whether it was there.

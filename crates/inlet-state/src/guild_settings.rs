@@ -98,7 +98,9 @@ impl Default for GuildNotificationSettings {
             suppress_everyone: false,
             suppress_roles: false,
             mute: Mute::default(),
-            message_notifications: notifications::ALL_MESSAGES,
+            // Fluxer's default for a guild without settings: follow the
+            // guild's own default (`effectiveMessageNotifications`).
+            message_notifications: notifications::INHERIT,
             channel_overrides: BTreeMap::new(),
         }
     }
@@ -115,7 +117,7 @@ impl GuildNotificationSettings {
         }
         self.mute = Mute::read(obj, self.mute);
         if let Some(v) = obj.get("message_notifications") {
-            self.message_notifications = v.as_i64().unwrap_or(notifications::ALL_MESSAGES);
+            self.message_notifications = v.as_i64().unwrap_or(notifications::INHERIT);
         }
         if let Some(v) = obj.get("channel_overrides") {
             self.channel_overrides = read_overrides(v);
@@ -284,12 +286,18 @@ mod tests {
         assert!(!s.guild_muted(g, 0));
         assert!(s.get(g).suppress_everyone);
         assert!(s.channel_muted(g, ChannelId(5), 0));
+        // No level chosen: the guild's default applies.
+        assert_eq!(s.guild_notifications(g, 1), 1);
+        s.update(&json!({"guild_id": "1", "message_notifications": 0}));
         assert_eq!(s.guild_notifications(g, 1), 0);
         s.update(&json!({"guild_id": "1", "message_notifications": 3}));
         assert_eq!(s.guild_notifications(g, 1), 1);
+        // A guild without any settings entry follows the guild's default too,
+        // and direct messages default to every message.
         assert_eq!(
-            s.guild_notifications(Some(GuildId(2)), 1),
-            notifications::ALL_MESSAGES
+            s.guild_notifications(Some(GuildId(2)), notifications::ONLY_MENTIONS),
+            notifications::ONLY_MENTIONS
         );
+        assert_eq!(s.guild_notifications(None, 1), notifications::ALL_MESSAGES);
     }
 }

@@ -21,8 +21,9 @@ use std::collections::BTreeMap;
 use inlet_protocol::models::parse_timestamp_ms;
 use inlet_protocol::ReadState;
 
+use crate::bounded::LruMap;
 use crate::ids::{ChannelId, GuildId, MessageId};
-use crate::limits::{MAX_COUNTED_MENTIONS, MAX_READ_STATES};
+use crate::limits::{MAX_ARCHIVED_READ_STATES, MAX_COUNTED_MENTIONS, MAX_READ_STATES};
 
 /// What the sidebar shows for a channel or guild.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -93,30 +94,78 @@ fn clamp_count(n: u64) -> u32 {
     u32::try_from(n).unwrap_or(u32::MAX)
 }
 
+/// How an ack came about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AckKind {
+    /// The user read the channel (opened it, pressed "mark as read").
+    /// Clears a "mark unread".
+    Explicit,
+    /// The channel is open at the bottom while messages arrive. Ignored
+    /// while a "mark unread" holds, as in Fluxer.
+    Automatic,
+}
+
 /// Every channel's read state.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+///
+/// Entries exist for known channels. Read states of channels that are not
+/// known right now (READY rows of guilds that are still loading, channels
+/// whose access was lost) wait in a bounded archive and come back when the
+/// channel does (Fluxer's `archiveState`).
+#[derive(Debug, Clone, PartialEq)]
 pub struct ReadStates {
     by_channel: BTreeMap<ChannelId, ReadStateEntry>,
+    archived: LruMap<ChannelId, ReadStateEntry>,
+}
+
+impl Default for ReadStates {
+    fn default() -> Self {
+        ReadStates {
+            by_channel: BTreeMap::new(),
+            archived: LruMap::new(MAX_ARCHIVED_READ_STATES),
+        }
+    }
 }
 
 impl ReadStates {
-    /// READY's `read_states`.
+    /// READY's `read_states`. They wait in the archive until their channel
+    /// is seeded.
     pub(crate) fn from_ready(rows: &[ReadState]) -> Self {
         let mut s = ReadStates::default();
         for row in rows {
             let Some(ch) = ChannelId::parse(&row.id) else {
                 continue;
             };
-            let Some(e) = s.ensure(ch, None) else { break };
-            e.ack_message_id = MessageId::parse_opt(row.last_message_id.as_deref());
+            let mut e = ReadStateEntry {
+                ack_message_id: MessageId::parse_opt(row.last_message_id.as_deref()),
+                ack_pin_ms: row
+                    .last_pin_timestamp
+                    .as_deref()
+                    .and_then(parse_timestamp_ms)
+                    .unwrap_or(0),
+                ..Default::default()
+            };
             e.reset_mentions(clamp_count(row.mention_count));
-            e.ack_pin_ms = row
-                .last_pin_timestamp
-                .as_deref()
-                .and_then(parse_timestamp_ms)
-                .unwrap_or(0);
+            s.archived.insert(ch, e);
         }
         s
+    }
+
+    /// Moves a channel's entry to the archive (the channel was hidden or
+    /// deleted). Its mentions are dropped, as in Fluxer.
+    pub(crate) fn archive(&mut self, ch: ChannelId) -> bool {
+        let Some(mut e) = self.by_channel.remove(&ch) else {
+            return false;
+        };
+        e.reset_mentions(0);
+        e.last_message_id = None;
+        e.last_pin_ms = 0;
+        self.archived.insert(ch, e);
+        true
+    }
+
+    /// Number of archived entries.
+    pub fn archived_len(&self) -> usize {
+        self.archived.len()
     }
 
     /// A channel's entry.
@@ -130,10 +179,14 @@ impl ReadStates {
         ch: ChannelId,
         guild: Option<GuildId>,
     ) -> Option<&mut ReadStateEntry> {
-        if !self.by_channel.contains_key(&ch) && self.by_channel.len() >= MAX_READ_STATES {
-            return None;
+        if !self.by_channel.contains_key(&ch) {
+            if self.by_channel.len() >= MAX_READ_STATES {
+                return None;
+            }
+            let restored = self.archived.remove(&ch).unwrap_or_default();
+            self.by_channel.insert(ch, restored);
         }
-        let e = self.by_channel.entry(ch).or_default();
+        let e = self.by_channel.get_mut(&ch)?;
         if guild.is_some() {
             e.guild = guild;
         }
@@ -204,8 +257,11 @@ impl ReadStates {
         *e != before
     }
 
-    /// MESSAGE_ACK from the server (`ReadStateServerAckMachine`, without the
-    /// version check: the protocol crate does not pass `version` on).
+    /// MESSAGE_ACK from the server (`ReadStateServerAckMachine`).
+    ///
+    /// Deviation: there is no version check, and a missing `mention_count`
+    /// counts as 0 (Fluxer keeps the old count); the protocol crate passes on
+    /// neither `version` nor a missing count yet.
     pub(crate) fn server_ack(
         &mut self,
         ch: ChannelId,
@@ -234,13 +290,16 @@ impl ReadStates {
         *e != before
     }
 
-    /// The account read the channel up to `id` (after the app sent the ack).
-    /// Never moves the ack back. `mentions_after` are the mentions that stay
-    /// unread after `id`.
-    pub(crate) fn local_ack(&mut self, ch: ChannelId, id: MessageId, mentions_after: u32) -> bool {
+    /// The account read the channel up to `id` (Fluxer's `applyAck`): the
+    /// mentions go to 0 and the ack never moves back. An automatic ack does
+    /// nothing while a "mark unread" holds.
+    pub(crate) fn local_ack(&mut self, ch: ChannelId, id: MessageId, kind: AckKind) -> bool {
         let Some(e) = self.by_channel.get_mut(&ch) else {
             return false;
         };
+        if kind == AckKind::Automatic && e.manual {
+            return false;
+        }
         if e.ack_message_id.is_some_and(|ack| id < ack) {
             return false;
         }
@@ -249,7 +308,7 @@ impl ReadStates {
         e.ack_message_id = Some(id);
         e.manual = false;
         e.counted.retain(|m| *m > id);
-        e.mention_count = mentions_after;
+        e.mention_count = 0;
         *e != before
     }
 
@@ -276,11 +335,14 @@ impl ReadStates {
     }
 
     pub(crate) fn remove(&mut self, ch: ChannelId) -> bool {
-        self.by_channel.remove(&ch).is_some()
+        let archived = self.archived.remove(&ch).is_some();
+        self.by_channel.remove(&ch).is_some() || archived
     }
 
+    /// Drops every entry, archived or not, that `keep` refuses.
     pub(crate) fn retain(&mut self, mut keep: impl FnMut(ChannelId, &ReadStateEntry) -> bool) {
         self.by_channel.retain(|k, v| keep(*k, v));
+        self.archived.retain(|k, v| keep(*k, v));
     }
 
     /// Number of entries.

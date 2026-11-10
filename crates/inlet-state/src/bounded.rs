@@ -72,6 +72,13 @@ impl<K: Ord + Copy, V> LruMap<K, V> {
         }
     }
 
+    /// Removes and returns the least recently used entry.
+    pub(crate) fn pop_oldest(&mut self) -> Option<(K, V)> {
+        let (_, key) = self.order.pop_first()?;
+        let (v, _) = self.entries.remove(&key)?;
+        Some((key, v))
+    }
+
     pub(crate) fn get(&self, key: &K) -> Option<&V> {
         self.entries.get(key).map(|(v, _)| v)
     }
@@ -134,7 +141,9 @@ mod tests {
         assert_eq!(m.insert(3, "d"), None);
         assert_eq!(m.get(&3), Some(&"d"));
         assert_eq!(m.remove(&1), Some("a"));
-        m.retain(|_, v| *v != "d");
+        m.insert(4, "e");
+        assert_eq!(m.pop_oldest(), Some((3, "d")));
+        m.retain(|_, v| *v != "e");
         assert_eq!(m.len(), 0);
         assert_eq!(m.order.len(), 0);
     }

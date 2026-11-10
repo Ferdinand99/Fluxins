@@ -6,7 +6,7 @@ use common::*;
 use inlet_protocol::permissions::*;
 use inlet_protocol::Dispatch;
 use inlet_state::limits::{MAX_MESSAGES_PER_CHANNEL, MAX_MESSAGE_WINDOWS, TYPING_EXPIRY_MS};
-use inlet_state::{AccountState, ChannelId, MessageId, MessagesPage, Permissions, Unread};
+use inlet_state::{AccountState, AckKind, ChannelId, MessageId, MessagesPage, Permissions, Unread};
 use serde_json::json;
 
 fn ids(s: &AccountState, c: ChannelId) -> Vec<MessageId> {
@@ -132,7 +132,7 @@ fn channel_delete_removes_it_and_its_messages() {
         ch(DM),
         MessagesPage::latest(vec![message(mid(4, 0), DM, OTHER)], 50),
     );
-    s.mark_read(ch(DM), None);
+    s.mark_read(ch(DM), None, AckKind::Explicit);
     s.apply(&d("CHANNEL_DELETE", json!({"id": DM, "type": 1})));
     assert!(s.channel(ch(DM)).is_none() && s.messages(ch(DM)).is_none());
     assert_eq!(
@@ -436,7 +436,8 @@ fn unread_counts_mentions_of_me_my_roles_everyone_and_here() {
     );
     assert_eq!(s.unread(ch(DM)).mentions, 2);
 
-    // mark_read keeps the mentions after the acked message (computeMentionCountAfterAck).
+    // An automatic ack does nothing while "mark unread" holds; an explicit
+    // ack clears it and, as Fluxer's applyAck, zeroes the mentions.
     s.apply_messages(
         ch(DM),
         MessagesPage::latest(
@@ -447,16 +448,23 @@ fn unread_counts_mentions_of_me_my_roles_everyone_and_here() {
             50,
         ),
     );
-    s.mark_read(ch(DM), Some(mid(12, 0)));
+    assert!(s
+        .mark_read(ch(DM), None, AckKind::Automatic)
+        .read_state_channels
+        .is_empty());
+    assert_eq!(s.unread(ch(DM)).mentions, 2);
+    let c = s.mark_read(ch(DM), Some(mid(12, 0)), AckKind::Explicit);
+    assert!(c.read_state_channels.contains(&ch(DM)) && c.read_state_guilds.contains(&None));
     assert_eq!(
         s.unread(ch(DM)),
         Unread {
             unread: true,
-            mentions: 1,
+            mentions: 0,
             muted: false
         }
     );
-    s.mark_read(ch(DM), None);
+    assert!(!s.read_state(ch(DM)).unwrap().manual);
+    s.mark_read(ch(DM), None, AckKind::Automatic);
     assert_eq!(s.unread(ch(DM)), Unread::default());
 }
 
@@ -741,7 +749,7 @@ fn typing_expires_and_ends_with_the_message() {
         "TYPING_START",
         json!({"channel_id": GENERAL, "user_id": OTHER, "timestamp": 1}),
     ));
-    assert_eq!(c.typing.as_slice(), &[ch(GENERAL)]);
+    assert!(c.typing.contains(&ch(GENERAL)) && c.typing.iter().count() == 1);
     // The account's own typing and typing in unknown channels are ignored.
     assert!(s
         .apply(&d(
@@ -757,7 +765,7 @@ fn typing_expires_and_ends_with_the_message() {
         .is_empty());
     assert_eq!(s.typing(ch(GENERAL)), vec![uid(OTHER)]);
     let c = s.tick(now + TYPING_EXPIRY_MS);
-    assert_eq!(c.typing.as_slice(), &[ch(GENERAL)]);
+    assert!(c.typing.contains(&ch(GENERAL)) && c.typing.iter().count() == 1);
     assert!(s.typing(ch(GENERAL)).is_empty());
     s.apply(&d(
         "TYPING_START",
@@ -903,7 +911,7 @@ fn huge_messages_stay_within_the_byte_budget() {
     assert!(w.len() > 1 && w.len() < 40);
     assert!(w.has_more_before());
     assert_eq!(w.newest_id(), Some(mid(40, 0)));
-    // A single message over the per-message cap is not kept, but still counts as unread.
+    // A single message over the per-message cap is kept as a stub, and still counts as unread.
     let huge = "x".repeat(300 * 1024);
     s.apply(&create(
         mid(100, 0),
@@ -911,6 +919,285 @@ fn huge_messages_stay_within_the_byte_budget() {
         OTHER,
         json!({"content": huge, "mention_everyone": true}),
     ));
-    assert!(s.messages(ch(GENERAL)).unwrap().get(mid(100, 0)).is_none());
+    let stub = s.messages(ch(GENERAL)).unwrap().get(mid(100, 0)).unwrap();
+    assert!(inlet_state::messages::is_oversized(stub) && stub.content.is_empty());
     assert_eq!(s.unread(ch(GENERAL)).mentions, 1);
+}
+
+fn window_ids(s: &AccountState, c: &str) -> Vec<MessageId> {
+    ids(s, ch(c))
+}
+
+#[test]
+fn create_and_delete_during_the_first_load_are_kept() {
+    let mut s = state();
+    let c = s.begin_load(ch(GENERAL));
+    assert!(c.messages.contains(&ch(GENERAL)));
+    assert!(!s.messages(ch(GENERAL)).unwrap().has_newest());
+    // While GET /messages is in flight: a new message, a delete and an edit.
+    s.apply(&create(mid(10, 0), GENERAL, OTHER, json!({})));
+    s.apply(&d(
+        "MESSAGE_DELETE",
+        json!({"id": mid(2, 0).to_string(), "channel_id": GENERAL}),
+    ));
+    s.apply(&d(
+        "MESSAGE_UPDATE",
+        message_json(
+            mid(3, 0),
+            GENERAL,
+            OTHER,
+            json!({"content": "edited", "edited_timestamp": "2026-01-01T01:30:00Z"}),
+        ),
+    ));
+    assert_eq!(s.messages(ch(GENERAL)).unwrap().pending_len(), 2);
+    // The page was read before all of it.
+    let page = vec![
+        message(mid(3, 0), GENERAL, OTHER),
+        message(mid(2, 0), GENERAL, OTHER),
+        message(mid(1, 0), GENERAL, OTHER),
+    ];
+    s.apply_messages(ch(GENERAL), MessagesPage::latest(page, 50));
+    assert_eq!(
+        window_ids(&s, GENERAL),
+        vec![mid(1, 0), mid(3, 0), mid(10, 0)]
+    );
+    let w = s.messages(ch(GENERAL)).unwrap();
+    assert_eq!(w.get(mid(3, 0)).unwrap().content, "edited");
+    assert!(w.has_newest() && w.pending_len() == 0);
+}
+
+#[test]
+fn delete_during_a_refetch_after_ready_stays_deleted() {
+    let mut s = state();
+    let first = vec![
+        message(mid(3, 0), GENERAL, OTHER),
+        message(mid(2, 0), GENERAL, OTHER),
+        message(mid(1, 0), GENERAL, OTHER),
+    ];
+    s.apply_messages(ch(GENERAL), MessagesPage::latest(first.clone(), 50));
+    s.apply(&Dispatch::Ready(Box::new(ready())));
+    assert!(!s.messages(ch(GENERAL)).unwrap().has_newest());
+    // Between READY and the refetch: one delete, one new message.
+    s.apply(&d(
+        "MESSAGE_DELETE",
+        json!({"id": mid(2, 0).to_string(), "channel_id": GENERAL}),
+    ));
+    s.apply(&create(mid(5, 0), GENERAL, OTHER, json!({})));
+    s.apply_messages(ch(GENERAL), MessagesPage::latest(first, 50));
+    assert_eq!(
+        window_ids(&s, GENERAL),
+        vec![mid(1, 0), mid(3, 0), mid(5, 0)]
+    );
+    assert!(s.messages(ch(GENERAL)).unwrap().has_newest());
+}
+
+#[test]
+fn an_overflowing_live_buffer_asks_for_another_page() {
+    use inlet_state::limits::MAX_PENDING_LIVE;
+    let mut s = state();
+    s.begin_load(ch(GENERAL));
+    let n = MAX_PENDING_LIVE as u64 + 5;
+    for i in 0..n {
+        s.apply(&create(mid(10 + i, 0), GENERAL, OTHER, json!({})));
+    }
+    s.apply_messages(
+        ch(GENERAL),
+        MessagesPage::latest(vec![message(mid(1, 0), GENERAL, OTHER)], 50),
+    );
+    let w = s.messages(ch(GENERAL)).unwrap();
+    assert!(!w.has_newest(), "the app must load the newest page again");
+    assert_eq!(window_ids(&s, GENERAL), vec![mid(1, 0)]);
+    // The next newest page completes the window.
+    let page: Vec<_> = (0..50)
+        .rev()
+        .map(|i| message(mid(10 + n - 50 + i, 0), GENERAL, OTHER))
+        .collect();
+    s.apply_messages(ch(GENERAL), MessagesPage::latest(page, 50));
+    assert!(s.messages(ch(GENERAL)).unwrap().has_newest());
+}
+
+#[test]
+fn a_hidden_channel_keeps_its_ack_and_takes_its_threads() {
+    let mut s = state();
+    s.apply(&create(mid(1, 0), GENERAL, OTHER, json!({})));
+    s.mark_read(ch(GENERAL), None, AckKind::Explicit);
+    s.apply(&d(
+        "CHANNEL_CREATE",
+        json!({"id": "304", "type": 11, "guild_id": GUILD, "parent_id": GENERAL}),
+    ));
+    assert!(s.channel(ch("304")).is_some());
+    // Access lost: Fluxer deletes the channel; its thread goes with it.
+    let c = s.apply(&d(
+        "CHANNEL_DELETE",
+        json!({"id": GENERAL, "type": 0, "guild_id": GUILD}),
+    ));
+    assert!(c.channels.contains(&ch("304")));
+    assert!(s.channel(ch("304")).is_none());
+    assert!(s
+        .guild(g())
+        .unwrap()
+        .channels
+        .iter()
+        .all(|c| *c != ch("304")));
+    assert_eq!(s.permissions(g(), ch("304")), Permissions::NONE);
+    // Access regained: the ack comes back, so the channel is not unread.
+    s.apply(&d(
+        "CHANNEL_CREATE",
+        json!({"id": GENERAL, "type": 0, "guild_id": GUILD,
+        "last_message_id": mid(1, 0).to_string()}),
+    ));
+    assert_eq!(
+        s.read_state(ch(GENERAL)).unwrap().ack_message_id,
+        Some(mid(1, 0))
+    );
+    assert_eq!(s.unread(ch(GENERAL)), Unread::default());
+}
+
+#[test]
+fn changes_name_the_channels_and_guilds() {
+    let mut s = state();
+    let c = s.apply(&create(mid(1, 0), GENERAL, OTHER, json!({})));
+    assert!(c.read_state_channels.contains(&ch(GENERAL)));
+    assert!(c.read_state_guilds.contains(&Some(g())) && !c.read_state_guilds.contains(&None));
+    let c = s.apply(&d(
+        "GUILD_ROLE_UPDATE",
+        json!({"guild_id": GUILD, "role": role(GUILD, VIEW_CHANNEL, 0)}),
+    ));
+    assert!(c.permission_guilds.contains(&g()));
+    let c = s.apply(&d(
+        "GUILD_MEMBER_ADD",
+        json!({"guild_id": GUILD, "user": {"id": "21", "username": "bo"}, "roles": []}),
+    ));
+    assert!(c.member_guilds.contains(&g()) && c.members);
+    // A settings change can touch every channel: the lists say "all".
+    let c = s.apply(&d(
+        "USER_GUILD_SETTINGS_UPDATE",
+        json!({"guild_id": GUILD, "muted": true}),
+    ));
+    assert!(c.read_state_guilds.is_all() && c.read_state_guilds.contains(&Some(g())));
+}
+
+#[test]
+fn a_message_member_never_overwrites_the_own_member() {
+    let mut s = state();
+    // A replayed message carries an old member without the mod role.
+    s.apply(&create(
+        mid(1, 0),
+        GENERAL,
+        ME,
+        json!({"member": {"roles": [], "nick": "old"}}),
+    ));
+    let me = s.member(g(), uid(ME)).unwrap();
+    assert_eq!(me.roles, vec![MOD_ROLE.to_string()]);
+    assert!(me.nick.is_none());
+    // A missing member is filled in, and not replaced by a later copy.
+    s.apply(&create(
+        mid(2, 0),
+        GENERAL,
+        OTHER,
+        json!({"member": {"roles": [OTHER_ROLE], "nick": "ana"}}),
+    ));
+    assert_eq!(
+        s.member(g(), uid(OTHER)).unwrap().nick.as_deref(),
+        Some("ana")
+    );
+    s.apply(&create(
+        mid(3, 0),
+        GENERAL,
+        OTHER,
+        json!({"member": {"roles": [], "nick": "older"}}),
+    ));
+    assert_eq!(
+        s.member(g(), uid(OTHER)).unwrap().nick.as_deref(),
+        Some("ana")
+    );
+}
+
+#[test]
+fn a_thread_with_a_parent_outside_the_guild_gets_nothing() {
+    let mut s = state();
+    s.apply(&d(
+        "CHANNEL_CREATE",
+        json!({"id": "305", "type": 11, "guild_id": GUILD, "parent_id": DM}),
+    ));
+    s.apply(&d(
+        "CHANNEL_CREATE",
+        json!({"id": "306", "type": 11, "guild_id": GUILD, "parent_id": GENERAL}),
+    ));
+    assert_eq!(s.permissions(g(), ch("305")), Permissions::NONE);
+    assert!(s.permissions(g(), ch("306")).can_view());
+}
+
+#[test]
+fn a_large_guild_defaults_to_only_mentions() {
+    use inlet_state::guild_settings::notifications::{ALL_MESSAGES, ONLY_MENTIONS};
+    let mut gr = guild_ready(default_roles(), default_channels(), &[MOD_ROLE]);
+    gr["member_count"] = json!(300);
+    let r = ready_from(ready_json(gr, json!([]), json!([])));
+    let s = AccountState::from_ready_at(&r, JOINED_MS as i64);
+    let guild = s.guild(g()).unwrap();
+    assert!(guild.is_large());
+    assert_eq!(
+        s.guild_settings()
+            .guild_notifications(Some(g()), guild.default_notifications()),
+        ONLY_MENTIONS
+    );
+    let small = state();
+    let guild = small.guild(g()).unwrap();
+    assert_eq!(
+        small
+            .guild_settings()
+            .guild_notifications(Some(g()), guild.default_notifications()),
+        ALL_MESSAGES
+    );
+}
+
+#[test]
+fn oversized_objects_are_trimmed_and_overwrite_floods_hide_the_channel() {
+    let mut s = state();
+    s.apply(&d(
+        "GUILD_MEMBER_ADD",
+        json!({"guild_id": GUILD,
+        "user": {"id": "21", "username": "bo", "junk": "x".repeat(100_000)},
+        "roles": [], "junk": "y".repeat(100_000)}),
+    ));
+    let m = s.member(g(), uid("21")).unwrap();
+    assert!(m.extra.is_empty() && m.user.as_ref().unwrap().extra.is_empty());
+    assert!(s.user(uid("21")).unwrap().extra.is_empty());
+    let ow: Vec<_> = (0..inlet_state::limits::MAX_OVERWRITES + 1)
+        .map(|i| json!({"id": (50_000 + i).to_string(), "type": 1, "allow": "0", "deny": "0"}))
+        .collect();
+    s.apply(&d(
+        "CHANNEL_UPDATE",
+        json!({"id": RANDOM, "type": 0, "guild_id": GUILD, "permission_overwrites": ow}),
+    ));
+    assert!(
+        !s.permissions(g(), ch(RANDOM)).can_view(),
+        "an unreadable overwrite list fails closed"
+    );
+}
+
+#[test]
+fn the_member_cache_has_an_account_wide_cap() {
+    use inlet_state::limits::{MAX_MEMBERS_PER_GUILD, MAX_MEMBERS_TOTAL};
+    let mut s = state();
+    let guilds = MAX_MEMBERS_TOTAL / MAX_MEMBERS_PER_GUILD + 2;
+    for gi in 0..guilds as u64 {
+        let gid = (60_000 + gi).to_string();
+        s.apply(&d(
+            "GUILD_CREATE",
+            json!({"id": gid, "roles": [role(&gid, VIEW_CHANNEL, 0)],
+            "members": [{"user": {"id": ME}, "roles": []}]}),
+        ));
+        let members: Vec<_> = (0..MAX_MEMBERS_PER_GUILD as u64)
+            .map(|i| json!({"user": {"id": (1_000_000 + gi * 10_000 + i).to_string(), "username": "m"}, "roles": []}))
+            .collect();
+        s.apply(&d(
+            "GUILD_MEMBERS_CHUNK",
+            json!({"guild_id": gid, "members": members}),
+        ));
+    }
+    let total: usize = s.guilds().map(|g| g.members.others_len()).sum();
+    assert_eq!(total, MAX_MEMBERS_TOTAL);
+    assert!(s.guilds().all(|g| g.members.me().is_some()));
 }

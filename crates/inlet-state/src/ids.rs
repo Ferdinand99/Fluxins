@@ -16,10 +16,12 @@ macro_rules! id_type {
         pub struct $name(pub u64);
 
         impl $name {
-            /// Parses a decimal snowflake; anything else is `None`.
+            /// Parses a snowflake in canonical decimal form (no sign, spaces
+            /// or leading zeros), so the parsed ID and the original string
+            /// always agree; anything else is `None`.
             pub fn parse(s: &str) -> Option<Self> {
-                let s = s.trim();
-                if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+                let b = s.as_bytes();
+                if b.is_empty() || !b.iter().all(u8::is_ascii_digit) || (b.len() > 1 && b[0] == b'0') {
                     return None;
                 }
                 s.parse().ok().map($name)
@@ -83,7 +85,9 @@ mod tests {
     #[test]
     fn parses_only_decimal_snowflakes() {
         assert_eq!(ChannelId::parse("123"), Some(ChannelId(123)));
-        assert_eq!(ChannelId::parse(" 7 "), Some(ChannelId(7)));
+        assert_eq!(ChannelId::parse(" 7 "), None);
+        assert_eq!(ChannelId::parse("007"), None);
+        assert_eq!(ChannelId::parse("0"), Some(ChannelId(0)));
         assert_eq!(ChannelId::parse(""), None);
         assert_eq!(ChannelId::parse("-1"), None);
         assert_eq!(ChannelId::parse("+1"), None);

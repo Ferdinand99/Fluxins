@@ -28,6 +28,9 @@ impl Users {
         let Some(id) = UserId::parse(&user.id) else {
             return false;
         };
+        let mut user = user.clone();
+        crate::size::cap_user(&mut user);
+        let user = &user;
         match self.cache.get(&id) {
             Some(old) if old == user => {
                 self.cache.touch(&id);

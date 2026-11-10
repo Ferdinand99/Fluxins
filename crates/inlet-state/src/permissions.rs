@@ -20,7 +20,7 @@ use inlet_protocol::CurrentUser;
 
 use crate::channels::Channels;
 use crate::guilds::GuildState;
-use crate::ids::ChannelId;
+use crate::ids::{ChannelId, GuildId};
 
 /// Permission bits in one channel (see [`inlet_protocol::permissions`] for the bits).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
@@ -106,10 +106,20 @@ fn with_context<T>(
     Some(f(&ctx))
 }
 
-fn channel_bits(ctx: &PermissionContext<'_>, channels: &Channels, id: ChannelId) -> Option<u64> {
+fn channel_bits(
+    ctx: &PermissionContext<'_>,
+    channels: &Channels,
+    guild: GuildId,
+    id: ChannelId,
+) -> Option<u64> {
     let ch = channels.get(id)?;
+    // A thread's parent counts only when it is in the same guild; otherwise
+    // the thread has no parent (nothing unless owner or administrator).
     let parent = if ch.is_thread() {
-        channels.parent_of(id).and_then(|p| channels.get(p))
+        channels
+            .parent_of(id)
+            .filter(|p| channels.guild_of(*p) == Some(guild))
+            .and_then(|p| channels.get(p))
     } else {
         None
     };
@@ -127,7 +137,7 @@ pub(crate) fn recompute(
         let perms: BTreeMap<ChannelId, u64> = guild
             .channels
             .iter()
-            .filter_map(|id| Some((*id, channel_bits(ctx, channels, *id)?)))
+            .filter_map(|id| Some((*id, channel_bits(ctx, channels, guild.id, *id)?)))
             .collect();
         (ctx.guild(), perms)
     })
@@ -156,7 +166,7 @@ pub(crate) fn recompute_channels(
         ids.iter()
             .map(|id| {
                 let bits = if guild.channels.contains(id) {
-                    channel_bits(ctx, channels, *id)
+                    channel_bits(ctx, channels, guild.id, *id)
                 } else {
                     None
                 };
