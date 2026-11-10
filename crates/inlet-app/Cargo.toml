@@ -1,11 +1,30 @@
 [package]
 name = "inlet"
-description = "A native desktop client for Fluxer"
+description = "A native desktop client that works with Fluxer"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[[bin]]
+name = "inlet"
+path = "src/main.rs"
+
 [dependencies]
 inlet-protocol = { path = "../inlet-protocol" }
+
+gpui.workspace = true
+gpui_platform.workspace = true
+# Fluxer's own markdown parser (AGPL-3.0-or-later, like Inlet), pinned to a commit.
+fluxer_markdown_parser = { git = "https://github.com/fluxerapp/fluxer", rev = "f1cba64e64bda5f57ad3cf827c1d5a98ecdd80df" }
+
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+dirs = "6"
+env_logger = "0.11"
+futures = "0.3"
+keyring = { version = "3.6", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust", "vendored"] }
+log = "0.4"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+unicode-segmentation = "1"
