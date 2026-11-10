@@ -1,0 +1,28 @@
+[package]
+name = "inlet-media"
+description = "Fetches, decodes, caches and animates images for Inlet, with hard limits on untrusted input"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+bytes = "1"
+dirs = "6"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+# Pure-Rust decoders only: png (with APNG), jpeg (zune-jpeg), gif and webp (image-webp).
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["rt", "sync", "time"] }
+tracing = "0.1"
+url = "2"
+
+[dev-dependencies]
+flate2 = "1"
+image-webp = "0.2"
+png = "0.18"
+proptest = { version = "1", default-features = false, features = ["std"] }
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "test-util"] }

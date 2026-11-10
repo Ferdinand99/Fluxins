@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
-members = ["crates/inlet-protocol", "crates/inlet-app", "crates/inlet-emoji", "crates/inlet-editor"]
+# Every crate under crates/ is a member. A new crate needs no edit here, so parallel pull
+# requests that add crates do not conflict on this line.
+members = ["crates/*"]
 
 [workspace.package]
 version = "0.0.1"

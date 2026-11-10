@@ -2968,6 +2968,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "inlet-media"
+version = "0.0.1"
+dependencies = [
+ "bytes",
+ "dirs",
+ "flate2",
+ "futures-util",
+ "image",
+ "image-webp",
+ "png 0.18.1",
+ "proptest",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "inlet-protocol"
 version = "0.0.1"
 dependencies = [
