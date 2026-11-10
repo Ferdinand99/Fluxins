@@ -71,8 +71,9 @@ async fn concurrent_requests_for_one_image_share_a_fetch_and_a_decode() {
             tokio::spawn(async move { media.load(avatar("a.png", 44)).await })
         })
         .collect();
-    wait_until("the fetch to start", || fetcher.calls() >= 1).await;
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Every caller has joined the one request before the fetch is let go.
+    wait_until("all 25 callers to join", || media.stats().waiters == 25).await;
+    assert_eq!(media.stats().in_flight, 1);
     fetcher.open_gate();
 
     let mut results = Vec::new();
@@ -154,16 +155,14 @@ async fn one_waiter_leaving_does_not_cancel_the_others() {
         let media = media.clone();
         tokio::spawn(async move { media.load(avatar("a.png", 40)).await })
     };
-    wait_until("the fetch to start", || fetcher.calls() == 1).await;
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    wait_until("both callers to join", || media.stats().waiters == 2).await;
 
     first.abort();
     let _ = first.await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert!(
-        !fetcher.dropped.load(Ordering::SeqCst),
-        "the fetch was cancelled too early"
-    );
+    // The request goes on for the one that is left. If the fetch had been cancelled,
+    // the second caller would fail below.
+    wait_until("the first caller to leave", || media.stats().waiters == 1).await;
+    assert_eq!(media.stats().in_flight, 1);
 
     fetcher.open_gate();
     assert!(second.await.unwrap().is_ok());
@@ -277,18 +276,22 @@ async fn bad_images_give_errors_and_are_not_retried_at_once() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn every_failure_is_remembered_with_a_growing_back_off() {
+    // Time only moves when the test moves it.
+    let clock = ManualClock::new();
     let fetcher = MockFetcher::new();
     let media = client(
         &fetcher,
         MediaConfig {
-            permanent_failure_backoff: Duration::from_millis(200),
-            failure_backoff: Duration::from_millis(200),
-            failure_backoff_max: Duration::from_millis(500),
+            permanent_failure_backoff: Duration::from_secs(200),
+            failure_backoff: Duration::from_secs(100),
+            failure_backoff_max: Duration::from_secs(500),
+            clock: clock.clone(),
             ..config()
         },
     );
+    let secs = Duration::from_secs;
 
-    // 404 is permanent, but the back-off ends.
+    // 404 is permanent, but the back-off ends: 200 s, then 400 s, then 500 s.
     let err = media.load(avatar("missing.png", 40)).await.unwrap_err();
     assert_eq!(err, MediaError::Fetch(FetchError::Status(404)));
     assert!(err.is_permanent());
@@ -304,31 +307,47 @@ async fn every_failure_is_remembered_with_a_growing_back_off() {
         "a dead URL must not be fetched on every paint"
     );
     assert_eq!(media.stats().failures, 1);
-    tokio::time::sleep(Duration::from_millis(260)).await;
+    clock.advance(secs(199));
+    let _ = media.load(avatar("missing.png", 40)).await;
+    assert_eq!(fetcher.calls(), 1, "still inside the first back-off");
+    clock.advance(secs(1));
+    let _ = media.load(avatar("missing.png", 40)).await;
+    assert_eq!(fetcher.calls(), 2, "the first back-off ended");
+    // The second failure doubled the wait to 400 s.
+    clock.advance(secs(399));
     let _ = media.load(avatar("missing.png", 40)).await;
     assert_eq!(fetcher.calls(), 2);
-    // The second failure doubled the wait (400 ms).
-    tokio::time::sleep(Duration::from_millis(260)).await;
-    let _ = media.load(avatar("missing.png", 40)).await;
-    assert_eq!(fetcher.calls(), 2);
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    clock.advance(secs(1));
     let _ = media.load(avatar("missing.png", 40)).await;
     assert_eq!(fetcher.calls(), 3);
+    // The third would be 800 s, but 500 s is the most.
+    clock.advance(secs(499));
+    let _ = media.load(avatar("missing.png", 40)).await;
+    assert_eq!(fetcher.calls(), 3);
+    clock.advance(secs(1));
+    let _ = media.load(avatar("missing.png", 40)).await;
+    assert_eq!(fetcher.calls(), 4);
 
-    // A server error is transient but remembered the same way.
+    // A server error is transient but remembered the same way, with the shorter wait.
     fetcher.serve_status("down.png", 503);
     let err = media.load(avatar("down.png", 40)).await.unwrap_err();
     assert_eq!(err, MediaError::Fetch(FetchError::Status(503)));
     assert!(!err.is_permanent());
+    assert_eq!(fetcher.calls(), 5);
+    clock.advance(secs(99));
     let _ = media.load(avatar("down.png", 40)).await;
-    assert_eq!(fetcher.calls(), 4);
+    assert_eq!(fetcher.calls(), 5);
+    clock.advance(secs(1));
+    let _ = media.load(avatar("down.png", 40)).await;
+    assert_eq!(fetcher.calls(), 6);
 
     // forget_failure ends the wait at once, and a success clears the record.
     media.forget_failure(&avatar("down.png", 40));
     fetcher.serve("down.png", png(&solid(8, 8, RED)));
     fetcher.statuses.lock().unwrap().clear();
     assert!(media.load(avatar("down.png", 40)).await.is_ok());
-    assert_eq!(fetcher.calls(), 5);
+    assert_eq!(fetcher.calls(), 7);
+    assert_eq!(media.stats().failures, 1, "only the dead URL is left");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -607,6 +626,10 @@ async fn avatars_and_emoji_still_decode_while_big_attachments_hold_every_general
         let media = media.clone();
         async move { media.load(attachment("a2.png")).await }
     });
+    wait_until("the second attachment to queue", || {
+        media.stats().waiting_to_decode == 1
+    })
+    .await;
     // An avatar and an emoji use the reserved slot and finish.
     let small = tokio::time::timeout(Duration::from_secs(10), async {
         let a = media.load(avatar("x.png", 40)).await;
@@ -659,7 +682,11 @@ async fn decodes_wait_for_the_memory_budget_not_only_for_a_slot() {
         let media = media.clone();
         async move { media.load(attachment("b.png")).await }
     });
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    // The second one has its image and waits for memory; the first still holds it all.
+    wait_until("the second decode to queue", || {
+        media.stats().waiting_to_decode == 1
+    })
+    .await;
     assert_eq!(
         gate.made.load(Ordering::SeqCst),
         1,
@@ -799,8 +826,13 @@ async fn a_damaged_disk_file_is_deleted_and_fetched_again_once() {
     first.load(avatar("a.png", 40)).await.unwrap();
     let file = dir.path().join(&files(dir.path())[0]);
 
-    // An empty file (power cut before the data reached the disk) and a bomb.
-    for damage in [Vec::new(), gif_claiming(65535, 65535), b"garbage".to_vec()] {
+    // An empty file (power cut before the data reached the disk), garbage, and a
+    // file cut off in the middle.
+    for damage in [
+        Vec::new(),
+        b"garbage".to_vec(),
+        good[..good.len() / 2].to_vec(),
+    ] {
         std::fs::write(&file, damage).unwrap();
         let before = fetcher.calls();
         let second = client(&fetcher, with_disk(dir.path(), 1 << 20));
@@ -832,5 +864,26 @@ async fn a_kind_with_a_lower_limit_does_not_delete_a_file_that_is_too_big_for_it
     let emoji = MediaRequest::new(url("big.png"), MediaKind::Emoji, Fit::square(32));
     let err = media.load(emoji).await.unwrap_err();
     assert!(matches!(err, MediaError::TooLargeEncoded { .. }), "{err:?}");
+    assert_eq!(std::fs::read(&file).unwrap(), big, "the file must stay");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_file_that_only_breaks_a_limit_of_one_request_is_kept_and_not_fetched_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let fetcher = MockFetcher::new();
+    let big = png(&solid(1000, 1000, RED));
+    fetcher.serve("big.png", big.clone());
+
+    let media = client(&fetcher, with_disk(dir.path(), 4 << 20));
+    assert!(media.load(attachment("big.png")).await.is_ok());
+    assert_eq!(fetcher.calls(), 1);
+    let file = dir.path().join(&files(dir.path())[0]);
+
+    // The same URL for a request that asked the proxy for 40 pixels: 1000 pixels
+    // is over its limit. The file is good; the network would say the same.
+    let small = avatar("big.png", 40).with_proxy_size(40);
+    let err = media.load(small).await.unwrap_err();
+    assert!(matches!(err, MediaError::BadDimensions { .. }), "{err:?}");
+    assert_eq!(fetcher.calls(), 1, "no download for a limit error");
     assert_eq!(std::fs::read(&file).unwrap(), big, "the file must stay");
 }

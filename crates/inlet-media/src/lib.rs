@@ -43,6 +43,7 @@
 #![forbid(unsafe_code)]
 
 mod client;
+mod clock;
 mod decode;
 mod disk;
 mod error;
@@ -54,6 +55,7 @@ mod scan;
 mod sink;
 
 pub use client::{MediaClient, MediaConfig, MediaRequest, MediaStats};
+pub use clock::{Clock, SystemClock};
 pub use decode::{decode, inspect, DecodeControl, Inspected};
 pub use disk::DiskCacheConfig;
 pub use error::{FetchError, MediaError};

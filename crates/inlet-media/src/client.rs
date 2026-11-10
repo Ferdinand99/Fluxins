@@ -14,6 +14,7 @@ use tokio::sync::{watch, OnceCell, OwnedSemaphorePermit, Semaphore};
 use tokio::task::AbortHandle;
 use url::{Host, Url};
 
+use crate::clock::{Clock, SystemClock};
 use crate::decode::{inspect, DecodeControl};
 use crate::disk::{key_for, DiskCache, DiskCacheConfig};
 use crate::fetch::FetchResponse;
@@ -64,6 +65,8 @@ pub struct MediaConfig {
     pub permanent_failure_backoff: Duration,
     /// The longest a failure is remembered. Default 1 hour.
     pub failure_backoff_max: Duration,
+    /// The clock that the back-off reads. The system clock by default.
+    pub clock: Arc<dyn Clock>,
 }
 
 impl Default for MediaConfig {
@@ -81,6 +84,7 @@ impl Default for MediaConfig {
             failure_backoff: Duration::from_secs(60),
             permanent_failure_backoff: Duration::from_secs(300),
             failure_backoff_max: Duration::from_secs(3600),
+            clock: Arc::new(SystemClock),
         }
     }
 }
@@ -137,6 +141,11 @@ pub struct MediaStats {
     pub memory_bytes: u64,
     /// Requests in progress.
     pub in_flight: usize,
+    /// Callers waiting for the requests in progress, summed. Two callers asking
+    /// for the same image share one request and count twice.
+    pub waiters: usize,
+    /// Requests that have an image to decode and wait for permission to start.
+    pub waiting_to_decode: usize,
     /// Images that are remembered as failed.
     pub failures: usize,
     /// Calls to the fetcher so far.
@@ -257,6 +266,7 @@ struct Inner<S: ImageSink> {
     next_id: AtomicU64,
     fetches: AtomicU64,
     decodes: AtomicU64,
+    waiting_to_decode: AtomicU64,
     memory_hits: AtomicU64,
     disk_hits: AtomicU64,
 }
@@ -322,6 +332,7 @@ impl<S: ImageSink> MediaClient<S> {
                 next_id: AtomicU64::new(1),
                 fetches: AtomicU64::new(0),
                 decodes: AtomicU64::new(0),
+                waiting_to_decode: AtomicU64::new(0),
                 memory_hits: AtomicU64::new(0),
                 disk_hits: AtomicU64::new(0),
                 config,
@@ -385,10 +396,16 @@ impl<S: ImageSink> MediaClient<S> {
             let memory = lock(&self.inner.memory);
             (memory.len(), memory.used())
         };
+        let (in_flight, waiters) = {
+            let flights = lock(&self.inner.flights);
+            (flights.len(), flights.values().map(|f| f.waiters).sum())
+        };
         MediaStats {
             memory_entries,
             memory_bytes,
-            in_flight: lock(&self.inner.flights).len(),
+            in_flight,
+            waiters,
+            waiting_to_decode: self.inner.waiting_to_decode.load(Ordering::Relaxed) as usize,
             failures: lock(&self.inner.failures).len(),
             fetches: self.inner.fetches.load(Ordering::Relaxed),
             decodes: self.inner.decodes.load(Ordering::Relaxed),
@@ -498,7 +515,7 @@ impl<S: ImageSink> Inner<S> {
     fn known_failure(&self, key: &Key) -> Option<MediaError> {
         let failures = lock(&self.failures);
         let failure = failures.get(key)?;
-        (failure.until > Instant::now()).then(|| failure.error.clone())
+        (failure.until > self.config.clock.now()).then(|| failure.error.clone())
     }
 
     fn record_failure(&self, key: &Key, error: &MediaError) {
@@ -508,7 +525,7 @@ impl<S: ImageSink> Inner<S> {
         } else {
             config.failure_backoff
         };
-        let now = Instant::now();
+        let now = self.config.clock.now();
         let mut failures = lock(&self.failures);
         let count = failures.get(key).map_or(0, |f| f.count).saturating_add(1);
         let delay = base
@@ -592,17 +609,16 @@ impl<S: ImageSink> Inner<S> {
                 Err(err)
             }
         };
-        {
-            let mut flights = lock(&self.flights);
-            if flights.get(key).is_some_and(|f| f.id == id) {
-                if let Some(flight) = flights.remove(key) {
-                    flight.tx.send_replace(Some(published));
-                }
-            }
-        }
-        // The app's code runs after every lock is released.
+        // The app's code runs after every lock is released, and before the waiters
+        // are woken: when `load` returns, the evictions it caused have been reported.
         for handle in released {
             self.sink.evicted(handle);
+        }
+        let mut flights = lock(&self.flights);
+        if flights.get(key).is_some_and(|f| f.id == id) {
+            if let Some(flight) = flights.remove(key) {
+                flight.tx.send_replace(Some(published));
+            }
         }
     }
 
@@ -718,13 +734,15 @@ impl<S: ImageSink> Inner<S> {
             .decode_one(encoded.clone(), request, &limits, small, cancel, &mut slot)
             .await;
         let (outcome, to_store) = match first {
-            // A file that does not decode is damaged, or from an older version with
-            // other limits. Delete it and ask the network once.
+            // A file that is not an image we can read is damaged. Delete it and ask
+            // the network once. A file that only breaks a limit of this request (a
+            // size, a frame count) is fine for another kind or size: keep it, and
+            // do not fetch what the same limits will refuse again.
             Err(err)
                 if from_disk
-                    && !matches!(
+                    && matches!(
                         err,
-                        MediaError::Cancelled | MediaError::DecodeTimeout | MediaError::TaskFailed
+                        MediaError::Corrupt(_) | MediaError::Unsupported | MediaError::DecoderPanic
                     ) =>
             {
                 tracing::debug!("cached image does not decode ({err}); fetching it again");
@@ -769,7 +787,10 @@ impl<S: ImageSink> Inner<S> {
     ) -> Result<(S::Handle, u64), MediaError> {
         let inspected = inspect(encoded, limits)?;
         let units = inspected.estimated_peak_bytes().div_ceil(MIB).min(1 << 20) as u32;
-        let permit = self.acquire_decode(small, units).await?;
+        self.waiting_to_decode.fetch_add(1, Ordering::Relaxed);
+        let permit = self.acquire_decode(small, units).await;
+        self.waiting_to_decode.fetch_sub(1, Ordering::Relaxed);
+        let permit = permit?;
         drop(slot.take());
 
         self.decodes.fetch_add(1, Ordering::Relaxed);
