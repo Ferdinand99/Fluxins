@@ -127,7 +127,7 @@ pub async fn connect(instance: p::Instance, credential: Credential) -> Result<Co
         // A stored token is only ever used with the hosts it was issued for.
         Credential::Stored { token, pins } => p::Session::from_token_pinned(instance, token, &pins)?,
         // A pasted token has no pins yet; it is pinned to this instance when saved.
-        Credential::Pasted(token) => p::Session::from_token(instance, token),
+        Credential::Pasted(token) => p::Session::from_token_unpinned(instance, token),
         Credential::SignedIn(signed_in) => p::Session::from_signed_in(instance, signed_in),
     };
     with_timeout(async {
