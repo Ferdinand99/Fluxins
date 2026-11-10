@@ -887,3 +887,100 @@ async fn a_file_that_only_breaks_a_limit_of_one_request_is_kept_and_not_fetched_
     assert_eq!(fetcher.calls(), 1, "no download for a limit error");
     assert_eq!(std::fs::read(&file).unwrap(), big, "the file must stay");
 }
+
+// ---- the app's code must not be able to hang a request ------------------------------
+
+/// A sink that panics every time the cache lets go of an image.
+struct PanicsOnEvict;
+
+impl ImageSink for PanicsOnEvict {
+    type Handle = Arc<DecodedImage>;
+    fn make(&self, image: DecodedImage) -> (Self::Handle, u64) {
+        let bytes = image.byte_size();
+        (Arc::new(image), bytes)
+    }
+    fn evicted(&self, _: Self::Handle) {
+        panic!("evicted bug");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sink_that_panics_in_evicted_cannot_hang_or_poison_a_request() {
+    let fetcher = MockFetcher::new();
+    for name in ["a", "b"] {
+        fetcher.serve(&format!("{name}.png"), png(&split(64, 64)));
+    }
+    // The cache holds one 20x20 image (1600 bytes), so every load evicts the last.
+    let media = MediaClient::new(
+        tokio::runtime::Handle::current(),
+        fetcher.clone(),
+        PanicsOnEvict,
+        MediaConfig {
+            memory_cache_bytes: 2000,
+            ..config()
+        },
+    );
+    assert!(media.load(avatar("a.png", 20)).await.is_ok());
+    // This one evicts the first, and the sink panics. The caller still gets its image.
+    let waiters = [
+        media.load(avatar("b.png", 20)),
+        media.load(avatar("b.png", 20)),
+    ];
+    for result in futures_util::future::join_all(waiters).await {
+        assert!(result.is_ok(), "{result:?}");
+    }
+    assert_eq!(media.stats().in_flight, 0, "the request must be gone");
+    // A new load of the evicted image starts fresh instead of joining a dead request.
+    let before = fetcher.calls();
+    assert!(media.load(avatar("a.png", 20)).await.is_ok());
+    assert_eq!(fetcher.calls(), before + 1);
+    // clear_memory survives the panics too.
+    media.clear_memory();
+    assert_eq!(media.stats().memory_entries, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancelled_waiter_does_not_leak_the_waiting_to_decode_count() {
+    let fetcher = MockFetcher::new();
+    for name in ["a1", "a2"] {
+        fetcher.serve(&format!("{name}.png"), png(&solid(300, 300, RED)));
+    }
+    let gate = Gate::new();
+    let media = gated_client(
+        &fetcher,
+        &gate,
+        MediaConfig {
+            decode_concurrency: 1,
+            ..config()
+        },
+    );
+    // The first attachment parks inside the only general slot.
+    let first = tokio::spawn({
+        let media = media.clone();
+        async move { media.load(attachment("a1.png")).await }
+    });
+    wait_until("the first decode to park", || {
+        gate.made.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    // The second queues for a slot, and then its caller leaves.
+    let second = tokio::spawn({
+        let media = media.clone();
+        async move { media.load(attachment("a2.png")).await }
+    });
+    wait_until("the second to queue", || {
+        media.stats().waiting_to_decode == 1
+    })
+    .await;
+    second.abort();
+    let _ = second.await;
+    wait_until("the count to go back down", || {
+        media.stats().waiting_to_decode == 0
+    })
+    .await;
+    assert_eq!(media.stats().in_flight, 1);
+
+    gate.release();
+    assert!(first.await.unwrap().is_ok());
+    assert_eq!(media.stats().waiting_to_decode, 0);
+}

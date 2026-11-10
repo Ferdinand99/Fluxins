@@ -242,6 +242,22 @@ async fn acquire_lane(lane: Arc<Lane>, units: u32) -> Result<DecodePermit, Media
     })
 }
 
+/// Counts one up while it lives.
+struct CountGuard<'a>(&'a AtomicU64);
+
+impl<'a> CountGuard<'a> {
+    fn new(counter: &'a AtomicU64) -> Self {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Self(counter)
+    }
+}
+
+impl Drop for CountGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 enum Produced<H> {
     /// Found in the cache by the time the request started.
     Cached(H),
@@ -386,7 +402,7 @@ impl<S: ImageSink> MediaClient<S> {
     pub fn clear_memory(&self) {
         let all = lock(&self.inner.memory).drain();
         for handle in all {
-            self.inner.sink.evicted(handle);
+            self.inner.notify_evicted(handle);
         }
     }
 
@@ -612,13 +628,23 @@ impl<S: ImageSink> Inner<S> {
         // The app's code runs after every lock is released, and before the waiters
         // are woken: when `load` returns, the evictions it caused have been reported.
         for handle in released {
-            self.sink.evicted(handle);
+            self.notify_evicted(handle);
         }
         let mut flights = lock(&self.flights);
         if flights.get(key).is_some_and(|f| f.id == id) {
             if let Some(flight) = flights.remove(key) {
                 flight.tx.send_replace(Some(published));
             }
+        }
+    }
+
+    /// Tells the sink. A panic in the app's code is caught and logged: it must never
+    /// stop the request that caused the eviction from being published.
+    fn notify_evicted(&self, handle: S::Handle) {
+        let sink = &self.sink;
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sink.evicted(handle))).is_err()
+        {
+            tracing::error!("ImageSink::evicted panicked; the panic was caught");
         }
     }
 
@@ -787,10 +813,11 @@ impl<S: ImageSink> Inner<S> {
     ) -> Result<(S::Handle, u64), MediaError> {
         let inspected = inspect(encoded, limits)?;
         let units = inspected.estimated_peak_bytes().div_ceil(MIB).min(1 << 20) as u32;
-        self.waiting_to_decode.fetch_add(1, Ordering::Relaxed);
-        let permit = self.acquire_decode(small, units).await;
-        self.waiting_to_decode.fetch_sub(1, Ordering::Relaxed);
-        let permit = permit?;
+        let permit = {
+            // Counted back down even when this task is dropped while it waits.
+            let _waiting = CountGuard::new(&self.waiting_to_decode);
+            self.acquire_decode(small, units).await?
+        };
         drop(slot.take());
 
         self.decodes.fetch_add(1, Ordering::Relaxed);
@@ -867,8 +894,9 @@ async fn run_flight<S: ImageSink>(
         done: false,
     };
     let outcome = inner.produce(&key, &request, &cancel).await;
-    guard.done = true;
     inner.finish(&key, id, outcome);
+    // Only now: if `finish` stops half way, the guard still publishes an answer.
+    guard.done = true;
 }
 
 #[cfg(test)]

@@ -63,7 +63,11 @@ pub trait ImageSink: Send + Sync + 'static {
     /// cache. The UI may still show the image, so release the platform resources
     /// (for gpui `cx.drop_image`) only when the handle is no longer in use; see the
     /// pattern above. Never called with a lock held, so it may call back into the
-    /// client. For evictions that a `load` causes, it has been called by the time that
+    /// client. It runs on a runtime thread before the waiters of the `load` that caused
+    /// it are woken, so **it must not block** (no full bounded channel to the UI
+    /// thread, no lock that the UI holds): queue the handle and return. A panic in it
+    /// is caught and logged, and the request still completes.
+    /// For evictions that a `load` causes, it has been called by the time that
     /// `load` returns.
     fn evicted(&self, _handle: Self::Handle) {}
 }

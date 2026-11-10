@@ -170,7 +170,15 @@ fn estimate_peak(
 }
 
 fn estimate_peak_pixels(pixels: u64, bytes_per_pixel: u64, animated: bool, encoded: usize) -> u64 {
-    let mut peak = pixels * (bytes_per_pixel + 8) + encoded as u64 + 8 * MIB;
+    // Still images: the decoder's buffer, an RGBA8 copy and a working copy. An
+    // animation holds three canvases (the canvas, the previous one and the frame) and
+    // the raw frame next to the RGBA copy, so at least 4 bytes per pixel and 12 more.
+    let per_pixel = if animated {
+        bytes_per_pixel.max(4) + 12
+    } else {
+        bytes_per_pixel + 8
+    };
+    let mut peak = pixels * per_pixel + encoded as u64 + 8 * MIB;
     if animated {
         // The finished frames, up to the animation cap of 64 MiB.
         peak += 64 * MIB;
