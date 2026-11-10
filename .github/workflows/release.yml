@@ -30,6 +30,9 @@ jobs:
     name: macOS signing
     needs: build
     uses: ./.github/workflows/macos-sign.yml
+    # The secrets of the "release" environment only reach the called workflow
+    # when the caller lets secrets through. The repository holds no others.
+    secrets: inherit
     permissions:
       contents: read
     with:

@@ -1,7 +1,5 @@
 [workspace]
 resolver = "2"
-# Every crate under crates/ is a member. A new crate needs no edit here, so parallel pull
-# requests that add crates do not conflict on this line.
 members = ["crates/*"]
 
 [workspace.package]

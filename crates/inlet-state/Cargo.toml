@@ -1,0 +1,13 @@
+[package]
+name = "inlet-state"
+description = "Per-account client state for Inlet: guilds, channels, members, permissions, read state and message windows"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+inlet-protocol = { path = "../inlet-protocol" }
+serde_json = { version = "1", features = ["preserve_order"] }
+smallvec = "1"

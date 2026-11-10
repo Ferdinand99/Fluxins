@@ -83,6 +83,9 @@ jobs:
     permissions:
       contents: read
     uses: ./.github/workflows/macos-sign.yml
+    # The secrets of the "release" environment only reach the called workflow
+    # when the caller lets secrets through. The repository holds no others.
+    secrets: inherit
     with:
       app-artifact: inlet-macos-aarch64-app
       dmg-artifact: inlet-macos-aarch64-dmg-check
