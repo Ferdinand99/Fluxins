@@ -6,7 +6,9 @@ use std::sync::OnceLock;
 
 use gpui::{div, prelude::*, px, uniform_list, Context, FontWeight, SharedString};
 
-use crate::{button, theme, Inlet};
+use crate::app::Inlet;
+use crate::theme;
+use crate::ui::widgets::button;
 
 /// Generated with `cargo about` (see `scripts/third-party-notices.sh`) and shipped next to
 /// every binary as `THIRD-PARTY-NOTICES`; also built into the app so it is always there.
@@ -69,42 +71,64 @@ pub fn render(show_licences: bool, cx: &mut Context<Inlet>) -> impl IntoElement 
                 .flex_row()
                 .items_baseline()
                 .gap_2()
-                .child(div().text_size(px(24.)).font_weight(FontWeight::BOLD).text_color(theme::text_strong()).child("Inlet"))
-                .child(div().text_color(theme::text_muted()).child(format!("version {}", env!("CARGO_PKG_VERSION")))),
+                .child(
+                    div()
+                        .text_size(px(24.))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(theme::text_strong())
+                        .child(t!("app-name")),
+                )
+                .child(
+                    div()
+                        .text_color(theme::text_muted())
+                        .child(t!("about-version", version = env!("CARGO_PKG_VERSION"))),
+                ),
         )
-        .child(div().child("A desktop client that works with Fluxer. Inlet is an independent project; it is not made or endorsed by Fluxer Platform AB. \"Fluxer\" is their trademark."))
-        .child(div().child("Copyright \u{a9} 2026 the Inlet contributors."))
-        .child(div().child(
-            "Inlet is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General Public License, version 3 or (at your option) any later version. It comes with ABSOLUTELY NO WARRANTY.",
-        ))
+        .child(div().child(t!("about-intro")))
+        .child(div().child(t!("about-copyright")))
+        .child(div().child(t!("about-licence")))
         .child(
             div()
                 .id("source-link")
                 .text_color(theme::link())
                 .cursor_pointer()
-                .child(format!("Source code of this build: {source}"))
+                .child(t!("about-source", url = source.as_str()))
                 .on_click(move |_, _, cx| cx.open_url(&source)),
         )
-        .child(div().text_color(theme::text_muted()).child(
-            "Built with Fluxer's markdown parser (fluxer_markdown_parser, AGPL-3.0-or-later, Fluxer Platform AB, commit f1cba64), gpui from Zed (Apache-2.0, Zed Industries) and the crates listed under third-party licences. The full text of every licence, including the AGPL, is under \"Third-party licences\".",
-        ))
+        .child(
+            div()
+                .text_color(theme::text_muted())
+                .child(t!("about-built-with")),
+        )
         .child(
             div()
                 .flex()
                 .flex_row()
                 .gap_2()
                 .child(
-                    button("toggle-licences", if show_licences { "Hide third-party licences" } else { "Third-party licences" }, false)
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.show_licences = !this.show_licences;
-                            cx.notify();
-                        })),
+                    button(
+                        "toggle-licences",
+                        if show_licences {
+                            t!("about-hide-licences")
+                        } else {
+                            t!("about-show-licences")
+                        },
+                        false,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.show_licences = !this.show_licences;
+                        cx.notify();
+                    })),
                 )
-                .child(button("close-about", "Close", true).on_click(cx.listener(|this, _, _, cx| {
-                    this.show_about = false;
-                    this.show_licences = false;
-                    cx.notify();
-                }))),
+                .child(
+                    button("close-about", t!("about-close"), true).on_click(cx.listener(
+                        |this, _, _, cx| {
+                            this.show_about = false;
+                            this.show_licences = false;
+                            cx.notify();
+                        },
+                    )),
+                ),
         );
 
     let lines = notice_lines();
@@ -123,7 +147,7 @@ pub fn render(show_licences: bool, cx: &mut Context<Inlet>) -> impl IntoElement 
                     .rounded_md()
                     .bg(theme::code_bg())
                     .p_2()
-                    .font_family(crate::markdown::mono_font())
+                    .font_family(crate::ui::markdown::mono_font())
                     .text_size(px(12.))
                     .child(
                         uniform_list("licences", lines.len(), move |range, _window, _cx| {
