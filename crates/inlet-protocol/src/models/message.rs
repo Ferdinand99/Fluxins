@@ -19,6 +19,10 @@ pub mod message_flags {
     pub const SUPPRESS_EMBEDS: u64 = 1 << 2;
     /// The source of a crosspost was deleted.
     pub const SOURCE_MESSAGE_DELETED: u64 = 1 << 3;
+    /// A thread was started from this message.
+    pub const HAS_THREAD: u64 = 1 << 5;
+    /// Some members of a mentioned role were not added to the thread.
+    pub const FAILED_TO_MENTION_SOME_ROLES_IN_THREAD: u64 = 1 << 8;
     /// Sent without a notification.
     pub const SUPPRESS_NOTIFICATIONS: u64 = 1 << 12;
     /// A voice message.
@@ -517,6 +521,39 @@ impl Message {
         self.flags.as_ref().and_then(value_u64).unwrap_or(0)
     }
 
+    /// Whether the message was sent without notifications (`SUPPRESS_NOTIFICATIONS`, "@silent").
+    pub fn is_silent(&self) -> bool {
+        self.flag_bits() & message_flags::SUPPRESS_NOTIFICATIONS != 0
+    }
+
+    /// Whether its embeds are hidden (`SUPPRESS_EMBEDS`).
+    pub fn embeds_suppressed(&self) -> bool {
+        self.flag_bits() & message_flags::SUPPRESS_EMBEDS != 0
+    }
+
+    /// Whether this is a forward (a `FORWARD` reference; the content is in
+    /// [`Message::message_snapshots`]).
+    pub fn is_forward(&self) -> bool {
+        self.message_reference()
+            .is_some_and(|r| r.kind == message_reference_type::FORWARD)
+    }
+
+    /// Copies of a forwarded message. Snapshots that do not parse are skipped.
+    pub fn message_snapshots(&self) -> Vec<MessageSnapshot> {
+        extra_list(&self.extra, "message_snapshots")
+    }
+
+    /// Whether a thread was started from this message (`HAS_THREAD`).
+    pub fn has_thread(&self) -> bool {
+        self.flag_bits() & message_flags::HAS_THREAD != 0
+            || self.extra.get("thread").is_some_and(Value::is_object)
+    }
+
+    /// The thread started from this message, when the server sent it.
+    pub fn thread(&self) -> Option<super::Channel> {
+        extra_field(&self.extra, "thread")
+    }
+
     /// Whether the account could edit this message by its kind: only its own
     /// `DEFAULT` and `REPLY` messages, and not forwards. In a guild use
     /// [`crate::PermissionContext::can_edit_message`], which also checks
@@ -625,8 +662,94 @@ pub struct OutgoingMessage {
     pub flags: Option<u64>,
     /// Text-to-speech (needs `SEND_TTS_MESSAGES`).
     pub tts: bool,
-    /// Suppress every mention (sends `allowed_mentions: {}`).
+    /// Suppress every mention (sends `allowed_mentions: {}`). Wins over
+    /// [`OutgoingMessage::allowed_mentions`].
     pub suppress_mentions: bool,
+    /// Which mentions in the text notify anyone. `None` leaves it to the
+    /// server (every mention notifies). The composer sets it from the
+    /// mentions the person picked.
+    pub allowed_mentions: Option<AllowedMentions>,
+}
+
+/// `allowed_mentions` of a message ([`OutgoingMessage::allowed_mentions`],
+/// [`MessageEdit::allowed_mentions`]). Fluxer's rules: `users` or `roles`
+/// without the matching `parse` value allow only the listed IDs; the empty
+/// object allows nothing; `parse` must not name `users` or `roles` when the
+/// matching list is sent. At most 100 IDs per list.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AllowedMentions {
+    /// [`allowed_mention_parse`] values.
+    pub parse: Vec<String>,
+    /// Users who may be notified.
+    pub users: Vec<Snowflake>,
+    /// Roles that may be notified.
+    pub roles: Vec<Snowflake>,
+    /// Whether a reply notifies the author of the message it replies to.
+    /// `None`: from [`ReplyTo::mention_author`] (default true).
+    pub replied_user: Option<bool>,
+}
+
+/// Values for [`AllowedMentions::parse`].
+pub mod allowed_mention_parse {
+    /// User mentions.
+    pub const USERS: &str = "users";
+    /// Role mentions.
+    pub const ROLES: &str = "roles";
+    /// `@everyone` and `@here`.
+    pub const EVERYONE: &str = "everyone";
+}
+
+impl AllowedMentions {
+    /// Allows exactly the listed users and roles, and `@everyone`/`@here`
+    /// when `everyone` is set (at most 100 IDs per list are sent).
+    pub fn only(users: &[Snowflake], roles: &[Snowflake], everyone: bool) -> Self {
+        AllowedMentions {
+            parse: if everyone {
+                vec![allowed_mention_parse::EVERYONE.to_owned()]
+            } else {
+                Vec::new()
+            },
+            users: users.iter().take(100).cloned().collect(),
+            roles: roles.iter().take(100).cloned().collect(),
+            replied_user: None,
+        }
+    }
+
+    pub(crate) fn to_json(&self, reply_mentions_author: Option<bool>) -> Value {
+        let mut m = Map::new();
+        if !self.parse.is_empty() {
+            m.insert("parse".into(), json!(self.parse));
+        }
+        if !self.users.is_empty() {
+            m.insert(
+                "users".into(),
+                json!(self.users.iter().take(100).collect::<Vec<_>>()),
+            );
+        }
+        if !self.roles.is_empty() {
+            m.insert(
+                "roles".into(),
+                json!(self.roles.iter().take(100).collect::<Vec<_>>()),
+            );
+        }
+        if let Some(r) = self.replied_user.or(reply_mentions_author) {
+            m.insert("replied_user".into(), json!(r));
+        }
+        Value::Object(m)
+    }
+}
+
+/// Removes Fluxer's `@silent` prefix from composer text: `Some(rest)` when
+/// the text starts with it (after spaces), `None` otherwise. Send the rest
+/// with [`OutgoingMessage::silent`], as Fluxer's client does.
+pub fn strip_silent_prefix(content: &str) -> Option<&str> {
+    let trimmed = content.trim_start();
+    let rest = trimmed.strip_prefix("@silent")?;
+    match rest.chars().next() {
+        None => Some(rest),
+        Some(c) if c.is_whitespace() => Some(&rest[c.len_utf8()..]),
+        Some(_) => None,
+    }
 }
 
 impl OutgoingMessage {
@@ -636,6 +759,18 @@ impl OutgoingMessage {
             content: Some(content.into()),
             ..Default::default()
         }
+    }
+
+    /// Sends it without notifications (`SUPPRESS_NOTIFICATIONS`, "@silent").
+    pub fn silent(mut self) -> Self {
+        self.flags = Some(self.flags.unwrap_or(0) | message_flags::SUPPRESS_NOTIFICATIONS);
+        self
+    }
+
+    /// Sets which mentions notify anyone.
+    pub fn with_allowed_mentions(mut self, allowed: AllowedMentions) -> Self {
+        self.allowed_mentions = Some(allowed);
+        self
     }
 
     /// Sets the nonce.
@@ -671,6 +806,11 @@ impl OutgoingMessage {
         }
         if self.suppress_mentions {
             body.insert("allowed_mentions".into(), json!({}));
+        } else if let Some(a) = &self.allowed_mentions {
+            body.insert(
+                "allowed_mentions".into(),
+                a.to_json(self.reply_to.as_ref().map(|r| r.mention_author)),
+            );
         } else if self.reply_to.as_ref().is_some_and(|r| !r.mention_author) {
             body.insert(
                 "allowed_mentions".into(),
@@ -701,6 +841,8 @@ pub struct MessageEdit {
     pub content: Option<String>,
     /// New [`message_flags`] (for example to set or clear `SUPPRESS_EMBEDS`).
     pub flags: Option<u64>,
+    /// Which mentions in the new text notify anyone.
+    pub allowed_mentions: Option<AllowedMentions>,
 }
 
 impl MessageEdit {
@@ -712,7 +854,56 @@ impl MessageEdit {
         if let Some(f) = self.flags {
             body.insert("flags".into(), json!(f));
         }
+        if let Some(a) = &self.allowed_mentions {
+            body.insert("allowed_mentions".into(), a.to_json(None));
+        }
         Value::Object(body)
+    }
+}
+
+/// A copy of a forwarded message ([`Message::message_snapshots`]). It does
+/// not change when the source is edited or deleted.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MessageSnapshot {
+    /// Text.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub content: String,
+    /// When the source was created.
+    #[serde(default)]
+    pub timestamp: Option<String>,
+    /// When the source was last edited.
+    #[serde(default)]
+    pub edited_timestamp: Option<String>,
+    /// IDs of mentioned users (resolve them against the message's `mentions`).
+    #[serde(default, deserialize_with = "sf_list")]
+    pub mentions: Vec<Snowflake>,
+    /// IDs of mentioned roles.
+    #[serde(default, deserialize_with = "sf_list")]
+    pub mention_roles: Vec<Snowflake>,
+    /// Raw embeds; parse them like [`Message::parsed_embeds`] via [`MessageSnapshot::parsed_embeds`].
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub embeds: Vec<Value>,
+    /// Attachments.
+    #[serde(default, deserialize_with = "lenient_vec")]
+    pub attachments: Vec<Attachment>,
+    /// Stickers.
+    #[serde(default, deserialize_with = "lenient_vec")]
+    pub stickers: Vec<StickerItem>,
+    /// The source's message type.
+    #[serde(rename = "type", default, deserialize_with = "null_as_default")]
+    pub kind: i64,
+    /// The source's [`message_flags`].
+    #[serde(default, deserialize_with = "opt_u64")]
+    pub flags: Option<u64>,
+    /// Every other field.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
+}
+
+impl MessageSnapshot {
+    /// The embeds, typed. Embeds that do not parse are skipped.
+    pub fn parsed_embeds(&self) -> Vec<Embed> {
+        super::parse_values(&self.embeds, "embed")
     }
 }
 
@@ -828,8 +1019,58 @@ mod tests {
         assert!(plain.get("allowed_mentions").is_none());
         let edit = MessageEdit {
             content: Some("new".into()),
-            flags: None,
+            ..MessageEdit::default()
         };
         assert_eq!(edit.to_json(), json!({"content": "new"}));
+    }
+
+    #[test]
+    fn silent_messages_and_allowed_mentions() {
+        assert_eq!(strip_silent_prefix("@silent hi"), Some("hi"));
+        assert_eq!(strip_silent_prefix("  @silent"), Some(""));
+        assert_eq!(strip_silent_prefix("@silently"), None);
+        assert_eq!(strip_silent_prefix("hi @silent"), None);
+        let v = OutgoingMessage::text("hi").silent().to_json(None);
+        assert_eq!(v["flags"], json!(message_flags::SUPPRESS_NOTIFICATIONS));
+        let picked = AllowedMentions::only(&["5".into()], &[], true);
+        let v = OutgoingMessage::text("<@5> @everyone")
+            .reply_to("1", false)
+            .with_allowed_mentions(picked.clone())
+            .to_json(None);
+        assert_eq!(
+            v["allowed_mentions"],
+            json!({"parse": ["everyone"], "users": ["5"], "replied_user": false})
+        );
+        let edit = MessageEdit {
+            content: Some("x".into()),
+            allowed_mentions: Some(AllowedMentions::default()),
+            ..MessageEdit::default()
+        };
+        assert_eq!(edit.to_json()["allowed_mentions"], json!({}));
+    }
+
+    #[test]
+    fn forwards_and_threads_on_a_message() {
+        let mut v = base();
+        v["flags"] = json!(message_flags::HAS_THREAD | message_flags::SUPPRESS_NOTIFICATIONS);
+        v["message_reference"] = json!({"channel_id": "2", "message_id": "0", "type": 1});
+        v["message_snapshots"] = json!([
+            {"content": "orig", "timestamp": "2026-01-01T00:00:00Z", "type": 0, "flags": null,
+             "mentions": ["4", 5], "attachments": [{"id": "9", "filename": "a.png", "size": 1}, {"bad": 1}],
+             "embeds": [{"type": "image"}], "future_field": {"x": 1}},
+            "not a snapshot"
+        ]);
+        v["thread"] = json!({"id": "1", "type": 11, "guild_id": "3", "parent_id": "2", "name": "t",
+                             "thread_metadata": {"archived": false, "locked": false}});
+        let m: Message = serde_json::from_value(v).unwrap();
+        assert!(m.is_forward() && m.is_silent() && m.has_thread());
+        assert!(!m.embeds_suppressed());
+        let snaps = m.message_snapshots();
+        assert_eq!(snaps.len(), 1);
+        assert_eq!(snaps[0].content, "orig");
+        assert_eq!(snaps[0].mentions, vec!["4".to_string(), "5".to_string()]);
+        assert_eq!(snaps[0].attachments.len(), 1);
+        assert_eq!(snaps[0].parsed_embeds().len(), 1);
+        assert_eq!(m.thread().unwrap().name.as_deref(), Some("t"));
     }
 }

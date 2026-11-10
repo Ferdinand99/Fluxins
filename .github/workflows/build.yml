@@ -48,6 +48,15 @@ jobs:
       - name: Build
         run: cargo build --release --locked -p inlet
 
+      # The test-only extra CA must not be in a shipped binary in any form.
+      - name: The release binary has no test CA code
+        shell: bash
+        run: |
+          if grep -aqF INLET_TEST_EXTRA_CA_FILE target/release/inlet.exe; then
+            echo "target/release/inlet.exe contains the test CA variable"
+            exit 1
+          fi
+
       - name: Test
         run: cargo test --workspace --locked
 
@@ -131,6 +140,14 @@ jobs:
 
       - name: Build
         run: cargo build --release --locked -p inlet
+
+      # The test-only extra CA must not be in a shipped binary in any form.
+      - name: The release binary has no test CA code
+        run: |
+          if grep -aqF INLET_TEST_EXTRA_CA_FILE target/release/inlet; then
+            echo "target/release/inlet contains the test CA variable"
+            exit 1
+          fi
 
       - name: Test
         run: cargo test --workspace --locked
@@ -220,6 +237,14 @@ jobs:
         run: |
           if cargo tree --locked -p inlet -e features,no-dev | grep -F 'test-extra-ca'; then
             echo "inlet enables the test-extra-ca feature"
+            exit 1
+          fi
+
+      # And the shipped binary holds none of its code, whatever the profile says.
+      - name: The release binary has no test CA code
+        run: |
+          if grep -aqF INLET_TEST_EXTRA_CA_FILE target/release/inlet; then
+            echo "target/release/inlet contains the test CA variable"
             exit 1
           fi
 

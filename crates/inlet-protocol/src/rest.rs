@@ -298,7 +298,12 @@ impl Client {
         raw.json()
     }
 
-    async fn raw(&self, method: Method, path: &str, body: Option<&Value>) -> Result<RawResponse> {
+    pub(crate) async fn raw(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&Value>,
+    ) -> Result<RawResponse> {
         let limiter = self.rate_limiter();
         let raw = send(
             &self.instance,
@@ -319,7 +324,11 @@ impl Client {
         Ok(raw)
     }
 
-    async fn get_list<T: DeserializeOwned>(&self, path: &str, what: &str) -> Result<Vec<T>> {
+    pub(crate) async fn get_list<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        what: &str,
+    ) -> Result<Vec<T>> {
         self.raw(Method::GET, path, None).await?.list(what)
     }
 
@@ -517,7 +526,7 @@ impl Client {
     ) -> Result<Message> {
         let edit = MessageEdit {
             content: Some(content.to_owned()),
-            flags: None,
+            ..MessageEdit::default()
         };
         self.edit_message_with(channel_id, message_id, &edit).await
     }
@@ -1041,7 +1050,7 @@ fn percent_encode_all(s: &str) -> String {
 /// A snowflake ID (or `@me`) for a path or query, or [`Error::InvalidInput`].
 /// IDs come from the server and the UI; anything else (`..`, `/`, `?`) could
 /// make the request hit another route.
-fn id(value: &str) -> Result<&str> {
+pub(crate) fn id(value: &str) -> Result<&str> {
     if value == "@me" || crate::media::is_snowflake(value) {
         Ok(value)
     } else {
@@ -1050,7 +1059,7 @@ fn id(value: &str) -> Result<&str> {
 }
 
 /// Percent-encodes a query value.
-fn enc_query(segment: &str) -> String {
+pub(crate) fn enc_query(segment: &str) -> String {
     url::form_urlencoded::byte_serialize(segment.as_bytes()).collect()
 }
 

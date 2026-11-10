@@ -262,9 +262,12 @@ impl AccountState {
                     MessageId::parse(&a.message_id),
                 ) {
                     if !self.untracked(ch)
-                        && self
-                            .read_states
-                            .server_ack(ch, id, a.mention_count, a.manual)
+                        && self.read_states.server_ack(
+                            ch,
+                            id,
+                            a.mention_count.unwrap_or(0),
+                            a.manual,
+                        )
                     {
                         c.read(ch, self.channels.guild_of(ch));
                     }
