@@ -109,19 +109,9 @@ fn main() {
             .expect("open the demo window");
         cx.activate(true);
 
-        match Notification::new(
-            "demo:1",
-            "Inlet demo",
-            "This notification came from inlet-platform.",
-        ) {
-            Ok(n) => gpui_glue::notify(cx, &n),
-            Err(err) => println!("notification refused: {err}"),
-        }
-
-        // Tray and badge calls talk to Explorer, which can dispatch window messages
-        // while it answers. gpui's window procedure needs the app, so on Windows
-        // these calls belong outside `cx.update` and outside this `run` callback:
-        // in a task, between its awaits.
+        // Shell calls (tray, taskbar) may dispatch window messages while they run,
+        // and gpui's window procedure needs the app, so on Windows they stay out of
+        // this `run` callback and out of `cx.update`: in a task, between awaits.
         let events = inlet_platform::events();
         cx.spawn(async move |cx| {
             let menu = vec![
@@ -191,13 +181,25 @@ fn main() {
         }
 
         // Flash the window after a moment (visible when it is in the background),
-        // and set the badge once the taskbar button exists.
+        // set the badge once the taskbar button exists, then post a notification.
         cx.spawn(async move |cx| {
             cx.background_executor().timer(Duration::from_secs(2)).await;
             set_badge(Badge::Count(3));
             cx.update(|cx| {
                 let _ = window.update(cx, |_, window, _| gpui_glue::flash_window(window));
             });
+            println!("posting the notification");
+            cx.update(|cx| {
+                match Notification::new(
+                    "demo:1",
+                    "Inlet demo",
+                    "This notification came from inlet-platform.",
+                ) {
+                    Ok(n) => gpui_glue::notify(cx, &n),
+                    Err(err) => println!("notification refused: {err}"),
+                }
+            });
+            println!("notification posted");
         })
         .detach();
 

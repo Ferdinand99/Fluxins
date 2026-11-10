@@ -9,11 +9,11 @@
 //! messages from that thread's message loop (gpui's main loop pumps them); on
 //! macOS AppKit only allows it on the main thread.
 //!
-//! With gpui on Windows, call the tray (and [`crate::set_badge`]) outside
-//! `cx.update` and outside the `Application::run` callback, for example in a
-//! `cx.spawn` task between awaits. Explorer can dispatch window messages while
-//! it answers these calls, and gpui's window procedure cannot borrow the app at
-//! that moment: it logs "RefCell already borrowed" and skips a frame.
+//! With gpui on Windows, shell calls (tray, taskbar) and toasts may dispatch
+//! window messages while they run, and gpui's window procedure cannot borrow the
+//! app at that moment: it logs "RefCell already borrowed" and skips a frame. The
+//! demo therefore keeps them out of the `Application::run` callback and makes the
+//! tray and badge calls in a `cx.spawn` task between awaits.
 
 use crate::{Icon, Result};
 
