@@ -163,10 +163,20 @@ fn a_webp_that_claims_four_gigabytes_of_exif_is_refused_before_it_allocates() {
 #[test]
 fn a_gif_with_a_tiny_canvas_and_huge_frames_is_refused_before_it_allocates() {
     let _serial = serial();
+    // Frames over the pixel limit.
     let frames = vec![(0u16, 0u16, 3535u16, 3535u16); 512];
     let bytes = raw_gif((1, 1), &frames);
     let (result, peak) = measure(|| run(&bytes, NO_RESIZE, &avatar_limits()));
-    assert!(matches!(result, Err(MediaError::Corrupt(_))), "{result:?}");
+    assert!(
+        matches!(result, Err(MediaError::BadDimensions { .. })),
+        "{result:?}"
+    );
+    assert!(peak < MIB, "peaked at {peak} bytes");
+    // Frames within the limit, but too many pixels together.
+    let frames = vec![(0u16, 0u16, 2000u16, 2000u16); 512];
+    let bytes = raw_gif((1, 1), &frames);
+    let (result, peak) = measure(|| run(&bytes, NO_RESIZE, &avatar_limits()));
+    assert_eq!(result.unwrap_err(), MediaError::AnimationTooLarge);
     assert!(peak < MIB, "peaked at {peak} bytes");
 }
 
@@ -319,6 +329,53 @@ fn the_estimate_covers_the_real_peak_for_every_format_at_the_size_limits() {
         assert!(
             peak <= estimate,
             "{name}: peak {:.1} MiB is above the estimate {:.1} MiB",
+            peak as f64 / MIB as f64,
+            estimate as f64 / MIB as f64
+        );
+    }
+}
+
+/// A picture that compresses well, so that the fixtures of 24 Mpx stay small and fast
+/// to make, but is not one flat colour.
+fn banded(width: u32, height: u32, seed: u8) -> image::RgbaImage {
+    image::RgbaImage::from_fn(width, height, |x, y| {
+        image::Rgba([(y / 8) as u8, seed, ((x / 32) % 251) as u8, 255])
+    })
+}
+
+#[test]
+fn the_estimate_covers_the_real_peak_at_the_pixel_limit_of_an_attachment() {
+    let _serial = serial();
+    // 6000 x 4000 is 24 Mpx, the limit. Animations are the worst case: the decoder
+    // keeps the canvas, the previous canvas and the frame next to the scaled copy.
+    let limits = KindLimits::for_kind(MediaKind::Attachment);
+    let cases: Vec<(&str, Vec<u8>)> = vec![
+        ("png8", png(&banded(6000, 4000, 1))),
+        (
+            "apng",
+            apng(&[(banded(6000, 4000, 1), 40), (banded(6000, 4000, 2), 40)]),
+        ),
+        (
+            "awebp",
+            animated_webp(&[(banded(6000, 4000, 1), 40), (banded(6000, 4000, 2), 40)]),
+        ),
+    ];
+    for (name, bytes) in cases {
+        let estimate = inspect(Bytes::from(bytes.clone()), &limits)
+            .unwrap_or_else(|e| panic!("{name}: {e:?}"))
+            .estimated_peak_bytes() as usize;
+        let (result, peak) = measure(|| run(&bytes, Fit::PREVIEW, &limits));
+        let img = result.unwrap_or_else(|e| panic!("{name}: {e:?}"));
+        eprintln!(
+            "{name}: {} frames, encoded {} KiB, peak {:.0} MiB, estimate {:.0} MiB",
+            img.frames.len(),
+            bytes.len() / 1024,
+            peak as f64 / MIB as f64,
+            estimate as f64 / MIB as f64
+        );
+        assert!(
+            peak <= estimate,
+            "{name}: peak {:.0} MiB is above the estimate {:.0} MiB",
             peak as f64 / MIB as f64,
             estimate as f64 / MIB as f64
         );

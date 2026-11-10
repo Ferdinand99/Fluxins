@@ -73,6 +73,22 @@ pub fn gif(frames: &[(RgbaImage, u32)]) -> Vec<u8> {
     out
 }
 
+/// Like `gif`, but every frame has a position on the canvas: (image, left, top, delay in ms).
+/// The canvas is the size of the first frame, so a frame at an offset overhangs it.
+pub fn gif_at(frames: &[(RgbaImage, u32, u32, u32)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    {
+        let mut encoder = image::codecs::gif::GifEncoder::new_with_speed(&mut out, 30);
+        for (img, left, top, delay_ms) in frames {
+            let delay = Delay::from_numer_denom_ms(*delay_ms, 1);
+            encoder
+                .encode_frame(Frame::from_parts(img.clone(), *left, *top, delay))
+                .unwrap();
+        }
+    }
+    out
+}
+
 pub fn apng(frames: &[(RgbaImage, u16)]) -> Vec<u8> {
     let (w, h) = frames[0].0.dimensions();
     let mut out = Vec::new();
@@ -232,6 +248,32 @@ pub fn rgba_at(img: &inlet_media::DecodedImage, frame: usize, x: u32, y: u32) ->
     let i = ((y * img.width + x) * 4) as usize;
     let p = &img.frames[frame].bgra[i..i + 4];
     [p[2], p[1], p[0], p[3]]
+}
+
+/// A clock that only moves when the test says so.
+#[derive(Debug)]
+pub struct ManualClock {
+    base: std::time::Instant,
+    offset: std::sync::Mutex<Duration>,
+}
+
+impl ManualClock {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            base: std::time::Instant::now(),
+            offset: std::sync::Mutex::new(Duration::ZERO),
+        })
+    }
+
+    pub fn advance(&self, by: Duration) {
+        *self.offset.lock().unwrap() += by;
+    }
+}
+
+impl inlet_media::Clock for ManualClock {
+    fn now(&self) -> std::time::Instant {
+        self.base + *self.offset.lock().unwrap()
+    }
 }
 
 pub fn control() -> DecodeControl {

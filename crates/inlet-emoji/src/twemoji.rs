@@ -205,8 +205,10 @@ pub fn twemoji_code(glyph: &str) -> String {
 /// The Twemoji drawing of a glyph as SVG, or `None` for text that is not a known emoji.
 /// A glyph without its `U+FE0F` is found too.
 ///
-/// Draw it with the SVG code in `inlet-media`; it is trusted data from this crate and the
-/// only SVG Inlet draws.
+/// This is trusted data from this crate and the only SVG Inlet will draw. `inlet-media`
+/// does not draw SVG (it refuses it, so SVG from the network can never be drawn). The
+/// drawing code for these bytes, when it exists, is its own API that nothing fed with
+/// network bytes can reach.
 #[must_use]
 pub fn twemoji_svg(glyph: &str) -> Option<Cow<'static, [u8]>> {
     let pack = pack()?;
