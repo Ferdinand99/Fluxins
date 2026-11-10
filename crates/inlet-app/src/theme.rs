@@ -115,6 +115,10 @@ pub fn text() -> Hsla {
 pub fn text_strong() -> Hsla {
     h(rgb(0xf4f4f6))
 }
+/// Unread channel names (`--text-secondary`).
+pub fn text_secondary() -> Hsla {
+    h(rgb(0xe5e4e9))
+}
 /// Muted: reply line, "(edited)", header icons (`--text-primary-muted`).
 pub fn text_muted() -> Hsla {
     h(rgb(0xcecbd4))
@@ -213,6 +217,10 @@ pub fn quote_bar() -> Hsla {
 pub fn danger() -> Hsla {
     h(rgb(0xe53734))
 }
+/// Text on the unread count (`white` on `--status-danger`).
+pub fn on_danger() -> Hsla {
+    h(rgb(0xffffff))
+}
 /// Date separator line: accent border at 30 %.
 pub fn separator_line() -> Hsla {
     h(rgba(0xc9c5d30b))
@@ -220,10 +228,6 @@ pub fn separator_line() -> Hsla {
 
 // ---- Markdown ---------------------------------------------------------------
 
-/// Secondary text: `######` headings (`--text-secondary`).
-pub fn text_secondary() -> Hsla {
-    h(rgb(0xe5e4e9))
-}
 /// Code block border: 90 % `--border-color`, 10 % `--text-code` (`--code-block-border`).
 pub fn code_border() -> Hsla {
     h(rgba(0xa19bad47))

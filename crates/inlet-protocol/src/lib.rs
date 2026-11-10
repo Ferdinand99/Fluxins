@@ -176,6 +176,7 @@ pub use models::{
 };
 pub use permissions::PermissionContext;
 pub use ratelimit::{RateLimitConfig, RateLimiter};
+pub use reqwest::Method;
 pub use rest::{new_nonce, Client};
 pub use token::Token;
 pub use upload::{ProgressFn, UploadFile, UploadLimits};
