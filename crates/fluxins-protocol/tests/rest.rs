@@ -56,7 +56,10 @@ async fn endpoints_send_token_and_parse_models() {
     Mock::given(method("GET"))
         .and(path("/api/v1/users/@me"))
         .and(auth())
-        .and(header("X-Fluxer-Features", "view_channel_members_permission,channel_threads"))
+        .and(|req: &wiremock::Request| {
+            req.headers.get("x-fluxer-features").and_then(|v| v.to_str().ok())
+                == Some("view_channel_members_permission,channel_threads")
+        })
         .and(header_exists("X-Fluxer-Client-Installation-ID"))
         .respond_with(ResponseTemplate::new(200).set_body_json({
             let mut u = common::user_json("10", "ana");
