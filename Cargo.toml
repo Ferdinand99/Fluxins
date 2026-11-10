@@ -8,3 +8,19 @@ edition = "2021"
 license = "AGPL-3.0-or-later"
 repository = "https://github.com/Ferdinand99/Inlet"
 rust-version = "1.88"
+
+[workspace.dependencies]
+# gpui is taken from Zed's repository at a fixed commit. The crates.io release (0.2.2)
+# is a year old and predates the gpui_platform split that current gpui uses.
+gpui = { git = "https://github.com/zed-industries/zed", rev = "f0d896f2c18a543335eb155f729d36b624695591" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "f0d896f2c18a543335eb155f729d36b624695591", features = ["font-kit", "x11", "wayland"] }
+
+# Zed's workspace patches these crates and gpui relies on the patched versions.
+# [patch] is not inherited through a git dependency, so it is repeated here.
+[patch.crates-io]
+async-task = { git = "https://github.com/zed-industries/async-task.git", rev = "015845a19fc31752c02367567d3b8900a406f9da" }
+calloop = { git = "https://github.com/zed-industries/calloop", rev = "3759371fee14c40066d64777e2a36b6ffcc22590" }
+khronos-egl = { git = "https://github.com/zed-industries/khronos-egl", rev = "42214b36347b108fd9630ca6254b96dde59e04fe" }
+
+[profile.release]
+strip = true
