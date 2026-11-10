@@ -6,7 +6,18 @@
 //! [`Editor`] and [`EditorElement`] put it on screen, with wrapping, selection and input
 //! method support.
 //!
-//! Limits: gpui shapes text in logical order and does no bidirectional reordering, so
+//! # Sending a message
+//!
+//! The composer MUST send `allowed_mentions` built from [`Buffer::allowed_mentions`] with
+//! every message it sends or edits: the picked users and roles as lists, and `parse:
+//! ["everyone"]` only when `everyone` is set (see [`AllowedMentions`] for the case with both).
+//! [`Buffer::to_wire`] escapes typed text that looks like a mention, but the escapes depend on
+//! how the server parses today. `allowed_mentions` is the guard that does not: the server
+//! drops every user and role mention that is not on the list. The limit given to
+//! [`Buffer::new`] must be the instance's message length limit, in UTF-16 code units.
+//!
+//! # Limits
+//! gpui shapes text in logical order and does no bidirectional reordering, so
 //! right-to-left text (Arabic, Hebrew) is shown in the wrong order and the caret and the
 //! selection follow that order. The web client gets this from the browser. It cannot be
 //! fixed in this crate.

@@ -5,7 +5,7 @@
 
 use std::ops::Range;
 
-use crate::sanitize::{clean_label, dropped_on_input};
+use crate::sanitize::clean_label;
 
 /// A snowflake id.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -96,14 +96,10 @@ fn parse_id(s: &str) -> Option<Id> {
     s.parse().ok().map(Id)
 }
 
-/// What the parser accepts in a custom emoji name: letters, digits, `_`, `-` and any
-/// non-ASCII character. White space, control and bidi characters are left out here, so a
-/// name from the server cannot hide anything.
+/// What the parser accepts in a custom emoji name: ASCII letters, digits, `_` and `-`
+/// (`is_custom_emoji_name_char` in `fluxer_markdown_parser`, which works on bytes).
 fn is_emoji_name_char(c: char) -> bool {
-    c.is_ascii_alphanumeric()
-        || c == '_'
-        || c == '-'
-        || (!c.is_ascii() && !c.is_whitespace() && !dropped_on_input(c))
+    c.is_ascii_alphanumeric() || c == '_' || c == '-'
 }
 
 fn safe_emoji_name(name: &str) -> String {

@@ -66,3 +66,30 @@ pub(crate) fn clean_label(s: &str) -> String {
         .collect();
     spaced.trim().to_owned()
 }
+
+/// Trims white space the way JavaScript's `String.prototype.trim` does, which is what the
+/// server does to message content. The set differs from Rust's `char::is_whitespace`: JS
+/// keeps U+0085 (next line) and removes U+FEFF.
+pub(crate) fn js_trim(s: &str) -> &str {
+    s.trim_matches(|c: char| {
+        matches!(
+            c,
+            '\u{0009}'..='\u{000d}'
+                | '\u{0020}'
+                | '\u{00a0}'
+                | '\u{1680}'
+                | '\u{2000}'..='\u{200a}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{202f}'
+                | '\u{205f}'
+                | '\u{3000}'
+                | '\u{feff}'
+        )
+    })
+}
+
+/// `sanitize_input(s) == s`, without making a copy.
+pub(crate) fn is_clean(s: &str) -> bool {
+    !s.chars().any(|c| c == '\r' || dropped_on_input(c))
+}

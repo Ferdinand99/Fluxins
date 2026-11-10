@@ -10,7 +10,7 @@ use std::ops::Range;
 
 use crate::fragment::Fragment;
 use crate::history::{History, Kind, Snapshot};
-use crate::sanitize::{clean_label, sanitize_input, sanitized_units_lower_bound};
+use crate::sanitize::{clean_label, is_clean, sanitize_input, sanitized_units_lower_bound};
 use crate::tokens::{label_for, special_at, Resolve, Special, Token, TokenSpan};
 use crate::wire::{self, AllowedMentions};
 
@@ -180,10 +180,10 @@ impl Buffer {
         range: Range<usize>,
         fragment: &Fragment,
     ) -> Result<Range<usize>, TooLong> {
-        if sanitize_input(&fragment.text) != fragment.text {
+        self.refuse_huge(&fragment.text)?;
+        if !is_clean(&fragment.text) {
             return self.replace(range, &fragment.text);
         }
-        self.refuse_huge(&fragment.text)?;
         let range = self.expand_range(range);
         let cursor_before = range.start;
         self.apply(
@@ -297,6 +297,22 @@ impl Buffer {
         }
     }
 
+    /// Like [`Buffer::discard_last_step`], but only when the last step made the text longer
+    /// than the limit. Text that is over the limit may shrink, and such a step is kept.
+    pub fn discard_last_step_if_too_long(&mut self) -> bool {
+        let Some(entry) = self.history.peek_undo() else {
+            return false;
+        };
+        let was = wire::to_wire(&entry.snapshot.text, &entry.snapshot.tokens)
+            .encode_utf16()
+            .count();
+        let now = self.len_utf16();
+        if now > self.max_len && now > was {
+            return self.discard_last_step();
+        }
+        false
+    }
+
     pub fn undo(&mut self) -> bool {
         let current = self.snapshot();
         match self.history.undo(current, self.cursor) {
@@ -334,8 +350,9 @@ impl Buffer {
     }
 
     /// Refuses text that is too long before any work is done on it. A paste of 100 MB must
-    /// not be copied, spliced and escaped just to be refused.
-    fn refuse_huge(&self, s: &str) -> Result<(), TooLong> {
+    /// not be copied, spliced and escaped just to be refused. Call it before anything that
+    /// copies the text.
+    pub fn refuse_huge(&self, s: &str) -> Result<(), TooLong> {
         let lower_bound = sanitized_units_lower_bound(s);
         if lower_bound > self.max_len && lower_bound > self.len_utf16() {
             return Err(TooLong {

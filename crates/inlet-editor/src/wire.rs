@@ -13,7 +13,7 @@ use fluxer_markdown_parser::ast::MentionKind;
 use fluxer_markdown_parser::{EmojiContext, MarkdownParser, Node, ParserFlags};
 use linkify::{LinkFinder, LinkKind};
 
-use crate::sanitize::server_strips;
+use crate::sanitize::{js_trim, server_strips};
 use crate::tokens::{special_at, Id, Special, Token, TokenSpan};
 
 /// The mentions Fluxer finds in a message.
@@ -186,6 +186,13 @@ pub(crate) fn to_wire(text: &str, tokens: &[TokenSpan]) -> String {
     if sites == 0 || sites > MAX_MARKERS {
         return all;
     }
+    // With `@everyone` or `@here` picked together with users or roles, the server can only be
+    // told `parse: ["everyone", "users", "roles"]`, and no list limits the mentions. Then
+    // only the escapes keep unpicked mentions out, so none may be left out.
+    let picked = Mentions::picked(tokens);
+    if (picked.everyone || picked.here) && !(picked.users.is_empty() && picked.roles.is_empty()) {
+        return all;
+    }
     let (probe, _) = build(text, tokens, &Mode::Probe);
     let Some(code_sites) = code_sites(&probe) else {
         return all;
@@ -194,7 +201,7 @@ pub(crate) fn to_wire(text: &str, tokens: &[TokenSpan]) -> String {
         return all;
     }
     let (selective, _) = build(text, tokens, &Mode::Selective(&code_sites));
-    if server_mentions(&selective) == Mentions::picked(tokens) {
+    if server_mentions(&selective) == picked {
         selective
     } else {
         all
@@ -208,7 +215,8 @@ fn parse(input: &str) -> Option<Vec<Node>> {
 
 /// The look-alikes (by number) that the parser puts into code or a link address.
 fn code_sites(probe: &str) -> Option<HashSet<usize>> {
-    let nodes = parse(probe)?;
+    // The server parses the trimmed content.
+    let nodes = parse(js_trim(probe))?;
     let mut found = HashSet::new();
     for node in &nodes {
         visit(node, &mut found);
@@ -270,7 +278,7 @@ fn visit(node: &Node, found: &mut HashSet<usize>) {
 /// U+202E and U+000C removed, then trimmed.
 pub fn server_mentions(content: &str) -> Mentions {
     let normalized: String = content.chars().filter(|c| !server_strips(*c)).collect();
-    let trimmed = normalized.trim_matches(|c: char| c.is_whitespace() || c == '\u{feff}');
+    let trimmed = js_trim(&normalized);
     let cleaned = blank_raw_urls(trimmed);
     let mut mentions = Mentions::default();
     if let Some(nodes) = parse(&cleaned) {

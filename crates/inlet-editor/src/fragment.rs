@@ -4,10 +4,22 @@
 //! Other apps get the plain text. The clipboard item also carries a small description of the
 //! tokens, so a pill that is cut and pasted stays a pill.
 
-use crate::sanitize::sanitize_input;
+use crate::sanitize::is_clean;
 use crate::tokens::{Token, TokenSpan};
 
 const HEADER: &str = "inlet-editor-fragment 1";
+
+/// The text of a pill has the shape its kind gives it. Metadata from another program must
+/// not turn plain words into a mention pill.
+fn label_fits(label: &str, token: &Token) -> bool {
+    match token {
+        Token::Everyone => label == "@everyone",
+        Token::Here => label == "@here",
+        Token::User(_) | Token::Role(_) => label.len() > 1 && label.starts_with('@'),
+        Token::Channel(_) => label.len() > 1 && label.starts_with('#'),
+        Token::CustomEmoji { name, .. } => label == format!(":{name}:"),
+    }
+}
 
 /// A piece of the buffer. The ranges of the tokens are relative to `text`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -42,7 +54,7 @@ impl Fragment {
         if lines.next()? != HEADER {
             return None;
         }
-        if sanitize_input(text) != text {
+        if !is_clean(text) {
             return None;
         }
         let mut tokens: Vec<TokenSpan> = Vec::new();
@@ -60,6 +72,9 @@ impl Fragment {
                 || !text.is_char_boundary(end)
                 || !in_order
             {
+                return None;
+            }
+            if !label_fits(&text[start..end], &token) {
                 return None;
             }
             tokens.push(TokenSpan {

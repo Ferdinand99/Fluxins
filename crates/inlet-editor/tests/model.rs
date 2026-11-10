@@ -230,7 +230,23 @@ fn fluxer_mentions(wire: &str) -> Mentions {
         .chars()
         .filter(|c| *c != '\u{202e}' && *c != '\u{000c}')
         .collect();
-    let trimmed = normalized.trim_matches(|c: char| c.is_whitespace() || c == '\u{feff}');
+    // JavaScript's `trim`: not Rust's `is_whitespace` (that also trims U+0085).
+    let trimmed = normalized.trim_matches(|c: char| {
+        matches!(
+            c,
+            '\u{0009}'..='\u{000d}'
+                | '\u{0020}'
+                | '\u{00a0}'
+                | '\u{1680}'
+                | '\u{2000}'..='\u{200a}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{202f}'
+                | '\u{205f}'
+                | '\u{3000}'
+                | '\u{feff}'
+        )
+    });
     let mut blanked = trimmed.to_owned();
     let mut finder = LinkFinder::new();
     finder.kinds(&[LinkKind::Url]);
@@ -369,6 +385,7 @@ fn to_wire_does_not_depend_on_what_was_filtered_on_the_way_in() {
         "@everyone",
         "\u{202e}",
         "\u{000c}",
+        "\u{0085}",
         "<",
         "@",
         "x",
@@ -386,7 +403,7 @@ fn to_wire_does_not_depend_on_what_was_filtered_on_the_way_in() {
         );
         checked += 1;
     });
-    assert!(checked > 30_000, "{checked}");
+    assert!(checked > 40_000, "{checked}");
 }
 
 #[test]
@@ -513,10 +530,15 @@ fn code_around_pills_never_adds_a_mention() {
 }
 
 #[test]
-fn custom_emoji_names_with_a_dash_stay_emoji() {
-    let buf = Buffer::from_wire("<:a-b:5> <a:caf\u{e9}_1:6>", &NoNames);
+fn custom_emoji_names_follow_the_parser() {
+    // ASCII letters, digits, `_` and `-`, as in `fluxer_markdown_parser`.
+    let buf = Buffer::from_wire("<:a-b:5> <a:Ab_1:6>", &NoNames);
     assert_eq!(buf.tokens().len(), 2);
-    assert_eq!(buf.to_wire(), "<:a-b:5> <a:caf\u{e9}_1:6>");
+    assert_eq!(buf.to_wire(), "<:a-b:5> <a:Ab_1:6>");
+    // A non-ASCII name is plain text for Fluxer, so it is plain text here too.
+    let buf = Buffer::from_wire("<a:caf\u{e9}_1:6>", &NoNames);
+    assert!(buf.tokens().is_empty());
+    assert_eq!(buf.text(), "<a:caf\u{e9}_1:6>");
 }
 
 #[test]
@@ -584,6 +606,32 @@ fn clipboard_metadata_that_does_not_fit_is_ignored() {
             Fragment::from_clipboard("hi @alice!", bad).is_none(),
             "{bad}"
         );
+    }
+    // The text of a pill must have the shape of its kind.
+    for (text, bad) in [
+        ("hello", "inlet-editor-fragment 1\n0 5 @everyone"),
+        ("hello", "inlet-editor-fragment 1\n0 5 @here"),
+        ("hello", "inlet-editor-fragment 1\n0 5 <@1>"),
+        ("hello", "inlet-editor-fragment 1\n0 5 <#1>"),
+        ("hello", "inlet-editor-fragment 1\n0 5 <:smile:1>"),
+        ("@", "inlet-editor-fragment 1\n0 1 <@1>"),
+        ("@everyone!", "inlet-editor-fragment 1\n0 9 <@1>x"),
+        (":other:", "inlet-editor-fragment 1\n0 7 <:smile:1>"),
+    ] {
+        assert!(
+            Fragment::from_clipboard(text, bad).is_none(),
+            "{text} {bad}"
+        );
+    }
+    for (text, good) in [
+        ("@everyone", "inlet-editor-fragment 1\n0 9 @everyone"),
+        ("@here", "inlet-editor-fragment 1\n0 5 @here"),
+        ("@Al", "inlet-editor-fragment 1\n0 3 <@&1>"),
+        ("#general", "inlet-editor-fragment 1\n0 8 <#1>"),
+        (":smile:", "inlet-editor-fragment 1\n0 7 <:smile:1>"),
+    ] {
+        let parsed = Fragment::from_clipboard(text, good);
+        assert!(parsed.is_some(), "{text} {good}");
     }
     // Text the editor would change is not trusted.
     assert!(Fragment::from_clipboard("hi \u{202e}@alice!", ok).is_none());
@@ -1065,4 +1113,37 @@ fn a_trigger_can_be_replaced_with_a_token_in_one_step() {
     assert_eq!(buf.to_wire(), "hi <@1>");
     assert!(buf.undo());
     assert_eq!(buf.text(), "hi @al");
+}
+
+#[test]
+fn a_next_line_character_next_to_a_fence_cannot_hide_a_mention() {
+    // JavaScript's `trim` keeps U+0085, and Rust's trims it. Whatever the parser makes of
+    // a NEL next to a fence, what the server finds must be exactly what was picked.
+    let mut buf = Buffer::from_wire("\u{85}```\n\n```", &NoNames);
+    let inside = "\u{85}```\n".len();
+    buf.insert(inside, "@everyone <@5> <@&6>").unwrap();
+    let wire = buf.to_wire();
+    assert_eq!(fluxer_mentions(&wire), Mentions::default(), "{wire:?}");
+    // The same block without the NEL is code, and is left alone.
+    let mut buf = Buffer::from_wire("```\n\n```", &NoNames);
+    buf.insert(4, "@everyone <@5>").unwrap();
+    assert_eq!(buf.to_wire(), "```\n@everyone <@5>\n```");
+}
+
+#[test]
+fn everything_is_escaped_when_everyone_is_picked_with_users() {
+    // With `parse: ["everyone", "users", "roles"]` no list limits the mentions, so nothing
+    // may be left unescaped on the server's word alone.
+    let mut buf = Buffer::new(2000);
+    buf.insert(0, "`@here` ").unwrap();
+    let end = buf.len();
+    assert!(buf.insert_token(end, Token::Here, "@here"));
+    assert_eq!(buf.to_wire(), "`@here` @here", "alone, code is left alone");
+    let end = buf.len();
+    assert!(buf.insert_token(end, Token::User(Id(7)), "@u"));
+    assert_eq!(buf.to_wire(), "`\\@here` @here<@7>");
+    assert_eq!(
+        fluxer_mentions(&buf.to_wire()),
+        Mentions::picked(buf.tokens())
+    );
 }

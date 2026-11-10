@@ -97,6 +97,10 @@ impl History {
         Some(entry)
     }
 
+    pub fn peek_undo(&self) -> Option<&Entry> {
+        self.undo.last()
+    }
+
     /// Takes back the last step without keeping it for redo.
     pub fn pop_undo(&mut self) -> Option<Entry> {
         self.open = None;

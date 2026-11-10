@@ -623,6 +623,11 @@ impl Editor {
         let Some(text) = item.text() else {
             return;
         };
+        // Before anything copies the text.
+        if self.buffer.refuse_huge(&text).is_err() {
+            window.play_system_bell();
+            return;
+        }
         let range = self.selection.range();
         let fragment = item
             .metadata()
@@ -675,10 +680,13 @@ impl Editor {
     fn finish_composition(&mut self, window: &Window, cx: &mut Context<Self>) {
         let start = self.marked.take().map(|m| m.start);
         self.buffer.end_composition();
-        if self.buffer.is_over_limit() && self.buffer.discard_last_step() {
-            let at = start.unwrap_or(self.selection.head);
-            self.selection = Selection::caret(self.buffer.clamp(at));
-            window.play_system_bell();
+        // Only a composition that was open can be taken back, and only when it made the
+        // text longer than the limit. Without one, the last step is the user's own edit.
+        if let Some(start) = start {
+            if self.buffer.discard_last_step_if_too_long() {
+                self.selection = Selection::caret(self.buffer.clamp(start));
+                window.play_system_bell();
+            }
         }
         self.after_edit(window, cx);
     }

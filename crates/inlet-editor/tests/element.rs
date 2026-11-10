@@ -398,3 +398,41 @@ fn home_and_end_stay_on_the_row_at_a_soft_wrap(cx: &mut TestAppContext) {
     let below = editor.update_in(cx, |ed, _, _| ed.selection().head);
     assert!(below > row_above);
 }
+
+#[gpui::test]
+fn unmark_without_a_composition_keeps_the_last_edit(cx: &mut TestAppContext) {
+    let window = cx.add_window(|_, cx| Editor::new(5, cx));
+    window
+        .update(cx, |ed, window, cx| {
+            // Text from the server that is over the limit.
+            ed.set_wire("0123456789", &NoNames, window, cx);
+            assert!(ed.buffer().is_over_limit());
+            // The user deletes some (still over the limit), and the platform calls unmark.
+            ed.replace_text_in_range(Some(0..2), "", window, cx);
+            assert_eq!(ed.buffer().text(), "23456789");
+            ed.unmark_text(window, cx);
+            assert_eq!(ed.buffer().text(), "23456789", "the deletion is kept");
+            assert!(ed.undo_edit(window, cx), "and it can be undone");
+            assert_eq!(ed.buffer().text(), "0123456789");
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn a_composition_that_shrinks_over_limit_text_is_kept(cx: &mut TestAppContext) {
+    let window = cx.add_window(|_, cx| Editor::new(5, cx));
+    window
+        .update(cx, |ed, window, cx| {
+            ed.set_wire("0123456789", &NoNames, window, cx);
+            // Replace "89" with "x" through the input method: shorter, still over.
+            ed.replace_and_mark_text_in_range(Some(8..10), "x", None, window, cx);
+            ed.unmark_text(window, cx);
+            assert_eq!(ed.buffer().text(), "01234567x");
+            // A composition that makes it longer is taken back.
+            ed.replace_and_mark_text_in_range(None, "yz", None, window, cx);
+            assert_eq!(ed.buffer().text(), "01234567xyz");
+            ed.unmark_text(window, cx);
+            assert_eq!(ed.buffer().text(), "01234567x");
+        })
+        .unwrap();
+}
