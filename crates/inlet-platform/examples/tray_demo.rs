@@ -109,36 +109,44 @@ fn main() {
             .expect("open the demo window");
         cx.activate(true);
 
-        let menu = vec![
-            TrayItem::action("open", "Open Inlet"),
-            TrayItem::action("unread", "Show unread"),
-            TrayItem::action("normal", "Clear"),
-            TrayItem::separator(),
-            TrayItem::action("quit", "Quit Inlet"),
-        ];
-        let tray = match Tray::new(demo_icon(32), menu) {
-            Ok(tray) => {
-                tray.set_state(TrayState::Mention);
-                tray.set_tooltip("Inlet \u{2013} 3 mentions");
-                println!("tray icon created");
-                Some(tray)
-            }
-            Err(err) => {
-                println!("no tray icon: {err}");
-                None
-            }
-        };
-        set_badge(Badge::Count(3));
-        match Notification::new("demo:1", "Inlet demo", "This notification came from inlet-platform.") {
+        match Notification::new(
+            "demo:1",
+            "Inlet demo",
+            "This notification came from inlet-platform.",
+        ) {
             Ok(n) => gpui_glue::notify(cx, &n),
             Err(err) => println!("notification refused: {err}"),
         }
-        println!("idle time: {:?}", idle_time());
 
-        // Platform events, including the tray menu.
+        // Tray and badge calls talk to Explorer, which can dispatch window messages
+        // while it answers. gpui's window procedure needs the app, so on Windows
+        // these calls belong outside `cx.update` and outside this `run` callback:
+        // in a task, between its awaits.
         let events = inlet_platform::events();
         cx.spawn(async move |cx| {
-            let tray = tray;
+            let menu = vec![
+                TrayItem::action("open", "Open Inlet"),
+                TrayItem::action("unread", "Show unread"),
+                TrayItem::action("normal", "Clear"),
+                TrayItem::separator(),
+                TrayItem::action("quit", "Quit Inlet"),
+            ];
+            let tray = match Tray::new(demo_icon(32), menu) {
+                Ok(tray) => {
+                    tray.set_state(TrayState::Mention);
+                    tray.set_tooltip("Inlet \u{2013} 3 mentions");
+                    println!("tray icon created");
+                    Some(tray)
+                }
+                Err(err) => {
+                    println!("no tray icon: {err}");
+                    None
+                }
+            };
+            set_badge(Badge::Count(3));
+            println!("idle time: {:?}", idle_time());
+
+            // Platform events, including the tray menu.
             while let Ok(event) = events.recv().await {
                 println!("event: {event:?}");
                 match event {
@@ -147,13 +155,13 @@ fn main() {
                         if let Some(tray) = &tray {
                             tray.set_state(TrayState::Unread);
                         }
-                        cx.update(|_| set_badge(Badge::Dot));
+                        set_badge(Badge::Dot);
                     }
                     PlatformEvent::TrayMenu(id) if id == "normal" => {
                         if let Some(tray) = &tray {
                             tray.set_state(TrayState::Normal);
                         }
-                        cx.update(|_| set_badge(None));
+                        set_badge(None);
                     }
                     _ => {}
                 }
@@ -186,8 +194,8 @@ fn main() {
         // and set the badge once the taskbar button exists.
         cx.spawn(async move |cx| {
             cx.background_executor().timer(Duration::from_secs(2)).await;
+            set_badge(Badge::Count(3));
             cx.update(|cx| {
-                set_badge(Badge::Count(3));
                 let _ = window.update(cx, |_, window, _| gpui_glue::flash_window(window));
             });
         })

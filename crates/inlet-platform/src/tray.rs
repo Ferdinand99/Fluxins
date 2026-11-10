@@ -8,6 +8,12 @@
 //! Create the tray on the UI thread. On Windows the tray's hidden window gets its
 //! messages from that thread's message loop (gpui's main loop pumps them); on
 //! macOS AppKit only allows it on the main thread.
+//!
+//! With gpui on Windows, call the tray (and [`crate::set_badge`]) outside
+//! `cx.update` and outside the `Application::run` callback, for example in a
+//! `cx.spawn` task between awaits. Explorer can dispatch window messages while
+//! it answers these calls, and gpui's window procedure cannot borrow the app at
+//! that moment: it logs "RefCell already borrowed" and skips a frame.
 
 use crate::{Icon, Result};
 
