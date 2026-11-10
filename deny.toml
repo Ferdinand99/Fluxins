@@ -15,6 +15,15 @@ yanked = "deny"
 # Only fail on unmaintained crates we depend on directly; gpui pulls in several
 # unmaintained transitive crates that are not ours to fix.
 unmaintained = "workspace"
+ignore = [
+    # bincode 1.3.3 is unmaintained. syntect (code block highlighting) needs it to load
+    # its built-in syntax set, which is compiled into the binary; bincode never reads
+    # data from the network. syntect cannot load that set without it (the only other
+    # loader parses grammar files at run time). Drop this once syntect moves off it.
+    # `unmaintained = "workspace"` already leaves this transitive crate out; the entry
+    # keeps the decision on record if that setting is ever tightened.
+    { id = "RUSTSEC-2025-0141", reason = "bincode only reads syntect's built-in syntax dump" },
+]
 
 [licenses]
 version = 2
