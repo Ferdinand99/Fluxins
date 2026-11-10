@@ -57,10 +57,18 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("enter", Submit, ctx),
         KeyBinding::new("tab", FocusNext, None),
         KeyBinding::new("shift-tab", FocusPrev, None),
-        KeyBinding::new("secondary-a", SelectAll, ctx),
-        KeyBinding::new("secondary-v", Paste, ctx),
-        KeyBinding::new("secondary-c", Copy, ctx),
-        KeyBinding::new("secondary-x", Cut, ctx),
+    ]);
+    // "secondary" needs an OS context in this gpui version, so pick the modifier here.
+    let [a, v, c, x] = if cfg!(target_os = "macos") {
+        ["cmd-a", "cmd-v", "cmd-c", "cmd-x"]
+    } else {
+        ["ctrl-a", "ctrl-v", "ctrl-c", "ctrl-x"]
+    };
+    cx.bind_keys([
+        KeyBinding::new(a, SelectAll, ctx),
+        KeyBinding::new(v, Paste, ctx),
+        KeyBinding::new(c, Copy, ctx),
+        KeyBinding::new(x, Cut, ctx),
     ]);
 }
 

@@ -37,7 +37,7 @@ shot 05-sent-and-live
 grep -E 'VmRSS|VmHWM' /proc/$pid/status > "$out/memory.txt"
 kill $pid; wait $pid 2>/dev/null
 
-tail -20 "$out/signin.log" "$out/demo.log" >&2
+tail -n 20 "$out/signin.log" "$out/demo.log" >&2
 cat "$out/memory.txt" >&2
 rm -rf "$out/config"
 tar -C "$out" -cf - .
