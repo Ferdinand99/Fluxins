@@ -168,6 +168,53 @@ pub struct EndpointPins {
     pub gateway: String,
 }
 
+/// [`EndpointPins`] plus the media endpoint, so a changed discovery document
+/// cannot move image loading (and with it the person's IP address and what
+/// they look at) to another host either. The JSON is backward compatible:
+/// `{"api", "gateway", "media"}` reads as [`EndpointPins`] (the extra field is
+/// ignored), and pins stored without `media` read as `media: None`, which
+/// accepts any media endpoint until the pins are stored again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionPins {
+    /// Origin of the API base.
+    pub api: String,
+    /// Origin of the gateway.
+    pub gateway: String,
+    /// Origin of the media endpoint, `None` for none (or for old stored pins).
+    #[serde(default)]
+    pub media: Option<String>,
+}
+
+impl From<EndpointPins> for SessionPins {
+    fn from(p: EndpointPins) -> Self {
+        SessionPins {
+            api: p.api,
+            gateway: p.gateway,
+            media: None,
+        }
+    }
+}
+
+impl SessionPins {
+    /// The API and gateway part.
+    pub fn endpoints(&self) -> EndpointPins {
+        EndpointPins {
+            api: self.api.clone(),
+            gateway: self.gateway.clone(),
+        }
+    }
+}
+
+impl std::fmt::Display for SessionPins {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "API {} and gateway {}", self.api, self.gateway)?;
+        if let Some(m) = &self.media {
+            write!(f, " and media {m}")?;
+        }
+        Ok(())
+    }
+}
+
 impl std::fmt::Display for EndpointPins {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "API {} and gateway {}", self.api, self.gateway)
@@ -264,11 +311,22 @@ pub fn normalize_origin(origin: &str) -> Result<String> {
 }
 
 fn http_builder(info: &ClientInfo) -> reqwest::ClientBuilder {
-    reqwest::Client::builder()
+    let builder = reqwest::Client::builder()
         .user_agent(info.user_agent.clone())
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(30))
-        .use_rustls_tls()
+        .use_rustls_tls();
+    extra_roots(builder)
+}
+
+#[cfg(feature = "test-extra-ca")]
+fn extra_roots(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    crate::test_ca::add_to_http(builder)
+}
+
+#[cfg(not(feature = "test-extra-ca"))]
+fn extra_roots(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    builder
 }
 
 pub(crate) fn build_http(info: &ClientInfo) -> Result<(reqwest::Client, reqwest::Client)> {
@@ -438,6 +496,37 @@ impl Instance {
         }
     }
 
+    /// The API, gateway and media hosts. Store these next to the token.
+    pub fn session_pins(&self) -> SessionPins {
+        let media = self
+            .inner
+            .media
+            .as_deref()
+            .and_then(|m| Url::parse(m).ok())
+            .map(|u| u.origin().ascii_serialization());
+        let p = self.pins();
+        SessionPins {
+            api: p.api,
+            gateway: p.gateway,
+            media,
+        }
+    }
+
+    /// Like [`Instance::verify_pins`], and also checks the media host when the
+    /// pins have one.
+    pub fn verify_session_pins(&self, pinned: &SessionPins) -> Result<()> {
+        let now = self.session_pins();
+        let media_ok = pinned.media.is_none() || pinned.media == now.media;
+        if now.api == pinned.api && now.gateway == pinned.gateway && media_ok {
+            Ok(())
+        } else {
+            Err(Error::EndpointsChanged {
+                old: pinned.to_string(),
+                new: now.to_string(),
+            })
+        }
+    }
+
     /// Errors with [`Error::EndpointsChanged`] unless this instance's API and
     /// gateway hosts are the pinned ones.
     pub fn verify_pins(&self, pinned: &EndpointPins) -> Result<()> {
@@ -502,7 +591,8 @@ impl Instance {
     }
 
     /// Media proxy URL of a user avatar, or `None` when the user has no avatar.
-    /// `size` is a power of two from 16 to 4096; Fluxer serves WebP.
+    /// `size` is a power of two from 16 to 4096; Fluxer serves WebP. See
+    /// [`Instance::media`] for animated variants and other assets.
     pub fn avatar_url(
         &self,
         user_id: &str,
@@ -511,6 +601,9 @@ impl Instance {
     ) -> Option<String> {
         let media = self.inner.media.as_deref()?;
         let hash = avatar_hash?;
+        if !crate::media::is_snowflake(user_id) || !crate::media::is_hash(hash) {
+            return None;
+        }
         Some(format!("{media}/avatars/{user_id}/{hash}.webp?size={size}"))
     }
 
@@ -523,6 +616,9 @@ impl Instance {
     ) -> Option<String> {
         let media = self.inner.media.as_deref()?;
         let hash = icon_hash?;
+        if !crate::media::is_snowflake(guild_id) || !crate::media::is_hash(hash) {
+            return None;
+        }
         Some(format!("{media}/icons/{guild_id}/{hash}.webp?size={size}"))
     }
 }
@@ -724,6 +820,23 @@ mod tests {
         ))
         .unwrap();
         let pins = a.pins();
+        let full = a.session_pins();
+        assert!(a.verify_session_pins(&full).is_ok());
+        // Old stored pins (no media) still read and still verify.
+        let old: SessionPins =
+            serde_json::from_str(&serde_json::to_string(&pins).unwrap()).unwrap();
+        assert_eq!(old.media, None);
+        assert!(a.verify_session_pins(&old).is_ok());
+        // New pins read as the old type too.
+        let back: EndpointPins =
+            serde_json::from_str(&serde_json::to_string(&full).unwrap()).unwrap();
+        assert_eq!(back, pins);
+        let mut moved = full.clone();
+        moved.media = Some("https://elsewhere.example".into());
+        assert!(matches!(
+            a.verify_session_pins(&moved),
+            Err(Error::EndpointsChanged { .. })
+        ));
         assert_eq!(pins.api, "https://chat.example.org");
         assert_eq!(pins.gateway, "wss://chat.example.org");
         assert!(a.verify_pins(&pins).is_ok());

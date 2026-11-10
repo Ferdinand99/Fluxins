@@ -9,8 +9,10 @@ rust-version.workspace = true
 
 [dependencies]
 base64 = "0.22"
+bytes = "1"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 hex = "0.4"
+http-body = "1"
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 psl = "2"
 rand = "0.8"
@@ -27,6 +29,11 @@ url = "2"
 webpki-roots = "0.26"
 zeroize = "1"
 zstd = "0.13"
+
+[features]
+# Trust the PEM file in INLET_TEST_EXTRA_CA_FILE as an extra root CA, for a
+# private test instance. Tests only: refused in release builds.
+test-extra-ca = []
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util", "time", "net", "sync"] }

@@ -119,6 +119,8 @@ pub struct RateLimiter {
     /// Callers queue here (FIFO) for a global slot.
     queue: tokio::sync::Mutex<()>,
     state: Mutex<State>,
+    /// Typing debounce, ack coalescing and traits of the account.
+    pub(crate) coalesce: crate::coalesce::Shared,
 }
 
 /// What a limiter is shared by.
@@ -171,6 +173,7 @@ impl RateLimiter {
                 routes: HashMap::new(),
                 last_used: Instant::now(),
             }),
+            coalesce: crate::coalesce::Shared::default(),
         }
     }
 
