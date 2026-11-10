@@ -1,0 +1,5 @@
+[toolchain]
+# Same stable release the Zed repository pins for gpui.
+channel = "1.98.1"
+profile = "minimal"
+components = ["clippy", "rustfmt"]
