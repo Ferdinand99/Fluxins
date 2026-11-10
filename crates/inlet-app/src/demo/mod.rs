@@ -9,12 +9,13 @@ mod guilds;
 mod messages;
 pub mod scenes;
 mod social;
+mod unread;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::backend::{accounts, messages as msgs, Ui};
+use crate::backend::{accounts, messages as msgs, notifications, Ui};
 use crate::model::{Channel, ChannelKind, Embed, EmbedField, Message, Names};
 
 pub struct MockSession {
@@ -180,6 +181,7 @@ impl MockSession {
             instance: "demo".into(),
         });
         let _ = events.unbounded_send(msgs::Ev::Guilds(guilds));
+        let _ = events.unbounded_send(notifications::Ev::Badges(unread::badges()));
         let _ = events.unbounded_send(accounts::Ev::Status("Demo mode".into()));
 
         Self {

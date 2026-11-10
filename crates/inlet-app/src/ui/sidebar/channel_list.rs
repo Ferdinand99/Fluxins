@@ -7,6 +7,7 @@ use crate::app::Inlet;
 use crate::assets::Icon;
 use crate::model::{Channel, ChannelKind};
 use crate::theme;
+use crate::ui::notifications::badge::{mention_badge, RowMarks};
 
 pub fn channel_icon(kind: ChannelKind) -> Icon {
     match kind {
@@ -46,10 +47,13 @@ impl Inlet {
                     let folded = self.sidebar.collapsed.contains(&c.id);
                     let cat = c.id.clone();
                     let spaced = std::mem::replace(&mut previous_was_channel, false);
+                    // A muted category is drawn at half strength, as a muted channel is.
+                    let dimmed = self.badge(&c.id).dimmed;
                     return div()
                         .id(SharedString::from(format!("ch-{}", c.id)))
                         .flex_none()
                         .when(spaced, |d| d.mt_4())
+                        .when(dimmed, |d| d.opacity(0.5))
                         .h(px(32.))
                         .ml_2()
                         .px_2()
@@ -103,12 +107,16 @@ impl Inlet {
     ) -> AnyElement {
         let messageable = c.is_messageable();
         let id = c.id.clone();
+        let badge = self.badge(&c.id);
+        let marks = RowMarks::of(badge, active);
         let color = if active {
             theme::text_strong()
+        } else if marks.highlight {
+            theme::text_secondary()
         } else {
             theme::text_channel()
         };
-        div()
+        let row = div()
             .id(SharedString::from(format!("ch-{}", c.id)))
             // Rows must not shrink: a scrolling flex column shrinks its children
             // when the list is taller than the view, and `overflow_hidden` lets
@@ -143,6 +151,29 @@ impl Inlet {
                     .text_ellipsis()
                     .child(c.name.clone()),
             )
+            .when(marks.count, |d| d.child(mention_badge(badge.mentions)));
+        // The unread pill sits 4 px left of the row, outside its clipped box, so the row
+        // goes in a frame that carries it (and the half-strength look of a muted channel).
+        div()
+            .relative()
+            .flex_none()
+            .flex()
+            .flex_col()
+            .when(marks.dimmed, |d| d.opacity(0.5))
+            .when(marks.pill, |d| {
+                d.child(
+                    div()
+                        .absolute()
+                        .left(px(4.))
+                        .top(px(12.))
+                        .w(px(8.))
+                        .h(px(8.))
+                        .rounded_r(px(4.))
+                        .bg(theme::text_strong())
+                        .when(marks.pill_faded, |p| p.opacity(0.4)),
+                )
+            })
+            .child(row)
             .into_any_element()
     }
 }

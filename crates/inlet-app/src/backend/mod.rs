@@ -287,6 +287,8 @@ struct RealActive {
     guilds: Arc<Mutex<Vec<Guild>>>,
     cache: ChannelCache,
     names: SharedNames,
+    /// Unread state, acknowledgements and notification settings of this session.
+    read: notifications::ReadHandle,
     active_guild: Option<String>,
     /// Restart bookkeeping; lives with the session so spacing survives restarts.
     policy: ReconnectPolicy,

@@ -218,6 +218,7 @@ impl Inlet {
         self.selected_guild = None;
         self.selected_channel = None;
         self.set_messages(Vec::new());
+        self.notifications.clear();
         self.chat.status.clear();
         self.chat.error = None;
         self.chat.notice = None;

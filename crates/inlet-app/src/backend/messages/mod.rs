@@ -4,7 +4,7 @@
 //! part, so the tasks that add pins, the inbox, threads, actions and read state each
 //! work in their own file.
 
-mod ack;
+pub(crate) mod ack;
 mod actions;
 mod fetch;
 mod inbox;

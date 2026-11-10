@@ -36,6 +36,9 @@ pub struct Mute {
     pub muted: bool,
     /// `mute_config.end_time` in Unix milliseconds.
     pub end_ms: Option<i64>,
+    /// `mute_config.selected_time_window` in milliseconds (0 when unknown):
+    /// the duration that was picked, kept so a write sends it back unchanged.
+    pub window_ms: i64,
 }
 
 impl Mute {
@@ -50,12 +53,35 @@ impl Mute {
             None => return old,
         };
         // An end time that does not parse means "until turned off", as in Fluxer.
-        let end_ms = obj
-            .get("mute_config")
-            .and_then(|c| c.get("end_time"))
-            .and_then(Value::as_str)
-            .and_then(parse_timestamp_ms);
-        Mute { muted, end_ms }
+        let config = obj.get("mute_config");
+        let end_ms = config.and_then(|c| c.get("end_time")).and_then(|v| {
+            v.as_str()
+                .and_then(parse_timestamp_ms)
+                .or_else(|| v.as_i64())
+        });
+        let window_ms = config
+            .and_then(|c| c.get("selected_time_window"))
+            .and_then(Value::as_i64)
+            .unwrap_or(0)
+            .max(0);
+        Mute {
+            muted,
+            end_ms,
+            window_ms,
+        }
+    }
+
+    /// The `mute_config` object of a write, `null` when there is none.
+    /// `end_time` goes out as Unix milliseconds, which the server accepts. A
+    /// mute until turned off has no config, as Fluxer's own client sends it.
+    pub fn config_json(&self) -> Value {
+        match (self.muted, self.end_ms) {
+            (true, Some(end)) => serde_json::json!({
+                "end_time": end,
+                "selected_time_window": self.window_ms,
+            }),
+            _ => Value::Null,
+        }
     }
 }
 
@@ -66,6 +92,12 @@ pub struct ChannelOverride {
     pub mute: Mute,
     /// Notification level, [`notifications::INHERIT`] when not set.
     pub message_notifications: i64,
+    /// The category is folded in the channel list.
+    pub collapsed: bool,
+    /// Unread-badge level (`None` = inherit). Kept only so a write returns it.
+    pub unread_badges: Option<i64>,
+    /// New-post flags of forum channels. Kept only so a write returns them.
+    pub flags: i64,
 }
 
 impl Default for ChannelOverride {
@@ -73,7 +105,33 @@ impl Default for ChannelOverride {
         ChannelOverride {
             mute: Mute::default(),
             message_notifications: notifications::INHERIT,
+            collapsed: false,
+            unread_badges: None,
+            flags: 0,
         }
+    }
+}
+
+impl ChannelOverride {
+    /// The override as the write route takes it (the channel notification
+    /// override input): every field the server keeps is carried, so changing
+    /// one channel does not reset another's folded state or badge level.
+    pub fn input_json(&self) -> Value {
+        let mut o = serde_json::json!({
+            "collapsed": self.collapsed,
+            "message_notifications": self.message_notifications,
+            "muted": self.mute.muted,
+            "mute_config": self.mute.config_json(),
+        });
+        if let Value::Object(m) = &mut o {
+            if let Some(level) = self.unread_badges {
+                m.insert("unread_badges".into(), Value::from(level));
+            }
+            if self.flags != 0 {
+                m.insert("flags".into(), Value::from(self.flags));
+            }
+        }
+        o
     }
 }
 
@@ -107,6 +165,31 @@ impl Default for GuildNotificationSettings {
 }
 
 impl GuildNotificationSettings {
+    /// The complete `channel_overrides` map of a write that changes one
+    /// channel: the server replaces the whole map, so every other override is
+    /// sent back as it is. `change` edits the channel's override (a new one
+    /// starts from the defaults). An override that ends up as the defaults is
+    /// left out, so the map does not grow with channels nobody configured.
+    pub fn overrides_with(
+        &self,
+        channel: ChannelId,
+        change: impl FnOnce(&mut ChannelOverride),
+    ) -> Value {
+        let mut all = self.channel_overrides.clone();
+        let mut o = all.get(&channel).copied().unwrap_or_default();
+        change(&mut o);
+        if o == ChannelOverride::default() {
+            all.remove(&channel);
+        } else {
+            all.insert(channel, o);
+        }
+        Value::Object(
+            all.iter()
+                .map(|(id, o)| (id.to_string(), o.input_json()))
+                .collect(),
+        )
+    }
+
     /// Applies a (full or partial) settings object on top of `self`.
     fn merge(&mut self, obj: &serde_json::Map<String, Value>) {
         if let Some(v) = obj.get("suppress_everyone") {
@@ -140,6 +223,12 @@ fn read_overrides(v: &Value) -> BTreeMap<ChannelId, ChannelOverride> {
         let Some(id) = id else { return };
         let mut o = ChannelOverride {
             mute: Mute::read(obj, Mute::default()),
+            collapsed: obj
+                .get("collapsed")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            unread_badges: obj.get("unread_badges").and_then(Value::as_i64),
+            flags: obj.get("flags").and_then(Value::as_i64).unwrap_or(0),
             ..Default::default()
         };
         if let Some(level) = obj.get("message_notifications").and_then(Value::as_i64) {
@@ -299,5 +388,63 @@ mod tests {
             notifications::ONLY_MENTIONS
         );
         assert_eq!(s.guild_notifications(None, 1), notifications::ALL_MESSAGES);
+    }
+
+    #[test]
+    fn a_write_keeps_every_other_override_whole() {
+        let mut s = GuildSettings::from_ready(&[json!({
+            "guild_id": "1",
+            "channel_overrides": {
+                "5": {"collapsed": true, "message_notifications": 1, "muted": false,
+                      "mute_config": null, "unread_badges": 2, "flags": 8192},
+                "6": {"collapsed": false, "message_notifications": 3, "muted": true,
+                      "mute_config": {"end_time": "1970-01-01T00:00:10Z", "selected_time_window": 3_600_000}}
+            }
+        })]);
+        let g = Some(GuildId(1));
+
+        // Muting channel 7 sends 5 and 6 back unchanged, with what the
+        // server keeps that this state does not use.
+        let body = s.get(g).overrides_with(ChannelId(7), |o| {
+            o.mute = Mute {
+                muted: true,
+                end_ms: Some(9_000),
+                window_ms: 1_000,
+            };
+        });
+        assert_eq!(body["5"]["collapsed"], json!(true));
+        assert_eq!(body["5"]["unread_badges"], json!(2));
+        assert_eq!(body["5"]["flags"], json!(8192));
+        assert_eq!(body["6"]["muted"], json!(true));
+        assert_eq!(
+            body["6"]["mute_config"],
+            json!({"end_time": 10_000, "selected_time_window": 3_600_000})
+        );
+        assert_eq!(
+            body["7"],
+            json!({"collapsed": false, "message_notifications": 3, "muted": true,
+                   "mute_config": {"end_time": 9_000, "selected_time_window": 1_000}})
+        );
+
+        // The body is a valid update: applying it changes only channel 7.
+        s.update(&json!({"guild_id": "1", "channel_overrides": body}));
+        assert!(s.channel_muted(g, ChannelId(7), 0));
+        assert!(!s.channel_muted(g, ChannelId(7), 9_000));
+        assert!(s.get(g).channel_overrides[&ChannelId(5)].collapsed);
+
+        // Muted until turned off has no config; unmuting a channel that
+        // has nothing else set drops its override.
+        let body = s
+            .get(g)
+            .overrides_with(ChannelId(7), |o| o.mute = Mute::default());
+        assert!(body.get("7").is_none());
+        let body = s.get(g).overrides_with(ChannelId(8), |o| {
+            o.mute = Mute {
+                muted: true,
+                ..Default::default()
+            }
+        });
+        assert_eq!(body["8"]["mute_config"], Value::Null);
+        assert_eq!(body["8"]["muted"], json!(true));
     }
 }

@@ -10,6 +10,7 @@ use crate::{about, assets, theme};
 impl Render for Inlet {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.take_channel_jump(window, cx);
+        self.sync_watching(window);
         let root = div()
             .relative()
             .size_full()
@@ -19,6 +20,7 @@ impl Render for Inlet {
             .text_color(theme::text())
             .text_size(px(16.))
             .font_family(assets::ui_font());
+        let root = self.notification_keys(root, cx);
         if self.show_about {
             return root
                 .child(about::render(self.show_licences, cx))

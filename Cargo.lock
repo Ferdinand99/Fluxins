@@ -2974,8 +2974,10 @@ dependencies = [
  "gpui_platform",
  "image",
  "inlet-protocol",
+ "inlet-state",
  "keyring",
  "log",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",
@@ -2983,6 +2985,7 @@ dependencies = [
  "unicode-segmentation",
  "url",
  "winresource",
+ "wiremock",
  "zeroize",
 ]
 
