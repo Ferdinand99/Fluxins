@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/fluxins-protocol", "crates/fluxins-app"]
+members = ["crates/inlet-protocol", "crates/inlet-app"]
 
 [workspace.package]
 version = "0.0.1"

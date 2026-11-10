@@ -1,5 +1,5 @@
 [package]
-name = "fluxins-protocol"
+name = "inlet-protocol"
 description = "Talks to a Fluxer instance: discovery, sign-in, REST and gateway"
 version.workspace = true
 edition.workspace = true

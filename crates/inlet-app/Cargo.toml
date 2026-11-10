@@ -1,5 +1,5 @@
 [package]
-name = "fluxins"
+name = "inlet"
 description = "A native desktop client for Fluxer"
 version.workspace = true
 edition.workspace = true
@@ -8,4 +8,4 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-fluxins-protocol = { path = "../fluxins-protocol" }
+inlet-protocol = { path = "../inlet-protocol" }
