@@ -21,6 +21,8 @@ path = "src/main.rs"
 inlet-protocol = { path = "../inlet-protocol" }
 # Per-account client state: the message windows the chat shows.
 inlet-state = { path = "../inlet-state" }
+# Tray, badge, single instance, deep links, autostart (with its gpui glue).
+inlet-platform = { path = "../inlet-platform", features = ["gpui"] }
 
 gpui.workspace = true
 gpui_platform.workspace = true

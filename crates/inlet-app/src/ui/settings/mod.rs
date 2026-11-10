@@ -2,19 +2,17 @@
 //! The settings view: a column of tabs on the left, the open tab on the right.
 //!
 //! Every tab is its own file under `tabs/` and implements [`SettingsTab`]; `tabs::all`
-//! lists them. Nothing opens the view yet: the tasks that add the first tabs also add
-//! the way in (the gear in the user panel).
-
-// The frame is in place before its first tab and its entry point.
-#![allow(dead_code)]
+//! lists them. The gear in the user panel opens the view over the whole window; it
+//! hides the chat, so nothing is read behind it (see `chat_is_visible`).
 
 pub mod tabs;
 
-use gpui::{div, prelude::*, px, AnyElement, Context, FontWeight, SharedString, Window};
+use gpui::{div, prelude::*, px, AnyElement, Context, Entity, FontWeight, SharedString, Window};
 
 use crate::app::Inlet;
 use crate::backend;
 use crate::theme;
+use crate::ui::widgets::button;
 
 /// One tab of the settings view.
 pub trait SettingsTab {
@@ -37,6 +35,13 @@ impl SettingsView {
         Self {
             tabs: tabs::all(),
             selected: 0,
+        }
+    }
+
+    /// Opens the tab with this ID, if there is one.
+    pub fn select(&mut self, id: &str) {
+        if let Some(ix) = self.tabs.iter().position(|t| t.id() == id) {
+            self.selected = ix;
         }
     }
 }
@@ -101,7 +106,10 @@ impl Render for SettingsView {
 
 /// The settings domain's view state.
 #[derive(Default)]
-pub struct State {}
+pub struct State {
+    /// The open settings view, if any.
+    pub view: Option<Entity<SettingsView>>,
+}
 
 impl Inlet {
     /// Events from the backend's settings domain.
@@ -112,5 +120,48 @@ impl Inlet {
         _cx: &mut Context<Self>,
     ) {
         match event {}
+    }
+
+    /// Opens the settings view over the window, at the tab `tab` if given.
+    pub(crate) fn open_settings(&mut self, tab: Option<&str>, cx: &mut Context<Self>) {
+        let view = cx.new(|_| {
+            let mut view = SettingsView::new();
+            if let Some(tab) = tab {
+                view.select(tab);
+            }
+            view
+        });
+        self.settings.view = Some(view);
+        cx.notify();
+    }
+
+    pub(crate) fn close_settings(&mut self, cx: &mut Context<Self>) {
+        self.settings.view = None;
+        cx.notify();
+    }
+
+    /// The settings view over the whole window, with a button to close it.
+    pub(crate) fn render_settings_overlay(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(view) = self.settings.view.clone() else {
+            return div().into_any_element();
+        };
+        div()
+            .id("settings-overlay")
+            .occlude()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(theme::bg_chat())
+            .child(div().flex_1().min_h_0().child(view))
+            .child(
+                div().absolute().top(px(16.)).right(px(16.)).child(
+                    button("settings-close", t!("settings-close"), false)
+                        .on_click(cx.listener(|this, _, _, cx| this.close_settings(cx))),
+                ),
+            )
+            .into_any_element()
     }
 }

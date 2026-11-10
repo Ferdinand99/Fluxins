@@ -2988,6 +2988,7 @@ dependencies = [
  "gpui",
  "gpui_platform",
  "image",
+ "inlet-platform",
  "inlet-protocol",
  "inlet-state",
  "keyring",
