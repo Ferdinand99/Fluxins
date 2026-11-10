@@ -396,7 +396,20 @@ impl Backend {
                     }
                     Ok(connected) => {
                         let pasted = credential.is_pasted();
-                        self.install(connected, false, pasted)
+                        // An entry stored before the media pin existed gets it now, right
+                        // after `me()` worked, so the media host is pinned from here on.
+                        let upgrade = match &credential {
+                            Credential::Stored { token, pins, .. } => {
+                                upgraded_pins(pins, &connected.session.session_pins())
+                                    .map(|pins| (token.clone(), pins))
+                            }
+                            _ => None,
+                        };
+                        let origin = connected.session.instance().origin().to_string();
+                        self.install(connected, false, pasted);
+                        if let Some((token, pins)) = upgrade {
+                            self.save_upgraded_pins(origin, token, pins, pasted);
+                        }
                     }
                     Err(failure) => self.connect_failed(failure, mode, instance, credential),
                 }
@@ -827,6 +840,40 @@ pub(super) async fn connect_task(
     session::connect(inst, credential).await
 }
 
+/// The pins to store for a restored session whose entry has no media host yet: the
+/// session's pins when its API and gateway hosts are the stored ones and it has a media
+/// host. `None` when there is nothing to upgrade.
+pub fn upgraded_pins(stored: &p::SessionPins, now: &p::SessionPins) -> Option<p::SessionPins> {
+    let same_hosts = stored.api == now.api && stored.gateway == now.gateway;
+    (stored.media.is_none() && now.media.is_some() && same_hosts).then(|| now.clone())
+}
+
+impl Backend {
+    /// Writes the upgraded pins of a restored session to its keychain entry. Runs as the
+    /// `saving` task, so a sign-out waits for it and cannot be undone by it.
+    fn save_upgraded_pins(
+        &mut self,
+        instance: String,
+        token: p::Token,
+        pins: p::SessionPins,
+        pasted: bool,
+    ) {
+        let previous = self.saving.take();
+        self.saving = Some(tokio::spawn(async move {
+            if let Some(previous) = previous {
+                let _ = previous.await;
+            }
+            let saved = tokio::task::spawn_blocking(move || {
+                token_store::save_session(&instance, &token, &pins, pasted)
+            })
+            .await;
+            if !matches!(saved, Ok(Ok(()))) {
+                log::warn!("could not store the media pin with the session");
+            }
+        }));
+    }
+}
+
 /// Whether signing out may end a token on the server. A pasted token belongs to another
 /// client and is only forgotten here.
 pub fn should_revoke(pasted: bool) -> bool {
@@ -858,6 +905,31 @@ fn notice_sign_out(events: &Ui, told_server: bool, deleted: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restored_entries_without_a_media_pin_are_upgraded_once() {
+        let old = p::SessionPins {
+            api: "https://fluxer.example".into(),
+            gateway: "wss://fluxer.example".into(),
+            media: None,
+        };
+        let now = p::SessionPins {
+            media: Some("https://media.fluxer.example".into()),
+            ..old.clone()
+        };
+        // Old entry, instance has a media host: store the full pins.
+        assert_eq!(upgraded_pins(&old, &now), Some(now.clone()));
+        // Already pinned: nothing to write.
+        assert_eq!(upgraded_pins(&now, &now), None);
+        // The instance has no media host: nothing to pin.
+        assert_eq!(upgraded_pins(&old, &old), None);
+        // Other API or gateway host (cannot happen after a pinned connect): never.
+        let moved = p::SessionPins {
+            api: "https://elsewhere.example".into(),
+            ..now.clone()
+        };
+        assert_eq!(upgraded_pins(&old, &moved), None);
+    }
 
     #[test]
     fn pasted_tokens_are_never_revoked() {

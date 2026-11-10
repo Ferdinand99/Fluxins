@@ -18,7 +18,7 @@ fn entry(instance: &str) -> Result<keyring::Entry> {
 
 /// What the keychain entry holds: the token and the hosts it was issued for, as one
 /// JSON value. Older entries hold only the bare token, or pins without the media host
-/// (those read as `media: None` and get it the next time the session is saved).
+/// (those read as `media: None` and get it after the next successful restore).
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Blob {
     token: String,
