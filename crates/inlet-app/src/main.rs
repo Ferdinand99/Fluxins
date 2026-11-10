@@ -6,6 +6,7 @@
 mod about;
 mod assets;
 mod backend;
+mod brand_icon;
 mod markdown;
 #[cfg(feature = "demo")]
 mod mock;
@@ -2052,6 +2053,9 @@ fn main() {
                     ..Default::default()
                 }),
                 app_id: Some("no.opland.inlet".into()),
+                // X11 only; Windows takes the icon from the .exe resource (build.rs).
+                #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+                icon: brand_icon::window_icon(),
                 ..Default::default()
             },
             |window, cx| cx.new(|cx| Inlet::new(window, cx)),
