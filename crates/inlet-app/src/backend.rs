@@ -23,7 +23,7 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender as
 use tokio::task::AbortHandle;
 
 use crate::model::{Channel, Guild, Message};
-use crate::real::{self, ChannelCache, Credential, Failure, FailureKind, GatewayEnd};
+use crate::real::{self, ChannelCache, Credential, Failure, FailureKind, GatewayEnd, SharedNames};
 use crate::reconnect::{Decision, ReconnectPolicy, Stop};
 use crate::token_store;
 
@@ -312,6 +312,7 @@ struct RealActive {
     forward: AbortHandle,
     guilds: Arc<Mutex<Vec<Guild>>>,
     cache: ChannelCache,
+    names: SharedNames,
     active_guild: Option<String>,
     /// Restart bookkeeping; lives with the session so spacing survives restarts.
     policy: ReconnectPolicy,
@@ -524,6 +525,12 @@ impl Backend {
     fn restore(&mut self) {
         #[cfg(feature = "demo")]
         if std::env::var_os("INLET_DEMO").is_some() {
+            // Lets screenshots show an instance accent, as on a branded instance.
+            crate::theme::set_accent(
+                std::env::var("INLET_DEMO_ACCENT")
+                    .ok()
+                    .and_then(|c| crate::theme::parse_hex(&c)),
+            );
             self.active = Some(Active::Demo(crate::mock::MockSession::start(
                 self.events.clone(),
             )));
@@ -863,7 +870,19 @@ impl Backend {
         let instance = session.instance().origin().to_string();
         let guilds = Arc::new(Mutex::new(connected.guilds.clone()));
         let cache: ChannelCache = Arc::default();
-        let (gateway, forward) = self.spawn_gateway(gen, &session, &guilds, &cache);
+        // Instance branding: its accent colour, as Fluxer's own client applies it.
+        let accent = session
+            .instance()
+            .discovery()
+            .app_public
+            .get("branding")
+            .and_then(|b| b.get("theme_color"))
+            .and_then(|c| c.as_str())
+            .and_then(crate::theme::parse_hex);
+        crate::theme::set_accent(accent);
+        let names: SharedNames = Arc::default();
+        names.lock().unwrap().me = Some(connected.user_id.clone());
+        let (gateway, forward) = self.spawn_gateway(gen, &session, &guilds, &cache, &names);
         let mut policy = ReconnectPolicy::default();
         policy.started(Instant::now());
 
@@ -924,6 +943,7 @@ impl Backend {
             forward,
             guilds,
             cache,
+            names,
             active_guild: None,
             policy,
             restart_timer: None,
@@ -936,11 +956,12 @@ impl Backend {
         session: &p::Session,
         guilds: &Arc<Mutex<Vec<Guild>>>,
         cache: &ChannelCache,
+        names: &SharedNames,
     ) -> (p::GatewayHandle, AbortHandle) {
         let (gateway, rx) = session.connect_gateway(p::GatewayOptions::default());
         let events = self.events.clone();
         let internal = self.internal.clone();
-        let (guilds, cache) = (guilds.clone(), cache.clone());
+        let (guilds, cache, names) = (guilds.clone(), cache.clone(), names.clone());
         let forward = self.spawn_guarded("gateway", Some(gen), async move {
             let on_connected = {
                 let internal = internal.clone();
@@ -948,7 +969,7 @@ impl Backend {
                     let _ = internal.send(Internal::GatewayConnected { gen });
                 }
             };
-            let end = real::forward_gateway(rx, events, guilds, cache, on_connected).await;
+            let end = real::forward_gateway(rx, events, guilds, cache, names, on_connected).await;
             let _ = internal.send(Internal::GatewayEnded { gen, end });
         });
         (gateway, forward)
@@ -998,7 +1019,8 @@ impl Backend {
         };
         r.forward.abort();
         r.gateway.close();
-        let (gateway, forward) = self.spawn_gateway(r.gen, &r.session, &r.guilds, &r.cache);
+        let (gateway, forward) =
+            self.spawn_gateway(r.gen, &r.session, &r.guilds, &r.cache, &r.names);
         // A new gateway handle does not know the guild on screen yet.
         if let Some(guild) = &r.active_guild {
             gateway.set_guild_active(guild, true);
@@ -1099,6 +1121,7 @@ impl Backend {
             t.abort();
         }
         let active = self.active.take();
+        crate::theme::set_accent(None);
         self.emit(Event::SignedOut);
         let events = self.events.clone();
         // A keychain write still running must finish first, or it could store the token
@@ -1198,6 +1221,7 @@ impl Backend {
                 }
                 let cached = r.cache.lock().unwrap().get(&guild_id).cloned();
                 let (session, cache, gen) = (r.session.clone(), r.cache.clone(), r.gen);
+                let names = r.names.clone();
                 let (events, internal) = (self.events.clone(), self.internal.clone());
                 if let Some(channels) = cached {
                     self.emit(Event::Channels { guild_id, channels });
@@ -1212,6 +1236,7 @@ impl Backend {
                         Ok(list) => {
                             let channels: Vec<Channel> =
                                 list.iter().map(real::to_channel).collect();
+                            real::remember_channels(&names, &channels);
                             cache
                                 .lock()
                                 .unwrap()
@@ -1242,12 +1267,13 @@ impl Backend {
                     self.internal.clone(),
                     r.gen,
                 );
+                let names = r.names.clone();
                 self.open_channel = Some(self.spawn_guarded("open channel", None, async move {
                     match session.client().messages(&channel_id, None, 50).await {
                         Ok(list) => {
                             // The API returns newest first; the view wants oldest first.
                             let mut messages: Vec<Message> =
-                                list.iter().map(real::to_message).collect();
+                                list.iter().map(|m| real::to_message(m, &names)).collect();
                             messages.sort_by(|a, b| {
                                 real::snowflake_key(&a.id).cmp(&real::snowflake_key(&b.id))
                             });
@@ -1277,6 +1303,7 @@ impl Backend {
                     self.internal.clone(),
                     r.gen,
                 );
+                let names = r.names.clone();
                 self.spawn_guarded("send", None, async move {
                     let nonce = p::new_nonce();
                     match session
@@ -1285,8 +1312,9 @@ impl Backend {
                         .await
                     {
                         Ok(message) => {
-                            let _ = events
-                                .unbounded_send(Event::MessageCreated(real::to_message(&message)));
+                            let _ = events.unbounded_send(Event::MessageCreated(real::to_message(
+                                &message, &names,
+                            )));
                         }
                         Err(err) => report(&events, &internal, gen, "Could not send: ", err),
                     }

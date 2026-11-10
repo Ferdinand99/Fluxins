@@ -114,7 +114,7 @@ pub fn render(show_licences: bool, cx: &mut Context<Inlet>) -> impl IntoElement 
         .flex_col()
         .gap_4()
         .p_8()
-        .bg(theme::chat_bg())
+        .bg(theme::bg_chat())
         .child(header)
         .when(show_licences, |d| {
             d.child(
