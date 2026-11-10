@@ -2745,6 +2745,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "inlet-emoji"
+version = "0.0.1"
+dependencies = [
+ "serde_json",
+ "sha2",
+ "zstd",
+]
+
+[[package]]
 name = "inlet-protocol"
 version = "0.0.1"
 dependencies = [
