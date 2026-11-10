@@ -72,6 +72,14 @@ impl<K: Ord + Copy, V> LruMap<K, V> {
         }
     }
 
+    /// The least recently used key whose value passes `pred`.
+    pub(crate) fn oldest_where(&self, mut pred: impl FnMut(&V) -> bool) -> Option<K> {
+        self.order
+            .values()
+            .find(|k| self.entries.get(*k).is_some_and(|(v, _)| pred(v)))
+            .copied()
+    }
+
     /// Removes and returns the least recently used entry.
     pub(crate) fn pop_oldest(&mut self) -> Option<(K, V)> {
         let (_, key) = self.order.pop_first()?;
@@ -87,6 +95,7 @@ impl<K: Ord + Copy, V> LruMap<K, V> {
         self.entries.get_mut(key).map(|(v, _)| v)
     }
 
+    #[cfg(test)]
     pub(crate) fn contains_key(&self, key: &K) -> bool {
         self.entries.contains_key(key)
     }

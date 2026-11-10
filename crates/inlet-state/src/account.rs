@@ -64,6 +64,8 @@ pub struct AccountState {
     settings: Settings,
     voice: Voice,
     now_ms: i64,
+    /// Cached members other than the account, across guilds.
+    member_total: usize,
 }
 
 impl AccountState {
@@ -96,6 +98,7 @@ impl AccountState {
             settings: Settings::default(),
             voice: Voice::default(),
             now_ms,
+            member_total: 0,
         };
         s.users.upsert(&r.user.user);
         for u in &r.users {
@@ -326,8 +329,10 @@ impl AccountState {
                         }
                         guild.visiting = guild.visiting || props.visiting;
                         guild.properties = Some(props);
-                        guild.refresh_cached();
                         c.guilds = true;
+                        // The default level, features and join time feed the pill.
+                        c.pill(id);
+                        self.refresh_guild(id, &mut c);
                         self.recompute(id, &mut c);
                     }
                 }
@@ -381,10 +386,13 @@ impl AccountState {
                     if let Some(guild) = self.guilds.get_mut(&g) {
                         if guild.members.remove(user, me) {
                             c.members_of(g);
+                            if user != me {
+                                self.member_total = self.member_total.saturating_sub(1);
+                            }
                         }
                         if user == me {
                             guild.left = true;
-                            guild.refresh_cached();
+                            self.refresh_guild(g, &mut c);
                             self.recompute(g, &mut c);
                         }
                     }
@@ -509,13 +517,24 @@ impl AccountState {
             return c;
         }
         let existed = self.windows.get(ch).is_some();
+        // `None`: every window is loading, so `messages(ch)` stays `None`.
+        // Try again when a page lands or after `cancel_load`.
         if let Some(evicted) = self.windows.begin_load(ch) {
-            c.message(evicted);
-        }
-        if !existed {
-            c.message(ch);
+            if let Some(e) = evicted {
+                c.message(e);
+            }
+            if !existed {
+                c.message(ch);
+            }
         }
         c
+    }
+
+    /// The request for a channel's newest page failed: its window stops
+    /// counting as loading and may be evicted again. A window stays
+    /// loading (and buffering) until its page lands or this is called.
+    pub fn cancel_load(&mut self, ch: ChannelId) {
+        self.windows.cancel_load(ch);
     }
 
     /// Merges a page of messages from REST into the channel's window. A page
@@ -591,7 +610,9 @@ impl AccountState {
     }
 
     /// Marks a channel's window as in use, so it is evicted last. Call it for
-    /// the visible channel, or a burst of prefetches can evict it.
+    /// the visible channel, or a burst of prefetches can evict it. Loading
+    /// windows are never evicted; an evicted window is listed in
+    /// [`Changes::messages`], so the app can load it again.
     pub fn touch_channel(&mut self, ch: ChannelId) {
         self.windows.touch(ch);
     }
@@ -776,6 +797,12 @@ impl AccountState {
     /// Every read state.
     pub fn read_states(&self) -> &ReadStates {
         &self.read_states
+    }
+
+    /// Cached members of other users across every guild (capped at
+    /// [`MAX_MEMBERS_TOTAL`]).
+    pub fn member_total(&self) -> usize {
+        self.member_total
     }
 
     /// Notification settings.
@@ -1025,7 +1052,9 @@ impl AccountState {
                 x
             })
             .collect();
-        guild.refresh_cached();
+        // A re-ingest can change the default level, the member count and the join time.
+        c.pill(id);
+        self.refresh_guild(id, c);
         for m in g.parsed_members() {
             self.upsert_member(id, &m, MemberSource::Authoritative, c);
         }
@@ -1189,6 +1218,7 @@ impl AccountState {
         let Some(guild) = self.guilds.remove(&g) else {
             return;
         };
+        self.member_total = self.member_total.saturating_sub(guild.members.others_len());
         for ch in &guild.channels {
             self.forget_channel(*ch, false, c);
         }
@@ -1221,7 +1251,7 @@ impl AccountState {
                 if src == MemberSource::Authoritative {
                     guild.left = false;
                 }
-                guild.refresh_cached();
+                self.refresh_guild(g, c);
                 self.recompute(g, c);
             }
         }
@@ -1229,7 +1259,22 @@ impl AccountState {
             c.users |= self.users.upsert(u);
         }
         if grew {
-            self.enforce_member_cap(c);
+            self.member_total += 1;
+            self.enforce_member_cap(g, c);
+        }
+    }
+
+    /// Re-parses a guild's cached values; a new join time changes the unread
+    /// floor of every channel in it.
+    fn refresh_guild(&mut self, g: GuildId, c: &mut Changes) {
+        let Some(guild) = self.guilds.get_mut(&g) else {
+            return;
+        };
+        let before = guild.joined_at;
+        guild.refresh_cached();
+        if guild.joined_at != before {
+            c.pill(g);
+            c.read_state_channels.set_all();
         }
     }
 
@@ -1250,34 +1295,37 @@ impl AccountState {
         self.upsert_member(g, &member, MemberSource::Attached, c);
     }
 
-    /// Keeps the cached members of all guilds under [`MAX_MEMBERS_TOTAL`] by
-    /// evicting from the guild that caches the most.
-    fn enforce_member_cap(&mut self, c: &mut Changes) {
-        let mut total: usize = self.guilds.values().map(|g| g.members.others_len()).sum();
-        while total > MAX_MEMBERS_TOTAL {
-            let Some(g) = self
-                .guilds
-                .values()
-                .max_by(|a, b| {
-                    a.members
-                        .others_len()
-                        .cmp(&b.members.others_len())
-                        .then(b.id.cmp(&a.id))
-                })
-                .map(|g| g.id)
-            else {
-                break;
+    /// Keeps the cached members of all guilds under [`MAX_MEMBERS_TOTAL`],
+    /// using the running total. The guild that just grew gives up its least
+    /// recently used member; only when it has no other member is the guild
+    /// that caches the most looked up.
+    fn enforce_member_cap(&mut self, grown: GuildId, c: &mut Changes) {
+        while self.member_total > MAX_MEMBERS_TOTAL {
+            let victim = match self.guilds.get(&grown) {
+                Some(g) if g.members.others_len() > 1 => grown,
+                _ => match self
+                    .guilds
+                    .values()
+                    .max_by(|a, b| {
+                        a.members
+                            .others_len()
+                            .cmp(&b.members.others_len())
+                            .then(b.id.cmp(&a.id))
+                    })
+                    .map(|g| g.id)
+                {
+                    Some(g) => g,
+                    None => break,
+                },
             };
-            match self.guilds.get_mut(&g) {
-                Some(guild) => {
-                    if !guild.members.evict_oldest() {
-                        break;
-                    }
-                    c.members_of(g);
+            match self.guilds.get_mut(&victim) {
+                Some(guild) if guild.members.others_len() > 0 => {
+                    guild.members.evict_oldest();
+                    c.members_of(victim);
+                    self.member_total -= 1;
                 }
-                None => break,
+                _ => break,
             }
-            total -= 1;
         }
     }
 

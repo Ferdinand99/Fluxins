@@ -12,8 +12,8 @@ use inlet_protocol::{Channel, Guild, GuildMember, Presence, Role, User};
 use serde_json::{Map, Value};
 
 use crate::limits::{
-    MAX_CHANNEL_EXTRA_BYTES, MAX_GUILD_EXTRA_BYTES, MAX_MEMBER_EXTRA_BYTES, MAX_OVERWRITES,
-    MAX_ROLES_PER_MEMBER, MAX_ROLE_EXTRA_BYTES, MAX_USER_EXTRA_BYTES,
+    MAX_CHANNEL_EXTRA_BYTES, MAX_GUILD_EXTRA_BYTES, MAX_MEMBER_EXTRA_BYTES, MAX_ROLES_PER_MEMBER,
+    MAX_ROLE_EXTRA_BYTES, MAX_USER_EXTRA_BYTES,
 };
 
 /// Approximate heap size of a JSON value. It undercounts the real use of
@@ -117,8 +117,11 @@ pub(crate) fn cap_role(r: &mut Role) {
     trim_extra(&mut r.extra, MAX_ROLE_EXTRA_BYTES, &[]);
 }
 
-/// Trims a channel. Too many permission overwrites make the list unreadable
-/// for the calculator, which then hides the channel (fails closed).
+/// Trims a channel. The permission overwrites are budgeted on their own
+/// (by count, [`crate::limits::MAX_OVERWRITES`], and stored compactly by
+/// [`crate::channels::Channels`]), so a channel with many overwrites keeps
+/// them. When the rest of `extra` must be dropped, a thread keeps fail-closed
+/// thread metadata (locked and archived) and loses its membership.
 pub(crate) fn cap_channel(c: &mut Channel) {
     truncate_opt(&mut c.name, NAME);
     truncate_opt(&mut c.topic, TEXT);
@@ -126,18 +129,12 @@ pub(crate) fn cap_channel(c: &mut Channel) {
     for u in &mut c.recipients {
         cap_user(u);
     }
-    if let Some(Value::Array(ow)) = c.extra.get("permission_overwrites") {
-        if ow.len() > MAX_OVERWRITES {
-            c.extra
-                .insert("permission_overwrites".into(), Value::Bool(false));
-        }
-    }
-    let had_overwrites = c.extra.contains_key("permission_overwrites");
+    let overwrites = c.extra.remove("permission_overwrites");
+    let had_thread_metadata = c.extra.contains_key("thread_metadata");
     trim_extra(
         &mut c.extra,
         MAX_CHANNEL_EXTRA_BYTES,
         &[
-            "permission_overwrites",
             "last_pin_timestamp",
             "flags",
             "thread_metadata",
@@ -145,11 +142,14 @@ pub(crate) fn cap_channel(c: &mut Channel) {
             "owner_id",
         ],
     );
-    // An overwrite list that had to be dropped must not read as "no
-    // overwrites": mark it unreadable so the channel is hidden.
-    if had_overwrites && !c.extra.contains_key("permission_overwrites") {
-        c.extra
-            .insert("permission_overwrites".into(), Value::Bool(false));
+    if had_thread_metadata && !c.extra.contains_key("thread_metadata") {
+        c.extra.insert(
+            "thread_metadata".into(),
+            serde_json::json!({"locked": true, "archived": true}),
+        );
+    }
+    if let Some(ow) = overwrites {
+        c.extra.insert("permission_overwrites".into(), ow);
     }
 }
 
@@ -195,7 +195,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn caps_trim_strings_and_extra_and_fail_closed_on_overwrites() {
+    fn caps_trim_strings_and_extra_but_keep_overwrites() {
         let mut s = "aé".repeat(10);
         truncate(&mut s, 2);
         assert_eq!(s, "a");
@@ -210,19 +210,26 @@ mod tests {
         assert!(!u.extra.contains_key("junk"));
         assert_eq!(u.extra.get("mfa_enabled"), Some(&json!(true)));
 
-        let ow: Vec<Value> = (0..MAX_OVERWRITES + 1)
-            .map(|i| json!({"id": i.to_string(), "type": 0, "allow": "0", "deny": "0"}))
+        // Overwrites are not part of the channel budget; thread metadata
+        // that has to go is replaced by a locked, archived marker.
+        let ow: Vec<Value> = (0..300)
+            .map(|i| json!({"id": (1000 + i).to_string(), "type": 0, "allow": "0", "deny": "0"}))
             .collect();
         let mut c: Channel = serde_json::from_value(json!({
-            "id": "5", "type": 0, "guild_id": "1", "permission_overwrites": ow,
+            "id": "5", "type": 11, "guild_id": "1", "permission_overwrites": ow,
+            "thread_metadata": {"locked": false, "pad": "q".repeat(100_000)},
             "huge": "z".repeat(200_000)
         }))
         .unwrap();
         cap_channel(&mut c);
         assert!(!c.extra.contains_key("huge"));
         assert_eq!(
-            c.extra.get("permission_overwrites"),
-            Some(&Value::Bool(false))
+            c.extra["permission_overwrites"].as_array().unwrap().len(),
+            300
+        );
+        assert_eq!(
+            c.extra["thread_metadata"],
+            json!({"locked": true, "archived": true})
         );
     }
 }

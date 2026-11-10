@@ -131,6 +131,12 @@ impl ReadStates {
     /// is seeded.
     pub(crate) fn from_ready(rows: &[ReadState]) -> Self {
         let mut s = ReadStates::default();
+        // Over the cap, keep the rows with the newest acks (inserted last,
+        // so the archive's LRU order drops the oldest first).
+        let mut rows: Vec<&ReadState> = rows.iter().collect();
+        if rows.len() > MAX_ARCHIVED_READ_STATES {
+            rows.sort_by_key(|r| MessageId::parse_opt(r.last_message_id.as_deref()));
+        }
         for row in rows {
             let Some(ch) = ChannelId::parse(&row.id) else {
                 continue;

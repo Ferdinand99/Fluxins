@@ -1201,3 +1201,137 @@ fn the_member_cache_has_an_account_wide_cap() {
     assert_eq!(total, MAX_MEMBERS_TOTAL);
     assert!(s.guilds().all(|g| g.members.me().is_some()));
 }
+
+#[test]
+fn many_overwrites_stay_visible_and_too_many_hide_the_channel() {
+    let mut s = state();
+    // 300 member overwrites for other users, plus one that denies sending to the account.
+    let mut ow: Vec<_> = (0..300)
+        .map(|i| json!({"id": (50_000 + i).to_string(), "type": 1, "allow": "0", "deny": VIEW_CHANNEL.to_string()}))
+        .collect();
+    ow.push(json!({"id": ME, "type": 1, "allow": "0", "deny": SEND_MESSAGES.to_string()}));
+    s.apply(&d(
+        "CHANNEL_UPDATE",
+        json!({"id": RANDOM, "type": 0, "guild_id": GUILD, "permission_overwrites": ow}),
+    ));
+    let p = s.permissions(g(), ch(RANDOM));
+    assert!(p.can_view() && !p.has(SEND_MESSAGES));
+    assert_eq!(s.channels().overwrites(ch(RANDOM)).unwrap().len(), 301);
+    // The stored channel carries an unreadable marker, so running the
+    // protocol calculator on it directly fails closed.
+    assert_eq!(
+        s.channel(ch(RANDOM)).unwrap().extra["permission_overwrites"],
+        json!(false)
+    );
+
+    // Fluxer's limit is 10,000; one more hides the channel.
+    let ow: Vec<_> = (0..inlet_state::limits::MAX_OVERWRITES as u64 + 1)
+        .map(|i| json!({"id": (50_000 + i).to_string(), "type": 1, "allow": "0", "deny": "0"}))
+        .collect();
+    s.apply(&d(
+        "CHANNEL_UPDATE",
+        json!({"id": RANDOM, "type": 0, "guild_id": GUILD, "permission_overwrites": ow}),
+    ));
+    assert!(s.channels().overwrites(ch(RANDOM)).is_none());
+    assert!(!s.permissions(g(), ch(RANDOM)).can_view());
+}
+
+#[test]
+fn reactions_while_loading_are_applied_after_the_page() {
+    let mut s = state();
+    s.begin_load(ch(GENERAL));
+    let react = |name: &str, user: &str| {
+        d(
+            name,
+            json!({"user_id": user, "channel_id": GENERAL,
+        "message_id": mid(1, 0).to_string(), "emoji": {"name": "🦔"}}),
+        )
+    };
+    s.apply(&react("MESSAGE_REACTION_ADD", OTHER));
+    s.apply(&react("MESSAGE_REACTION_ADD", ME));
+    s.apply(&react("MESSAGE_REACTION_ADD", ME));
+    s.apply_messages(
+        ch(GENERAL),
+        MessagesPage::latest(vec![message(mid(1, 0), GENERAL, OTHER)], 50),
+    );
+    let r = &s
+        .messages(ch(GENERAL))
+        .unwrap()
+        .get(mid(1, 0))
+        .unwrap()
+        .reactions()[0];
+    assert_eq!((r.count, r.me), (2, true));
+}
+
+#[test]
+fn too_many_deletes_while_loading_ask_for_another_page() {
+    use inlet_state::limits::MAX_RECENTLY_DELETED;
+    let mut s = state();
+    s.begin_load(ch(GENERAL));
+    for i in 0..(MAX_RECENTLY_DELETED as u64 + 1) {
+        s.apply(&d(
+            "MESSAGE_DELETE",
+            json!({"id": mid(1, i).to_string(), "channel_id": GENERAL}),
+        ));
+    }
+    // The first delete was forgotten; its message is in the page.
+    s.apply_messages(
+        ch(GENERAL),
+        MessagesPage::latest(vec![message(mid(1, 0), GENERAL, OTHER)], 50),
+    );
+    assert!(
+        !s.messages(ch(GENERAL)).unwrap().has_newest(),
+        "load the newest page again"
+    );
+}
+
+#[test]
+fn loading_windows_are_not_evicted() {
+    let count = MAX_MESSAGE_WINDOWS + 2;
+    let channels: Vec<_> = (0..count)
+        .map(|i| channel(&(1000 + i).to_string(), 0, None, i as i64, json!([])))
+        .collect();
+    let r = ready_from(ready_json(
+        guild_ready(default_roles(), json!(channels), &[]),
+        json!([]),
+        json!([]),
+    ));
+    let mut s = AccountState::from_ready_at(&r, JOINED_MS as i64);
+    let id = |i: usize| ch(&(1000 + i).to_string());
+    for i in 0..MAX_MESSAGE_WINDOWS {
+        s.begin_load(id(i));
+    }
+    // Every window is loading: no room, nothing evicted.
+    let c = s.begin_load(id(MAX_MESSAGE_WINDOWS));
+    assert!(c.messages.is_empty());
+    assert!(s.messages(id(MAX_MESSAGE_WINDOWS)).is_none());
+    assert!((0..MAX_MESSAGE_WINDOWS).all(|i| s.messages(id(i)).unwrap().is_loading()));
+    // A failed request frees its window for eviction.
+    s.cancel_load(id(3));
+    let c = s.begin_load(id(MAX_MESSAGE_WINDOWS));
+    assert!(c.messages.contains(&id(3)));
+    assert!(s.messages(id(3)).is_none());
+    assert!(s.messages(id(MAX_MESSAGE_WINDOWS)).unwrap().is_loading());
+    // A page that lands ends the loading state.
+    s.apply_messages(id(0), MessagesPage::latest(vec![], 50));
+    assert!(!s.messages(id(0)).unwrap().is_loading());
+}
+
+#[test]
+fn guild_record_changes_refresh_the_pill() {
+    let mut s = state();
+    let c = s.apply(&d(
+        "GUILD_UPDATE",
+        json!({"id": GUILD, "name": "Hedgerow", "owner_id": OWNER,
+        "default_message_notifications": 1}),
+    ));
+    assert!(c.read_state_guilds.contains(&Some(g())));
+    let c = s.apply(&d("GUILD_MEMBER_UPDATE", json!({"guild_id": GUILD,
+        "user": {"id": ME, "username": "me"}, "roles": [MOD_ROLE], "joined_at": "2026-01-02T00:00:00Z"})));
+    assert!(c.read_state_guilds.contains(&Some(g())) && c.read_state_channels.is_all());
+    let c = s.apply(&d(
+        "GUILD_CREATE",
+        guild_ready(default_roles(), default_channels(), &[MOD_ROLE]),
+    ));
+    assert!(c.read_state_guilds.contains(&Some(g())));
+}

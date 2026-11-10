@@ -78,6 +78,8 @@ pub mod limits {
     pub const MAX_MESSAGE_BYTES: usize = 256 * 1024;
     /// Live messages buffered while a window waits for its newest page.
     pub const MAX_PENDING_LIVE: usize = 100;
+    /// Reaction events buffered while a window waits for its newest page.
+    pub const MAX_PENDING_REACTIONS: usize = 500;
     /// Channels with a message window; the least recently used is evicted.
     pub const MAX_MESSAGE_WINDOWS: usize = 30;
     /// Deleted message IDs remembered per window, so a page fetched before
@@ -95,8 +97,9 @@ pub mod limits {
     pub const MAX_ROLES_PER_GUILD: usize = 1_000;
     /// Role IDs kept per cached member (the account's own member keeps all).
     pub const MAX_ROLES_PER_MEMBER: usize = 256;
-    /// Permission overwrites per channel; more makes the channel hidden.
-    pub const MAX_OVERWRITES: usize = 1_000;
+    /// Permission overwrites per channel (Fluxer's limit); more makes the
+    /// channel hidden. They are stored compactly, about 32 bytes each.
+    pub const MAX_OVERWRITES: usize = 10_000;
     /// Custom emoji or stickers per guild.
     pub const MAX_EXPRESSIONS_PER_GUILD: usize = 2_000;
     /// Cached members per guild (the account's own member is kept apart).
@@ -110,8 +113,10 @@ pub mod limits {
     /// Read-state entries of known channels.
     pub const MAX_READ_STATES: usize = 100_000;
     /// Read states kept for channels that are not known right now (READY
-    /// rows for guilds still loading, channels whose access was lost).
-    pub const MAX_ARCHIVED_READ_STATES: usize = 20_000;
+    /// rows for guilds still loading, channels whose access was lost). A
+    /// READY with more rows keeps the ones with the newest acks; the dropped
+    /// channels count as unread from the join time until they are read.
+    pub const MAX_ARCHIVED_READ_STATES: usize = 100_000;
     /// Message IDs counted as mentions since the last ack, per channel.
     pub const MAX_COUNTED_MENTIONS: usize = 256;
     /// Typing users per channel.
@@ -300,8 +305,44 @@ impl Changes {
         self.read_state_guilds.add(Some(g));
     }
 
+    /// A guild's pill may have changed (default level, size, join time).
+    pub(crate) fn pill(&mut self, g: GuildId) {
+        self.read_state = true;
+        self.read_state_guilds.add(Some(g));
+    }
+
     pub(crate) fn members_of(&mut self, g: GuildId) {
         self.members = true;
         self.member_guilds.add(g);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn change_sets_switch_to_all_and_merge_it() {
+        let mut a = ChangeSet::default();
+        for i in 0..limits::MAX_CHANGE_ITEMS as u64 {
+            a.add(ChannelId(i));
+        }
+        assert!(!a.is_all() && a.iter().count() == limits::MAX_CHANGE_ITEMS);
+        a.add(ChannelId(1));
+        assert!(!a.is_all(), "a repeat is not a new item");
+        a.add(ChannelId(9_999));
+        assert!(a.is_all() && a.iter().count() == 0);
+        assert!(a.contains(&ChannelId(123_456)) && !a.is_empty());
+
+        let mut c = Changes::default();
+        c.message(ChannelId(1));
+        let mut big = Changes::default();
+        big.messages.set_all();
+        c.merge(big);
+        assert!(c.messages.is_all() && c.messages.contains(&ChannelId(77)));
+        let mut d = Changes::default();
+        d.merge(c.clone());
+        assert!(d.messages.is_all());
+        assert!(Changes::default().is_empty() && !d.is_empty());
     }
 }

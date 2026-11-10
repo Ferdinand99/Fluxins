@@ -26,7 +26,7 @@ use crate::bounded::LruMap;
 use crate::ids::{ChannelId, MessageId};
 use crate::limits::{
     MAX_MESSAGES_PER_CHANNEL, MAX_MESSAGE_BYTES, MAX_MESSAGE_WINDOWS, MAX_PENDING_LIVE,
-    MAX_REACTIONS_PER_MESSAGE, MAX_RECENTLY_DELETED, MAX_WINDOW_BYTES,
+    MAX_PENDING_REACTIONS, MAX_REACTIONS_PER_MESSAGE, MAX_RECENTLY_DELETED, MAX_WINDOW_BYTES,
 };
 use crate::size::{map_size, opt_len, value_size};
 
@@ -106,7 +106,13 @@ pub struct MessageWindow {
     has_newest: bool,
     /// Live creates and edits while the window waits for its newest page.
     pending: BTreeMap<MessageId, Message>,
+    /// Reaction events while the window waits, applied after the page.
+    pending_reactions: Vec<(MessageId, ReactionOp)>,
+    /// Something was lost while waiting (buffer or delete memory full): the
+    /// page merge leaves the window waiting for another page.
     pending_overflow: bool,
+    /// A newest page was asked for and has not landed: never evicted.
+    loading: bool,
     recently_deleted: VecDeque<MessageId>,
 }
 
@@ -158,6 +164,11 @@ impl MessageWindow {
         self.pending.len()
     }
 
+    /// Whether a newest page was asked for and has not landed.
+    pub fn is_loading(&self) -> bool {
+        self.loading
+    }
+
     /// Approximate memory the messages take, in bytes.
     pub fn approx_bytes(&self) -> usize {
         self.bytes
@@ -191,6 +202,11 @@ impl MessageWindow {
         }
         if self.recently_deleted.len() >= MAX_RECENTLY_DELETED {
             self.recently_deleted.pop_front();
+            // A delete forgotten while a page is on its way could come back
+            // with that page: ask for another one instead.
+            if !self.has_newest {
+                self.pending_overflow = true;
+            }
         }
         self.recently_deleted.push_back(id);
     }
@@ -231,7 +247,9 @@ impl MessageWindow {
     /// Merges the newest page and the live buffer.
     fn merge_latest(&mut self, page: BTreeMap<MessageId, Message>, reached_start: bool) {
         let pending = std::mem::take(&mut self.pending);
+        let reactions = std::mem::take(&mut self.pending_reactions);
         let overflow = std::mem::take(&mut self.pending_overflow);
+        self.loading = false;
         let fresh = self.has_newest;
         let mut merged = BTreeMap::new();
         let mut has_more_before = !reached_start;
@@ -284,6 +302,15 @@ impl MessageWindow {
                     merged.insert(id, m);
                 }
                 None => {}
+            }
+        }
+        // Reactions that arrived while waiting, in order. After an overflow
+        // the next page brings the server's counts instead.
+        if !overflow {
+            for (id, op) in &reactions {
+                if let Some(m) = merged.get_mut(id) {
+                    apply_reaction(m, op);
+                }
             }
         }
         self.bytes = merged.values().map(approx_size).sum();
@@ -369,27 +396,112 @@ impl MessageWindow {
         self.take(id).is_some()
     }
 
-    fn react(&mut self, id: MessageId, f: impl Fn(&mut Vec<Reaction>) -> bool) -> bool {
-        if let Some(p) = self.pending.get_mut(&id) {
-            let mut reactions = p.reactions();
-            if f(&mut reactions) {
-                let value = serde_json::to_value(&reactions).unwrap_or(Value::Array(Vec::new()));
-                p.extra.insert("reactions".into(), value);
+    /// A reaction event. While the window waits for its newest page the
+    /// event is buffered and applied after the merge, like creates.
+    fn react(&mut self, id: MessageId, op: ReactionOp) -> bool {
+        if !self.has_newest {
+            // A repeat of an idempotent event (the account's own reaction, a
+            // clear) adds nothing.
+            let idempotent = match &op {
+                ReactionOp::Add { me, .. } | ReactionOp::Remove { me, .. } => *me,
+                ReactionOp::Clear(_) => true,
+            };
+            let repeat = self
+                .pending_reactions
+                .iter()
+                .rev()
+                .find(|(m, _)| *m == id)
+                .is_some_and(|(_, last)| *last == op);
+            if idempotent && repeat {
+                return false;
             }
+            if self.pending_reactions.len() >= MAX_PENDING_REACTIONS {
+                self.pending_overflow = true;
+            } else {
+                self.pending_reactions.push((id, op));
+            }
+            return false;
         }
         let Some(m) = self.messages.get(&id) else {
             return false;
         };
-        let mut reactions = m.reactions();
-        if !f(&mut reactions) {
+        let mut m = m.clone();
+        if !apply_reaction(&mut m, &op) {
             return false;
         }
-        let mut m = m.clone();
-        let value = serde_json::to_value(&reactions).unwrap_or(Value::Array(Vec::new()));
-        m.extra.insert("reactions".into(), value);
         self.put(id, m);
         true
     }
+}
+
+/// One reaction event.
+#[derive(Debug, Clone, PartialEq)]
+enum ReactionOp {
+    /// Someone reacted; `me` when it was the account.
+    Add { emoji: Emoji, me: bool },
+    /// A reaction was removed.
+    Remove { emoji: Emoji, me: bool },
+    /// Every reaction, or every reaction with one emoji, was removed.
+    Clear(Option<Emoji>),
+}
+
+/// Applies a reaction event to a message. Returns whether it changed.
+fn apply_reaction(m: &mut Message, op: &ReactionOp) -> bool {
+    let mut rs = m.reactions();
+    let changed = match op {
+        ReactionOp::Add { emoji, me } => {
+            if let Some(r) = rs.iter_mut().find(|r| r.emoji.same_reaction(emoji)) {
+                // The account's own reaction is idempotent; others' cannot be told apart.
+                if *me && r.me {
+                    false
+                } else {
+                    r.count = r.count.saturating_add(1);
+                    r.me |= *me;
+                    if emoji.animated {
+                        r.emoji.animated = true;
+                    }
+                    true
+                }
+            } else if rs.len() >= MAX_REACTIONS_PER_MESSAGE {
+                false
+            } else {
+                rs.push(Reaction {
+                    emoji: emoji.clone(),
+                    count: 1,
+                    me: *me,
+                });
+                true
+            }
+        }
+        ReactionOp::Remove { emoji, me } => {
+            match rs.iter().position(|r| r.emoji.same_reaction(emoji)) {
+                Some(i) if !*me || rs[i].me => {
+                    rs[i].count = rs[i].count.saturating_sub(1);
+                    if *me {
+                        rs[i].me = false;
+                    }
+                    if rs[i].count == 0 {
+                        rs.remove(i);
+                    }
+                    true
+                }
+                _ => false,
+            }
+        }
+        ReactionOp::Clear(emoji) => {
+            let before = rs.len();
+            match emoji {
+                Some(e) => rs.retain(|r| !r.emoji.same_reaction(e)),
+                None => rs.clear(),
+            }
+            rs.len() != before
+        }
+    };
+    if changed {
+        let value = serde_json::to_value(&rs).unwrap_or(Value::Array(Vec::new()));
+        m.extra.insert("reactions".into(), value);
+    }
+    changed
 }
 
 /// A cheap estimate of the memory a message takes: its text, plus every
@@ -499,14 +611,36 @@ impl MessageWindows {
         self.windows.touch(&channel);
     }
 
-    /// Opens a loading window (or keeps the existing one) before the newest
-    /// page is requested. Returns a channel whose window was evicted.
-    pub(crate) fn begin_load(&mut self, channel: ChannelId) -> Option<ChannelId> {
-        if self.windows.contains_key(&channel) {
+    /// Marks the channel's window as loading (creating it if needed) before
+    /// the newest page is requested. A loading window is never evicted: the
+    /// least recently used idle window makes room, and when every window is
+    /// loading the call is refused (`None`). Otherwise returns a channel whose
+    /// window was evicted.
+    pub(crate) fn begin_load(&mut self, channel: ChannelId) -> Option<Option<ChannelId>> {
+        if let Some(w) = self.windows.get_mut(&channel) {
+            w.loading = true;
             self.windows.touch(&channel);
-            return None;
+            return Some(None);
         }
-        self.windows.insert(channel, MessageWindow::default())
+        let mut evicted = None;
+        if self.windows.len() >= MAX_MESSAGE_WINDOWS {
+            let idle = self.windows.oldest_where(|w| !w.loading)?;
+            self.windows.remove(&idle);
+            evicted = Some(idle);
+        }
+        let w = MessageWindow {
+            loading: true,
+            ..Default::default()
+        };
+        self.windows.insert(channel, w);
+        Some(evicted)
+    }
+
+    /// The request for the newest page failed: the window may be evicted again.
+    pub(crate) fn cancel_load(&mut self, channel: ChannelId) {
+        if let Some(w) = self.windows.get_mut(&channel) {
+            w.loading = false;
+        }
     }
 
     /// Merges a REST page. Returns whether the window changed, and a channel
@@ -520,7 +654,11 @@ impl MessageWindows {
         let reached_start = page.reached_start();
         let mut evicted = None;
         if page.before.is_none() {
-            evicted = self.begin_load(channel);
+            match self.begin_load(channel) {
+                Some(e) => evicted = e,
+                // Every window is loading: no room for this page.
+                None => return (false, None),
+            }
         } else {
             self.windows.touch(&channel);
         }
@@ -555,6 +693,12 @@ impl MessageWindows {
         self.windows.get_mut(&channel).is_some_and(|w| w.delete(id))
     }
 
+    fn react(&mut self, channel: ChannelId, id: MessageId, op: ReactionOp) -> bool {
+        self.windows
+            .get_mut(&channel)
+            .is_some_and(|w| w.react(id, op))
+    }
+
     /// Adds one reaction. `me` says whether the account reacted.
     pub(crate) fn add_reaction(
         &mut self,
@@ -563,32 +707,11 @@ impl MessageWindows {
         emoji: &Emoji,
         me: bool,
     ) -> bool {
-        let Some(w) = self.windows.get_mut(&channel) else {
-            return false;
+        let op = ReactionOp::Add {
+            emoji: emoji.clone(),
+            me,
         };
-        w.react(id, |rs| {
-            if let Some(r) = rs.iter_mut().find(|r| r.emoji.same_reaction(emoji)) {
-                // The account's own reaction is idempotent; others' cannot be told apart.
-                if me && r.me {
-                    return false;
-                }
-                r.count = r.count.saturating_add(1);
-                r.me |= me;
-                if emoji.animated && !r.emoji.animated {
-                    r.emoji.animated = true;
-                }
-                return true;
-            }
-            if rs.len() >= MAX_REACTIONS_PER_MESSAGE {
-                return false;
-            }
-            rs.push(Reaction {
-                emoji: emoji.clone(),
-                count: 1,
-                me,
-            });
-            true
-        })
+        self.react(channel, id, op)
     }
 
     /// Removes one reaction.
@@ -599,25 +722,11 @@ impl MessageWindows {
         emoji: &Emoji,
         me: bool,
     ) -> bool {
-        let Some(w) = self.windows.get_mut(&channel) else {
-            return false;
+        let op = ReactionOp::Remove {
+            emoji: emoji.clone(),
+            me,
         };
-        w.react(id, |rs| {
-            let Some(i) = rs.iter().position(|r| r.emoji.same_reaction(emoji)) else {
-                return false;
-            };
-            if me && !rs[i].me {
-                return false;
-            }
-            rs[i].count = rs[i].count.saturating_sub(1);
-            if me {
-                rs[i].me = false;
-            }
-            if rs[i].count == 0 {
-                rs.remove(i);
-            }
-            true
-        })
+        self.react(channel, id, op)
     }
 
     /// Removes every reaction, or every reaction with one emoji.
@@ -627,17 +736,7 @@ impl MessageWindows {
         id: MessageId,
         emoji: Option<&Emoji>,
     ) -> bool {
-        let Some(w) = self.windows.get_mut(&channel) else {
-            return false;
-        };
-        w.react(id, |rs| {
-            let before = rs.len();
-            match emoji {
-                Some(e) => rs.retain(|r| !r.emoji.same_reaction(e)),
-                None => rs.clear(),
-            }
-            rs.len() != before
-        })
+        self.react(channel, id, ReactionOp::Clear(emoji.cloned()))
     }
 
     pub(crate) fn remove(&mut self, channel: ChannelId) -> bool {

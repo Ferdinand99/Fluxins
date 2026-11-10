@@ -13,14 +13,14 @@
 //! It fails closed: until the everyone role and the account's own member are
 //! loaded, and after the account left the guild, every bit is 0.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use inlet_protocol::permissions::{self as bits, PermissionContext};
 use inlet_protocol::CurrentUser;
 
 use crate::channels::Channels;
 use crate::guilds::GuildState;
-use crate::ids::{ChannelId, GuildId};
+use crate::ids::{ChannelId, GuildId, RoleId, UserId};
 
 /// Permission bits in one channel (see [`inlet_protocol::permissions`] for the bits).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
@@ -81,7 +81,7 @@ fn with_context<T>(
     guild: &GuildState,
     me: &CurrentUser,
     now_ms: i64,
-    f: impl FnOnce(&PermissionContext<'_>) -> T,
+    f: impl FnOnce(&Calc<'_>) -> T,
 ) -> Option<T> {
     let own = guild.members.me();
     if !guild.roles_loaded() || guild.left || (own.is_none() && !guild.visiting) {
@@ -103,27 +103,51 @@ fn with_context<T>(
         visiting: guild.visiting,
         mfa_missing,
     };
-    Some(f(&ctx))
+    let calc = Calc {
+        ctx,
+        guild: guild.id,
+        roles: own
+            .map(|m| {
+                m.roles
+                    .iter()
+                    .filter_map(|r| RoleId::parse(r))
+                    .map(|r| r.0)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        me: UserId::parse(&me.id).map_or(0, |u| u.0),
+    };
+    Some(f(&calc))
 }
 
-fn channel_bits(
-    ctx: &PermissionContext<'_>,
-    channels: &Channels,
+/// The calculator with what is needed to pick the overwrites that apply.
+struct Calc<'a> {
+    ctx: PermissionContext<'a>,
     guild: GuildId,
-    id: ChannelId,
-) -> Option<u64> {
-    let ch = channels.get(id)?;
-    // A thread's parent counts only when it is in the same guild; otherwise
-    // the thread has no parent (nothing unless owner or administrator).
-    let parent = if ch.is_thread() {
-        channels
-            .parent_of(id)
-            .filter(|p| channels.guild_of(*p) == Some(guild))
-            .and_then(|p| channels.get(p))
-    } else {
-        None
-    };
-    Some(ctx.channel(ch, parent))
+    roles: BTreeSet<u64>,
+    me: u64,
+}
+
+impl Calc<'_> {
+    fn guild(&self) -> u64 {
+        self.ctx.guild()
+    }
+
+    fn channel(&self, channels: &Channels, id: ChannelId) -> Option<u64> {
+        let ch = channels.get(id)?;
+        let view = |c: ChannelId| channels.permission_view(c, self.guild, &self.roles, self.me);
+        // A thread's parent counts only when it is in the same guild;
+        // otherwise the thread has no parent (nothing unless owner or administrator).
+        let parent = if ch.is_thread() {
+            channels
+                .parent_of(id)
+                .filter(|p| channels.guild_of(*p) == Some(self.guild))
+                .and_then(view)
+        } else {
+            None
+        };
+        Some(self.ctx.channel(&view(id)?, parent.as_ref()))
+    }
 }
 
 /// Recomputes the account's permissions in `guild`. Returns whether any bit changed.
@@ -137,7 +161,7 @@ pub(crate) fn recompute(
         let perms: BTreeMap<ChannelId, u64> = guild
             .channels
             .iter()
-            .filter_map(|id| Some((*id, channel_bits(ctx, channels, guild.id, *id)?)))
+            .filter_map(|id| Some((*id, ctx.channel(channels, *id)?)))
             .collect();
         (ctx.guild(), perms)
     })
@@ -166,7 +190,7 @@ pub(crate) fn recompute_channels(
         ids.iter()
             .map(|id| {
                 let bits = if guild.channels.contains(id) {
-                    channel_bits(ctx, channels, guild.id, *id)
+                    ctx.channel(channels, *id)
                 } else {
                     None
                 };

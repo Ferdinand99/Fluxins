@@ -425,15 +425,32 @@ fn expected_permissions(s: &AccountState, g: GuildId, c: ChannelId) -> u64 {
             .is_some_and(|p| p.mfa_level() == 1)
             && !s.me().mfa_enabled(),
     };
+    // The stored channel holds a marker; give the calculator every overwrite.
+    let full = |id: ChannelId| -> Option<inlet_protocol::Channel> {
+        let mut ch = s.channel(id)?.clone();
+        let list = match s.channels().overwrites(id) {
+            None => Value::Bool(false),
+            Some(list) => Value::Array(
+                list.iter()
+                    .map(|o| {
+                        json!({"id": o.id.to_string(), "type": o.kind,
+                                    "allow": o.allow.to_string(), "deny": o.deny.to_string()})
+                    })
+                    .collect(),
+            ),
+        };
+        ch.extra.insert("permission_overwrites".into(), list);
+        Some(ch)
+    };
     let parent = if channel.is_thread() {
         s.channels()
             .parent_of(c)
             .filter(|p| s.channels().guild_of(*p) == Some(g))
-            .and_then(|p| s.channel(p))
+            .and_then(full)
     } else {
         None
     };
-    ctx.channel(channel, parent)
+    ctx.channel(&full(c).unwrap(), parent.as_ref())
 }
 
 fn check_invariants(s: &AccountState, seed: u64, step: usize) {
@@ -515,6 +532,7 @@ fn check_invariants(s: &AccountState, seed: u64, step: usize) {
     }
     let members: usize = s.guilds().map(|g| g.members.others_len()).sum();
     assert!(members <= MAX_MEMBERS_TOTAL, "{at}");
+    assert_eq!(s.member_total(), members, "{at}: running member total");
     let _ = s.private_unread();
     assert!(s.presences().len() <= MAX_PRESENCES, "{at}");
 }
