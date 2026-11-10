@@ -2950,7 +2950,9 @@ dependencies = [
 name = "inlet-editor"
 version = "0.0.1"
 dependencies = [
+ "fluxer_markdown_parser",
  "gpui",
+ "linkify",
  "unicode-segmentation",
 ]
 
@@ -3268,6 +3270,15 @@ name = "link-section"
 version = "0.19.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39c29a617ce3df32c08497bdc1ab6e2376e0b17948ac166a2fbe5977c5954cd9"
+
+[[package]]
+name = "linkify"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92f9ae2f3d31697697311f016320fe984127e636b45cf5eb5c175b7eb103dadb"
+dependencies = [
+ "memchr",
+]
 
 [[package]]
 name = "linktime-proc-macro"

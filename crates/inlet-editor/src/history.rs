@@ -97,6 +97,12 @@ impl History {
         Some(entry)
     }
 
+    /// Takes back the last step without keeping it for redo.
+    pub fn pop_undo(&mut self) -> Option<Entry> {
+        self.open = None;
+        self.undo.pop()
+    }
+
     pub fn redo(&mut self, current: Snapshot, cursor: usize) -> Option<Entry> {
         let entry = self.redo.pop()?;
         self.undo.push(Entry {

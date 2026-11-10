@@ -231,3 +231,52 @@ pub fn word_range_at(buf: &Buffer, offset: usize) -> Range<usize> {
 pub fn line_range_at(buf: &Buffer, offset: usize) -> Range<usize> {
     line_start(buf, offset)..line_end(buf, offset)
 }
+
+/// The grapheme boundary nearest to `offset`. A click that lands inside a cluster (between a
+/// letter and its combining mark) goes to the nearer edge. A token counts as one cluster.
+pub fn nearest_grapheme_boundary(buf: &Buffer, offset: usize) -> usize {
+    let o = buf.snap_nearest(offset);
+    for (i, cluster) in buf.text().grapheme_indices(true) {
+        if i >= o {
+            break;
+        }
+        let end = i + cluster.len();
+        if o < end {
+            return if o - i < end - o { i } else { end };
+        }
+    }
+    o
+}
+
+/// Where Backspace deletes back to from `offset`.
+///
+/// A token, an emoji sequence or a single character goes whole. For letters with combining
+/// marks and for scripts where a cluster is built from several parts (Devanagari vowel signs,
+/// for example), Backspace removes one code point, as editors on all platforms do. That lets
+/// the user fix one vowel sign without retyping the whole syllable.
+pub fn prev_backspace_boundary(buf: &Buffer, offset: usize) -> usize {
+    let offset = buf.clamp(offset);
+    let start = prev_grapheme(buf, offset);
+    if buf.token_inside(offset).is_some() || buf.tokens().iter().any(|t| t.range.end == offset) {
+        return start;
+    }
+    let cluster = &buf.text()[start..offset];
+    if cluster.chars().nth(1).is_none() || is_emoji_cluster(cluster) {
+        return start;
+    }
+    cluster
+        .char_indices()
+        .next_back()
+        .map_or(start, |(i, _)| start + i)
+}
+
+fn is_emoji_cluster(cluster: &str) -> bool {
+    cluster.chars().any(|c| {
+        let n = c as u32;
+        n >= 0x1f000
+            || (0x2190..=0x2bff).contains(&n)
+            || n == 0xfe0f
+            || n == 0x20e3
+            || (0xe0020..=0xe007f).contains(&n)
+    })
+}

@@ -2,8 +2,10 @@
 //! Tests of the text model: buffer, tokens, selection, undo and triggers. No window needed.
 
 use inlet_editor::{
-    line_end, line_start, next_grapheme, next_word, prev_grapheme, prev_word, trigger_at, Buffer,
-    Id, Move, NoNames, Resolve, Selection, Token, Trigger,
+    line_end, line_start, nearest_grapheme_boundary, next_grapheme, next_word,
+    prev_backspace_boundary, prev_grapheme, prev_word, server_mentions, trigger_at,
+    AllowedMentions, Buffer, Fragment, Id, Mentions, Move, NoNames, Resolve, Selection, Token,
+    Trigger,
 };
 
 struct Names;
@@ -165,45 +167,137 @@ fn a_crafted_emoji_name_cannot_open_a_mention() {
     assert_eq!(wire, "<:x1123:9>");
 }
 
-/// What a server that follows Fluxer's markdown rules would read as mentions in `wire`.
-fn server_mentions(wire: &str) -> Vec<Token> {
-    let b = wire.as_bytes();
-    let escapable = b"[]()\\*_~`@#-|:<>";
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < wire.len() {
-        let c = b[i];
-        if c == b'\\' && i + 1 < wire.len() && escapable.contains(&b[i + 1]) {
-            i += 2;
-            continue;
-        }
-        let rest = &wire[i..];
-        if c == b'<' {
-            if let Some((t, len)) = Token::parse_wire(rest) {
-                out.push(t);
-                i += len;
-                continue;
+/// What a Fluxer server reads as mentions in `wire`. This is a port of the server's own
+/// extraction (`fluxer_messages::mention_extractor`), written for the test on purpose: it
+/// uses the real `fluxer_markdown_parser` but not the editor's own code. The server first
+/// removes U+202E and U+000C from the content and trims it (`normalizeString`).
+fn fluxer_mentions(wire: &str) -> Mentions {
+    use fluxer_markdown_parser::ast::{ListItem, MentionKind};
+    use fluxer_markdown_parser::{EmojiContext, MarkdownParser, Node, ParserFlags};
+    use linkify::{LinkFinder, LinkKind};
+
+    fn walk(node: &Node, m: &mut Mentions) {
+        let each = |nodes: &[Node], m: &mut Mentions| nodes.iter().for_each(|n| walk(n, m));
+        let ids = |id: &str, set: &mut std::collections::BTreeSet<u64>| {
+            if let Ok(id) = id.parse::<i64>() {
+                if id != 0 {
+                    set.insert(id as u64);
+                }
             }
-        }
-        if c == b'@' && !(i > 0 && b[i - 1] == b'\\') {
-            if let Some((t, len)) = Token::parse_wire(rest) {
-                out.push(t);
-                i += len;
-                continue;
+        };
+        match node {
+            Node::Mention { kind } => match kind {
+                MentionKind::User { id } => ids(id, &mut m.users),
+                MentionKind::Role { id } => ids(id, &mut m.roles),
+                MentionKind::Channel { id } => ids(id, &mut m.channels),
+                MentionKind::Everyone => m.everyone = true,
+                MentionKind::Here => m.here = true,
+                _ => {}
+            },
+            Node::Blockquote { children, .. }
+            | Node::Strong { children }
+            | Node::Emphasis { children }
+            | Node::Underline { children }
+            | Node::Strikethrough { children }
+            | Node::Heading { children, .. }
+            | Node::Subtext { children }
+            | Node::Sequence { children }
+            | Node::TableCell { children }
+            | Node::Alert { children, .. }
+            | Node::Spoiler { children, .. } => each(children, m),
+            Node::List { items, .. } => items
+                .iter()
+                .for_each(|ListItem { children, .. }| each(children, m)),
+            Node::Link { text, .. } => {
+                if let Some(text) = text {
+                    walk(text, m);
+                }
             }
+            Node::Table { header, rows, .. } => {
+                walk(header, m);
+                each(rows, m);
+            }
+            Node::TableRow { cells } => each(cells, m),
+            Node::Text { .. }
+            | Node::CodeBlock { .. }
+            | Node::InlineCode { .. }
+            | Node::Timestamp { .. }
+            | Node::Emoji { .. } => {}
         }
-        i += rest.chars().next().map_or(1, char::len_utf8);
     }
-    out
+
+    let normalized: String = wire
+        .chars()
+        .filter(|c| *c != '\u{202e}' && *c != '\u{000c}')
+        .collect();
+    let trimmed = normalized.trim_matches(|c: char| c.is_whitespace() || c == '\u{feff}');
+    let mut blanked = trimmed.to_owned();
+    let mut finder = LinkFinder::new();
+    finder.kinds(&[LinkKind::Url]);
+    for link in finder.links(trimmed) {
+        let end = trimmed[link.end()..]
+            .char_indices()
+            .find_map(|(i, ch)| ch.is_whitespace().then_some(link.end() + i))
+            .unwrap_or(trimmed.len());
+        blanked.replace_range(link.start()..end, &" ".repeat(end - link.start()));
+    }
+    let mut mentions = Mentions::default();
+    let mut parser = MarkdownParser::new(ParserFlags::ALL, EmojiContext::default());
+    if let Ok(nodes) = parser.parse(&blanked) {
+        nodes.iter().for_each(|n| walk(n, &mut mentions));
+    }
+    mentions
+}
+
+/// Every sequence of up to `max_len` of `count` pieces, one at a time.
+fn for_each_sequence(count: usize, max_len: usize, mut f: impl FnMut(&[usize])) {
+    let mut stack: Vec<Vec<usize>> = vec![vec![]];
+    while let Some(seq) = stack.pop() {
+        if !seq.is_empty() {
+            f(&seq);
+        }
+        if seq.len() < max_len {
+            for p in 0..count {
+                let mut next = seq.clone();
+                next.push(p);
+                stack.push(next);
+            }
+        }
+    }
+}
+
+/// An `@everyone` or `@here` token right after a typed backslash cannot be sent as a ping
+/// (the backslash would escape it). That is the safe direction, so it may go missing.
+fn lost(buf: &Buffer, t: &inlet_editor::TokenSpan) -> bool {
+    // The character before the token, once the server has removed U+202E and U+000C.
+    let before = buf.text()[..t.range.start]
+        .chars()
+        .rev()
+        .find(|c| *c != '\u{202e}' && *c != '\u{000c}');
+    matches!(t.token, Token::Everyone | Token::Here) && before == Some('\\')
+}
+
+fn picked_without_lost(buf: &Buffer) -> Mentions {
+    let kept: Vec<_> = buf
+        .tokens()
+        .iter()
+        .filter(|t| !lost(buf, t))
+        .cloned()
+        .collect();
+    Mentions::picked(&kept)
 }
 
 #[test]
 fn the_server_only_sees_the_mentions_the_user_picked() {
-    // Every way up to five of these pieces can be put together, as typed text or as tokens.
+    // Typed text and picked tokens, every combination of up to four pieces. The text pieces
+    // include the characters the server removes (U+202E, U+000C), other bidi controls and
+    // control characters. The editor drops those on the way in, and the checks run against
+    // the real markdown parser.
     #[derive(Clone, Copy)]
     enum Piece {
         Text(&'static str),
         User,
+        Role,
         Everyone,
     }
     use Piece::*;
@@ -215,54 +309,373 @@ fn the_server_only_sees_the_mentions_the_user_picked() {
         Text("7>"),
         Text("everyone"),
         Text("<@7>"),
+        Text("<@&8>"),
+        Text("<#9>"),
         Text("x"),
+        Text("\u{202e}"),
+        Text("\u{000c}"),
+        Text("\u{202a}"),
+        Text("\u{0007}"),
         User,
+        Role,
         Everyone,
     ];
     let mut checked = 0usize;
-    let mut stack: Vec<Vec<usize>> = vec![vec![]];
-    while let Some(seq) = stack.pop() {
-        if !seq.is_empty() {
-            let mut buf = Buffer::new(10_000);
-            for &p in &seq {
-                let at = buf.len();
-                match pieces[p] {
-                    Text(s) => buf.insert(at, s).unwrap(),
-                    User => assert!(buf.insert_token(at, Token::User(Id(7)), "@u")),
-                    Everyone => assert!(buf.insert_token(at, Token::Everyone, "@everyone")),
-                }
+    for_each_sequence(pieces.len(), 4, |seq| {
+        let mut buf = Buffer::new(10_000);
+        for &p in seq {
+            let at = buf.len();
+            match pieces[p] {
+                Text(s) => buf.insert(at, s).unwrap(),
+                User => assert!(buf.insert_token(at, Token::User(Id(7)), "@u")),
+                Role => assert!(buf.insert_token(at, Token::Role(Id(8)), "@r")),
+                Everyone => assert!(buf.insert_token(at, Token::Everyone, "@everyone")),
             }
-            let wire = buf.to_wire();
-            // A mention token right after a backslash cannot be sent (the backslash would
-            // escape it). That is the safe direction, so it is allowed to go missing.
-            let lost = |t: &inlet_editor::TokenSpan| {
-                matches!(t.token, Token::Everyone | Token::Here)
-                    && t.range.start > 0
-                    && buf.text().as_bytes()[t.range.start - 1] == b'\\'
-            };
-            let expected: Vec<Token> = buf
-                .tokens()
-                .iter()
-                .filter(|t| !lost(t))
-                .map(|t| t.token.clone())
-                .collect();
-            assert_eq!(server_mentions(&wire), expected, "text {:?}", buf.text());
-            if !buf.tokens().iter().any(lost) {
-                let back = Buffer::from_wire(&wire, &Names);
-                assert_eq!(back.text(), buf.text(), "wire {wire:?}");
-                assert_eq!(back.tokens(), buf.tokens(), "wire {wire:?}");
-            }
-            checked += 1;
         }
-        if seq.len() < 5 {
-            for p in 0..pieces.len() {
-                let mut next = seq.clone();
-                next.push(p);
-                stack.push(next);
+        assert!(
+            !buf.text()
+                .chars()
+                .any(|c| matches!(c, '\u{202a}'..='\u{202e}' | '\u{000c}' | '\u{0007}')),
+            "text {:?}",
+            buf.text()
+        );
+        let wire = buf.to_wire();
+        assert_eq!(
+            fluxer_mentions(&wire),
+            picked_without_lost(&buf),
+            "text {:?} wire {wire:?}",
+            buf.text()
+        );
+        assert_eq!(server_mentions(&wire), fluxer_mentions(&wire));
+        checked += 1;
+    });
+    assert!(checked > 80_000, "{checked}");
+}
+
+#[test]
+fn to_wire_does_not_depend_on_what_was_filtered_on_the_way_in() {
+    // The buffer also fills from server text. Here the typed text holds U+202E and U+000C
+    // between a backslash and a tag: the server removes them, and a backslash that was
+    // counted as separate would no longer escape. `from_wire` keeps such characters.
+    let pieces = [
+        "\\",
+        "\\\\",
+        "\\<@7>",
+        "\\<@&8>",
+        "\\<#9>",
+        "\\@everyone",
+        "<@7>",
+        "<@&8>",
+        "@everyone",
+        "\u{202e}",
+        "\u{000c}",
+        "<",
+        "@",
+        "x",
+    ];
+    let mut checked = 0usize;
+    for_each_sequence(pieces.len(), 4, |seq| {
+        let raw: String = seq.iter().map(|&p| pieces[p]).collect();
+        let buf = Buffer::from_wire(&raw, &Names);
+        let wire = buf.to_wire();
+        assert_eq!(
+            fluxer_mentions(&wire),
+            picked_without_lost(&buf),
+            "raw {raw:?} text {:?} wire {wire:?}",
+            buf.text()
+        );
+        checked += 1;
+    });
+    assert!(checked > 30_000, "{checked}");
+}
+
+#[test]
+fn a_backslash_and_a_stripped_character_cannot_ping_a_role() {
+    // The attack: backslash, U+202E, then a role tag, typed or pasted as plain text.
+    let mut buf = Buffer::new(2000);
+    buf.insert(0, "\\\u{202e}<@&42>").unwrap();
+    assert_eq!(buf.text(), "\\<@&42>", "the override is dropped");
+    assert_eq!(fluxer_mentions(&buf.to_wire()), Mentions::default());
+    for stripped in ['\u{202e}', '\u{000c}'] {
+        let raw = format!("\\{stripped}\\<@&42>");
+        let buf = Buffer::from_wire(&raw, &Names);
+        assert!(buf.tokens().is_empty());
+        let wire = buf.to_wire();
+        assert!(!wire.contains(stripped), "{wire:?}");
+        assert_eq!(fluxer_mentions(&wire), Mentions::default(), "{wire:?}");
+    }
+}
+
+#[test]
+fn input_drops_controls_and_normalizes_line_breaks() {
+    let mut buf = Buffer::new(2000);
+    buf.insert(
+        0,
+        "a\u{202e}b\u{000c}c\u{200e}\u{200f}\u{061c}\u{2066}\u{2069}\u{0007}d\te\r\nf\rg\u{0085}h",
+    )
+    .unwrap();
+    assert_eq!(buf.text(), "abcd\te\nf\ngh");
+}
+
+#[test]
+fn allowed_mentions_hold_only_picked_tokens() {
+    let mut buf = Buffer::new(2000);
+    typed(&mut buf, "hi <@99> ");
+    assert_eq!(buf.allowed_mentions(), AllowedMentions::default());
+    let end = buf.len();
+    user_token(&mut buf, end, 7, "@u");
+    let end = buf.len();
+    user_token(&mut buf, end, 7, "@u");
+    assert!(buf.insert_token(buf.len(), Token::Role(Id(8)), "@r"));
+    assert!(buf.insert_token(buf.len(), Token::Channel(Id(3)), "#c"));
+    let allowed = buf.allowed_mentions();
+    assert_eq!(allowed.users, vec![Id(7)]);
+    assert_eq!(allowed.roles, vec![Id(8)]);
+    assert!(!allowed.everyone);
+    assert!(buf.insert_token(buf.len(), Token::Here, "@here"));
+    assert!(buf.allowed_mentions().everyone);
+}
+
+#[test]
+fn code_and_links_are_left_alone() {
+    let same = [
+        "```xml\n<a:t>Hi</a:t>\n```",
+        "`<#list items as x>`",
+        "`<@macro/>`",
+        "`@here`",
+        "see https://example.com/@hereford now",
+        "``<@7>``",
+    ];
+    for text in same {
+        let mut buf = Buffer::new(2000);
+        buf.insert(0, text).unwrap();
+        assert_eq!(buf.to_wire(), text, "{text:?}");
+        assert_eq!(fluxer_mentions(&buf.to_wire()), Mentions::default());
+    }
+    // The same text outside code is escaped, even when code sits next to it.
+    let mut buf = Buffer::new(2000);
+    buf.insert(0, "`<@7>` <@7> `@here` @here").unwrap();
+    assert_eq!(buf.to_wire(), "`<@7>` \\<@7> `@here` \\@here");
+    assert_eq!(fluxer_mentions(&buf.to_wire()), Mentions::default());
+}
+
+#[test]
+fn code_around_pills_never_adds_a_mention() {
+    #[derive(Clone, Copy)]
+    enum Piece {
+        Text(&'static str),
+        User,
+    }
+    use Piece::*;
+    let pieces = [
+        Text("`"),
+        Text("\n```\n"),
+        Text("https://a.b/"),
+        Text(" "),
+        Text("<@7>"),
+        Text("<@8>"),
+        Text("<a:t>"),
+        Text("@here"),
+        Text("<#list>"),
+        Text("x"),
+        User,
+    ];
+    let mut checked = 0usize;
+    for_each_sequence(pieces.len(), 4, |seq| {
+        let mut buf = Buffer::new(10_000);
+        for &p in seq {
+            let at = buf.len();
+            match pieces[p] {
+                Text(s) => buf.insert(at, s).unwrap(),
+                User => assert!(buf.insert_token(at, Token::User(Id(7)), "@u")),
             }
+        }
+        let wire = buf.to_wire();
+        let found = fluxer_mentions(&wire);
+        let picked = Mentions::picked(buf.tokens());
+        // A pill inside code is not a mention, so the found set may be smaller. It is never
+        // bigger: nothing the user did not pick can ping.
+        assert!(
+            found.users.is_subset(&picked.users)
+                && found.roles.is_empty()
+                && found.channels.is_empty()
+                && !found.everyone
+                && !found.here,
+            "text {:?} wire {wire:?} found {found:?}",
+            buf.text()
+        );
+        if buf.tokens().is_empty() {
+            assert_eq!(found, Mentions::default(), "wire {wire:?}");
+        }
+        checked += 1;
+    });
+    assert!(checked > 10_000, "{checked}");
+}
+
+#[test]
+fn custom_emoji_names_with_a_dash_stay_emoji() {
+    let buf = Buffer::from_wire("<:a-b:5> <a:caf\u{e9}_1:6>", &NoNames);
+    assert_eq!(buf.tokens().len(), 2);
+    assert_eq!(buf.to_wire(), "<:a-b:5> <a:caf\u{e9}_1:6>");
+}
+
+#[test]
+fn pill_labels_from_names_are_cleaned() {
+    struct Dirty;
+    impl Resolve for Dirty {
+        fn user(&self, _: Id) -> Option<String> {
+            Some("al\nice\u{202e}\t\u{0007}".into())
+        }
+        fn role(&self, _: Id) -> Option<String> {
+            Some("\n\u{202e}".into())
+        }
+        fn channel(&self, _: Id) -> Option<String> {
+            None
         }
     }
-    assert!(checked > 100_000);
+    let buf = Buffer::from_wire("<@1> <@&2>", &Dirty);
+    assert_eq!(buf.text(), "@al ice @unknown-role");
+    let mut buf = Buffer::new(2000);
+    assert!(buf.insert_token(0, Token::User(Id(1)), "a\u{202e}b\nc"));
+    assert_eq!(buf.text(), "ab c");
+    assert!(!buf.insert_token(0, Token::User(Id(1)), "\u{202e}\n"));
+}
+
+// --- clipboard --------------------------------------------------------------------------
+
+#[test]
+fn a_copied_pill_survives_paste() {
+    let mut buf = Buffer::new(2000);
+    typed(&mut buf, "hi !");
+    user_token(&mut buf, 3, 1, "@alice");
+    let fragment = buf.fragment(0..buf.len());
+    assert_eq!(fragment.text, "hi @alice!");
+    assert_eq!(fragment.tokens.len(), 1);
+    assert_eq!(fragment.tokens[0].range, 3..9);
+    let metadata = fragment.to_metadata().unwrap();
+    // Other apps get plain text. Inlet gets the pill back.
+    let back = Fragment::from_clipboard(&fragment.text, &metadata).unwrap();
+    assert_eq!(back, fragment);
+    let mut other = Buffer::new(2000);
+    typed(&mut other, ">> ");
+    other.insert_fragment(3..3, &back).unwrap();
+    assert_eq!(other.text(), ">> hi @alice!");
+    assert_eq!(other.to_wire(), ">> hi <@1>!");
+    assert!(other.undo());
+    assert_eq!(other.text(), ">> ");
+    // A part of a pill is never copied.
+    assert_eq!(buf.fragment(4..7).text, "@alice");
+}
+
+#[test]
+fn clipboard_metadata_that_does_not_fit_is_ignored() {
+    let ok = "inlet-editor-fragment 1\n3 9 <@1>";
+    assert!(Fragment::from_clipboard("hi @alice!", ok).is_some());
+    for bad in [
+        "inlet-editor-fragment 2\n3 9 <@1>",
+        "inlet-editor-fragment 1\n3 99 <@1>",
+        "inlet-editor-fragment 1\n9 3 <@1>",
+        "inlet-editor-fragment 1\n3 9 <@1> junk",
+        "inlet-editor-fragment 1\n3 9 hello",
+        "inlet-editor-fragment 1\n3 9 <@1>\n4 8 <@2>",
+        "nonsense",
+    ] {
+        assert!(
+            Fragment::from_clipboard("hi @alice!", bad).is_none(),
+            "{bad}"
+        );
+    }
+    // Text the editor would change is not trusted.
+    assert!(Fragment::from_clipboard("hi \u{202e}@alice!", ok).is_none());
+    // Without pills there is no metadata.
+    let mut buf = Buffer::new(2000);
+    typed(&mut buf, "plain");
+    assert!(buf.fragment(0..5).to_metadata().is_none());
+}
+
+// --- limits and the input method -----------------------------------------------------------
+
+#[test]
+fn a_huge_paste_is_refused_without_work() {
+    let mut buf = Buffer::new(2000);
+    typed(&mut buf, "keep");
+    let huge = "x".repeat(50_000_000);
+    assert!(buf.insert(4, &huge).is_err());
+    assert_eq!(buf.text(), "keep");
+}
+
+#[test]
+fn a_composition_may_pass_the_limit_until_it_is_committed() {
+    let mut buf = Buffer::new(3);
+    buf.insert(0, "ab").unwrap();
+    buf.break_undo_group();
+    let r = buf.replace_composing(2..2, "cdef").unwrap();
+    assert!(buf.is_over_limit());
+    // Taking the composition back restores the text, and it cannot be redone.
+    buf.end_composition();
+    assert!(buf.discard_last_step());
+    assert_eq!(buf.text(), "ab");
+    assert!(!buf.redo());
+    assert_eq!(r, 2..6);
+    assert!(!buf.is_over_limit());
+}
+
+// --- movement details -------------------------------------------------------------------
+
+#[test]
+fn backspace_removes_one_code_point_in_complex_scripts_and_whole_emoji() {
+    let mut buf = Buffer::new(2000);
+    // Devanagari "ki": a consonant and a vowel sign form one cluster.
+    buf.insert(0, "\u{0915}\u{093f}").unwrap();
+    assert_eq!(prev_grapheme(&buf, 6), 0);
+    assert_eq!(prev_backspace_boundary(&buf, 6), 3);
+    // e with a combining acute accent: the accent goes first.
+    let mut buf = Buffer::new(2000);
+    buf.insert(0, "xe\u{301}").unwrap();
+    assert_eq!(prev_backspace_boundary(&buf, 4), 2);
+    // Emoji sequences, flags and keycaps go whole.
+    for emoji in [
+        "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}",
+        "\u{1f1f3}\u{1f1f4}",
+        "1\u{fe0f}\u{20e3}",
+        "\u{1f44d}\u{1f3fd}",
+    ] {
+        let mut buf = Buffer::new(2000);
+        buf.insert(0, "a").unwrap();
+        buf.insert(1, emoji).unwrap();
+        assert_eq!(prev_backspace_boundary(&buf, buf.len()), 1, "{emoji:?}");
+    }
+    // A plain letter, and a pill.
+    let mut buf = Buffer::new(2000);
+    typed(&mut buf, "ab");
+    assert_eq!(prev_backspace_boundary(&buf, 2), 1);
+    user_token(&mut buf, 2, 1, "@alice");
+    assert_eq!(prev_backspace_boundary(&buf, 8), 2);
+}
+
+#[test]
+fn clicks_land_on_grapheme_boundaries() {
+    let mut buf = Buffer::new(2000);
+    buf.insert(0, "ae\u{301}b").unwrap();
+    // Offsets: a 0..1, e 1..2, accent 2..4, b 4..5.
+    assert_eq!(nearest_grapheme_boundary(&buf, 1), 1);
+    assert_eq!(
+        nearest_grapheme_boundary(&buf, 2),
+        1,
+        "between e and its accent"
+    );
+    assert_eq!(
+        nearest_grapheme_boundary(&buf, 3),
+        1,
+        "inside the accent, nearer the start"
+    );
+    assert_eq!(nearest_grapheme_boundary(&buf, 4), 4);
+    assert_eq!(nearest_grapheme_boundary(&buf, 99), 5);
+    // Inside a pill, the nearer edge.
+    let mut buf = Buffer::new(2000);
+    user_token(&mut buf, 0, 1, "@alice");
+    assert_eq!(nearest_grapheme_boundary(&buf, 2), 0);
+    assert_eq!(nearest_grapheme_boundary(&buf, 5), 6);
 }
 
 // --- tokens as one unit ---------------------------------------------------------------------
@@ -340,7 +753,7 @@ fn offsets_are_bytes_and_stay_on_char_boundaries() {
     user_token(&mut buf, 4, 1, "@ålice");
     assert_eq!(buf.text(), "x本@ålice語");
     assert_eq!(buf.tokens()[0].range, 4..11);
-    assert_eq!(buf.len_chars(), "x本<@1>語".chars().count());
+    assert_eq!(buf.len_utf16(), "x本<@1>語".encode_utf16().count());
 }
 
 #[test]
@@ -357,7 +770,7 @@ fn max_chars_rejects_paste_over_the_limit() {
     let mut buf = Buffer::new(10);
     buf.insert(0, "abcde").unwrap();
     let err = buf.insert(5, "123456").unwrap_err();
-    assert_eq!(err.max_chars, 10);
+    assert_eq!(err.max_len_utf16, 10);
     assert_eq!(buf.text(), "abcde", "a rejected paste changes nothing");
     buf.insert(5, "12345").unwrap();
     assert_eq!(buf.text(), "abcde12345");
@@ -369,10 +782,24 @@ fn max_chars_rejects_paste_over_the_limit() {
 }
 
 #[test]
-fn max_chars_counts_characters_not_bytes() {
+fn the_limit_counts_utf16_code_units_as_the_server_does() {
+    // The server counts JavaScript string length: a character outside the BMP counts as 2.
     let mut buf = Buffer::new(3);
-    buf.insert(0, "日本語").unwrap();
+    buf.insert(0, "\u{1f600}").unwrap();
+    assert_eq!(buf.len_utf16(), 2);
+    assert!(buf.insert(4, "\u{1f600}").is_err(), "4 units");
+    buf.insert(4, "x").unwrap();
+    // Characters in the BMP count as 1, whatever their length in bytes.
+    let mut buf = Buffer::new(3);
+    buf.insert(0, "\u{65e5}\u{672c}\u{8a9e}").unwrap();
     assert!(buf.insert(9, "x").is_err());
+    // A flag is two regional indicators, 4 units. A family emoji is 8.
+    let mut buf = Buffer::new(7);
+    assert!(buf
+        .insert(0, "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}")
+        .is_err());
+    buf.insert(0, "\u{1f1f3}\u{1f1f4}").unwrap();
+    assert_eq!(buf.len_utf16(), 4);
 }
 
 #[test]
@@ -380,7 +807,7 @@ fn max_chars_counts_what_is_sent() {
     // `<@123456789012345678>` is 21 characters on the wire, although the pill shows 6.
     let mut buf = Buffer::new(25);
     assert!(buf.insert_token(0, Token::User(Id(123_456_789_012_345_678)), "@alice"));
-    assert_eq!(buf.len_chars(), 21);
+    assert_eq!(buf.len_utf16(), 21);
     assert!(buf.insert(6, "12345").is_err());
     buf.insert(6, "1234").unwrap();
     // A token that does not fit is refused too.
@@ -390,7 +817,7 @@ fn max_chars_counts_what_is_sent() {
 
 #[test]
 fn text_over_the_limit_can_shrink_but_not_grow() {
-    let mut buf = Buffer::from_wire("0123456789", &NoNames).with_max_chars(5);
+    let mut buf = Buffer::from_wire("0123456789", &NoNames).with_max_len(5);
     assert!(buf.insert(10, "x").is_err());
     buf.delete(0..2);
     assert_eq!(buf.text(), "23456789");

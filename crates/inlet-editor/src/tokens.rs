@@ -5,6 +5,8 @@
 
 use std::ops::Range;
 
+use crate::sanitize::{clean_label, dropped_on_input};
+
 /// A snowflake id.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Id(pub u64);
@@ -94,13 +96,23 @@ fn parse_id(s: &str) -> Option<Id> {
     s.parse().ok().map(Id)
 }
 
+/// What the parser accepts in a custom emoji name: letters, digits, `_`, `-` and any
+/// non-ASCII character. White space, control and bidi characters are left out here, so a
+/// name from the server cannot hide anything.
+fn is_emoji_name_char(c: char) -> bool {
+    c.is_ascii_alphanumeric()
+        || c == '_'
+        || c == '-'
+        || (!c.is_ascii() && !c.is_whitespace() && !dropped_on_input(c))
+}
+
 fn safe_emoji_name(name: &str) -> String {
     if valid_emoji_name(name) {
         return name.to_owned();
     }
     let cleaned: String = name
         .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .filter(|c| is_emoji_name_char(*c))
         .take(32)
         .collect();
     if cleaned.is_empty() {
@@ -111,7 +123,7 @@ fn safe_emoji_name(name: &str) -> String {
 }
 
 fn valid_emoji_name(name: &str) -> bool {
-    (1..=32).contains(&name.len()) && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    (1..=32).contains(&name.chars().count()) && name.chars().all(is_emoji_name_char)
 }
 
 /// Which kind of wire syntax the text at the start of `s` could be mistaken for.
@@ -174,23 +186,16 @@ impl Resolve for NoNames {
 
 /// The label a token gets when it is read from wire text.
 pub(crate) fn label_for(token: &Token, names: &dyn Resolve) -> String {
+    let named = |name: Option<String>, sigil: char, fallback: &str| {
+        let name = name.map(|n| clean_label(&n)).filter(|n| !n.is_empty());
+        format!("{sigil}{}", name.as_deref().unwrap_or(fallback))
+    };
     match token {
-        Token::User(id) => format!(
-            "@{}",
-            names.user(*id).unwrap_or_else(|| "unknown-user".into())
-        ),
-        Token::Role(id) => format!(
-            "@{}",
-            names.role(*id).unwrap_or_else(|| "unknown-role".into())
-        ),
-        Token::Channel(id) => format!(
-            "#{}",
-            names
-                .channel(*id)
-                .unwrap_or_else(|| "unknown-channel".into())
-        ),
+        Token::User(id) => named(names.user(*id), '@', "unknown-user"),
+        Token::Role(id) => named(names.role(*id), '@', "unknown-role"),
+        Token::Channel(id) => named(names.channel(*id), '#', "unknown-channel"),
         Token::Everyone => "@everyone".into(),
         Token::Here => "@here".into(),
-        Token::CustomEmoji { name, .. } => format!(":{name}:"),
+        Token::CustomEmoji { name, .. } => format!(":{}:", clean_label(name)),
     }
 }

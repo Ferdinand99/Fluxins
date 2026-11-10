@@ -10,6 +10,11 @@ publish = false
 
 [dependencies]
 gpui.workspace = true
+# Fluxer's own markdown parser (AGPL-3.0-or-later, like Inlet), at the commit the app uses.
+# It decides which typed text the server reads as a mention.
+fluxer_markdown_parser = { git = "https://github.com/fluxerapp/fluxer", rev = "f1cba64e64bda5f57ad3cf827c1d5a98ecdd80df" }
+# Finds raw URLs the way the server does.
+linkify = "0.11"
 unicode-segmentation = "1"
 
 [dev-dependencies]

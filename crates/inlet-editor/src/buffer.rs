@@ -8,13 +8,25 @@
 use std::fmt;
 use std::ops::Range;
 
+use crate::fragment::Fragment;
 use crate::history::{History, Kind, Snapshot};
+use crate::sanitize::{clean_label, sanitize_input, sanitized_units_lower_bound};
 use crate::tokens::{label_for, special_at, Resolve, Special, Token, TokenSpan};
+use crate::wire::{self, AllowedMentions};
 
-/// The text would pass `max_chars`.
+/// The text would pass the limit.
+///
+/// The limit is in UTF-16 code units of the wire text, as the server counts it. The `Display`
+/// text is English and only for logs. The app shows [`TooLong::MESSAGE_KEY`] through its own
+/// string table, with `max_len_utf16` as the argument.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TooLong {
-    pub max_chars: usize,
+    pub max_len_utf16: usize,
+}
+
+impl TooLong {
+    /// The key of the string for the app's string table (Fluent). It takes the argument `max`.
+    pub const MESSAGE_KEY: &'static str = "composer-too-long";
 }
 
 impl fmt::Display for TooLong {
@@ -22,7 +34,7 @@ impl fmt::Display for TooLong {
         write!(
             f,
             "the message cannot be longer than {} characters",
-            self.max_chars
+            self.max_len_utf16
         )
     }
 }
@@ -33,18 +45,20 @@ impl std::error::Error for TooLong {}
 pub struct Buffer {
     text: String,
     tokens: Vec<TokenSpan>,
-    max_chars: usize,
+    max_len: usize,
     history: History,
     cursor: usize,
 }
 
 impl Buffer {
-    /// An empty buffer. `max_chars` limits the length of the wire text (what Fluxer receives).
-    pub fn new(max_chars: usize) -> Self {
+    /// An empty buffer. `max_len_utf16` limits the length of the wire text (what Fluxer
+    /// receives) in UTF-16 code units, which is how the server counts. Take it from the
+    /// instance's message length limit (2000, or 4000 with the larger limit).
+    pub fn new(max_len_utf16: usize) -> Self {
         Self {
             text: String::new(),
             tokens: Vec::new(),
-            max_chars,
+            max_len: max_len_utf16,
             history: History::default(),
             cursor: 0,
         }
@@ -52,13 +66,14 @@ impl Buffer {
 
     /// Changes the limit. Text already in the buffer is kept even if it is over the new limit,
     /// but no edit can make it longer.
-    pub fn with_max_chars(mut self, max_chars: usize) -> Self {
-        self.max_chars = max_chars;
+    pub fn with_max_len(mut self, max_len_utf16: usize) -> Self {
+        self.max_len = max_len_utf16;
         self
     }
 
-    pub fn max_chars(&self) -> usize {
-        self.max_chars
+    /// The limit, in UTF-16 code units of the wire text.
+    pub fn max_len(&self) -> usize {
+        self.max_len
     }
 
     /// The text as the user sees it. A token shows as its label.
@@ -125,16 +140,22 @@ impl Buffer {
 
     // --- editing -------------------------------------------------------------------------
 
-    /// Inserts text. Fails, and changes nothing, when the result would pass `max_chars`.
+    /// Inserts text. Fails, and changes nothing, when the result would pass the limit.
+    /// Characters that must not be sent are dropped, see [`Buffer::replace`].
     pub fn insert(&mut self, at: usize, s: &str) -> Result<(), TooLong> {
         let at = self.snap_nearest(at);
         self.replace(at..at, s).map(|_| ())
     }
 
     /// Replaces a range with text, as one undo step. Returns where the new text is.
+    ///
+    /// Line breaks become `\n`. Bidi controls, U+202E, U+000C and control characters (except
+    /// the line feed and the tab) are dropped: the server removes some of them, and the rest
+    /// can make the composer show text in another order than it is sent.
     pub fn replace(&mut self, range: Range<usize>, s: &str) -> Result<Range<usize>, TooLong> {
+        self.refuse_huge(s)?;
         let range = self.expand_range(range);
-        let s = normalize_newlines(s);
+        let s = sanitize_input(s);
         let mut chars = s.chars();
         let kind = match (range.is_empty(), chars.next(), chars.next()) {
             (true, Some(c), None) => Kind::Typing {
@@ -149,19 +170,52 @@ impl Buffer {
         } else {
             range.end
         };
-        self.apply(range, &s, None, kind, cursor_before)
+        self.apply(range, &s, Vec::new(), kind, cursor_before, true)
+    }
+
+    /// Replaces a range with a fragment that was copied from a buffer, tokens included, as one
+    /// undo step. Text the buffer does not accept is inserted as plain text.
+    pub fn insert_fragment(
+        &mut self,
+        range: Range<usize>,
+        fragment: &Fragment,
+    ) -> Result<Range<usize>, TooLong> {
+        if sanitize_input(&fragment.text) != fragment.text {
+            return self.replace(range, &fragment.text);
+        }
+        self.refuse_huge(&fragment.text)?;
+        let range = self.expand_range(range);
+        let cursor_before = range.start;
+        self.apply(
+            range,
+            &fragment.text,
+            fragment.tokens.clone(),
+            Kind::Other,
+            cursor_before,
+            true,
+        )
     }
 
     /// A step of an input method composition. Steps in a row are one undo step.
+    ///
+    /// The limit is not enforced while composing, because the input method has its own idea
+    /// of what is on screen. The editor checks it when the composition is committed.
     pub fn replace_composing(
         &mut self,
         range: Range<usize>,
         s: &str,
     ) -> Result<Range<usize>, TooLong> {
         let range = self.expand_range(range);
-        let s = normalize_newlines(s);
+        let s = sanitize_input(s);
         let cursor_before = range.start;
-        self.apply(range, &s, None, Kind::Composition, cursor_before)
+        self.apply(
+            range,
+            &s,
+            Vec::new(),
+            Kind::Composition,
+            cursor_before,
+            false,
+        )
     }
 
     /// Deletes a range. A token the range touches is deleted whole.
@@ -176,11 +230,11 @@ impl Buffer {
         };
         let cursor_before = range.end;
         // A deletion never makes the text longer, so it cannot fail.
-        let _ = self.apply(range, "", None, kind, cursor_before);
+        let _ = self.apply(range, "", Vec::new(), kind, cursor_before, true);
     }
 
     /// Inserts a token that shows as `label`. Returns false, and changes nothing, when the
-    /// label is empty or the result would pass `max_chars`.
+    /// label is empty or the result would pass the limit.
     pub fn insert_token(&mut self, at: usize, t: Token, label: &str) -> bool {
         let at = self.snap_nearest(at);
         self.replace_with_token(at..at, t, label)
@@ -188,17 +242,36 @@ impl Buffer {
 
     /// Replaces a range (for example the text of a trigger) with a token, as one undo step.
     pub fn replace_with_token(&mut self, range: Range<usize>, t: Token, label: &str) -> bool {
-        let label: String = label
-            .chars()
-            .map(|c| if c.is_control() { ' ' } else { c })
-            .collect();
+        let label = clean_label(label);
         if label.is_empty() {
             return false;
         }
         let range = self.expand_range(range);
         let cursor_before = range.start;
-        self.apply(range, &label, Some(t), Kind::Other, cursor_before)
+        let span = TokenSpan {
+            range: 0..label.len(),
+            token: t,
+        };
+        self.apply(range, &label, vec![span], Kind::Other, cursor_before, true)
             .is_ok()
+    }
+
+    /// The text of a range, with its tokens, for the clipboard.
+    pub fn fragment(&self, range: Range<usize>) -> Fragment {
+        let range = self.expand_range(range);
+        let tokens = self
+            .tokens
+            .iter()
+            .filter(|t| t.range.start >= range.start && t.range.end <= range.end)
+            .map(|t| TokenSpan {
+                range: t.range.start - range.start..t.range.end - range.start,
+                token: t.token.clone(),
+            })
+            .collect();
+        Fragment {
+            text: self.text[range].to_owned(),
+            tokens,
+        }
     }
 
     /// The next edit starts a new undo step. Call it when the caret moves.
@@ -209,6 +282,19 @@ impl Buffer {
     /// An input method composition ended.
     pub fn end_composition(&mut self) {
         self.history.close_group();
+    }
+
+    /// Goes back one undo step and forgets it: it cannot be redone. For a composition that
+    /// turned out to be too long.
+    pub fn discard_last_step(&mut self) -> bool {
+        match self.history.pop_undo() {
+            Some(entry) => {
+                self.restore(entry.snapshot);
+                self.cursor = self.clamp(entry.cursor);
+                true
+            }
+            None => false,
+        }
     }
 
     pub fn undo(&mut self) -> bool {
@@ -247,27 +333,48 @@ impl Buffer {
         self.tokens = snapshot.tokens;
     }
 
-    /// The one place the text changes. `range` must already be valid.
+    /// Refuses text that is too long before any work is done on it. A paste of 100 MB must
+    /// not be copied, spliced and escaped just to be refused.
+    fn refuse_huge(&self, s: &str) -> Result<(), TooLong> {
+        let lower_bound = sanitized_units_lower_bound(s);
+        if lower_bound > self.max_len && lower_bound > self.len_utf16() {
+            return Err(TooLong {
+                max_len_utf16: self.max_len,
+            });
+        }
+        Ok(())
+    }
+
+    /// The one place the text changes. `range` must already be valid, `new` already clean,
+    /// and the ranges of `new_tokens` are relative to `new`.
     fn apply(
         &mut self,
         range: Range<usize>,
         new: &str,
-        token: Option<Token>,
+        new_tokens: Vec<TokenSpan>,
         kind: Kind,
         cursor_before: usize,
+        enforce_limit: bool,
     ) -> Result<Range<usize>, TooLong> {
         if range.is_empty() && new.is_empty() {
             return Ok(range);
         }
         let before = self.snapshot();
-        let chars_before = self.len_chars();
-        self.splice(&range, new, token);
-        let chars_after = self.len_chars();
-        if chars_after > self.max_chars && chars_after > chars_before {
-            self.restore(before);
-            return Err(TooLong {
-                max_chars: self.max_chars,
-            });
+        self.splice(&range, new, new_tokens);
+        if enforce_limit {
+            let after = self.len_utf16();
+            if after > self.max_len {
+                // Only a longer text is refused: text that is over the limit may shrink.
+                let was = wire::to_wire(&before.text, &before.tokens)
+                    .encode_utf16()
+                    .count();
+                if after > was {
+                    self.restore(before);
+                    return Err(TooLong {
+                        max_len_utf16: self.max_len,
+                    });
+                }
+            }
         }
         self.history.begin(kind, || before, cursor_before);
         let inserted = range.start..range.start + new.len();
@@ -275,62 +382,67 @@ impl Buffer {
         Ok(inserted)
     }
 
-    fn splice(&mut self, range: &Range<usize>, new: &str, token: Option<Token>) {
+    fn splice(&mut self, range: &Range<usize>, new: &str, new_tokens: Vec<TokenSpan>) {
         self.text.replace_range(range.clone(), new);
         let old_len = range.end - range.start;
-        let mut kept = Vec::with_capacity(self.tokens.len() + 1);
+        let mut kept = Vec::with_capacity(self.tokens.len() + new_tokens.len());
+        let mut after = Vec::new();
         for mut t in std::mem::take(&mut self.tokens) {
             if t.range.end <= range.start {
                 kept.push(t);
             } else if t.range.start >= range.end {
                 t.range = t.range.start - old_len + new.len()..t.range.end - old_len + new.len();
-                kept.push(t);
+                after.push(t);
             }
             // Otherwise the token lay inside the replaced range, and is gone.
         }
-        if let Some(token) = token {
-            let span = TokenSpan {
-                range: range.start..range.start + new.len(),
-                token,
-            };
-            let at = kept.partition_point(|t| t.range.start < span.range.start);
-            kept.insert(at, span);
-        }
+        kept.extend(new_tokens.into_iter().map(|mut t| {
+            t.range = range.start + t.range.start..range.start + t.range.end;
+            t
+        }));
+        kept.extend(after);
         self.tokens = kept;
     }
 
     // --- wire text -----------------------------------------------------------------------
 
-    /// How many characters Fluxer would count in the message.
-    pub fn len_chars(&self) -> usize {
-        self.to_wire().chars().count()
+    /// How long the message is, as the server counts: UTF-16 code units of the wire text.
+    pub fn len_utf16(&self) -> usize {
+        self.to_wire().encode_utf16().count()
+    }
+
+    /// The text is longer than the limit. Only possible for text that came from the server,
+    /// or from an input method composition that has not been committed.
+    pub fn is_over_limit(&self) -> bool {
+        self.len_utf16() > self.max_len
     }
 
     /// The text to send: `<@id>`, `<@&id>`, `<#id>`, `<:name:id>`, `<a:name:id>`, `@everyone`
     /// and `@here` for tokens.
     ///
-    /// Plain text that looks like one of those is escaped with a backslash, so the server
+    /// Typed text that looks like one of those is escaped with a backslash, so the server
     /// never sees a mention the user did not pick. Backslashes right before such text are
-    /// doubled, so they cannot cancel the escape.
+    /// doubled, so they cannot cancel the escape. The escapes are computed on the text the
+    /// server reads, after it has removed U+202E and U+000C. Text in code and in links is
+    /// left alone, where Fluxer reads no mentions. The result is checked against a port of
+    /// the server's mention extraction. If it finds anything but the picked mentions, every
+    /// look-alike is escaped.
+    ///
+    /// The server does not count or send the leading and trailing white space; this text
+    /// keeps it.
     pub fn to_wire(&self) -> String {
-        let mut out = String::with_capacity(self.text.len() + 16);
-        let mut pos = 0;
-        for span in &self.tokens {
-            let plain = &self.text[pos..span.range.start];
-            push_plain(&mut out, plain);
-            if span.token.wire_starts_with_angle() {
-                push_backslashes(&mut out, trailing_backslashes(plain));
-            }
-            out.push_str(&span.token.to_wire());
-            pos = span.range.end;
-        }
-        push_plain(&mut out, &self.text[pos..]);
-        out
+        wire::to_wire(&self.text, &self.tokens)
+    }
+
+    /// The mentions the user picked, to send as `allowed_mentions` so that the server drops
+    /// every other mention. See [`AllowedMentions`] for how to send it.
+    pub fn allowed_mentions(&self) -> AllowedMentions {
+        AllowedMentions::from_tokens(&self.tokens)
     }
 
     /// Reads wire text from the server (to edit a message). Mentions and custom emoji become
     /// tokens. `names` gives the labels. The reverse of [`Buffer::to_wire`].
-    /// The limit is off; set it with [`Buffer::with_max_chars`].
+    /// The limit is off; set it with [`Buffer::with_max_len`].
     pub fn from_wire(s: &str, names: &dyn Resolve) -> Self {
         let mut buf = Buffer::new(usize::MAX);
         let bytes = s.as_bytes();
@@ -404,34 +516,4 @@ impl Buffer {
 
 fn push_backslashes(out: &mut String, n: usize) {
     out.extend(std::iter::repeat_n('\\', n));
-}
-
-fn trailing_backslashes(s: &str) -> usize {
-    s.bytes().rev().take_while(|b| *b == b'\\').count()
-}
-
-fn push_plain(out: &mut String, plain: &str) {
-    for (i, ch) in plain.char_indices() {
-        if ch == '<' || ch == '@' {
-            match special_at(&plain[i..]) {
-                Some(Special::Angle) => {
-                    // The backslashes before it are already in `out`. Doubling them makes
-                    // an even run, then one more escapes the `<`.
-                    push_backslashes(out, trailing_backslashes(&plain[..i]));
-                    out.push('\\');
-                }
-                Some(Special::At) => out.push('\\'),
-                None => {}
-            }
-        }
-        out.push(ch);
-    }
-}
-
-/// Fluxer messages use `\n` only.
-fn normalize_newlines(s: &str) -> String {
-    if !s.contains('\r') {
-        return s.to_owned();
-    }
-    s.replace("\r\n", "\n").replace('\r', "\n")
 }

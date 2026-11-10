@@ -2,13 +2,14 @@
 //! Tests of the gpui side: input method, UTF-16 offsets, layout and scrolling. They run in
 //! gpui's test platform, so they need no screen.
 
-use gpui::{div, prelude::*, px, Entity, EntityInputHandler, TestAppContext};
-use inlet_editor::{Editor, Id, NoNames, Token, Trigger};
+use gpui::{div, prelude::*, px, Entity, EntityInputHandler, Focusable, TestAppContext};
+use inlet_editor::{Editor, EditorEvent, Id, NoNames, Submit, Token, Trigger};
 
 /// A window that holds an editor in a fixed width.
 struct Host {
     editor: Entity<Editor>,
     width: f32,
+    submits: usize,
 }
 
 impl Render for Host {
@@ -18,9 +19,19 @@ impl Render for Host {
 }
 
 fn host(cx: &mut TestAppContext, width: f32) -> (Entity<Editor>, &mut gpui::VisualTestContext) {
-    let (host, cx) = cx.add_window_view(|_, cx| Host {
-        editor: cx.new(|cx| Editor::new(5000, cx)),
-        width,
+    let (host, cx) = cx.add_window_view(|_, cx| {
+        let editor = cx.new(|cx| Editor::new(5000, cx));
+        cx.subscribe(&editor, |host: &mut Host, _, event: &EditorEvent, _| {
+            if *event == EditorEvent::Submit {
+                host.submits += 1;
+            }
+        })
+        .detach();
+        Host {
+            editor,
+            width,
+            submits: 0,
+        }
     });
     let editor = host.read_with(cx, |host, _| host.editor.clone());
     (editor, cx)
@@ -265,4 +276,125 @@ fn a_short_text_does_not_scroll(cx: &mut TestAppContext) {
         assert_eq!(ed.scroll_offset(), px(0.));
         assert!(ed.painted_bounds().unwrap().size.height > px(0.));
     });
+}
+
+#[gpui::test]
+fn a_composition_that_ends_too_long_is_taken_back(cx: &mut TestAppContext) {
+    let window = cx.add_window(|_, cx| Editor::new(5, cx));
+    window
+        .update(cx, |ed, window, cx| {
+            ed.replace_text_in_range(None, "abc", window, cx);
+            // The input method may show more than the limit while it composes.
+            ed.replace_and_mark_text_in_range(None, "defgh", None, window, cx);
+            assert_eq!(ed.buffer().text(), "abcdefgh");
+            assert_eq!(ed.marked_range(), Some(3..8));
+            // Undo is refused while the input method owns the text.
+            assert!(!ed.undo_edit(window, cx));
+            // The commit is checked against the limit, and refused as a whole.
+            ed.replace_text_in_range(None, "defgh", window, cx);
+            assert_eq!(ed.buffer().text(), "abc");
+            assert_eq!(ed.marked_range(), None);
+            assert_eq!(ed.selection().head, 3);
+            // A short composition is committed as usual.
+            ed.replace_and_mark_text_in_range(None, "d", None, window, cx);
+            ed.replace_text_in_range(None, "de", window, cx);
+            assert_eq!(ed.buffer().text(), "abcde");
+            assert!(!ed.buffer().is_over_limit());
+        })
+        .unwrap();
+}
+
+fn submits(cx: &mut gpui::VisualTestContext) -> usize {
+    cx.update(|window, cx| {
+        let root = window.root::<Host>().flatten().unwrap();
+        root.read(cx).submits
+    })
+}
+
+#[gpui::test]
+fn submit_ends_an_open_composition_before_it_sends(cx: &mut TestAppContext) {
+    let (editor, cx) = host(cx, 300.);
+    editor.update_in(cx, |ed, window, cx| {
+        window.focus(&ed.focus_handle(cx), cx);
+        ed.replace_text_in_range(None, "ab", window, cx);
+        ed.replace_and_mark_text_in_range(None, "\u{306b}", None, window, cx);
+    });
+    cx.dispatch_action(Submit);
+    editor.update_in(cx, |ed, _, _| {
+        assert_eq!(ed.marked_range(), None, "the composition was ended");
+        assert_eq!(ed.buffer().text(), "ab\u{306b}");
+    });
+    assert_eq!(submits(cx), 0, "nothing was sent yet");
+    cx.dispatch_action(Submit);
+    assert_eq!(submits(cx), 1);
+}
+
+#[gpui::test]
+fn copy_and_paste_keep_pills_inside_the_app(cx: &mut TestAppContext) {
+    let (editor, cx) = host(cx, 300.);
+    editor.update_in(cx, |ed, window, cx| {
+        window.focus(&ed.focus_handle(cx), cx);
+        ed.set_wire("hi <@1> there", &NoNames, window, cx);
+    });
+    editor.update_in(cx, |ed, window, cx| {
+        ed.set_selected_text_range(0..22, window, cx);
+    });
+    cx.dispatch_action(inlet_editor::actions::Copy);
+    let item = cx.read_from_clipboard().expect("copied");
+    assert_eq!(item.text().as_deref(), Some("hi @unknown-user there"));
+    assert!(item.metadata().is_some(), "the pills are in the metadata");
+    editor.update_in(cx, |ed, window, cx| {
+        ed.clear(window, cx);
+    });
+    cx.dispatch_action(inlet_editor::actions::Paste);
+    editor.update_in(cx, |ed, _, _| {
+        assert_eq!(ed.to_wire(), "hi <@1> there");
+        assert_eq!(ed.buffer().tokens().len(), 1);
+    });
+    // Another app puts plain text with the same words on the clipboard: no pill.
+    cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+        "hi @unknown-user <@5> there".into(),
+    ));
+    editor.update_in(cx, |ed, window, cx| ed.clear(window, cx));
+    cx.dispatch_action(inlet_editor::actions::Paste);
+    editor.update_in(cx, |ed, _, _| {
+        assert!(ed.buffer().tokens().is_empty());
+        assert_eq!(ed.to_wire(), "hi @unknown-user \\<@5> there");
+    });
+}
+
+#[gpui::test]
+fn home_and_end_stay_on_the_row_at_a_soft_wrap(cx: &mut TestAppContext) {
+    let (editor, cx) = host(cx, 120.);
+    editor.update_in(cx, |ed, window, cx| {
+        window.focus(&ed.focus_handle(cx), cx);
+        ed.insert_text("aaaa bbbb cccc dddd eeee ffff gggg", window, cx)
+            .unwrap();
+    });
+    cx.run_until_parked();
+    // The caret is at the end of the text, on the last row. Home goes to the start of it.
+    cx.dispatch_action(inlet_editor::actions::Home);
+    let last_row = editor.update_in(cx, |ed, _, _| ed.selection().head);
+    assert!(
+        last_row > 0 && last_row < 34,
+        "start of a later row: {last_row}"
+    );
+    // Up goes one row up. Home goes to the start of that row, and not further back.
+    cx.dispatch_action(inlet_editor::actions::Up);
+    cx.dispatch_action(inlet_editor::actions::Home);
+    let row_above = editor.update_in(cx, |ed, _, _| ed.selection().head);
+    assert!(row_above < last_row);
+    // End goes to the end of that row. Home from there stays on the same row, even though
+    // the end of a row is also the start of the next one.
+    cx.dispatch_action(inlet_editor::actions::End);
+    cx.dispatch_action(inlet_editor::actions::Home);
+    assert_eq!(
+        editor.update_in(cx, |ed, _, _| ed.selection().head),
+        row_above
+    );
+    // Down onto the row below lands at its start: Home stays there.
+    cx.dispatch_action(inlet_editor::actions::Down);
+    cx.dispatch_action(inlet_editor::actions::Home);
+    let below = editor.update_in(cx, |ed, _, _| ed.selection().head);
+    assert!(below > row_above);
 }

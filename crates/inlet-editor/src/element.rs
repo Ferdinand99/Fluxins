@@ -14,6 +14,7 @@ use gpui::{
 };
 
 use crate::buffer::{Buffer, TooLong};
+use crate::fragment::Fragment;
 use crate::selection::{self, Move, Selection};
 use crate::tokens::{Resolve, Token, TokenSpan};
 use crate::trigger::{trigger_at, Trigger};
@@ -153,7 +154,7 @@ impl Default for EditorStyle {
     }
 }
 
-/// What the editor tells its owner.
+/// What the editor tells the entity that holds it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EditorEvent {
     /// The text changed.
@@ -178,6 +179,9 @@ pub struct Editor {
     preferred_x: Option<Pixels>,
     selecting: bool,
     autoscroll: bool,
+    /// The caret is at a soft wrap and sits at the start of the row below, not at the end of
+    /// the row above.
+    caret_next_row: bool,
 }
 
 impl EventEmitter<EditorEvent> for Editor {}
@@ -189,10 +193,11 @@ impl Focusable for Editor {
 }
 
 impl Editor {
-    pub fn new(max_chars: usize, cx: &mut Context<Self>) -> Self {
+    /// `max_len_utf16` is the message length limit of the instance, in UTF-16 code units.
+    pub fn new(max_len_utf16: usize, cx: &mut Context<Self>) -> Self {
         Self {
             focus_handle: cx.focus_handle(),
-            buffer: Buffer::new(max_chars),
+            buffer: Buffer::new(max_len_utf16),
             selection: Selection::default(),
             marked: None,
             placeholder: SharedString::default(),
@@ -202,6 +207,7 @@ impl Editor {
             preferred_x: None,
             selecting: false,
             autoscroll: false,
+            caret_next_row: false,
         }
     }
 
@@ -259,7 +265,7 @@ impl Editor {
         window: &Window,
         cx: &mut Context<Self>,
     ) {
-        self.buffer = Buffer::from_wire(wire, names).with_max_chars(self.buffer.max_chars());
+        self.buffer = Buffer::from_wire(wire, names).with_max_len(self.buffer.max_len());
         self.marked = None;
         self.selection = Selection::caret(self.buffer.len());
         self.after_edit(window, cx);
@@ -267,7 +273,7 @@ impl Editor {
 
     /// Empties the editor, for example after a message was sent.
     pub fn clear(&mut self, window: &Window, cx: &mut Context<Self>) {
-        let max = self.buffer.max_chars();
+        let max = self.buffer.max_len();
         self.buffer = Buffer::new(max);
         self.marked = None;
         self.selection = Selection::default();
@@ -309,8 +315,13 @@ impl Editor {
         true
     }
 
-    /// Undoes the last edit. Returns false when there is nothing to undo.
+    /// Undoes the last edit. Returns false when there is nothing to undo, or an input method
+    /// composition is open.
     pub fn undo_edit(&mut self, window: &Window, cx: &mut Context<Self>) -> bool {
+        if self.marked.is_some() {
+            // The input method owns the text until the composition ends.
+            return false;
+        }
         let done = self.buffer.undo();
         if done {
             self.marked = None;
@@ -322,6 +333,9 @@ impl Editor {
 
     /// Redoes the last undone edit. Returns false when there is nothing to redo.
     pub fn redo_edit(&mut self, window: &Window, cx: &mut Context<Self>) -> bool {
+        if self.marked.is_some() {
+            return false;
+        }
         let done = self.buffer.redo();
         if done {
             self.marked = None;
@@ -335,6 +349,7 @@ impl Editor {
 
     fn after_edit(&mut self, window: &Window, cx: &mut Context<Self>) {
         self.preferred_x = None;
+        self.caret_next_row = false;
         self.autoscroll = true;
         window.notify_text_input_changed(&self.focus_handle);
         cx.emit(EditorEvent::Changed);
@@ -345,6 +360,7 @@ impl Editor {
     fn set_selection(&mut self, selection: Selection, window: &Window, cx: &mut Context<Self>) {
         self.selection = selection.normalized(&self.buffer);
         self.buffer.break_undo_group();
+        self.caret_next_row = false;
         self.autoscroll = true;
         window.notify_text_selection_changed(&self.focus_handle);
         cx.emit(EditorEvent::SelectionChanged);
@@ -368,19 +384,20 @@ impl Editor {
             return;
         };
         let layout = &painted.layout;
-        let caret = layout.position_for_index(self.selection.head);
+        let caret = layout.position_for_index(self.selection.head, self.caret_next_row);
         let x = self.preferred_x.unwrap_or(caret.x);
         let y = caret.y + layout.line_height * (rows as f32 + 0.5);
-        let target = if y < Pixels::ZERO {
-            0
+        let (target, next_row) = if y < Pixels::ZERO {
+            (0, false)
         } else if y >= layout.height {
-            self.buffer.len()
+            (self.buffer.len(), false)
         } else {
             layout.index_for_point(point(x, y), self.buffer.len())
         };
         let next = self.selection.with_head(&self.buffer, target, extend);
         self.set_selection(next, window, cx);
         self.preferred_x = Some(x);
+        self.caret_next_row = next_row && self.selection.head == target;
     }
 
     /// Home and End: the start or end of the visual row the caret is on.
@@ -391,21 +408,32 @@ impl Editor {
         window: &Window,
         cx: &mut Context<Self>,
     ) {
-        let target = match &self.last {
+        let (target, next_row) = match &self.last {
             Some(painted) => {
-                let (start, stop) = painted.layout.row_of(self.selection.head);
+                let (start, stop) = painted
+                    .layout
+                    .row_of(self.selection.head, self.caret_next_row);
                 if end {
-                    stop
+                    (stop, false)
                 } else {
-                    start
+                    // The start of a row below a soft wrap is also the end of the row above.
+                    // The caret stays on the row it was moved to.
+                    let line_start = selection::line_start(&self.buffer, start);
+                    (start, start != line_start)
                 }
             }
-            None if end => selection::line_end(&self.buffer, self.selection.head),
-            None => selection::line_start(&self.buffer, self.selection.head),
+            None if end => (
+                selection::line_end(&self.buffer, self.selection.head),
+                false,
+            ),
+            None => (
+                selection::line_start(&self.buffer, self.selection.head),
+                false,
+            ),
         };
-        self.preferred_x = None;
         let next = self.selection.with_head(&self.buffer, target, extend);
         self.set_selection(next, window, cx);
+        self.caret_next_row = next_row && self.selection.head == target;
     }
 
     /// Deletes the selection, or the range from the caret to `edge` when nothing is selected.
@@ -426,15 +454,10 @@ impl Editor {
         self.after_edit(window, cx);
     }
 
-    fn selected_text(&self) -> Option<String> {
-        let range = self.selection.range();
-        (!range.is_empty()).then(|| self.buffer.text()[range].to_owned())
-    }
-
     // --- action handlers -----------------------------------------------------------------
 
     fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
-        let edge = selection::prev_grapheme(&self.buffer, self.selection.head);
+        let edge = selection::prev_backspace_boundary(&self.buffer, self.selection.head);
         self.delete_to(edge, window, cx);
     }
 
@@ -562,25 +585,58 @@ impl Editor {
         self.set_selection(Selection::select_all(&self.buffer), window, cx);
     }
 
+    /// The selection as a clipboard item: plain text for other apps, and the tokens in the
+    /// item's metadata, so pills survive a copy and paste inside Inlet.
+    fn clipboard_item(&self) -> Option<ClipboardItem> {
+        let range = self.selection.range();
+        if range.is_empty() {
+            return None;
+        }
+        let fragment = self.buffer.fragment(range);
+        Some(match fragment.to_metadata() {
+            Some(metadata) => ClipboardItem::new_string_with_metadata(fragment.text, metadata),
+            None => ClipboardItem::new_string(fragment.text),
+        })
+    }
+
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(text) = self.selected_text() {
-            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        if let Some(item) = self.clipboard_item() {
+            cx.write_to_clipboard(item);
         }
     }
 
     fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(text) = self.selected_text() {
-            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        if let Some(item) = self.clipboard_item() {
+            cx.write_to_clipboard(item);
             let edge = self.selection.head;
             self.delete_to(edge, window, cx);
         }
     }
 
     fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-            if self.insert_text(&text, window, cx).is_err() {
-                window.play_system_bell();
+        if self.marked.is_some() {
+            return;
+        }
+        let Some(item) = cx.read_from_clipboard() else {
+            return;
+        };
+        let Some(text) = item.text() else {
+            return;
+        };
+        let range = self.selection.range();
+        let fragment = item
+            .metadata()
+            .and_then(|metadata| Fragment::from_clipboard(&text, metadata));
+        let result = match fragment {
+            Some(fragment) => self.buffer.insert_fragment(range, &fragment),
+            None => self.buffer.replace(range, &text),
+        };
+        match result {
+            Ok(inserted) => {
+                self.selection = Selection::caret(inserted.end);
+                self.after_edit(window, cx);
             }
+            Err(_) => window.play_system_bell(),
         }
     }
 
@@ -593,26 +649,55 @@ impl Editor {
     }
 
     fn newline(&mut self, _: &Newline, window: &mut Window, cx: &mut Context<Self>) {
+        if self.marked.is_some() {
+            // The line break belongs to the input method: end the composition first.
+            self.finish_composition(window, cx);
+            return;
+        }
         if self.insert_text("\n", window, cx).is_err() {
             window.play_system_bell();
         }
     }
 
-    fn submit(&mut self, _: &Submit, _: &mut Window, cx: &mut Context<Self>) {
+    fn submit(&mut self, _: &Submit, window: &mut Window, cx: &mut Context<Self>) {
+        if self.marked.is_some() {
+            // Half-composed text must not be sent. The key ends the composition; the next
+            // press sends.
+            self.finish_composition(window, cx);
+            return;
+        }
         cx.emit(EditorEvent::Submit);
+    }
+
+    /// Ends a composition and keeps its text. A composition may pass the limit while it is
+    /// open (the input method decides what is on screen). If the result is too long, the
+    /// composition is taken back.
+    fn finish_composition(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let start = self.marked.take().map(|m| m.start);
+        self.buffer.end_composition();
+        if self.buffer.is_over_limit() && self.buffer.discard_last_step() {
+            let at = start.unwrap_or(self.selection.head);
+            self.selection = Selection::caret(self.buffer.clamp(at));
+            window.play_system_bell();
+        }
+        self.after_edit(window, cx);
     }
 
     // --- mouse ---------------------------------------------------------------------------
 
-    fn index_for_mouse(&self, position: Point<Pixels>) -> usize {
+    /// The offset under a window position, on a grapheme boundary, and whether the caret
+    /// belongs at the start of a row below a soft wrap.
+    fn index_for_mouse(&self, position: Point<Pixels>) -> (usize, bool) {
         let Some(painted) = &self.last else {
-            return 0;
+            return (0, false);
         };
         let local = point(
             position.x - painted.bounds.left(),
             position.y - painted.bounds.top() + painted.scroll_y,
         );
-        painted.layout.index_for_point(local, self.buffer.len())
+        let (index, next_row) = painted.layout.index_for_point(local, self.buffer.len());
+        let snapped = selection::nearest_grapheme_boundary(&self.buffer, index);
+        (snapped, next_row && snapped == index)
     }
 
     fn on_mouse_down(
@@ -622,7 +707,7 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         window.request_virtual_keyboard();
-        let index = self.index_for_mouse(event.position);
+        let (index, next_row) = self.index_for_mouse(event.position);
         self.preferred_x = None;
         match event.click_count {
             0 | 1 => {
@@ -631,6 +716,7 @@ impl Editor {
                     .selection
                     .with_head(&self.buffer, index, event.modifiers.shift);
                 self.set_selection(next, window, cx);
+                self.caret_next_row = next_row && self.selection.head == index;
             }
             2 => {
                 let r = selection::word_range_at(&self.buffer, index);
@@ -668,9 +754,10 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         if self.selecting {
-            let index = self.index_for_mouse(event.position);
+            let (index, next_row) = self.index_for_mouse(event.position);
             let next = self.selection.with_head(&self.buffer, index, true);
             self.set_selection(next, window, cx);
+            self.caret_next_row = next_row && self.selection.head == index;
         }
     }
 
@@ -786,10 +873,7 @@ impl EntityInputHandler for Editor {
     }
 
     fn unmark_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.marked = None;
-        self.buffer.end_composition();
-        window.notify_text_input_changed(&self.focus_handle);
-        cx.notify();
+        self.finish_composition(window, cx);
     }
 
     fn replace_text_in_range(
@@ -806,14 +890,15 @@ impl EntityInputHandler for Editor {
         } else {
             self.buffer.replace(range, new_text)
         };
-        if composing {
-            self.marked = None;
-            self.buffer.end_composition();
-        }
         match result {
             Ok(inserted) => {
                 self.selection = Selection::caret(inserted.end);
-                self.after_edit(window, cx);
+                if composing {
+                    // The commit: the composition ends, and the limit is checked now.
+                    self.finish_composition(window, cx);
+                } else {
+                    self.after_edit(window, cx);
+                }
             }
             Err(_) => window.play_system_bell(),
         }
@@ -862,8 +947,8 @@ impl EntityInputHandler for Editor {
     ) -> Option<Bounds<Pixels>> {
         let painted = self.last.as_ref()?;
         let range = self.range_from_utf16(&range_utf16);
-        let start = painted.layout.position_for_index(range.start);
-        let end = painted.layout.position_for_index(range.end);
+        let start = painted.layout.position_for_index(range.start, false);
+        let end = painted.layout.position_for_index(range.end, false);
         let width = if end.y == start.y {
             (end.x - start.x).max(px(1.))
         } else {
@@ -913,7 +998,7 @@ impl EntityInputHandler for Editor {
     ) -> Option<usize> {
         let painted = self.last.as_ref()?;
         painted.bounds.localize(&position)?;
-        let index = self.index_for_mouse(position);
+        let (index, _) = self.index_for_mouse(position);
         Some(self.offset_to_utf16(index))
     }
 }
@@ -1050,22 +1135,50 @@ impl Layout {
             .saturating_sub(1)
     }
 
-    fn position_for_index(&self, index: usize) -> Point<Pixels> {
-        let Some(line) = self.lines.get(self.line_ix(index)) else {
-            return point(Pixels::ZERO, Pixels::ZERO);
-        };
-        let local = (index - line.start.min(index)).min(line.wrapped.len());
-        let p = line
-            .wrapped
-            .position_for_index(local, self.line_height)
-            .unwrap_or_default();
-        point(p.x, line.y + p.y)
+    /// The line and visual row that hold `index`. A caret at a soft wrap sits at the end of
+    /// the row above, or, with `next_row`, at the start of the row below.
+    fn row_for_index(&self, index: usize, next_row: bool) -> Option<(usize, usize)> {
+        let ix = self.line_ix(index);
+        let line = self.lines.get(ix)?;
+        let local = index - line.start.min(index);
+        if next_row {
+            if let Some(r) = line
+                .rows
+                .iter()
+                .enumerate()
+                .skip(1)
+                .find_map(|(r, row)| (row.start == local).then_some(r))
+            {
+                return Some((ix, r));
+            }
+        }
+        let r = line
+            .rows
+            .iter()
+            .position(|row| local <= row.end)
+            .unwrap_or(line.rows.len().saturating_sub(1));
+        Some((ix, r))
     }
 
-    /// The offset nearest a point. `len` is the length of the real text.
-    fn index_for_point(&self, p: Point<Pixels>, len: usize) -> usize {
+    fn position_for_index(&self, index: usize, next_row: bool) -> Point<Pixels> {
+        let Some((ix, r)) = self.row_for_index(index, next_row) else {
+            return point(Pixels::ZERO, Pixels::ZERO);
+        };
+        let line = &self.lines[ix];
+        let local = (index - line.start.min(index)).min(line.wrapped.len());
+        let layout = &line.wrapped.unwrapped_layout;
+        let row_start = line.rows.get(r).map_or(0, |row| row.start);
+        point(
+            layout.x_for_index(local) - layout.x_for_index(row_start),
+            line.y + self.line_height * r,
+        )
+    }
+
+    /// The offset nearest a point, and whether the caret belongs at the start of a row
+    /// below a soft wrap. `len` is the length of the real text.
+    fn index_for_point(&self, p: Point<Pixels>, len: usize) -> (usize, bool) {
         if self.placeholder || self.lines.is_empty() {
-            return 0;
+            return (0, false);
         }
         let ix = self
             .lines
@@ -1077,22 +1190,18 @@ impl Layout {
             .wrapped
             .closest_index_for_position(point(p.x, y), self.line_height)
             .unwrap_or_else(|nearest| nearest);
-        (line.start + local).min(len)
+        let row = ((y / self.line_height) as usize).min(line.rows.len().saturating_sub(1));
+        let at_row_start = row > 0 && line.rows.get(row).is_some_and(|r| r.start == local);
+        ((line.start + local).min(len), at_row_start)
     }
 
     /// The offsets where the visual row holding `index` starts and ends.
-    fn row_of(&self, index: usize) -> (usize, usize) {
-        let Some(line) = self.lines.get(self.line_ix(index)) else {
+    fn row_of(&self, index: usize, next_row: bool) -> (usize, usize) {
+        let Some((ix, r)) = self.row_for_index(index, next_row) else {
             return (0, 0);
         };
-        let local = index - line.start.min(index);
-        let row = line
-            .rows
-            .iter()
-            .find(|r| local <= r.end)
-            .or(line.rows.last())
-            .cloned()
-            .unwrap_or(0..0);
+        let line = &self.lines[ix];
+        let row = line.rows.get(r).cloned().unwrap_or(0..0);
         (line.start + row.start, line.start + row.end)
     }
 
@@ -1335,6 +1444,7 @@ impl Element for EditorElement {
         let ed = self.editor.read(cx);
         let layout = ed.shape(metrics, Some(bounds.size.width), window);
         let caret_index = ed.selection.head;
+        let caret_next_row = ed.caret_next_row;
         let selection = ed.selection.range();
         let autoscroll = ed.autoscroll;
         let mut scroll_y = ed.scroll_y;
@@ -1343,7 +1453,7 @@ impl Element for EditorElement {
         let view_height = bounds.size.height;
         let max_scroll = (layout.height - view_height).max(Pixels::ZERO);
         if autoscroll && !layout.placeholder {
-            let caret = layout.position_for_index(caret_index);
+            let caret = layout.position_for_index(caret_index, caret_next_row);
             if caret.y < scroll_y {
                 scroll_y = caret.y;
             } else if caret.y + layout.line_height > scroll_y + view_height {
@@ -1380,7 +1490,7 @@ impl Element for EditorElement {
                 .collect()
         };
         let caret = selection.is_empty().then(|| {
-            let p = layout.position_for_index(caret_index);
+            let p = layout.position_for_index(caret_index, caret_next_row);
             at(Bounds::new(p, size(px(1.5), layout.line_height)))
         });
         PrepaintState {
