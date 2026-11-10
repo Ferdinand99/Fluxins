@@ -294,8 +294,10 @@ fn thread_flag(channel: &Channel, name: &str) -> bool {
 
 /// Whether the account joined the thread: `member` on the thread channel.
 /// Fluxer sends it in READY/GUILD_CREATE `threads`, THREAD_CREATE, THREAD_LIST_SYNC
-/// and REST answers, but strips it from THREAD_UPDATE; the stored thread must
-/// keep it ([`Channel::merge_thread_update`], [`Channel::set_thread_member`]).
+/// and REST answers (a missing `member` there means "not a member"; store
+/// those with [`Channel::replace_thread`]), but strips it from THREAD_UPDATE,
+/// so the stored thread must keep it across one ([`Channel::merge_thread_update`],
+/// [`Channel::set_thread_member`]).
 fn thread_member(channel: &Channel) -> bool {
     channel.is_thread_member()
 }

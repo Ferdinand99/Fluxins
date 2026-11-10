@@ -12,7 +12,7 @@ use serde_json::{json, Map, Value};
 
 use crate::error::Result;
 use crate::models::{lenient_opt, null_as_default, sf, Message, Snowflake};
-use crate::rest::id;
+use crate::rest::snowflake;
 use crate::Client;
 
 /// Values of [`SavedMessage::status`].
@@ -66,7 +66,7 @@ impl Client {
         let mut path = format!("/users/@me/saved-messages?limit={}", limit.clamp(1, 100));
         if let Some(b) = before {
             path.push_str("&before=");
-            path.push_str(id(b)?);
+            path.push_str(snowflake(b)?);
         }
         self.get_list(&path, "saved message").await
     }
@@ -74,7 +74,8 @@ impl Client {
     /// `POST /users/@me/saved-messages`: saves a message. Fluxer allows 50
     /// per account by default (`MAX_BOOKMARKS` past that).
     pub async fn save_message(&self, channel_id: &str, message_id: &str) -> Result<()> {
-        let body = json!({ "channel_id": id(channel_id)?, "message_id": id(message_id)? });
+        let body =
+            json!({ "channel_id": snowflake(channel_id)?, "message_id": snowflake(message_id)? });
         self.raw(Method::POST, "/users/@me/saved-messages", Some(&body))
             .await?;
         Ok(())
@@ -85,7 +86,7 @@ impl Client {
     pub async fn unsave_message(&self, message_id: &str) -> Result<()> {
         self.raw(
             Method::DELETE,
-            &format!("/users/@me/saved-messages/{}", id(message_id)?),
+            &format!("/users/@me/saved-messages/{}", snowflake(message_id)?),
             None,
         )
         .await?;

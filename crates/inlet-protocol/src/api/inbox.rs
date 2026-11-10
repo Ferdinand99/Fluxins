@@ -8,7 +8,7 @@ use serde_json::json;
 
 use crate::error::{Error, Result};
 use crate::models::{Message, Snowflake};
-use crate::rest::id;
+use crate::rest::snowflake;
 use crate::Client;
 
 /// Most entries [`Client::mark_mentions_read`] takes per request.
@@ -55,7 +55,7 @@ impl Client {
         );
         if let Some(b) = &query.before {
             path.push_str("&before=");
-            path.push_str(id(b)?);
+            path.push_str(snowflake(b)?);
         }
         self.get_list(&path, "mention").await
     }
@@ -64,7 +64,7 @@ impl Client {
     pub async fn delete_recent_mention(&self, message_id: &str) -> Result<()> {
         self.raw(
             Method::DELETE,
-            &format!("/users/@me/mentions/{}", id(message_id)?),
+            &format!("/users/@me/mentions/{}", snowflake(message_id)?),
             None,
         )
         .await?;
@@ -80,7 +80,7 @@ impl Client {
             )));
         }
         for m in message_ids {
-            id(m)?;
+            snowflake(m)?;
         }
         self.raw(
             Method::POST,

@@ -9,7 +9,7 @@ use serde_json::{json, Map, Value};
 
 use crate::error::{Error, Result};
 use crate::models::{message_flags, message_reference_type, Message, MessageEdit, Snowflake};
-use crate::rest::id;
+use crate::rest::snowflake;
 use crate::Client;
 
 /// Most attachments or embeds picked for one forward.
@@ -43,10 +43,10 @@ impl ForwardSource {
 
     fn to_json(&self) -> Result<Value> {
         let mut r = Map::new();
-        r.insert("message_id".into(), json!(id(&self.message_id)?));
-        r.insert("channel_id".into(), json!(id(&self.channel_id)?));
+        r.insert("message_id".into(), json!(snowflake(&self.message_id)?));
+        r.insert("channel_id".into(), json!(snowflake(&self.channel_id)?));
         if let Some(g) = &self.guild_id {
-            r.insert("guild_id".into(), json!(id(g)?));
+            r.insert("guild_id".into(), json!(snowflake(g)?));
         }
         r.insert("type".into(), json!(message_reference_type::FORWARD));
         super::id_list(
@@ -82,9 +82,9 @@ impl Client {
         self.get_list(
             &format!(
                 "/channels/{}/messages?limit={}&around={}",
-                id(channel_id)?,
+                snowflake(channel_id)?,
                 limit.clamp(1, 100),
-                id(message_id)?
+                snowflake(message_id)?
             ),
             "message",
         )
@@ -102,9 +102,9 @@ impl Client {
         self.get_list(
             &format!(
                 "/channels/{}/messages?limit={}&after={}",
-                id(channel_id)?,
+                snowflake(channel_id)?,
                 limit.clamp(1, 100),
-                id(message_id)?
+                snowflake(message_id)?
             ),
             "message",
         )
@@ -133,7 +133,7 @@ impl Client {
         self.rate_limiter().coalesce.reset_typing(channel_id);
         self.raw(
             Method::POST,
-            &format!("/channels/{}/messages", id(channel_id)?),
+            &format!("/channels/{}/messages", snowflake(channel_id)?),
             Some(&body),
         )
         .await?
@@ -143,15 +143,22 @@ impl Client {
     /// Hides (`true`) or shows the embeds of a message by flipping
     /// `SUPPRESS_EMBEDS` in its current flags. The author, or someone with
     /// `MANAGE_MESSAGES`, may do this.
+    ///
+    /// Only the bits a client may set ([`message_flags::CLIENT_SETTABLE`])
+    /// are sent. Fluxer keeps the server-set bits (`HAS_THREAD`,
+    /// `CROSSPOSTED` …) itself, but replaces the client-settable ones of an
+    /// author's message with the request, so `SUPPRESS_NOTIFICATIONS` and
+    /// `VOICE_MESSAGE` are sent back as they are.
     pub async fn set_embeds_suppressed(
         &self,
         message: &Message,
         suppressed: bool,
     ) -> Result<Message> {
+        let kept = message.flag_bits() & message_flags::CLIENT_SETTABLE;
         let flags = if suppressed {
-            message.flag_bits() | message_flags::SUPPRESS_EMBEDS
+            kept | message_flags::SUPPRESS_EMBEDS
         } else {
-            message.flag_bits() & !message_flags::SUPPRESS_EMBEDS
+            kept & !message_flags::SUPPRESS_EMBEDS
         };
         let edit = MessageEdit {
             flags: Some(flags),

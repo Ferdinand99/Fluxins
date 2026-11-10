@@ -311,7 +311,9 @@ pub enum Dispatch {
     /// ([`Channel::thread_member`], [`Channel::newly_created`]).
     ThreadCreate(Box<Channel>),
     /// A thread changed. It never carries the account's membership: merge
-    /// it with [`Channel::merge_thread_update`].
+    /// it with [`Channel::merge_thread_update`] (only for this event; store
+    /// threads from READY, GUILD_CREATE, THREAD_CREATE and THREAD_LIST_SYNC
+    /// with [`Channel::replace_thread`]).
     ThreadUpdate(Box<Channel>),
     /// A thread was deleted.
     ThreadDelete(Box<ThreadDelete>),
@@ -509,6 +511,8 @@ impl std::fmt::Debug for Command {
 pub struct GatewayHandle {
     tx: mpsc::Sender<Command>,
     close: Arc<watch::Sender<bool>>,
+    /// The Identify session flags ([`GatewayOptions::flags`]).
+    flags: u32,
 }
 
 impl GatewayHandle {
@@ -617,8 +621,15 @@ impl GatewayHandle {
     /// with the threads whose member list is shown; an empty list is fine.
     /// Pass no member lists for a guild the account only visits (Fluxer's
     /// client does the same). Remembered (the 5 most recently used guilds)
-    /// and sent again after a reconnect. Invalid IDs are dropped.
-    pub fn subscribe_threads(&self, guild_id: &str, member_lists: &[&str]) {
+    /// and sent again after a reconnect. Invalid thread IDs are dropped.
+    ///
+    /// Returns `false` and sends nothing when `guild_id` is not a snowflake
+    /// (Fluxer would close the session with 4002) or the session was opened
+    /// without [`FLAG_CHANNEL_THREADS`] (Fluxer ignores the options then).
+    pub fn subscribe_threads(&self, guild_id: &str, member_lists: &[&str]) -> bool {
+        if !self.threads_enabled() || !crate::media::is_snowflake(guild_id) {
+            return false;
+        }
         let lists: Vec<String> = member_lists
             .iter()
             .filter(|t| crate::media::is_snowflake(t))
@@ -626,17 +637,31 @@ impl GatewayHandle {
             .map(|t| (*t).to_owned())
             .collect();
         self.push(Command::Threads(guild_id.to_owned(), Some(lists)));
+        true
     }
 
     /// Stops the thread options of a guild (`threads: false` and no member
-    /// lists) and forgets them for reconnects.
-    pub fn unsubscribe_threads(&self, guild_id: &str) {
+    /// lists) and forgets them for reconnects. Returns `false` and sends
+    /// nothing under the same conditions as [`GatewayHandle::subscribe_threads`].
+    pub fn unsubscribe_threads(&self, guild_id: &str) -> bool {
+        if !self.threads_enabled() || !crate::media::is_snowflake(guild_id) {
+            return false;
+        }
         self.push(Command::Threads(guild_id.to_owned(), None));
+        true
+    }
+
+    /// Whether the session was opened with [`FLAG_CHANNEL_THREADS`].
+    fn threads_enabled(&self) -> bool {
+        self.flags & FLAG_CHANNEL_THREADS != 0
     }
 
     /// Request Forum Unreads (op 28): unread counts for up to 40 posts of a
     /// forum or media channel; FORUM_UNREADS answers. Returns `false` and
-    /// sends nothing when no post ID is a snowflake; posts past 40 are left
+    /// sends nothing when `guild_id` or `channel_id` is not a snowflake
+    /// (Fluxer would close the session with 4002), when no post ID is one,
+    /// or when the session was opened without [`FLAG_CHANNEL_THREADS`]
+    /// (Fluxer closes such a session with 4001); posts past 40 are left
     /// out. Paced like Fluxer's client: at most 4 per 5 s (Fluxer drops more
     /// than 5), within the shared limit of 4 bounded commands per second;
     /// when more wait, only the newest 4 are kept. Made while the gateway is
@@ -647,6 +672,12 @@ impl GatewayHandle {
         channel_id: &str,
         threads: &[ForumUnreadRequest],
     ) -> bool {
+        if !self.threads_enabled()
+            || !crate::media::is_snowflake(guild_id)
+            || !crate::media::is_snowflake(channel_id)
+        {
+            return false;
+        }
         let threads: Vec<Value> = threads
             .iter()
             .filter(|t| crate::media::is_snowflake(&t.thread_id))
@@ -695,6 +726,7 @@ impl Gateway {
         let (event_tx, event_rx) = mpsc::channel(options.event_buffer.max(1));
         let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_BUFFER);
         let (close_tx, close_rx) = watch::channel(false);
+        let flags = options.flags;
         let task = Task {
             url: instance.gateway_url().to_owned(),
             user_agent: instance.client_info().user_agent.clone(),
@@ -718,6 +750,7 @@ impl Gateway {
             GatewayHandle {
                 tx: cmd_tx,
                 close: Arc::new(close_tx),
+                flags,
             },
             event_rx,
         )

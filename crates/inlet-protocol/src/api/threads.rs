@@ -11,11 +11,21 @@
 //!
 //! Fluxer puts the account's own membership as `member` on a thread only in
 //! READY/GUILD_CREATE `threads`, THREAD_CREATE, THREAD_LIST_SYNC
-//! (`members`) and REST answers. THREAD_UPDATE never carries it. Keep the
-//! membership on the stored thread with [`Channel::merge_thread_update`]
-//! and [`Channel::set_thread_member`] (from THREAD_MEMBER_UPDATE,
-//! THREAD_MEMBERS_UPDATE and THREAD_LIST_SYNC), because
-//! [`crate::PermissionContext`] reads it to show private threads.
+//! (`members`) and REST answers. In those sources a missing `member` means
+//! the account is not a member. THREAD_UPDATE never carries it. So:
+//!
+//! - store a thread from READY, GUILD_CREATE, THREAD_CREATE,
+//!   THREAD_LIST_SYNC ([`crate::gateway::events::ThreadListSync::threads_with_members`])
+//!   or REST with [`Channel::replace_thread`], which takes the membership
+//!   as it is; after a new READY, rebuild every stored thread that way, so
+//!   a membership whose removal was missed does not stay behind;
+//! - merge a THREAD_UPDATE with [`Channel::merge_thread_update`], which
+//!   keeps the stored membership;
+//! - set or clear it with [`Channel::set_thread_member`] from
+//!   THREAD_MEMBER_UPDATE, THREAD_MEMBERS_UPDATE or a join or leave.
+//!
+//! [`crate::PermissionContext`] reads it to show private threads, and fails
+//! closed when it is missing.
 //!
 //! # Listing a forum
 //!
@@ -38,7 +48,7 @@ use crate::models::{
     channel_type, extra_field, extra_list, lenient_bool, lenient_vec, null_as_default, opt_sf,
     opt_u64, sf, sf_list, Channel, GuildMember, Message, OutgoingMessage, Snowflake,
 };
-use crate::rest::{enc_query, id};
+use crate::rest::{enc_query, snowflake};
 use crate::Client;
 
 /// Thread member flags ([`ThreadMember::flags`]). At most one of the three
@@ -204,8 +214,13 @@ impl Channel {
         }
     }
 
-    /// Replaces this stored thread with a THREAD_UPDATE (or any thread
-    /// object), keeping the account's membership when the update has none.
+    /// Replaces this stored thread with a THREAD_UPDATE, keeping the
+    /// account's membership (THREAD_UPDATE never carries it).
+    ///
+    /// Use it for THREAD_UPDATE only. A thread from READY, GUILD_CREATE,
+    /// THREAD_CREATE, THREAD_LIST_SYNC or REST is authoritative: a missing
+    /// `member` there means the account is not a member, so store it with
+    /// [`Channel::replace_thread`], or an old membership stays behind.
     pub fn merge_thread_update(&mut self, update: Channel) {
         let member = self.extra.remove("member");
         *self = update;
@@ -214,6 +229,14 @@ impl Channel {
                 self.extra.insert("member".into(), m);
             }
         }
+    }
+
+    /// Replaces this stored thread with an authoritative thread object (from
+    /// READY, GUILD_CREATE, THREAD_CREATE, THREAD_LIST_SYNC or REST),
+    /// membership included: a missing `member` clears the stored one. For
+    /// THREAD_UPDATE use [`Channel::merge_thread_update`].
+    pub fn replace_thread(&mut self, thread: Channel) {
+        *self = thread;
     }
 
     /// Forum tag IDs on a forum post.
@@ -414,7 +437,7 @@ impl NewForumPost {
         message.tts = false;
         let mut body = json!({
             "name": self.name,
-            "message": message.to_json(None),
+            "message": message.to_json(None)?,
             "type": channel_type::PUBLIC_THREAD,
         });
         if !self.applied_tags.is_empty() {
@@ -576,10 +599,10 @@ impl ThreadSearch {
             q.push(format!("offset={}", o.min(9_975)));
         }
         if let Some(m) = &self.max_id {
-            q.push(format!("max_id={}", id(m)?));
+            q.push(format!("max_id={}", snowflake(m)?));
         }
         if let Some(m) = &self.min_id {
-            q.push(format!("min_id={}", id(m)?));
+            q.push(format!("min_id={}", snowflake(m)?));
         }
         Ok(q.join("&"))
     }
@@ -627,8 +650,8 @@ impl Client {
             Method::POST,
             &format!(
                 "/channels/{}/messages/{}/threads",
-                id(channel_id)?,
-                id(message_id)?
+                snowflake(channel_id)?,
+                snowflake(message_id)?
             ),
             Some(&body),
         )
@@ -661,7 +684,7 @@ impl Client {
         }
         self.raw(
             Method::POST,
-            &format!("/channels/{}/threads", id(channel_id)?),
+            &format!("/channels/{}/threads", snowflake(channel_id)?),
             Some(&body),
         )
         .await?
@@ -679,7 +702,7 @@ impl Client {
         let mut thread: Channel = self
             .raw(
                 Method::POST,
-                &format!("/channels/{}/threads", id(forum_id)?),
+                &format!("/channels/{}/threads", snowflake(forum_id)?),
                 Some(&body),
             )
             .await?
@@ -695,7 +718,7 @@ impl Client {
         let body = edit.to_json()?;
         self.raw(
             Method::PATCH,
-            &format!("/channels/{}", id(thread_id)?),
+            &format!("/channels/{}", snowflake(thread_id)?),
             Some(&body),
         )
         .await?
@@ -718,7 +741,7 @@ impl Client {
     pub async fn join_thread(&self, thread_id: &str) -> Result<()> {
         self.raw(
             Method::PUT,
-            &format!("/channels/{}/thread-members/@me", id(thread_id)?),
+            &format!("/channels/{}/thread-members/@me", snowflake(thread_id)?),
             None,
         )
         .await?;
@@ -729,7 +752,7 @@ impl Client {
     pub async fn leave_thread(&self, thread_id: &str) -> Result<()> {
         self.raw(
             Method::DELETE,
-            &format!("/channels/{}/thread-members/@me", id(thread_id)?),
+            &format!("/channels/{}/thread-members/@me", snowflake(thread_id)?),
             None,
         )
         .await?;
@@ -759,7 +782,10 @@ impl Client {
         let raw = self
             .raw(
                 Method::PATCH,
-                &format!("/channels/{}/thread-members/@me/settings", id(thread_id)?),
+                &format!(
+                    "/channels/{}/thread-members/@me/settings",
+                    snowflake(thread_id)?
+                ),
                 Some(&Value::Object(body)),
             )
             .await?;
@@ -786,7 +812,10 @@ impl Client {
         limit: u8,
     ) -> Result<ThreadList> {
         self.thread_list(archived_path(
-            &format!("/channels/{}/threads/archived/public", id(channel_id)?),
+            &format!(
+                "/channels/{}/threads/archived/public",
+                snowflake(channel_id)?
+            ),
             before,
             limit,
             false,
@@ -803,7 +832,10 @@ impl Client {
         limit: u8,
     ) -> Result<ThreadList> {
         self.thread_list(archived_path(
-            &format!("/channels/{}/threads/archived/private", id(channel_id)?),
+            &format!(
+                "/channels/{}/threads/archived/private",
+                snowflake(channel_id)?
+            ),
             before,
             limit,
             false,
@@ -822,7 +854,7 @@ impl Client {
         self.thread_list(archived_path(
             &format!(
                 "/channels/{}/users/@me/threads/archived/private",
-                id(channel_id)?
+                snowflake(channel_id)?
             ),
             before,
             limit,
@@ -841,7 +873,7 @@ impl Client {
         search: &ThreadSearch,
     ) -> Result<SearchOutcome<ThreadSearchResults>> {
         let query = search.to_query()?;
-        let mut path = format!("/channels/{}/threads/search", id(channel_id)?);
+        let mut path = format!("/channels/{}/threads/search", snowflake(channel_id)?);
         if !query.is_empty() {
             path.push('?');
             path.push_str(&query);
@@ -874,12 +906,12 @@ impl Client {
             return Err(Error::InvalidInput("post data: 1-100 thread IDs".into()));
         }
         for t in thread_ids {
-            id(t)?;
+            snowflake(t)?;
         }
         let raw = self
             .raw(
                 Method::POST,
-                &format!("/channels/{}/post-data", id(forum_id)?),
+                &format!("/channels/{}/post-data", snowflake(forum_id)?),
                 Some(&json!({ "thread_ids": thread_ids })),
             )
             .await?;
@@ -911,7 +943,7 @@ fn archived_path(
     if let Some(b) = before {
         path.push_str("&before=");
         if before_is_id {
-            path.push_str(id(b)?);
+            path.push_str(snowflake(b)?);
         } else {
             if b.is_empty()
                 || b.len() > 40
@@ -990,5 +1022,36 @@ mod tests {
             stored.thread_member().unwrap().notification_flags(),
             thread_member_flags::ONLY_MENTIONS
         );
+    }
+
+    /// An authoritative thread object without `member` (READY, GUILD_CREATE,
+    /// THREAD_LIST_SYNC, REST) means the account is no longer a member:
+    /// `replace_thread` drops a stale membership, `merge_thread_update`
+    /// (THREAD_UPDATE only) keeps it.
+    #[test]
+    fn authoritative_threads_replace_a_stale_membership() {
+        let joined = json!({
+            "id": "5", "type": 12, "guild_id": "1", "parent_id": "2",
+            "member": {"join_timestamp": "2026-01-01T00:00:00Z", "flags": 1}
+        });
+        let without: Channel = serde_json::from_value(json!({
+            "id": "5", "type": 12, "guild_id": "1", "parent_id": "2", "name": "from ready"
+        }))
+        .unwrap();
+        let mut stored: Channel = serde_json::from_value(joined.clone()).unwrap();
+        stored.replace_thread(without.clone());
+        assert!(!stored.is_thread_member());
+        assert_eq!(stored.name.as_deref(), Some("from ready"));
+
+        let mut stored: Channel = serde_json::from_value(joined.clone()).unwrap();
+        stored.merge_thread_update(without);
+        assert!(stored.is_thread_member());
+
+        let mut stored: Channel = serde_json::from_value(json!({
+            "id": "5", "type": 12, "guild_id": "1", "parent_id": "2"
+        }))
+        .unwrap();
+        stored.replace_thread(serde_json::from_value(joined).unwrap());
+        assert!(stored.is_thread_member());
     }
 }

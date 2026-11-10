@@ -65,7 +65,8 @@ impl crate::Client {
     }
 }
 
-/// Checks a list of IDs for a query or body: at most `max`, all snowflakes.
+/// Checks a list of IDs for a query or body: at most `max`, all snowflakes
+/// (`@me` is refused).
 pub(crate) fn id_list(ids: &[String], max: usize, what: &str) -> crate::Result<()> {
     if ids.len() > max {
         return Err(crate::Error::InvalidInput(format!(
@@ -74,7 +75,7 @@ pub(crate) fn id_list(ids: &[String], max: usize, what: &str) -> crate::Result<(
         )));
     }
     for i in ids {
-        crate::rest::id(i)?;
+        crate::rest::snowflake(i)?;
     }
     Ok(())
 }

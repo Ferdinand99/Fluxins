@@ -6,7 +6,7 @@ mod common;
 use inlet_protocol::models::message_flags;
 use inlet_protocol::{
     AllowedMentions, Client, Dispatch, Error, ForwardSource, Instance, MentionsQuery, Message,
-    OutgoingMessage, Token,
+    OutgoingMessage, ThreadSearch, Token,
 };
 use serde_json::json;
 use wiremock::matchers::{body_json, method, path, query_param};
@@ -130,13 +130,21 @@ async fn saved_messages_and_recent_mentions() {
 async fn jump_forward_suppress_and_silent() {
     let (server, instance) = common::instance().await;
     let c = client(&instance, "tok-msg-extras");
+    // Server-set bits (HAS_THREAD, CROSSPOSTED) next to a client-settable
+    // one (SUPPRESS_NOTIFICATIONS).
+    let mut target_json = common::message_json("500", "200", "target");
+    target_json["flags"] = json!(
+        message_flags::HAS_THREAD
+            | message_flags::CROSSPOSTED
+            | message_flags::SUPPRESS_NOTIFICATIONS
+    );
     Mock::given(method("GET"))
         .and(path("/api/v1/channels/200/messages"))
         .and(query_param("around", "500"))
         .and(query_param("limit", "50"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!([
             common::message_json("501", "200", "after"),
-            common::message_json("500", "200", "target"),
+            target_json,
         ])))
         .expect(1)
         .mount(&server)
@@ -167,9 +175,12 @@ async fn jump_forward_suppress_and_silent() {
         .expect(1)
         .mount(&server)
         .await;
+    // Only the bits a client may set are sent; the server keeps the rest.
     Mock::given(method("PATCH"))
         .and(path("/api/v1/channels/200/messages/500"))
-        .and(body_json(json!({"flags": message_flags::SUPPRESS_EMBEDS})))
+        .and(body_json(json!({
+            "flags": message_flags::SUPPRESS_EMBEDS | message_flags::SUPPRESS_NOTIFICATIONS
+        })))
         .respond_with(ResponseTemplate::new(200).set_body_json({
             let mut m = common::message_json("500", "200", "target");
             m["flags"] = json!(message_flags::SUPPRESS_EMBEDS);
@@ -183,7 +194,7 @@ async fn jump_forward_suppress_and_silent() {
         .and(body_json(json!({
             "content": "<@10> ship it", "nonce": "n2",
             "flags": message_flags::SUPPRESS_NOTIFICATIONS,
-            "allowed_mentions": {"users": ["10"]}
+            "allowed_mentions": {"parse": [], "users": ["10"]}
         })))
         .respond_with(ResponseTemplate::new(200).set_body_json({
             let mut m = common::message_json("700", "200", "<@10> ship it");
@@ -220,7 +231,7 @@ async fn jump_forward_suppress_and_silent() {
             &OutgoingMessage::text(text)
                 .with_nonce("n2")
                 .silent()
-                .with_allowed_mentions(AllowedMentions::only(&["10".into()], &[], false)),
+                .with_allowed_mentions(AllowedMentions::only(&["10".into()], &[], false).unwrap()),
         )
         .await
         .unwrap();
@@ -234,5 +245,70 @@ async fn jump_forward_suppress_and_silent() {
         c.forward("300", &greedy, None, false).await,
         Err(Error::InvalidInput(_))
     ));
+    assert_eq!(server.received_requests().await.unwrap().len(), before);
+}
+
+/// `@me` is only valid as a literal path segment; where a message, channel
+/// or thread ID is expected it is refused before any request.
+#[tokio::test]
+async fn at_me_is_refused_where_a_snowflake_is_needed() {
+    let (server, instance) = common::instance().await;
+    let c = client(&instance, "tok-at-me");
+    // Requests the instance set-up made; none may follow.
+    let before = server.received_requests().await.unwrap().len();
+    let refused = |r: Result<(), Error>| assert!(matches!(r, Err(Error::InvalidInput(_))));
+
+    let mut source = ForwardSource {
+        message_id: "@me".into(),
+        channel_id: "200".into(),
+        ..ForwardSource::default()
+    };
+    refused(c.forward("300", &source, None, false).await.map(drop));
+    source.message_id = "500".into();
+    source.channel_id = "@me".into();
+    refused(c.forward("300", &source, None, false).await.map(drop));
+    source.channel_id = "200".into();
+    source.guild_id = Some("@me".into());
+    refused(c.forward("300", &source, None, false).await.map(drop));
+    source.guild_id = None;
+    source.attachment_ids = vec!["@me".into()];
+    refused(c.forward("300", &source, None, false).await.map(drop));
+
+    refused(c.messages_around("200", "@me", 50).await.map(drop));
+    refused(c.messages_after("200", "@me", 50).await.map(drop));
+    refused(c.saved_messages(Some("@me"), 50).await.map(drop));
+    refused(
+        c.recent_mentions(&MentionsQuery {
+            before: Some("@me".into()),
+            ..MentionsQuery::default()
+        })
+        .await
+        .map(drop),
+    );
+    let search = ThreadSearch {
+        max_id: Some("@me".into()),
+        ..ThreadSearch::default()
+    };
+    refused(c.search_threads("200", &search).await.map(drop));
+    let search = ThreadSearch {
+        min_id: Some("@me".into()),
+        ..ThreadSearch::default()
+    };
+    refused(c.search_threads("200", &search).await.map(drop));
+
+    let too_wide = AllowedMentions {
+        parse: vec!["everyone".into()],
+        users: vec!["10".into()],
+        ..AllowedMentions::default()
+    };
+    refused(
+        c.send(
+            "200",
+            &OutgoingMessage::text("x").with_allowed_mentions(too_wide),
+        )
+        .await
+        .map(drop),
+    );
+
     assert_eq!(server.received_requests().await.unwrap().len(), before);
 }

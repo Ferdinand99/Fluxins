@@ -51,7 +51,8 @@ pub struct ThreadListSync {
 
 impl ThreadListSync {
     /// The threads with their memberships attached
-    /// ([`Channel::set_thread_member`]), ready to store.
+    /// ([`Channel::set_thread_member`]), ready to store with
+    /// [`Channel::replace_thread`]: a thread without one is not joined.
     pub fn threads_with_members(&self) -> Vec<Channel> {
         let mut threads = self.threads.clone();
         crate::api::threads::attach_members(&mut threads, &self.members);

@@ -493,11 +493,12 @@ impl Client {
     /// `POST /channels/{id}/messages` with replies, stickers, flags and mention
     /// control. See [`OutgoingMessage`].
     pub async fn send(&self, channel_id: &str, message: &OutgoingMessage) -> Result<Message> {
+        let body = message.to_json(None)?;
         self.rate_limiter().coalesce.reset_typing(channel_id);
         self.raw(
             Method::POST,
             &format!("/channels/{}/messages", id(channel_id)?),
-            Some(&message.to_json(None)),
+            Some(&body),
         )
         .await?
         .json()
@@ -541,7 +542,7 @@ impl Client {
         self.raw(
             Method::PATCH,
             &format!("/channels/{}/messages/{}", id(channel_id)?, id(message_id)?),
-            Some(&edit.to_json()),
+            Some(&edit.to_json()?),
         )
         .await?
         .json()
@@ -998,8 +999,9 @@ impl Client {
         if total > limits.max_total_size {
             return Err(too_large(limits.max_total_size));
         }
+        let json = message.to_json(None)?;
         self.rate_limiter().coalesce.reset_typing(channel_id);
-        let body = crate::upload::Multipart::message(message.to_json(None), files, progress);
+        let body = crate::upload::Multipart::message(json, files, progress);
         self.raw_upload(&format!("/channels/{channel_id}/messages"), &body)
             .await?
             .json()
@@ -1052,6 +1054,17 @@ fn percent_encode_all(s: &str) -> String {
 /// make the request hit another route.
 pub(crate) fn id(value: &str) -> Result<&str> {
     if value == "@me" || crate::media::is_snowflake(value) {
+        Ok(value)
+    } else {
+        Err(Error::InvalidInput("an ID is not a snowflake".into()))
+    }
+}
+
+/// A snowflake ID (not `@me`) for a path, query or body where only a real
+/// ID makes sense (message, channel, thread or tag IDs), or
+/// [`Error::InvalidInput`].
+pub(crate) fn snowflake(value: &str) -> Result<&str> {
+    if crate::media::is_snowflake(value) {
         Ok(value)
     } else {
         Err(Error::InvalidInput("an ID is not a snowflake".into()))

@@ -168,10 +168,11 @@ pub use gateway::{
 pub use instance::{ClientInfo, Discovery, EndpointPins, Endpoints, Instance, SessionPins};
 pub use media::{ImageFormat, ImageOptions, Media, Transform};
 pub use models::{
-    AllowedMentions, Attachment, Channel, CurrentUser, Embed, Emoji, FullUserProfile, Guild,
-    GuildEmoji, GuildMember, GuildMemberListUpdate, GuildReady, GuildSticker, MemberList,
-    MemberListItem, Message, MessageEdit, OutgoingMessage, Presence, Reaction, ReadState, Ready,
-    ReferencedMessage, Role, Snowflake, User, UserSettings, UserSettingsUpdate, VoiceState,
+    AllowedMentions, AllowedMentionsError, Attachment, Channel, CurrentUser, Embed, Emoji,
+    FullUserProfile, Guild, GuildEmoji, GuildMember, GuildMemberListUpdate, GuildReady,
+    GuildSticker, MemberList, MemberListItem, Message, MessageEdit, OutgoingMessage, Presence,
+    Reaction, ReadState, Ready, ReferencedMessage, Role, Snowflake, User, UserSettings,
+    UserSettingsUpdate, VoiceState,
 };
 pub use permissions::PermissionContext;
 pub use ratelimit::{RateLimitConfig, RateLimiter};
