@@ -94,6 +94,10 @@ pub enum Ev {
     MessageCreated(Message),
     /// A message is being sent, or could not be sent.
     Pending(Pending),
+    /// The server took the message with this nonce: its pending row goes.
+    Sent {
+        nonce: String,
+    },
 }
 
 pub(super) fn handle(backend: &mut Backend, cmd: Cmd) {

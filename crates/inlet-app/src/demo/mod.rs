@@ -402,7 +402,8 @@ impl MockSession {
     /// "Retry" in the demo: the message goes through this time, with its nonce.
     pub fn resend(&mut self, channel_id: String, nonce: String, text: String) {
         self.next_seq += 1;
-        self.post(channel_id, nonce, text);
+        self.post(channel_id, nonce.clone(), text);
+        let _ = self.events.unbounded_send(msgs::Ev::Sent { nonce });
     }
 
     fn post(&mut self, channel_id: String, nonce: String, text: String) {

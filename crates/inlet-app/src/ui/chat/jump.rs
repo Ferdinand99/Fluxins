@@ -73,7 +73,9 @@ impl Inlet {
         if view.rows.is_empty() || !(view.scrolled_away || view.detached) {
             return None;
         }
-        let label = if view.detached_new > 0 {
+        let label = if view.detached_new == 1 {
+            t!("chat-jump-new-message")
+        } else if view.detached_new > 1 {
             t!("chat-jump-new-messages", count = view.detached_new)
         } else {
             t!("chat-jump-to-present")

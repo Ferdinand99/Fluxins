@@ -67,6 +67,9 @@ pub struct Names {
     pub channels: HashMap<String, String>,
     pub users: HashMap<String, String>,
     pub roles: HashMap<String, String>,
+    /// User IDs in the order they were first seen, so the oldest go first past the cap
+    /// (see `backend::messages::parse::remember_user`).
+    pub user_order: std::collections::VecDeque<String>,
 }
 
 /// A rich embed (bots post these), drawn as a card.

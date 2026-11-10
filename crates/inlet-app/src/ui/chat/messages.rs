@@ -747,6 +747,20 @@ impl MessageView {
         self.next_request
     }
 
+    /// Whether the newest page answering `request` for `ch` is still wanted: it is the
+    /// current request (which it ends), or no request is waiting. A page for a request
+    /// that a newer one replaced is not.
+    pub fn accept_newest(&mut self, ch: ChannelId, request: u64) -> bool {
+        match self.loading.get(&ch) {
+            Some(current) if *current == request => {
+                self.loading.remove(&ch);
+                true
+            }
+            Some(_) => false,
+            None => true,
+        }
+    }
+
     /// What "Jump to present" should do for channel `ch`.
     pub fn jump_action(&self, state: &AccountState, ch: ChannelId) -> JumpAction {
         if is_detached(state, ch) {
@@ -942,6 +956,14 @@ impl Inlet {
                 self.chat.view.upsert_pending(out);
                 self.refresh_rows(cx);
             }
+            Ev::Sent { nonce } => {
+                let before = self.chat.view.outbox.len();
+                self.chat.view.outbox.retain(|o| o.out.nonce != nonce);
+                if self.chat.view.outbox.len() != before {
+                    self.refresh_rows(cx);
+                    cx.notify();
+                }
+            }
         }
     }
 
@@ -997,7 +1019,11 @@ impl Inlet {
             }
             let open = self.open_channel_id();
             if let Some(ch) = open.filter(|ch| ChannelId::parse(&m.channel_id) == Some(*ch)) {
+                let counted = self.chat.view.detached_new;
                 self.chat.view.note_live(account.read(cx), ch);
+                if self.chat.view.detached_new != counted {
+                    cx.notify();
+                }
                 // A message in the open channel while it shows the newest messages and
                 // has focus: read.
                 let at_bottom = self.chat.message_list.is_following_tail();
@@ -1031,8 +1057,24 @@ impl Inlet {
         let older = page.before.is_some();
         if older {
             self.chat.view.pager.done(request);
-        } else if self.chat.view.loading.get(&ch) == Some(&request) {
-            self.chat.view.loading.remove(&ch);
+        } else if !self.chat.view.accept_newest(ch, request) {
+            // A page a newer request replaced: its snapshot may be older than what the
+            // state knows (from before a reconnect). The newer answer pairs the load.
+            return;
+        }
+        if !older {
+            // Messages of this account that the page already has are no longer pending.
+            let nonces: HashSet<&str> = page
+                .messages
+                .iter()
+                .filter_map(|m| m.nonce.as_deref())
+                .collect();
+            if !nonces.is_empty() {
+                self.chat
+                    .view
+                    .outbox
+                    .retain(|o| !nonces.contains(o.out.nonce.as_str()));
+            }
         }
         let edits = edits_of(&page.messages);
         let mut changes = account.update(cx, |s, _| s.apply_messages(ch, page));
@@ -1622,6 +1664,21 @@ mod tests {
         // Building again gives equal rows: nothing to splice.
         let again = view.build_rows(&state, ch);
         assert_eq!(splice_range(&rows, &again), None);
+    }
+
+    #[test]
+    fn a_newest_page_for_a_replaced_request_is_dropped() {
+        let ch = ChannelId(100);
+        let mut view = MessageView::default();
+        // No request waiting (the demo, or a page after a failure): taken.
+        assert!(view.accept_newest(ch, 1));
+        // Request 2, then request 3 after a reconnect: the late page for 2 is dropped,
+        // the page for 3 is taken and ends the load.
+        view.loading.insert(ch, 2);
+        view.loading.insert(ch, 3);
+        assert!(!view.accept_newest(ch, 2));
+        assert!(view.accept_newest(ch, 3));
+        assert!(!view.loading.contains_key(&ch));
     }
 
     #[test]

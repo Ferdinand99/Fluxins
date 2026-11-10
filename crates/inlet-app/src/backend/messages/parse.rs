@@ -29,9 +29,21 @@ pub fn remember_channels(names: &SharedNames, list: &[Channel]) {
     }
 }
 
+/// User names kept for mentions; past this the first seen are forgotten (a mention of
+/// a forgotten user shows as an unknown mention until they post again).
+pub const MAX_USER_NAMES: usize = 5_000;
+
 pub fn remember_user(n: &mut Names, u: &p::User) {
-    n.users
-        .insert(u.id.clone(), model::clean_name(u.display_name()));
+    let name = model::clean_name(u.display_name());
+    if n.users.insert(u.id.clone(), name).is_none() {
+        n.user_order.push_back(u.id.clone());
+        while n.users.len() > MAX_USER_NAMES {
+            let Some(old) = n.user_order.pop_front() else {
+                break;
+            };
+            n.users.remove(&old);
+        }
+    }
 }
 
 /// Roles from a READY or GUILD_CREATE guild (raw JSON objects with `id` and `name`).
@@ -251,6 +263,22 @@ mod tests {
         }
         assert!(to_embed(&serde_json::json!({}), &names).is_none());
         assert!(to_embed(&serde_json::json!("x"), &names).is_none());
+    }
+
+    #[test]
+    fn user_names_are_capped_oldest_first() {
+        let mut n = Names::default();
+        for i in 0..(MAX_USER_NAMES as u64 + 1_000) {
+            let u: p::User =
+                serde_json::from_value(serde_json::json!({"id": i.to_string(), "username": "u"}))
+                    .unwrap();
+            remember_user(&mut n, &u);
+        }
+        assert_eq!(n.users.len(), MAX_USER_NAMES);
+        assert!(!n.users.contains_key("0"));
+        assert!(n
+            .users
+            .contains_key(&(MAX_USER_NAMES as u64 + 999).to_string()));
     }
 
     #[test]
