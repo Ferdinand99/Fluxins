@@ -211,10 +211,10 @@ pub struct EmbedAuthor {
     /// Link (third-party; open it in the browser only after the person clicks).
     #[serde(default)]
     pub url: Option<String>,
-    /// Icon URL (third-party).
+    /// Icon URL (third-party). Never fetch it; see [`Embed`].
     #[serde(default)]
     pub icon_url: Option<String>,
-    /// Icon URL through the media proxy. Use [`crate::Media::external`] to check it.
+    /// Icon URL through the media proxy. Load it with [`EmbedAuthor::proxied_icon`].
     #[serde(default)]
     pub proxy_icon_url: Option<String>,
 }
@@ -222,7 +222,7 @@ pub struct EmbedAuthor {
 /// Embed image, thumbnail, video or audio.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EmbedMedia {
-    /// The original URL (third-party).
+    /// The original URL (third-party). Never fetch it; see [`Embed`].
     #[serde(default, deserialize_with = "null_as_default")]
     pub url: String,
     /// The URL through the media proxy. Use [`crate::Media::external`] or
@@ -258,10 +258,10 @@ pub struct EmbedFooter {
     /// Text.
     #[serde(default, deserialize_with = "null_as_default")]
     pub text: String,
-    /// Icon URL (third-party).
+    /// Icon URL (third-party). Never fetch it; see [`Embed`].
     #[serde(default)]
     pub icon_url: Option<String>,
-    /// Icon URL through the media proxy.
+    /// Icon URL through the media proxy. Load it with [`EmbedFooter::proxied_icon`].
     #[serde(default)]
     pub proxy_icon_url: Option<String>,
 }
@@ -292,6 +292,14 @@ pub struct EmbedProvider {
 }
 
 /// An embed: a link preview Fluxer built or a rich embed someone sent.
+///
+/// **Never fetch the raw URL fields** (`url`, `EmbedMedia::url`,
+/// `icon_url`): they point at third-party hosts chosen by whoever sent the
+/// message (tracking pixels, IP leaks). Load images only through the
+/// instance's media proxy: [`EmbedMedia::proxied`],
+/// [`EmbedAuthor::proxied_icon`] and [`EmbedFooter::proxied_icon`], which
+/// return `None` unless the proxy URL is on the session's media endpoint.
+/// Open links in the browser only after the person clicks them.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Embed {
     /// `rich`, `link`, `image`, `video`, `audio`, `gifv`, `article` or `bluesky`.
@@ -346,6 +354,40 @@ pub struct Embed {
     /// client should not render).
     #[serde(flatten)]
     pub extra: Map<String, Value>,
+}
+
+impl EmbedMedia {
+    /// The URL to load: `proxy_url` checked against the session's media
+    /// endpoint (external media or an attachment of the instance), with an
+    /// optional resize. `None` when there is no safe URL; then show a placeholder.
+    pub fn proxied(&self, media: &crate::Media, t: crate::Transform) -> Option<String> {
+        let p = self.proxy_url.as_deref()?;
+        media.external(p, t).or_else(|| media.attachment(p, t))
+    }
+}
+
+impl EmbedAuthor {
+    /// The author icon through the media proxy, or `None`.
+    pub fn proxied_icon(&self, media: &crate::Media, size: u32) -> Option<String> {
+        let t = crate::Transform {
+            width: Some(size),
+            height: Some(size),
+            ..Default::default()
+        };
+        media.external(self.proxy_icon_url.as_deref()?, t)
+    }
+}
+
+impl EmbedFooter {
+    /// The footer icon through the media proxy, or `None`.
+    pub fn proxied_icon(&self, media: &crate::Media, size: u32) -> Option<String> {
+        let t = crate::Transform {
+            width: Some(size),
+            height: Some(size),
+            ..Default::default()
+        };
+        media.external(self.proxy_icon_url.as_deref()?, t)
+    }
 }
 
 /// An optional object where a value that does not parse counts as absent.
@@ -475,8 +517,10 @@ impl Message {
         self.flags.as_ref().and_then(value_u64).unwrap_or(0)
     }
 
-    /// Whether the account can edit this message: only its own `DEFAULT` and
-    /// `REPLY` messages, and not forwards.
+    /// Whether the account could edit this message by its kind: only its own
+    /// `DEFAULT` and `REPLY` messages, and not forwards. In a guild use
+    /// [`crate::PermissionContext::can_edit_message`], which also checks
+    /// timeouts and thread state.
     pub fn can_edit(&self, current_user_id: &str) -> bool {
         self.author.id == current_user_id
             && matches!(self.kind, message_type::DEFAULT | message_type::REPLY)

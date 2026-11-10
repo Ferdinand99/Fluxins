@@ -31,6 +31,10 @@ pub const MAX_VOICE_MESSAGE_DURATION: &str = "max_voice_message_duration";
 /// says (Fluxer's own ceiling for a premium account is 500 MiB).
 pub const UPLOAD_HARD_CAP: u64 = 500 * 1024 * 1024;
 
+/// Most bytes this crate uploads in one message, whatever the instance allows
+/// (the files are in memory; see [`crate::upload`]).
+pub const MAX_UPLOAD_TOTAL: u64 = 512 * 1024 * 1024;
+
 /// Fluxer's default for a key this crate knows (the restricted defaults).
 pub fn default_limit(key: &str) -> Option<u64> {
     Some(match key {

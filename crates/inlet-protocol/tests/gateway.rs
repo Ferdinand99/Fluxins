@@ -558,6 +558,10 @@ async fn member_list_subscription_is_sent_and_replayed() {
         fast_options(false),
     );
     handle.set_guild_active("100", true);
+    // Only invalid ranges: refused, nothing is sent (it would unsubscribe).
+    assert!(!handle.subscribe_member_list("100", "200", &[[0, 150], [10, 5]]));
+    // A search before READY is dropped, not sent after connecting.
+    assert!(handle.request_guild_members("100", "early", &[], 5, false, None));
     // Invalid ranges are dropped: too wide, reversed, past 100,000.
     handle.subscribe_member_list(
         "100",
@@ -630,7 +634,7 @@ async fn member_list_subscription_is_sent_and_replayed() {
     );
 
     // Unsubscribing stops the replay.
-    handle.subscribe_member_list("100", "200", &[]);
+    handle.unsubscribe_member_list("100", "200");
     let lazy = c.recv(false).await;
     assert_eq!(
         lazy["d"]["subscriptions"]["100"]["member_list_channels"],

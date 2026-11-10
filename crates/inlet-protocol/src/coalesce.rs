@@ -1,11 +1,15 @@
 //! Debouncing for typing and coalescing for read acknowledgements, so a UI
 //! that calls them on every key press or scroll cannot flood the API.
 //!
+//! The state lives in the account's [`crate::RateLimiter`], so every
+//! [`crate::Client`] of one account (on one instance) shares it.
+//!
 //! - Typing: at most one `POST /channels/{id}/typing` per channel every
 //!   [`TYPING_INTERVAL`] (Fluxer shows the indicator for about 10 s).
 //! - Acks: [`crate::Client::ack`] only records the newest message per channel.
-//!   One background flush per [`ACK_DELAY`] sends everything pending in one
-//!   `POST /read-states/ack` (up to 100 channels per request).
+//!   A background flush after [`ACK_DELAY`] sends what is pending in one
+//!   `POST /read-states/ack` (up to 100 channels per request), and two ack
+//!   requests of one account are always at least [`ACK_DELAY`] apart.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
@@ -39,6 +43,8 @@ pub(crate) struct AckState {
     pub(crate) sent: HashMap<Snowflake, Snowflake>,
     /// A flush task is scheduled.
     pub(crate) scheduled: bool,
+    /// When the last ack request started.
+    pub(crate) last_request: Option<Instant>,
 }
 
 impl AckState {
@@ -62,6 +68,20 @@ impl AckState {
         } else {
             self.scheduled = true;
             true
+        }
+    }
+
+    /// Claims the next request slot: `None` when a request may start now (and
+    /// records it), otherwise how long to wait.
+    pub(crate) fn reserve_slot(&mut self, now: Instant) -> Option<Duration> {
+        match self.last_request {
+            Some(last) if now.saturating_duration_since(last) < ACK_DELAY => {
+                Some(ACK_DELAY - now.saturating_duration_since(last))
+            }
+            _ => {
+                self.last_request = Some(now);
+                None
+            }
         }
     }
 
@@ -101,7 +121,7 @@ impl AckState {
     }
 }
 
-/// State shared by every clone of one [`crate::Client`].
+/// State shared by every client of one account (kept in its rate limiter).
 #[derive(Debug, Default)]
 pub(crate) struct Shared {
     typing: Mutex<HashMap<Snowflake, Instant>>,
@@ -137,6 +157,51 @@ impl Shared {
 
     pub(crate) fn lock_acks(&self) -> std::sync::MutexGuard<'_, AckState> {
         self.acks.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Takes over another state's pending acks, typing times and traits (when
+    /// a client moves from its token's limiter to the account's).
+    pub(crate) fn absorb(&self, other: &Shared) {
+        let (pending, sent, other_scheduled) = {
+            let mut o = other.lock_acks();
+            (
+                std::mem::take(&mut o.pending),
+                std::mem::take(&mut o.sent),
+                std::mem::replace(&mut o.scheduled, false),
+            )
+        };
+        {
+            let mut mine = self.lock_acks();
+            let was_scheduled = mine.scheduled;
+            for (c, a) in pending {
+                mine.push(&c, a);
+            }
+            for (c, m) in sent {
+                mine.sent.entry(c).or_insert(m);
+            }
+            // A flush task scheduled on the old state runs against this one
+            // (it asks the client for its current limiter).
+            mine.scheduled = was_scheduled || other_scheduled;
+        }
+        let typing: Vec<(Snowflake, Instant)> = other
+            .typing
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain()
+            .collect();
+        self.typing
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend(typing);
+        let traits = other
+            .traits
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        let mut mine = self.traits.lock().unwrap_or_else(|e| e.into_inner());
+        if mine.is_none() {
+            *mine = traits;
+        }
     }
 }
 

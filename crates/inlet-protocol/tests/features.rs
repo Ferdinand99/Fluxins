@@ -269,9 +269,19 @@ async fn acks_are_coalesced_into_one_batch() {
         c.ack(&format!("{}", 1_000 + i), "1");
     }
     let states = c.flush_acks().await.unwrap();
-    assert_eq!(states.len(), 151);
+    // The background flush may send the second batch; give it time.
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    assert!(states.len() >= 100);
     let all = requests_to(&server, "POST", "/api/v1/read-states/ack").await;
     assert_eq!(all.len(), 3, "151 channels go out as 100 + 51");
+    let entries: usize = all[1..]
+        .iter()
+        .map(|r| {
+            let v: Value = serde_json::from_slice(&r.body).unwrap();
+            v["read_states"].as_array().unwrap().len()
+        })
+        .sum();
+    assert_eq!(entries, 151);
     let manual: Vec<Value> = all[1..]
         .iter()
         .flat_map(|r| {
@@ -395,7 +405,7 @@ async fn upload_sends_multipart_with_progress_and_checks_limits() {
     let c = client(&instance, "tok-upload");
     assert_eq!(c.upload_limits().max_file_size, 200_000);
     assert_eq!(c.upload_limits().max_files, 2);
-    // First a 429 (the body must be sent again), then success.
+    // First a 429: not retried, the caller gets retry_after. Then success.
     Mock::given(method("POST"))
         .and(path("/api/v1/channels/2/messages"))
         .respond_with(ResponseTemplate::new(429).set_body_json(json!({
@@ -437,17 +447,58 @@ async fn upload_sends_multipart_with_progress_and_checks_limits() {
         t2.store(all, Ordering::SeqCst);
     });
     let files = vec![
-        UploadFile::new("cat.png", vec![7u8; 150_000]).content_type("image/png"),
-        UploadFile::new("evil\"name.txt", b"x".to_vec()),
+        UploadFile::new("C:\\Users\\ana\\Pictures\\cat.png", vec![7u8; 150_000])
+            .content_type("image/png"),
+        UploadFile::new("/home/ana/evil\"name.txt", b"x".to_vec()),
     ];
+    let err = c
+        .send_with_files("2", &OutgoingMessage::text("look"), &files, None)
+        .await
+        .unwrap_err();
+    match err {
+        Error::RateLimited { retry_after } => assert!(retry_after <= Duration::from_secs(1)),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        requests_to(&server, "POST", "/api/v1/channels/2/messages")
+            .await
+            .len(),
+        1,
+        "the upload is not sent again on its own"
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
     let m = c
         .send_with_files("2", &OutgoingMessage::text("look"), &files, Some(progress))
         .await
         .unwrap();
     assert_eq!(m.id, "9");
+    // Progress comes from a separate task: wait for the last report.
+    for _ in 0..50 {
+        let t = total.load(Ordering::SeqCst);
+        if t > 0 && sent.load(Ordering::SeqCst) == t {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     let total = total.load(Ordering::SeqCst);
     assert!(total > 150_000);
     assert_eq!(sent.load(Ordering::SeqCst), total);
+
+    // A panicking progress callback does not break the upload.
+    Mock::given(method("POST"))
+        .and(path("/api/v1/channels/3/messages"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(common::message_json("10", "3", "x")),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let bad: inlet_protocol::ProgressFn = Arc::new(|_, _| panic!("callback bug"));
+    let m = c
+        .send_with_files("3", &OutgoingMessage::default(), &files[1..], Some(bad))
+        .await
+        .unwrap();
+    assert_eq!(m.id, "10");
 
     // Over the limits: refused before anything is sent.
     let before = server.received_requests().await.unwrap().len();
@@ -471,12 +522,17 @@ async fn upload_sends_multipart_with_progress_and_checks_limits() {
 #[tokio::test]
 async fn new_routes_share_the_hard_cap() {
     let (server, instance) = common::instance().await;
+    // Arrival times at the server, so response jitter does not count.
+    let arrivals = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = arrivals.clone();
     Mock::given(method("PUT"))
-        .respond_with(ResponseTemplate::new(204))
+        .respond_with(move |_: &Request| {
+            seen.lock().unwrap().push(std::time::Instant::now());
+            ResponseTemplate::new(204)
+        })
         .mount(&server)
         .await;
     let c = client(&instance, "tok-cap");
-    let start = tokio::time::Instant::now();
     let mut tasks = Vec::new();
     for i in 0..45u32 {
         let c = c.clone();
@@ -484,24 +540,22 @@ async fn new_routes_share_the_hard_cap() {
             c.add_reaction("2", &format!("{}", 100 + i), &Emoji::unicode("👍"))
                 .await
                 .unwrap();
-            tokio::time::Instant::now()
         }));
     }
-    let mut times = Vec::new();
     for t in tasks {
-        times.push(t.await.unwrap());
+        t.await.unwrap();
     }
+    let mut times = arrivals.lock().unwrap().clone();
     times.sort();
+    assert_eq!(times.len(), 45);
     // 45 requests at no more than 20 per rolling second take at least 2 s.
-    assert!(
-        times[44] - start >= Duration::from_millis(1_900),
-        "{:?}",
-        times[44] - start
-    );
+    assert!(times[44] - times[0] >= Duration::from_millis(1_900));
+    // No 21 requests inside one second (with a little slack for scheduling).
     for w in times.windows(21) {
         assert!(
-            w[20] - w[0] >= Duration::from_millis(950),
-            "21 within a second"
+            w[20] - w[0] >= Duration::from_millis(900),
+            "21 within {:?}",
+            w[20] - w[0]
         );
     }
 }
@@ -535,5 +589,68 @@ async fn media_urls_come_from_the_instance_only() {
             }
         ),
         Some(format!("{own}&width=320"))
+    );
+}
+
+#[tokio::test]
+async fn coalescing_is_shared_by_every_client_of_the_account() {
+    let (server, instance) = common::instance().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/channels/2/typing"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let a = client(&instance, "tok-shared");
+    let b = client(&instance, "tok-shared");
+    a.trigger_typing("2").await.unwrap();
+    b.trigger_typing("2").await.unwrap();
+}
+
+#[tokio::test]
+async fn ids_that_are_not_snowflakes_never_reach_the_network() {
+    let (server, instance) = common::instance().await;
+    let c = client(&instance, "tok-ids");
+    let before = server.received_requests().await.unwrap().len();
+    for bad in ["..", "1/2", "1?x=2", "", "abc", "12345678901234567890123"] {
+        assert!(matches!(
+            c.messages(bad, None, 10).await,
+            Err(Error::InvalidInput(_))
+        ));
+        assert!(matches!(
+            c.delete_message("2", bad).await,
+            Err(Error::InvalidInput(_))
+        ));
+        assert!(matches!(
+            c.guild_member(bad, "@me").await,
+            Err(Error::InvalidInput(_))
+        ));
+        assert!(matches!(
+            c.trigger_typing(bad).await,
+            Err(Error::InvalidInput(_))
+        ));
+        assert!(matches!(
+            c.messages("2", Some(bad), 10).await,
+            Err(Error::InvalidInput(_))
+        ));
+        c.ack(bad, "1");
+        c.ack("2", bad);
+    }
+    assert!(c.flush_acks().await.unwrap().is_empty());
+    assert_eq!(server.received_requests().await.unwrap().len(), before);
+}
+
+#[tokio::test]
+async fn total_upload_size_is_capped_at_512_mib() {
+    let (_server, instance) = upload_instance(500 * 1024 * 1024).await;
+    let c = client(&instance, "tok-total");
+    let l = c.upload_limits();
+    assert_eq!(l.max_file_size, 500 * 1024 * 1024);
+    assert_eq!(l.max_files, 2);
+    assert_eq!(l.max_total_size, 512 * 1024 * 1024);
+    let (_s2, small) = upload_instance(1_000).await;
+    assert_eq!(
+        client(&small, "tok-total-2").upload_limits().max_total_size,
+        2_000
     );
 }

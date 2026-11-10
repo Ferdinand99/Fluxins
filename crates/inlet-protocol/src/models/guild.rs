@@ -275,6 +275,16 @@ impl Channel {
 }
 
 impl Guild {
+    /// The MFA level: 1 (elevated) means moderators need two-factor
+    /// authentication for elevated permissions (see
+    /// [`crate::PermissionContext::mfa_missing`]).
+    pub fn mfa_level(&self) -> i64 {
+        self.extra
+            .get("mfa_level")
+            .and_then(Value::as_i64)
+            .unwrap_or(0)
+    }
+
     /// Banner hash (see [`crate::Media::banner`]).
     pub fn banner(&self) -> Option<&str> {
         self.extra.get("banner")?.as_str()

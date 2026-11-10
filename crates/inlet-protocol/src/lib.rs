@@ -117,6 +117,7 @@ pub mod rest;
 pub mod token;
 pub mod upload;
 
+
 pub use auth::{
     poll_ip_authorization, sign_in_password, sign_in_totp, Handoff, HandoffStatus, IpAuthorization,
     MfaMethod, Session, SignInResult, SignedIn, Ticket,
@@ -126,7 +127,7 @@ pub use gateway::{
     CloseReason, ConnectionState, Dispatch, Gateway, GatewayEvent, GatewayHandle, GatewayOptions,
     IdentifyProperties,
 };
-pub use instance::{ClientInfo, Discovery, EndpointPins, Endpoints, Instance};
+pub use instance::{ClientInfo, Discovery, EndpointPins, Endpoints, Instance, SessionPins};
 pub use media::{ImageFormat, ImageOptions, Media, Transform};
 pub use models::{
     Attachment, Channel, CurrentUser, Embed, Emoji, FullUserProfile, Guild, GuildEmoji,

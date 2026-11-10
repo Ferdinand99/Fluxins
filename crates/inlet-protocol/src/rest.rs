@@ -21,6 +21,7 @@ use crate::ratelimit::{
 };
 use crate::token::Token;
 use crate::upload::{ProgressFn, UploadFile, UploadLimits};
+use tokio::time::Instant;
 
 /// Feature names the official client sends in `X-Fluxer-Features`. Without
 /// `channel_threads`, thread and forum routes return 404.
@@ -178,6 +179,10 @@ pub(crate) async fn send(
             if global && token.is_some() {
                 return Err(Error::GlobalRateLimited);
             }
+            if req.upload.is_some() {
+                // An upload body is never sent twice; the caller decides.
+                return Err(Error::RateLimited { retry_after: wait });
+            }
             attempts += 1;
             if attempts > MAX_429_RETRIES || wait > MAX_AUTO_WAIT {
                 return Err(Error::RateLimited { retry_after: wait });
@@ -197,9 +202,10 @@ pub(crate) async fn send(
     }
 }
 
-/// Time allowed for an upload request: 2 minutes plus 4 s per MiB, at most 30 minutes.
+/// Time allowed for an upload request: 2 minutes plus the time at 1 Mbit/s
+/// (8 s per MiB), at most 90 minutes (512 MiB at about 0.8 Mbit/s).
 fn upload_timeout(len: u64) -> Duration {
-    Duration::from_secs((120 + len / (256 * 1024)).min(30 * 60))
+    Duration::from_secs(120u64.saturating_add(len / (128 * 1024)).min(90 * 60))
 }
 
 /// The REST client for one signed-in session. Cheap to clone. Every client of
@@ -210,7 +216,6 @@ pub struct Client {
     instance: Instance,
     token: Arc<Token>,
     limiter: Arc<Mutex<Arc<RateLimiter>>>,
-    shared: Arc<crate::coalesce::Shared>,
 }
 
 impl std::fmt::Debug for Client {
@@ -237,7 +242,6 @@ impl Client {
             instance,
             token: Arc::new(token),
             limiter: Arc::new(Mutex::new(limiter)),
-            shared: Arc::new(crate::coalesce::Shared::default()),
         }
     }
 
@@ -254,6 +258,10 @@ impl Client {
     fn bind_user(&self, user_id: &str) {
         let mut slot = self.limiter.lock().unwrap_or_else(|e| e.into_inner());
         let shared = RateLimiter::adopt_user(self.instance.origin(), user_id, &slot);
+        if !Arc::ptr_eq(&shared, &slot) {
+            // Keep pending acks and typing times when moving to the account's state.
+            shared.coalesce.absorb(&slot.coalesce);
+        }
         *slot = shared;
     }
 
@@ -320,7 +328,12 @@ impl Client {
     pub async fn me(&self) -> Result<CurrentUser> {
         let me: CurrentUser = self.raw(Method::GET, "/users/@me", None).await?.json()?;
         self.bind_user(&me.id);
-        *self.shared.traits.lock().unwrap_or_else(|e| e.into_inner()) = Some(me.traits());
+        *self
+            .rate_limiter()
+            .coalesce
+            .traits
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(me.traits());
         Ok(me)
     }
 
@@ -351,7 +364,7 @@ impl Client {
 
     /// `GET /guilds/{id}/channels`: the guild's channels the account can see.
     pub async fn channels(&self, guild_id: &str) -> Result<Vec<Channel>> {
-        self.get_list(&format!("/guilds/{}/channels", enc(guild_id)), "channel")
+        self.get_list(&format!("/guilds/{}/channels", id(guild_id)?), "channel")
             .await
     }
 
@@ -369,10 +382,10 @@ impl Client {
         limit: u8,
     ) -> Result<Vec<Message>> {
         let limit = limit.clamp(1, 100);
-        let mut path = format!("/channels/{}/messages?limit={limit}", enc(channel_id));
+        let mut path = format!("/channels/{}/messages?limit={limit}", id(channel_id)?);
         if let Some(b) = before {
             path.push_str("&before=");
-            path.push_str(&enc(b));
+            path.push_str(id(b)?);
         }
         self.get_list(&path, "message").await
     }
@@ -389,10 +402,10 @@ impl Client {
         if let Some(n) = nonce {
             body["nonce"] = Value::String(n.to_owned());
         }
-        self.shared.reset_typing(channel_id);
+        self.rate_limiter().coalesce.reset_typing(channel_id);
         self.raw(
             Method::POST,
-            &format!("/channels/{}/messages", enc(channel_id)),
+            &format!("/channels/{}/messages", id(channel_id)?),
             Some(&body),
         )
         .await?
@@ -404,14 +417,15 @@ impl Client {
     /// per channel goes out every 8 s ([`crate::coalesce::TYPING_INTERVAL`]),
     /// and the others return `Ok(())` at once.
     pub async fn trigger_typing(&self, channel_id: &str) -> Result<()> {
-        if !self.shared.typing_due(channel_id) {
+        let channel_id = id(channel_id)?;
+        if !self.rate_limiter().coalesce.typing_due(channel_id) {
             return Ok(());
         }
         // A failed request also waits the full interval, so a channel where
         // typing is refused (no permission, timeout) is not retried per key press.
         self.raw(
             Method::POST,
-            &format!("/channels/{}/typing", enc(channel_id)),
+            &format!("/channels/{}/typing", id(channel_id)?),
             None,
         )
         .await?;
@@ -460,7 +474,7 @@ impl Client {
     pub async fn message(&self, channel_id: &str, message_id: &str) -> Result<Message> {
         self.raw(
             Method::GET,
-            &format!("/channels/{}/messages/{}", enc(channel_id), enc(message_id)),
+            &format!("/channels/{}/messages/{}", id(channel_id)?, id(message_id)?),
             None,
         )
         .await?
@@ -470,10 +484,10 @@ impl Client {
     /// `POST /channels/{id}/messages` with replies, stickers, flags and mention
     /// control. See [`OutgoingMessage`].
     pub async fn send(&self, channel_id: &str, message: &OutgoingMessage) -> Result<Message> {
-        self.shared.reset_typing(channel_id);
+        self.rate_limiter().coalesce.reset_typing(channel_id);
         self.raw(
             Method::POST,
-            &format!("/channels/{}/messages", enc(channel_id)),
+            &format!("/channels/{}/messages", id(channel_id)?),
             Some(&message.to_json(None)),
         )
         .await?
@@ -517,7 +531,7 @@ impl Client {
     ) -> Result<Message> {
         self.raw(
             Method::PATCH,
-            &format!("/channels/{}/messages/{}", enc(channel_id), enc(message_id)),
+            &format!("/channels/{}/messages/{}", id(channel_id)?, id(message_id)?),
             Some(&edit.to_json()),
         )
         .await?
@@ -528,7 +542,7 @@ impl Client {
     pub async fn delete_message(&self, channel_id: &str, message_id: &str) -> Result<()> {
         self.raw(
             Method::DELETE,
-            &format!("/channels/{}/messages/{}", enc(channel_id), enc(message_id)),
+            &format!("/channels/{}/messages/{}", id(channel_id)?, id(message_id)?),
             None,
         )
         .await?;
@@ -540,8 +554,8 @@ impl Client {
     fn reaction_path(channel_id: &str, message_id: &str, emoji: &Emoji) -> Result<String> {
         Ok(format!(
             "/channels/{}/messages/{}/reactions/{}",
-            enc(channel_id),
-            enc(message_id),
+            id(channel_id)?,
+            id(message_id)?,
             reaction_segment(emoji)?
         ))
     }
@@ -592,7 +606,7 @@ impl Client {
         );
         if let Some(a) = after {
             path.push_str("&after=");
-            path.push_str(&enc(a));
+            path.push_str(id(a)?);
         }
         self.raw(Method::GET, &path, None).await?.json()
     }
@@ -609,12 +623,12 @@ impl Client {
     ) -> Result<PinsPage> {
         let mut path = format!(
             "/channels/{}/messages/pins?limit={}",
-            enc(channel_id),
+            id(channel_id)?,
             limit.clamp(1, 50)
         );
         if let Some(b) = before {
             path.push_str("&before=");
-            path.push_str(&enc(b));
+            path.push_str(&enc_query(b));
         }
         self.raw(Method::GET, &path, None).await?.json()
     }
@@ -623,7 +637,7 @@ impl Client {
     pub async fn pin_message(&self, channel_id: &str, message_id: &str) -> Result<()> {
         self.raw(
             Method::PUT,
-            &format!("/channels/{}/pins/{}", enc(channel_id), enc(message_id)),
+            &format!("/channels/{}/pins/{}", id(channel_id)?, id(message_id)?),
             None,
         )
         .await?;
@@ -634,7 +648,7 @@ impl Client {
     pub async fn unpin_message(&self, channel_id: &str, message_id: &str) -> Result<()> {
         self.raw(
             Method::DELETE,
-            &format!("/channels/{}/pins/{}", enc(channel_id), enc(message_id)),
+            &format!("/channels/{}/pins/{}", id(channel_id)?, id(message_id)?),
             None,
         )
         .await?;
@@ -645,7 +659,7 @@ impl Client {
     pub async fn ack_pins(&self, channel_id: &str) -> Result<()> {
         self.raw(
             Method::POST,
-            &format!("/channels/{}/pins/ack", enc(channel_id)),
+            &format!("/channels/{}/pins/ack", id(channel_id)?),
             None,
         )
         .await?;
@@ -654,13 +668,14 @@ impl Client {
 
     // ----- Read states -----
 
-    /// Marks `channel_id` read up to `message_id`. Coalesced: nothing is sent
-    /// right away; the newest message per channel goes out with the others in
-    /// one `POST /read-states/ack` after [`crate::coalesce::ACK_DELAY`]. Acks
-    /// for a message at or before one already acknowledged are dropped. Call
-    /// it as often as you like (for example on every scroll). Needs a tokio
-    /// runtime for the background flush; without one, call
-    /// [`Client::flush_acks`].
+    /// Marks `channel_id` read up to `message_id`. Coalesced per account: nothing
+    /// is sent right away; the newest message per channel goes out with the
+    /// others in one `POST /read-states/ack` after [`crate::coalesce::ACK_DELAY`],
+    /// and the account never sends two ack requests less than that apart
+    /// (100 channels per request). Acks for a message at or before one already
+    /// acknowledged are dropped, and so are IDs that are not snowflakes. Call it
+    /// as often as you like (for example on every scroll). Needs a tokio runtime
+    /// for the background flush; without one, call [`Client::flush_acks`].
     pub fn ack(&self, channel_id: &str, message_id: &str) {
         self.queue_ack(
             channel_id,
@@ -686,7 +701,12 @@ impl Client {
     }
 
     fn queue_ack(&self, channel_id: &str, ack: PendingAck) {
-        let schedule = self.shared.lock_acks().push(channel_id, ack);
+        if id(channel_id).is_err() || id(&ack.message_id).is_err() || channel_id == "@me" {
+            tracing::warn!("dropping an ack with an ID that is not a snowflake");
+            return;
+        }
+        let limiter = self.rate_limiter();
+        let schedule = limiter.coalesce.lock_acks().push(channel_id, ack);
         if !schedule {
             return;
         }
@@ -695,44 +715,54 @@ impl Client {
                 let client = self.clone();
                 handle.spawn(async move {
                     tokio::time::sleep(ACK_DELAY).await;
-                    if let Err(e) = client.flush_acks_inner(true).await {
+                    if let Err(e) = client.flush_acks_inner(None).await {
                         tracing::warn!(error = %e, "sending read acknowledgements failed");
                     }
                 });
             }
-            Err(_) => self.shared.lock_acks().scheduled = false,
+            Err(_) => limiter.coalesce.lock_acks().scheduled = false,
         }
     }
 
-    /// Sends every pending ack now (for example before signing out) and
-    /// returns the read states the server reports.
+    /// Sends the acks pending now (for example before signing out) and
+    /// returns the read states the server reports. Requests stay at least
+    /// [`crate::coalesce::ACK_DELAY`] apart, so more than 100 pending channels
+    /// take a second per extra 100.
     pub async fn flush_acks(&self) -> Result<Vec<ReadState>> {
-        self.flush_acks_inner(false).await
+        let pending = self.rate_limiter().coalesce.lock_acks().pending.len();
+        let rounds = pending.div_ceil(crate::coalesce::ACK_BATCH).max(1);
+        self.flush_acks_inner(Some(rounds)).await
     }
 
-    async fn flush_acks_inner(&self, paced: bool) -> Result<Vec<ReadState>> {
+    /// Sends pending acks, at most `rounds` requests (`None`: until none are left).
+    async fn flush_acks_inner(&self, rounds: Option<usize>) -> Result<Vec<ReadState>> {
+        let limiter = self.rate_limiter();
+        let shared = &limiter.coalesce;
         let mut out = Vec::new();
-        let mut first = true;
+        let mut sent_rounds = 0usize;
         loop {
-            let batch = {
-                let mut state = self.shared.lock_acks();
-                let batch = state.take_batch();
-                if batch.is_empty() {
-                    state.scheduled = false;
-                }
-                batch
-            };
-            if batch.is_empty() {
+            if rounds.is_some_and(|r| sent_rounds >= r) {
                 return Ok(out);
             }
-            if paced && !first && batch.len() < crate::coalesce::ACK_BATCH {
-                // Acks that arrived while the last request ran wait one more delay.
-                self.shared.lock_acks().restore(batch);
-                tokio::time::sleep(ACK_DELAY).await;
-                first = true;
+            // One ack request per ACK_DELAY per account, across every flusher.
+            let batch = loop {
+                let wait = {
+                    let mut state = shared.lock_acks();
+                    if state.pending.is_empty() {
+                        state.scheduled = false;
+                        return Ok(out);
+                    }
+                    state.reserve_slot(Instant::now())
+                };
+                match wait {
+                    Some(d) => tokio::time::sleep(d).await,
+                    None => break shared.lock_acks().take_batch(),
+                }
+            };
+            if batch.is_empty() {
                 continue;
             }
-            first = false;
+            sent_rounds += 1;
             let entries: Vec<Value> = batch
                 .iter()
                 .map(|(channel, a)| {
@@ -752,7 +782,7 @@ impl Client {
                 .await
             {
                 Ok(raw) => {
-                    self.shared.lock_acks().mark_sent(&batch);
+                    shared.lock_acks().mark_sent(&batch);
                     if !raw.body.is_empty() {
                         if let Some(Value::Array(items)) = raw.value().get_mut("read_states") {
                             out.extend(lenient_list::<ReadState>(
@@ -763,7 +793,7 @@ impl Client {
                     }
                 }
                 Err(e) => {
-                    let mut state = self.shared.lock_acks();
+                    let mut state = shared.lock_acks();
                     if matches!(e, Error::Http(_) | Error::RateLimited { .. }) {
                         // Worth another try with the next ack or flush.
                         state.restore(batch);
@@ -795,7 +825,7 @@ impl Client {
 
     /// `GET /users/{id}`.
     pub async fn user(&self, user_id: &str) -> Result<User> {
-        self.raw(Method::GET, &format!("/users/{}", enc(user_id)), None)
+        self.raw(Method::GET, &format!("/users/{}", id(user_id)?), None)
             .await?
             .json()
     }
@@ -810,12 +840,12 @@ impl Client {
     ) -> Result<FullUserProfile> {
         let mut query: Vec<String> = Vec::new();
         if let Some(g) = guild_id {
-            query.push(format!("guild_id={}", enc(g)));
+            query.push(format!("guild_id={}", id(g)?));
         }
         if with_mutuals {
             query.push("with_mutual_guilds=true&with_mutual_friends=true".to_owned());
         }
-        let mut path = format!("/users/{}/profile", enc(user_id));
+        let mut path = format!("/users/{}/profile", id(user_id)?);
         if !query.is_empty() {
             path.push('?');
             path.push_str(&query.join("&"));
@@ -829,7 +859,7 @@ impl Client {
     pub async fn guild_member(&self, guild_id: &str, user_id: &str) -> Result<GuildMember> {
         self.raw(
             Method::GET,
-            &format!("/guilds/{}/members/{}", enc(guild_id), enc(user_id)),
+            &format!("/guilds/{}/members/{}", id(guild_id)?, id(user_id)?),
             None,
         )
         .await?
@@ -840,7 +870,7 @@ impl Client {
     pub async fn my_guild_member(&self, guild_id: &str) -> Result<GuildMember> {
         self.raw(
             Method::GET,
-            &format!("/guilds/{}/members/@me", enc(guild_id)),
+            &format!("/guilds/{}/members/@me", id(guild_id)?),
             None,
         )
         .await?
@@ -858,31 +888,31 @@ impl Client {
     ) -> Result<Vec<GuildMember>> {
         let mut path = format!(
             "/guilds/{}/members?limit={}",
-            enc(guild_id),
+            id(guild_id)?,
             limit.clamp(1, 1000)
         );
         if let Some(a) = after {
             path.push_str("&after=");
-            path.push_str(&enc(a));
+            path.push_str(id(a)?);
         }
         self.get_list(&path, "member").await
     }
 
     /// `GET /guilds/{id}/roles`: every role, highest first.
     pub async fn roles(&self, guild_id: &str) -> Result<Vec<Role>> {
-        self.get_list(&format!("/guilds/{}/roles", enc(guild_id)), "role")
+        self.get_list(&format!("/guilds/{}/roles", id(guild_id)?), "role")
             .await
     }
 
     /// `GET /guilds/{id}/emojis`.
     pub async fn guild_emojis(&self, guild_id: &str) -> Result<Vec<GuildEmoji>> {
-        self.get_list(&format!("/guilds/{}/emojis", enc(guild_id)), "emoji")
+        self.get_list(&format!("/guilds/{}/emojis", id(guild_id)?), "emoji")
             .await
     }
 
     /// `GET /guilds/{id}/stickers`.
     pub async fn guild_stickers(&self, guild_id: &str) -> Result<Vec<GuildSticker>> {
-        self.get_list(&format!("/guilds/{}/stickers", enc(guild_id)), "sticker")
+        self.get_list(&format!("/guilds/{}/stickers", id(guild_id)?), "sticker")
             .await
     }
 
@@ -890,26 +920,41 @@ impl Client {
 
     /// The upload limits for this account: from the instance's limit rules
     /// and the account traits seen in the last [`Client::me`] (defaults
-    /// before that).
+    /// before that). The total per message is at most
+    /// [`crate::limits::MAX_UPLOAD_TOTAL`] (512 MiB) whatever the instance allows.
     pub fn upload_limits(&self) -> UploadLimits {
         let traits = self
-            .shared
+            .rate_limiter()
+            .coalesce
             .traits
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
             .unwrap_or_default();
         let d = self.instance.discovery();
+        let max_file_size = d.max_attachment_file_size(&traits);
+        let max_files = d.max_attachments_per_message(&traits);
         UploadLimits {
-            max_file_size: d.max_attachment_file_size(&traits),
-            max_files: d.max_attachments_per_message(&traits),
+            max_file_size,
+            max_files,
+            max_total_size: max_file_size
+                .saturating_mul(max_files)
+                .min(crate::limits::MAX_UPLOAD_TOTAL),
         }
     }
 
     /// `POST /channels/{id}/messages` as `multipart/form-data` with files.
-    /// Checks the file count and sizes against [`Client::upload_limits`]
-    /// first ([`Error::InvalidInput`], [`Error::TooLarge`]), goes through the
-    /// rate limiter, and reports `(sent, total)` bytes to `progress`.
+    ///
+    /// Checks the file count, each size and the total against
+    /// [`Client::upload_limits`] first ([`Error::InvalidInput`],
+    /// [`Error::TooLarge`]), and goes through the rate limiter. A 429 is not
+    /// retried: the body is not sent again, and [`Error::RateLimited`] carries
+    /// `retry_after` so the UI can offer "try again". `progress` gets
+    /// `(sent, total)` bytes from a separate task (see [`ProgressFn`]).
+    ///
+    /// The files must be in memory. Streaming from disk
+    /// (`UploadFile::from_path`) and Fluxer's pre-signed uploads for large
+    /// files are later work.
     pub async fn send_with_files(
         &self,
         channel_id: &str,
@@ -917,6 +962,7 @@ impl Client {
         files: &[UploadFile],
         progress: Option<ProgressFn>,
     ) -> Result<Message> {
+        let channel_id = id(channel_id)?;
         if files.is_empty() {
             return self.send(channel_id, message).await;
         }
@@ -928,17 +974,24 @@ impl Client {
                 limits.max_files
             )));
         }
+        let too_large = |limit: u64| Error::TooLarge {
+            limit: usize::try_from(limit).unwrap_or(usize::MAX),
+        };
         if files
             .iter()
             .any(|f| f.data.len() as u64 > limits.max_file_size)
         {
-            return Err(Error::TooLarge {
-                limit: usize::try_from(limits.max_file_size).unwrap_or(usize::MAX),
-            });
+            return Err(too_large(limits.max_file_size));
         }
-        self.shared.reset_typing(channel_id);
+        let total = files
+            .iter()
+            .fold(0u64, |sum, f| sum.saturating_add(f.data.len() as u64));
+        if total > limits.max_total_size {
+            return Err(too_large(limits.max_total_size));
+        }
+        self.rate_limiter().coalesce.reset_typing(channel_id);
         let body = crate::upload::Multipart::message(message.to_json(None), files, progress);
-        self.raw_upload(&format!("/channels/{}/messages", enc(channel_id)), &body)
+        self.raw_upload(&format!("/channels/{channel_id}/messages"), &body)
             .await?
             .json()
     }
@@ -985,8 +1038,19 @@ fn percent_encode_all(s: &str) -> String {
     out
 }
 
-/// Percent-encodes a path segment. Snowflakes pass through unchanged.
-fn enc(segment: &str) -> String {
+/// A snowflake ID (or `@me`) for a path or query, or [`Error::InvalidInput`].
+/// IDs come from the server and the UI; anything else (`..`, `/`, `?`) could
+/// make the request hit another route.
+fn id(value: &str) -> Result<&str> {
+    if value == "@me" || crate::media::is_snowflake(value) {
+        Ok(value)
+    } else {
+        Err(Error::InvalidInput("an ID is not a snowflake".into()))
+    }
+}
+
+/// Percent-encodes a query value.
+fn enc_query(segment: &str) -> String {
     url::form_urlencoded::byte_serialize(segment.as_bytes()).collect()
 }
 

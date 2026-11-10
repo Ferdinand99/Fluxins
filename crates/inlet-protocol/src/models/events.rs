@@ -353,11 +353,15 @@ pub struct GuildMemberListUpdate {
 /// Rows a member list keeps at most (Fluxer's highest range end is 100,000).
 const MAX_MEMBER_LIST_ROWS: u64 = 100_001;
 
-/// A member list as the UI shows it: apply every GUILD_MEMBER_LIST_UPDATE for
-/// the subscribed channel, then read `rows`. Rows outside the subscribed
-/// ranges are `None` (not loaded).
+/// A member list as the UI shows it: make it with the ranges passed to
+/// [`crate::GatewayHandle::subscribe_member_list`], apply every
+/// GUILD_MEMBER_LIST_UPDATE for that channel, then read `rows`. Rows outside
+/// the subscribed ranges stay `None` (not loaded), even if the server sends
+/// them, so a hostile server cannot fill memory with members nobody asked for.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct MemberList {
+    /// Subscribed ranges (inclusive). Empty means the first 100 rows.
+    pub ranges: Vec<[u32; 2]>,
     /// Guild.
     pub guild_id: Snowflake,
     /// List ID (channel ID).
@@ -373,6 +377,36 @@ pub struct MemberList {
 }
 
 impl MemberList {
+    /// An empty list for a guild's channel and the subscribed ranges.
+    pub fn new(guild_id: &str, list_id: &str, ranges: &[[u32; 2]]) -> Self {
+        MemberList {
+            guild_id: guild_id.to_owned(),
+            id: list_id.to_owned(),
+            ranges: ranges.to_vec(),
+            ..Default::default()
+        }
+    }
+
+    /// Changes the subscribed ranges (after a new
+    /// [`crate::GatewayHandle::subscribe_member_list`]); rows outside them are dropped.
+    pub fn set_ranges(&mut self, ranges: &[[u32; 2]]) {
+        self.ranges = ranges.to_vec();
+        for i in 0..self.rows.len() {
+            if !self.subscribed(i as u64) {
+                self.rows[i] = None;
+            }
+        }
+    }
+
+    fn subscribed(&self, row: u64) -> bool {
+        if self.ranges.is_empty() {
+            return row <= 99;
+        }
+        self.ranges
+            .iter()
+            .any(|[s, e]| u64::from(*s) <= row && row <= u64::from(*e))
+    }
+
     /// Applies one update. Updates for another guild or list are ignored and
     /// return `false`.
     pub fn apply(&mut self, update: &GuildMemberListUpdate) -> bool {
@@ -386,12 +420,17 @@ impl MemberList {
         self.online_count = update.online_count;
         self.groups = update.groups.clone();
         // Rows = members + group headers.
-        let total = (update.member_count + update.groups.len() as u64).min(MAX_MEMBER_LIST_ROWS);
+        let total = update
+            .member_count
+            .saturating_add(update.groups.len() as u64)
+            .min(MAX_MEMBER_LIST_ROWS);
         self.rows.resize(total as usize, None);
         for op in &update.ops {
             // Fluxer's ranges span at most 100 rows and end by 100,000.
             let (start, end) = match op.range.as_slice() {
-                [s, e] if s <= e && e - s <= 99 && *e < MAX_MEMBER_LIST_ROWS => (*s, *e),
+                [s, e] if s <= e && e.saturating_sub(*s) <= 99 && *e < MAX_MEMBER_LIST_ROWS => {
+                    (*s, *e)
+                }
                 _ => continue,
             };
             match op.op.as_str() {
@@ -404,6 +443,9 @@ impl MemberList {
                         let idx = i as usize;
                         if idx >= self.rows.len() {
                             break;
+                        }
+                        if !self.subscribed(i) {
+                            continue;
                         }
                         self.rows[idx] = op.items.get((i - start) as usize).cloned();
                     }
@@ -484,6 +526,32 @@ mod tests {
         );
         assert!(list.apply(&huge));
         assert_eq!(list.rows.len(), 5);
+    }
+
+    #[test]
+    fn rows_outside_the_subscribed_ranges_are_ignored() {
+        let mut list = MemberList::new("100", "200", &[[0, 1]]);
+        let u = update(
+            json!([{"op": "SYNC", "range": [0, 3], "items": [
+                {"group": {"id": "7", "count": 1}},
+                {"member": {"user": {"id": "10"}, "roles": []}},
+                {"group": {"id": "offline", "count": 2}},
+                {"member": {"user": {"id": "11"}, "roles": []}}
+            ]}]),
+            3,
+        );
+        assert!(list.apply(&u));
+        assert_eq!(list.members().count(), 1);
+        assert!(list.rows[3].is_none());
+        list.set_ranges(&[[2, 3]]);
+        assert_eq!(list.members().count(), 0);
+        assert!(list.apply(&u));
+        assert_eq!(list.members().next().unwrap().user_id(), Some("11"));
+        // A huge member_count does not overflow.
+        let mut huge = u.clone();
+        huge.member_count = u64::MAX;
+        assert!(list.apply(&huge));
+        assert_eq!(list.rows.len() as u64, MAX_MEMBER_LIST_ROWS);
     }
 
     #[test]

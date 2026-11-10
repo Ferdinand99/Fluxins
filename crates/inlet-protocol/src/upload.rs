@@ -3,12 +3,22 @@
 //! callback.
 //!
 //! Limits are checked before anything is sent: the number of files
-//! (`max_attachments_per_message`) and each file's size
-//! (`max_attachment_file_size`, at most [`crate::limits::UPLOAD_HARD_CAP`]),
+//! (`max_attachments_per_message`), each file's size
+//! (`max_attachment_file_size`, at most [`crate::limits::UPLOAD_HARD_CAP`])
+//! and the total (at most [`crate::limits::MAX_UPLOAD_TOTAL`], 512 MiB),
 //! resolved from the discovery document and the account's traits. The
-//! request goes through the account's rate limiter like every other call.
+//! request goes through the account's rate limiter like every other call,
+//! and is never sent twice: a 429 comes back as [`crate::Error::RateLimited`].
+//!
+//! Only the last path component of a file name is sent, so a full local path
+//! never shows up in the channel.
+//!
+//! Later work: `UploadFile::from_path` that streams from disk instead of
+//! holding the file in memory, and Fluxer's pre-signed uploads (parts of
+//! 10 MiB to storage) for large files.
 
 use std::convert::Infallible;
+use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -16,9 +26,13 @@ use std::task::{Context, Poll};
 use bytes::Bytes;
 use http_body::{Frame, SizeHint};
 use serde_json::{json, Value};
+use tokio::sync::watch;
 
-/// Called with `(bytes_sent, total_bytes)` as the request body goes out. It
-/// can be called again from 0 if the request is retried after a 429.
+/// Called with `(bytes_sent, total_bytes)` while the request body goes out:
+/// about every 1 % and at the end. It runs on a separate tokio task, never
+/// inside the HTTP body, so a slow callback cannot stall the upload, and a
+/// panic in it is caught (and stops further calls). Keep it quick and
+/// non-blocking anyway, for example by sending to a channel the UI reads.
 pub type ProgressFn = Arc<dyn Fn(u64, u64) + Send + Sync>;
 
 /// One file to attach.
@@ -73,11 +87,16 @@ pub struct UploadLimits {
     pub max_file_size: u64,
     /// Most files in one message.
     pub max_files: u64,
+    /// Most bytes in one message, all files together.
+    pub max_total_size: u64,
 }
 
-/// A file name safe inside a quoted `Content-Disposition` parameter.
+/// A file name safe inside a quoted `Content-Disposition` parameter: the
+/// last path component only (`/` and `\` both separate), with quotes and
+/// control characters replaced.
 fn safe_filename(name: &str) -> String {
-    let cleaned: String = name
+    let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    let cleaned: String = base
         .chars()
         .map(|c| match c {
             '"' | '\\' | '/' => '_',
@@ -176,15 +195,20 @@ impl Multipart {
         self.total
     }
 
-    /// A fresh request body that reports progress.
+    /// A fresh request body that reports progress to a reporter task.
     pub(crate) fn body(&self) -> reqwest::Body {
+        let progress = self
+            .progress
+            .clone()
+            .and_then(|cb| spawn_reporter(cb, self.total));
         reqwest::Body::wrap(ProgressBody {
             parts: self.parts.clone(),
             index: 0,
             offset: 0,
             sent: 0,
             total: self.total,
-            progress: self.progress.clone(),
+            reported: 0,
+            progress,
         })
     }
 
@@ -197,13 +221,40 @@ impl Multipart {
 /// Size of one body chunk.
 const CHUNK: usize = 64 * 1024;
 
+/// Starts the task that calls the callback with the latest progress. `None`
+/// outside a tokio runtime (then there is no progress).
+fn spawn_reporter(cb: ProgressFn, total: u64) -> Option<watch::Sender<u64>> {
+    let handle = tokio::runtime::Handle::try_current().ok()?;
+    let (tx, mut rx) = watch::channel(0u64);
+    handle.spawn(async move {
+        let mut last = None;
+        loop {
+            let ended = rx.changed().await.is_err();
+            let sent = *rx.borrow_and_update();
+            if last != Some(sent) {
+                last = Some(sent);
+                if std::panic::catch_unwind(AssertUnwindSafe(|| cb(sent, total))).is_err() {
+                    tracing::warn!("the upload progress callback panicked; no more progress");
+                    return;
+                }
+            }
+            if ended {
+                return;
+            }
+        }
+    });
+    Some(tx)
+}
+
 struct ProgressBody {
     parts: Arc<[Bytes]>,
     index: usize,
     offset: usize,
     sent: u64,
     total: u64,
-    progress: Option<ProgressFn>,
+    /// Bytes at the last report.
+    reported: u64,
+    progress: Option<watch::Sender<u64>>,
 }
 
 impl http_body::Body for ProgressBody {
@@ -224,9 +275,14 @@ impl http_body::Body for ProgressBody {
             let end = (this.offset + CHUNK).min(part.len());
             let chunk = part.slice(this.offset..end);
             this.offset = end;
-            this.sent += chunk.len() as u64;
-            if let Some(p) = &this.progress {
-                p(this.sent, this.total);
+            this.sent = this.sent.saturating_add(chunk.len() as u64);
+            if let Some(tx) = &this.progress {
+                // About every 1 %, and at the end. Never blocks.
+                let step = (this.total / 100).max(1);
+                if this.sent >= this.total || this.sent - this.reported >= step {
+                    this.reported = this.sent;
+                    tx.send_replace(this.sent);
+                }
             }
             return Poll::Ready(Some(Ok(Frame::data(chunk))));
         }
@@ -238,7 +294,7 @@ impl http_body::Body for ProgressBody {
     }
 
     fn size_hint(&self) -> SizeHint {
-        SizeHint::with_exact(self.total - self.sent)
+        SizeHint::with_exact(self.total.saturating_sub(self.sent))
     }
 }
 
@@ -248,7 +304,18 @@ mod tests {
 
     #[test]
     fn names_and_types_are_sanitized() {
-        assert_eq!(safe_filename("a\"b\r\nc/d\\e.png"), "a_b__c_d_e.png");
+        assert_eq!(safe_filename("a\"b\r\nc.png"), "a_b__c.png");
+        // Only the last path component, from Windows and Unix paths.
+        assert_eq!(
+            safe_filename("C:\\Users\\ferdi\\Documents\\lønn 2026.pdf"),
+            "lønn 2026.pdf"
+        );
+        assert_eq!(
+            safe_filename("/home/ferdi/private/report.txt"),
+            "report.txt"
+        );
+        assert_eq!(safe_filename("..\\..\\x/../y.png"), "y.png");
+        assert_eq!(safe_filename("dir/"), "file");
         assert_eq!(safe_filename("  "), "file");
         assert_eq!(safe_filename(".."), "file");
         assert_eq!(safe_filename(&"x".repeat(400)).len(), 255);

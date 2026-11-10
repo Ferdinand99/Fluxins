@@ -168,6 +168,53 @@ pub struct EndpointPins {
     pub gateway: String,
 }
 
+/// [`EndpointPins`] plus the media endpoint, so a changed discovery document
+/// cannot move image loading (and with it the person's IP address and what
+/// they look at) to another host either. The JSON is backward compatible:
+/// `{"api", "gateway", "media"}` reads as [`EndpointPins`] (the extra field is
+/// ignored), and pins stored without `media` read as `media: None`, which
+/// accepts any media endpoint until the pins are stored again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionPins {
+    /// Origin of the API base.
+    pub api: String,
+    /// Origin of the gateway.
+    pub gateway: String,
+    /// Origin of the media endpoint, `None` for none (or for old stored pins).
+    #[serde(default)]
+    pub media: Option<String>,
+}
+
+impl From<EndpointPins> for SessionPins {
+    fn from(p: EndpointPins) -> Self {
+        SessionPins {
+            api: p.api,
+            gateway: p.gateway,
+            media: None,
+        }
+    }
+}
+
+impl SessionPins {
+    /// The API and gateway part.
+    pub fn endpoints(&self) -> EndpointPins {
+        EndpointPins {
+            api: self.api.clone(),
+            gateway: self.gateway.clone(),
+        }
+    }
+}
+
+impl std::fmt::Display for SessionPins {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "API {} and gateway {}", self.api, self.gateway)?;
+        if let Some(m) = &self.media {
+            write!(f, " and media {m}")?;
+        }
+        Ok(())
+    }
+}
+
 impl std::fmt::Display for EndpointPins {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "API {} and gateway {}", self.api, self.gateway)
@@ -435,6 +482,37 @@ impl Instance {
         EndpointPins {
             api,
             gateway: self.inner.gateway.origin().ascii_serialization(),
+        }
+    }
+
+    /// The API, gateway and media hosts. Store these next to the token.
+    pub fn session_pins(&self) -> SessionPins {
+        let media = self
+            .inner
+            .media
+            .as_deref()
+            .and_then(|m| Url::parse(m).ok())
+            .map(|u| u.origin().ascii_serialization());
+        let p = self.pins();
+        SessionPins {
+            api: p.api,
+            gateway: p.gateway,
+            media,
+        }
+    }
+
+    /// Like [`Instance::verify_pins`], and also checks the media host when the
+    /// pins have one.
+    pub fn verify_session_pins(&self, pinned: &SessionPins) -> Result<()> {
+        let now = self.session_pins();
+        let media_ok = pinned.media.is_none() || pinned.media == now.media;
+        if now.api == pinned.api && now.gateway == pinned.gateway && media_ok {
+            Ok(())
+        } else {
+            Err(Error::EndpointsChanged {
+                old: pinned.to_string(),
+                new: now.to_string(),
+            })
         }
     }
 
@@ -731,6 +809,23 @@ mod tests {
         ))
         .unwrap();
         let pins = a.pins();
+        let full = a.session_pins();
+        assert!(a.verify_session_pins(&full).is_ok());
+        // Old stored pins (no media) still read and still verify.
+        let old: SessionPins =
+            serde_json::from_str(&serde_json::to_string(&pins).unwrap()).unwrap();
+        assert_eq!(old.media, None);
+        assert!(a.verify_session_pins(&old).is_ok());
+        // New pins read as the old type too.
+        let back: EndpointPins =
+            serde_json::from_str(&serde_json::to_string(&full).unwrap()).unwrap();
+        assert_eq!(back, pins);
+        let mut moved = full.clone();
+        moved.media = Some("https://elsewhere.example".into());
+        assert!(matches!(
+            a.verify_session_pins(&moved),
+            Err(Error::EndpointsChanged { .. })
+        ));
         assert_eq!(pins.api, "https://chat.example.org");
         assert_eq!(pins.gateway, "wss://chat.example.org");
         assert!(a.verify_pins(&pins).is_ok());
