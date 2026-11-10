@@ -21,7 +21,7 @@ mod send;
 mod upload;
 
 pub(super) use directory::{members_chunk, State};
-pub use directory::{ChannelEntry, CustomEmoji, Directory, Person, RoleEntry, Rights};
+pub use directory::{ChannelEntry, CustomEmoji, Directory, Person, Rights, RoleEntry};
 pub use send::{snowflake_u64, Mentions, Outgoing};
 
 use super::Backend;

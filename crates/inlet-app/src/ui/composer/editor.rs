@@ -252,14 +252,15 @@ impl ComposerView {
             |this, _, event: &EditorEvent, window, cx| {
                 match event {
                     EditorEvent::Changed => {
-                        this.error = None;
                         this.store_draft(cx);
-                        // A draft the composer restored is no typing.
+                        // Text the composer put in itself is no typing and keeps the error
+                        // line (a failed /msg puts its text back).
                         let text = this.editor.read(cx).buffer().text();
                         if this.quiet_text.as_deref() == Some(text) {
                             this.quiet_text = None;
                         } else {
                             this.quiet_text = None;
+                            this.error = None;
                             this.typing(cx);
                         }
                         this.update_autocomplete(cx);
@@ -1341,7 +1342,9 @@ mod tests {
         view.update_in(cx, |v, window, cx| v.retry(&nonce, window, cx));
         assert_eq!(sends(&host, cx).len(), 3);
         // An unclear one, retried after the server forgot the nonce: look first.
-        view.update(cx, |v, cx| v.on_send_failed(&nonce, "timeout".into(), None, true, cx));
+        view.update(cx, |v, cx| {
+            v.on_send_failed(&nonce, "timeout".into(), None, true, cx)
+        });
         view.update(cx, |v, _| v.skew_ms += 301_000);
         view.update_in(cx, |v, window, cx| v.retry(&nonce, window, cx));
         assert_eq!(sends(&host, cx).len(), 3);

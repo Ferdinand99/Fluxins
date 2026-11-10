@@ -483,9 +483,15 @@ mod tests {
         let deny = (MENTION_EVERYONE | BYPASS_SLOWMODE).to_string();
         let channels = [
             channel("10", json!([])),
-            channel("11", json!([{ "id": "2", "type": 0, "allow": "0", "deny": deny }])),
-            channel("12", json!([{ "id": "1", "type": 0, "allow": "0",
-                                   "deny": p::permissions::VIEW_CHANNEL.to_string() }])),
+            channel(
+                "11",
+                json!([{ "id": "2", "type": 0, "allow": "0", "deny": deny }]),
+            ),
+            channel(
+                "12",
+                json!([{ "id": "1", "type": 0, "allow": "0",
+                                   "deny": p::permissions::VIEW_CHANNEL.to_string() }]),
+            ),
         ];
         let me = member(&["2"]);
         let dir = build(fetched(&roles, Some(&me), &channels));

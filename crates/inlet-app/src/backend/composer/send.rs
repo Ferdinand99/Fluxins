@@ -315,9 +315,11 @@ impl Backend {
             return;
         }
         if let Some(ctx) = self.send_ctx() {
-            self.spawn_guarded("send", None, async move {
-                ctx.post_and_report(message).await
-            });
+            self.spawn_guarded(
+                "send",
+                None,
+                async move { ctx.post_and_report(message).await },
+            );
         }
     }
 
@@ -605,7 +607,15 @@ mod tests {
     #[test]
     fn only_snowflakes_go_into_paths() {
         assert_eq!(snowflake("123"), Some("123"));
-        for bad in ["", "0123", "12a", "../1", "1/2", "123456789012345678901", "@me"] {
+        for bad in [
+            "",
+            "0123",
+            "12a",
+            "../1",
+            "1/2",
+            "123456789012345678901",
+            "@me",
+        ] {
             assert_eq!(snowflake(bad), None, "{bad:?}");
         }
     }

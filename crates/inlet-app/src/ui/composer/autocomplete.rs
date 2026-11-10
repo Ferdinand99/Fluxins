@@ -12,9 +12,7 @@ use inlet_state::{AccountState, ChannelId, GuildId};
 
 use super::commands;
 use super::editor::ComposerView;
-use crate::backend::composer::{
-    ChannelEntry, CustomEmoji, Directory, Person, RoleEntry, Rights,
-};
+use crate::backend::composer::{ChannelEntry, CustomEmoji, Directory, Person, Rights, RoleEntry};
 use crate::theme;
 
 /// Rows the list shows at most.
@@ -518,7 +516,7 @@ mod tests {
                 bypass_slowmode: false,
             },
         };
-        let (_, rows) = candidates(&Trigger::Mention("e".into()), &src);
+        let (_, rows) = candidates(&Trigger::Mention("ev".into()), &src);
         assert_eq!(picked_ids(&rows), [Token::Everyone]);
         // With the right, roles nobody else may mention are offered too.
         let (_, rows) = candidates(&Trigger::Mention("hid".into()), &src);

@@ -3,9 +3,7 @@
 //! (pills need real snowflakes), and edits of the demo's own messages.
 
 use super::MockSession;
-use crate::backend::composer::{
-    ChannelEntry, CustomEmoji, Directory, Person, RoleEntry, Rights,
-};
+use crate::backend::composer::{ChannelEntry, CustomEmoji, Directory, Person, Rights, RoleEntry};
 use crate::backend::messages as msgs;
 
 /// The demo account's ID: the author ID of the demo's own messages.

@@ -37,23 +37,37 @@ pub fn last_editable<'a>(
     messages.rev().find(|m| m.author_id == my_user_id)
 }
 
+/// An own message to edit, as the message list gives it.
+pub struct EditTarget {
+    pub message_id: String,
+    pub channel_id: String,
+    /// The wire text.
+    pub content: String,
+    /// Whether the message, a reply, notified the author it replies to; `None` when not
+    /// known (then an edit never adds that author).
+    pub replied_user: Option<bool>,
+}
+
 impl ComposerView {
-    /// Opens `content` (wire text) of an own message for editing. `names` labels its pills.
+    /// Opens an own message for editing. `names` labels its pills.
     pub fn start_edit(
         &mut self,
-        message_id: String,
-        channel_id: String,
-        content: &str,
+        target: EditTarget,
         names: &dyn Resolve,
-        replied_user: Option<bool>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let EditTarget {
+            message_id,
+            channel_id,
+            content,
+            replied_user,
+        } = target;
         if self.channel.as_ref().map(|c| &c.channel_id) != Some(&channel_id) {
             return;
         }
         let editor = new_editor(self.max_len, cx);
-        editor.update(cx, |e, cx| e.set_wire(content, names, window, cx));
+        editor.update(cx, |e, cx| e.set_wire(&content, names, window, cx));
         let original = editor.read(cx).to_wire();
         let events = cx.subscribe_in(&editor, window, |this, _, event, window, cx| {
             if *event == EditorEvent::Submit {

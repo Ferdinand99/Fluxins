@@ -35,7 +35,6 @@ pub use editor::{bind_keys, ChannelContext, ComposerEvent, ComposerView, Shared}
 /// two, so nothing typed before can be too long for the server.
 const DEFAULT_MAX_LEN: usize = 2000;
 
-
 pub struct ComposerState {
     pub view: Entity<ComposerView>,
     pub shared: Rc<RefCell<Shared>>,
@@ -121,19 +120,15 @@ pub(crate) fn edit_last<'a>(
             .filter_map(|m| Some((m.author_id.parse().ok()?, m.author.clone())))
             .collect(),
     );
-    view.update(cx, |v, cx| {
+    let target = edit_inline::EditTarget {
+        message_id: message.id,
+        channel_id: message.channel_id,
+        content: message.content,
         // Whether the original reply notified its author is not in the list's model
         // yet; unknown keeps the author from being added by the edit.
-        v.start_edit(
-            message.id,
-            message.channel_id,
-            &message.content,
-            &names,
-            None,
-            window,
-            cx,
-        )
-    });
+        replied_user: None,
+    };
+    view.update(cx, |v, cx| v.start_edit(target, &names, window, cx));
 }
 
 impl Inlet {
