@@ -2736,8 +2736,12 @@ dependencies = [
  "inlet-protocol",
  "keyring",
  "log",
+ "serde",
+ "serde_json",
  "tokio",
  "unicode-segmentation",
+ "url",
+ "zeroize",
 ]
 
 [[package]]

@@ -1,14 +1,19 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! Renders message markdown with Fluxer's own parser (`fluxer_markdown_parser`, from the
 //! Fluxer repository, AGPL-3.0-or-later), so a message is split into the same nodes as in
 //! Fluxer's clients. v0 draws it simply: styled text runs, code blocks, quotes and lists.
+//!
+//! Parsing happens on the backend thread ([`parse`] returns plain data that is `Send`);
+//! the UI thread only draws.
 
 use std::ops::Range;
+use std::rc::Rc;
 
 use fluxer_markdown_parser::ast::{AlertType, EmojiKind, ListItem, MentionKind};
 use fluxer_markdown_parser::{EmojiContext, MarkdownParser, Node, ParserFlags};
 use gpui::{
-    AnyElement, FontStyle, FontWeight, HighlightStyle, InteractiveText, SharedString,
-    StrikethroughStyle, StyledText, UnderlineStyle, div, prelude::*, px,
+    AnyElement, App, FontStyle, FontWeight, HighlightStyle, InteractiveText, SharedString,
+    StrikethroughStyle, StyledText, UnderlineStyle, Window, div, prelude::*, px,
 };
 
 use crate::theme;
@@ -25,12 +30,21 @@ pub enum Block {
     List(Vec<(String, Vec<Block>)>),
 }
 
+/// A link in the text.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Link {
+    pub range: Range<usize>,
+    pub url: String,
+    /// The visible text is not the URL itself: the person cannot see where it goes.
+    pub masked: bool,
+}
+
 /// Text with styled ranges and clickable links.
 #[derive(Clone, Debug, Default)]
 pub struct Inline {
     pub text: String,
     pub highlights: Vec<(Range<usize>, Style)>,
-    pub links: Vec<(Range<usize>, String)>,
+    pub links: Vec<Link>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -43,6 +57,32 @@ pub enum Style {
     Spoiler,
     Link,
     Mention,
+    /// The target host shown after a masked link.
+    LinkTarget,
+}
+
+/// A URL that may be opened from a message: it parses and is http or https.
+pub fn openable(url: &str) -> Option<url::Url> {
+    let parsed = url::Url::parse(url).ok()?;
+    matches!(parsed.scheme(), "https" | "http").then_some(parsed)
+}
+
+/// What to show after a masked link so the target is visible: the host, in its ASCII
+/// (punycode) form, so look-alike Unicode domains stand out.
+pub fn link_target_label(url: &str) -> String {
+    match url::Url::parse(url) {
+        Ok(u) => match u.host_str() {
+            Some(host) => host.to_string(),
+            None => u.scheme().to_string(),
+        },
+        Err(_) => "invalid link".into(),
+    }
+}
+
+/// Whether the visible text of a link hides its target.
+pub fn is_masked(text: &str, url: &str) -> bool {
+    let norm = |s: &str| s.trim().trim_end_matches('/').to_ascii_lowercase();
+    norm(text) != norm(url)
 }
 
 pub fn parse(input: &str) -> Vec<Block> {
@@ -63,6 +103,8 @@ fn blocks(nodes: &[Node]) -> Vec<Block> {
     let flush = |current: &mut Inline, out: &mut Vec<Block>| {
         let trimmed_len = current.text.trim_end_matches('\n').len();
         current.text.truncate(trimmed_len);
+        current.highlights.retain(|(r, _)| r.end <= trimmed_len);
+        current.links.retain(|l| l.range.end <= trimmed_len);
         if !current.text.trim().is_empty() {
             out.push(Block::Text(std::mem::take(current)));
         } else {
@@ -164,6 +206,12 @@ fn styled(children: &[Node], style: Style, inline: &mut Inline) {
     }
 }
 
+fn push_marked(inline: &mut Inline, text: &str, style: Style) {
+    let start = inline.text.len();
+    inline.text.push_str(text);
+    inline.highlights.push((start..inline.text.len(), style));
+}
+
 fn push_inline(node: &Node, inline: &mut Inline) {
     match node {
         Node::Text { content } => inline.text.push_str(content),
@@ -173,11 +221,7 @@ fn push_inline(node: &Node, inline: &mut Inline) {
         Node::Strikethrough { children } => styled(children, Style::Strike, inline),
         Node::Spoiler { children, .. } => styled(children, Style::Spoiler, inline),
         Node::Sequence { children } => children.iter().for_each(|c| push_inline(c, inline)),
-        Node::InlineCode { content } => {
-            let start = inline.text.len();
-            inline.text.push_str(content);
-            inline.highlights.push((start..inline.text.len(), Style::Code));
-        }
+        Node::InlineCode { content } => push_marked(inline, content, Style::Code),
         Node::Link { text, url, .. } => {
             let start = inline.text.len();
             match text {
@@ -185,30 +229,32 @@ fn push_inline(node: &Node, inline: &mut Inline) {
                 None => inline.text.push_str(url),
             }
             let range = start..inline.text.len();
+            let masked = is_masked(&inline.text[range.clone()], url);
             inline.highlights.push((range.clone(), Style::Link));
-            inline.links.push((range, url.clone()));
+            inline.links.push(Link { range, url: url.clone(), masked });
+            if masked {
+                push_marked(inline, &format!(" ({})", link_target_label(url)), Style::LinkTarget);
+            }
         }
         Node::Mention { kind } => {
             let label = match kind {
-                MentionKind::User { id } => format!("@{}", short_id(id)),
-                MentionKind::Channel { id } => format!("#{}", short_id(id)),
-                MentionKind::Role { id } => format!("@role-{}", short_id(id)),
+                MentionKind::User { id } => format!("@{id}"),
+                MentionKind::Channel { id } => format!("#{id}"),
+                MentionKind::Role { id } => format!("@role-{id}"),
                 MentionKind::Command { name, .. } => format!("/{name}"),
                 MentionKind::GuildNavigation { .. } => "#navigation".into(),
                 MentionKind::Everyone => "@everyone".into(),
                 MentionKind::Here => "@here".into(),
             };
-            let start = inline.text.len();
-            inline.text.push_str(&label);
-            inline.highlights.push((start..inline.text.len(), Style::Mention));
+            push_marked(inline, &label, Style::Mention);
         }
         Node::Timestamp { timestamp, .. } => {
-            let text = chrono::DateTime::from_timestamp(*timestamp as i64, 0)
+            let text = i64::try_from(*timestamp)
+                .ok()
+                .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
                 .map(|t| t.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string())
                 .unwrap_or_else(|| timestamp.to_string());
-            let start = inline.text.len();
-            inline.text.push_str(&text);
-            inline.highlights.push((start..inline.text.len(), Style::Code));
+            push_marked(inline, &text, Style::Code);
         }
         Node::Emoji { kind } => match kind {
             EmojiKind::Standard { raw, .. } => inline.text.push_str(raw),
@@ -224,11 +270,7 @@ fn push_inline(node: &Node, inline: &mut Inline) {
         | Node::Blockquote { children, .. }
         | Node::Alert { children, .. }
         | Node::TableCell { children } => children.iter().for_each(|c| push_inline(c, inline)),
-        Node::CodeBlock { content, .. } => {
-            let start = inline.text.len();
-            inline.text.push_str(content);
-            inline.highlights.push((start..inline.text.len(), Style::Code));
-        }
+        Node::CodeBlock { content, .. } => push_marked(inline, content, Style::Code),
         Node::List { items, .. } => {
             for item in items {
                 inline.text.push_str("\n\u{2022} ");
@@ -237,10 +279,6 @@ fn push_inline(node: &Node, inline: &mut Inline) {
         }
         Node::Table { .. } | Node::TableRow { .. } => {}
     }
-}
-
-fn short_id(id: &str) -> &str {
-    id
 }
 
 pub fn mono_font() -> &'static str {
@@ -253,7 +291,23 @@ pub fn mono_font() -> &'static str {
     }
 }
 
-fn highlight(style: Style) -> HighlightStyle {
+/// Called when a link is clicked: the URL and whether its text hides the target.
+pub type OnLink = Rc<dyn Fn(&str, bool, &mut Window, &mut App)>;
+/// Called when a hidden spoiler is clicked.
+pub type OnReveal = Rc<dyn Fn(&mut Window, &mut App)>;
+
+/// Callbacks and state for drawing one message.
+#[derive(Clone)]
+pub struct RenderCtx {
+    /// Spoilers of this message are shown.
+    pub revealed: bool,
+    /// A link was clicked: the URL and whether its text hides the target.
+    pub on_link: OnLink,
+    /// A hidden spoiler was clicked.
+    pub on_reveal: OnReveal,
+}
+
+fn highlight(style: Style, revealed: bool) -> HighlightStyle {
     match style {
         Style::Bold => HighlightStyle { font_weight: Some(FontWeight::BOLD), ..Default::default() },
         Style::Italic => HighlightStyle { font_style: Some(FontStyle::Italic), ..Default::default() },
@@ -266,9 +320,13 @@ fn highlight(style: Style) -> HighlightStyle {
             ..Default::default()
         },
         Style::Code => HighlightStyle { background_color: Some(theme::code_bg()), ..Default::default() },
+        Style::Spoiler if revealed => {
+            HighlightStyle { background_color: Some(theme::code_bg()), ..Default::default() }
+        }
         Style::Spoiler => HighlightStyle {
             background_color: Some(theme::rail_bg()),
             color: Some(theme::rail_bg()),
+            underline: None,
             ..Default::default()
         },
         Style::Link => HighlightStyle {
@@ -276,6 +334,7 @@ fn highlight(style: Style) -> HighlightStyle {
             underline: Some(UnderlineStyle { thickness: px(1.), ..Default::default() }),
             ..Default::default()
         },
+        Style::LinkTarget => HighlightStyle { color: Some(theme::text_muted()), ..Default::default() },
         Style::Mention => HighlightStyle {
             background_color: Some(theme::mention_bg()),
             color: Some(theme::text_strong()),
@@ -284,67 +343,94 @@ fn highlight(style: Style) -> HighlightStyle {
     }
 }
 
-/// Merges overlapping highlights: gpui wants sorted, non-overlapping ranges.
-fn flatten(inline: &Inline) -> Vec<(Range<usize>, HighlightStyle)> {
+/// Merges overlapping highlights: gpui wants sorted, non-overlapping ranges. A hidden
+/// spoiler wins over everything inside it, so nothing leaks through its colour.
+fn flatten(inline: &Inline, revealed: bool) -> Vec<(Range<usize>, HighlightStyle)> {
     if inline.highlights.is_empty() {
         return Vec::new();
     }
-    let mut cuts: Vec<usize> = inline
-        .highlights
-        .iter()
-        .flat_map(|(r, _)| [r.start, r.end])
-        .collect();
+    let mut cuts: Vec<usize> = inline.highlights.iter().flat_map(|(r, _)| [r.start, r.end]).collect();
     cuts.sort_unstable();
     cuts.dedup();
     let mut out = Vec::new();
     for w in cuts.windows(2) {
         let (a, b) = (w[0], w[1]);
-        let mut style = HighlightStyle::default();
-        let mut any = false;
-        for (r, s) in &inline.highlights {
-            if r.start <= a && b <= r.end {
-                style = style.highlight(highlight(*s));
-                any = true;
-            }
+        let covering: Vec<Style> =
+            inline.highlights.iter().filter(|(r, _)| r.start <= a && b <= r.end).map(|(_, s)| *s).collect();
+        if covering.is_empty() || a >= b {
+            continue;
         }
-        if any && a < b {
-            out.push((a..b, style));
-        }
+        let style = if !revealed && covering.contains(&Style::Spoiler) {
+            highlight(Style::Spoiler, false)
+        } else {
+            covering.iter().fold(HighlightStyle::default(), |acc, s| acc.highlight(highlight(*s, revealed)))
+        };
+        out.push((a..b, style));
     }
     out
 }
 
-fn inline_element(id: SharedString, inline: &Inline) -> AnyElement {
-    let text = StyledText::new(SharedString::from(inline.text.clone())).with_highlights(flatten(inline));
-    if inline.links.is_empty() {
+fn overlaps(a: &Range<usize>, b: &Range<usize>) -> bool {
+    a.start < b.end && b.start < a.end
+}
+
+/// What a click on a range of an inline does.
+enum Click {
+    Link(String, bool),
+    Reveal,
+}
+
+fn clickables(inline: &Inline, revealed: bool) -> Vec<(Range<usize>, Click)> {
+    let spoilers: Vec<&Range<usize>> =
+        inline.highlights.iter().filter(|(_, s)| *s == Style::Spoiler).map(|(r, _)| r).collect();
+    let mut out = Vec::new();
+    for link in &inline.links {
+        // Links inside a hidden spoiler stay inert until it is revealed.
+        if !revealed && spoilers.iter().any(|s| overlaps(s, &link.range)) {
+            continue;
+        }
+        out.push((link.range.clone(), Click::Link(link.url.clone(), link.masked)));
+    }
+    if !revealed {
+        for s in spoilers {
+            out.push((s.clone(), Click::Reveal));
+        }
+    }
+    out.sort_by_key(|(r, _)| r.start);
+    out
+}
+
+fn inline_element(id: SharedString, inline: &Inline, ctx: &RenderCtx) -> AnyElement {
+    let text = StyledText::new(SharedString::from(inline.text.clone())).with_highlights(flatten(inline, ctx.revealed));
+    let clicks = clickables(inline, ctx.revealed);
+    if clicks.is_empty() {
         return div().child(text).into_any_element();
     }
-    let ranges: Vec<Range<usize>> = inline.links.iter().map(|(r, _)| r.clone()).collect();
-    let urls: Vec<String> = inline.links.iter().map(|(_, u)| u.clone()).collect();
+    let ranges: Vec<Range<usize>> = clicks.iter().map(|(r, _)| r.clone()).collect();
+    let actions: Vec<Click> = clicks.into_iter().map(|(_, c)| c).collect();
+    let ctx = ctx.clone();
     div()
-        .child(InteractiveText::new(id, text).on_click(ranges, move |ix, _window, cx| {
-            if let Some(url) = urls.get(ix) {
-                if url.starts_with("https://") || url.starts_with("http://") {
-                    cx.open_url(url);
-                }
-            }
+        .child(InteractiveText::new(id, text).on_click(ranges, move |ix, window, cx| match actions.get(ix) {
+            Some(Click::Link(url, masked)) => (ctx.on_link)(url, *masked, window, cx),
+            Some(Click::Reveal) => (ctx.on_reveal)(window, cx),
+            None => {}
         }))
         .into_any_element()
 }
 
 /// Draws the blocks of one message. `id` must be unique per message.
-pub fn render(id: &str, blocks: &[Block]) -> AnyElement {
+pub fn render(id: &str, blocks: &[Block], ctx: &RenderCtx) -> AnyElement {
     div()
         .flex()
         .flex_col()
         .gap_1()
-        .children(blocks.iter().enumerate().map(|(i, b)| render_block(&format!("{id}-{i}"), b)))
+        .children(blocks.iter().enumerate().map(|(i, b)| render_block(&format!("{id}-{i}"), b, ctx)))
         .into_any_element()
 }
 
-fn render_block(id: &str, block: &Block) -> AnyElement {
+fn render_block(id: &str, block: &Block, ctx: &RenderCtx) -> AnyElement {
     match block {
-        Block::Text(inline) => inline_element(id.to_string().into(), inline),
+        Block::Text(inline) => inline_element(id.to_string().into(), inline, ctx),
         Block::Heading(level, inline) => div()
             .font_weight(FontWeight::BOLD)
             .text_size(px(match level {
@@ -352,12 +438,12 @@ fn render_block(id: &str, block: &Block) -> AnyElement {
                 2 => 19.,
                 _ => 16.,
             }))
-            .child(inline_element(id.to_string().into(), inline))
+            .child(inline_element(id.to_string().into(), inline, ctx))
             .into_any_element(),
         Block::Subtext(inline) => div()
             .text_size(px(12.))
             .text_color(theme::text_muted())
-            .child(inline_element(id.to_string().into(), inline))
+            .child(inline_element(id.to_string().into(), inline, ctx))
             .into_any_element(),
         Block::Code { content } => div()
             .bg(theme::code_bg())
@@ -374,7 +460,7 @@ fn render_block(id: &str, block: &Block) -> AnyElement {
             .flex_row()
             .gap_2()
             .child(div().w(px(4.)).rounded_sm().bg(theme::quote_bar()))
-            .child(div().flex_1().child(render(id, children)))
+            .child(div().flex_1().child(render(id, children, ctx)))
             .into_any_element(),
         Block::Alert(label, children) => div()
             .flex()
@@ -387,7 +473,7 @@ fn render_block(id: &str, block: &Block) -> AnyElement {
                     .flex()
                     .flex_col()
                     .child(div().font_weight(FontWeight::BOLD).child(*label))
-                    .child(render(id, children)),
+                    .child(render(id, children, ctx)),
             )
             .into_any_element(),
         Block::List(items) => div()
@@ -399,7 +485,7 @@ fn render_block(id: &str, block: &Block) -> AnyElement {
                     .flex_row()
                     .gap_2()
                     .child(div().text_color(theme::text_muted()).child(marker.clone()))
-                    .child(div().flex_1().child(render(&format!("{id}-l{i}"), children)))
+                    .child(div().flex_1().child(render(&format!("{id}-l{i}"), children, ctx)))
             }))
             .into_any_element(),
     }
@@ -409,31 +495,79 @@ fn render_block(id: &str, block: &Block) -> AnyElement {
 mod tests {
     use super::*;
 
+    fn first_inline(blocks: &[Block]) -> &Inline {
+        match &blocks[0] {
+            Block::Text(inline) => inline,
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
     #[test]
     fn parses_bold_code_and_link() {
         let blocks = parse("hello **world** `x` https://fluxer.app");
-        let Block::Text(inline) = &blocks[0] else { panic!("expected text, got {blocks:?}") };
+        let inline = first_inline(&blocks);
         assert!(inline.text.starts_with("hello world x"));
         assert!(inline.highlights.iter().any(|(r, s)| *s == Style::Bold && &inline.text[r.clone()] == "world"));
         assert!(inline.highlights.iter().any(|(r, s)| *s == Style::Code && &inline.text[r.clone()] == "x"));
         assert_eq!(inline.links.len(), 1);
-        assert_eq!(inline.links[0].1, "https://fluxer.app");
+        assert_eq!(inline.links[0].url, "https://fluxer.app");
+        assert!(!inline.links[0].masked);
+        assert!(!inline.text.contains("(fluxer.app)"));
+    }
+
+    #[test]
+    fn masked_link_shows_its_host() {
+        let blocks = parse("[Confirm your account](https://fluxer-login.example/x)");
+        let inline = first_inline(&blocks);
+        assert!(inline.links[0].masked);
+        assert_eq!(inline.text, "Confirm your account (fluxer-login.example)");
+    }
+
+    #[test]
+    fn link_target_is_punycode_for_unicode_hosts() {
+        assert_eq!(link_target_label("https://flüxer.app/login"), "xn--flxer-lva.app");
+        assert_eq!(link_target_label("https://fluxer.app"), "fluxer.app");
+        assert_eq!(link_target_label("not a url"), "invalid link");
+    }
+
+    #[test]
+    fn masked_detection() {
+        assert!(!is_masked("https://fluxer.app/", "https://fluxer.app"));
+        assert!(is_masked("fluxer.app", "https://evil.example"));
+    }
+
+    #[test]
+    fn only_http_links_open() {
+        assert!(openable("https://fluxer.app").is_some());
+        assert!(openable("http://example.com").is_some());
+        assert!(openable("file:///etc/passwd").is_none());
+        assert!(openable("fluxer://handoff").is_none());
+        assert!(openable("javascript:alert(1)").is_none());
     }
 
     #[test]
     fn code_block_and_quote() {
         let blocks = parse("before\n```rust\nfn main() {}\n```\n> quoted");
-        assert!(blocks.iter().any(|b| matches!(b, Block::Code { content, .. } if content.contains("fn main"))));
+        assert!(blocks.iter().any(|b| matches!(b, Block::Code { content } if content.contains("fn main"))));
         assert!(blocks.iter().any(|b| matches!(b, Block::Quote(_))));
     }
 
     #[test]
     fn overlapping_highlights_are_flattened() {
         let blocks = parse("***both*** plain");
-        let Block::Text(inline) = &blocks[0] else { panic!() };
-        let flat = flatten(inline);
+        let flat = flatten(first_inline(&blocks), false);
         for w in flat.windows(2) {
             assert!(w[0].0.end <= w[1].0.start);
         }
+    }
+
+    #[test]
+    fn links_in_hidden_spoilers_are_inert() {
+        let blocks = parse("||[click](https://example.com)||");
+        let inline = first_inline(&blocks);
+        let hidden = clickables(inline, false);
+        assert!(hidden.iter().all(|(_, c)| matches!(c, Click::Reveal)));
+        let shown = clickables(inline, true);
+        assert!(shown.iter().any(|(_, c)| matches!(c, Click::Link(..))));
     }
 }

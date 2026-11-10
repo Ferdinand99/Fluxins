@@ -1,0 +1,22 @@
+THIRD-PARTY NOTICES FOR INLET
+=============================
+
+Inlet is licensed under the GNU Affero General Public License, version 3 or later
+(see LICENSE). It is built from the software listed below. Each licence text is
+reproduced, followed by the crates that use that text.
+
+{{#each overview}}
+- {{{name}}}: {{count}} crate(s)
+{{/each}}
+
+{{#each licenses}}
+================================================================================
+{{{name}}} ({{id}})
+Used by:
+{{#each used_by}}
+  - {{crate.name}} {{crate.version}}{{#if crate.repository}} ({{crate.repository}}){{/if}}
+{{/each}}
+--------------------------------------------------------------------------------
+{{{text}}}
+
+{{/each}}

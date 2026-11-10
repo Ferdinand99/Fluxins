@@ -4,7 +4,10 @@
 // (https://github.com/zed-industries/zed, crates/gpui/examples/input.rs),
 // Copyright Zed Industries, Inc., licensed under the Apache License 2.0.
 // Changes for Inlet: dark styling, masked (password) mode, Enter emits a
-// submit event, programmatic get/set/clear, and key bindings for all platforms.
+// submit event, programmatic get/set/clear, a length limit, and key bindings for
+// all platforms. A masked field never hands its plain text to the platform text
+// input system (IME, accessibility): it reports mask characters and takes no
+// composition.
 
 use std::ops::Range;
 
@@ -81,6 +84,7 @@ pub struct TextInput {
     content: SharedString,
     placeholder: SharedString,
     masked: bool,
+    max_chars: usize,
     selected_range: Range<usize>,
     selection_reversed: bool,
     marked_range: Option<Range<usize>>,
@@ -98,6 +102,7 @@ impl TextInput {
             content: SharedString::default(),
             placeholder: placeholder.into(),
             masked: false,
+            max_chars: 4_000,
             selected_range: 0..0,
             selection_reversed: false,
             marked_range: None,
@@ -110,6 +115,21 @@ impl TextInput {
     pub fn masked(mut self) -> Self {
         self.masked = true;
         self
+    }
+
+    pub fn max_chars(mut self, max: usize) -> Self {
+        self.max_chars = max;
+        self
+    }
+
+    /// Cuts inserted text so the content stays within `max_chars`.
+    fn limit<'a>(&self, replaced: &Range<usize>, new_text: &'a str) -> &'a str {
+        let kept = self.content.chars().count() - self.content[replaced.clone()].chars().count();
+        let room = self.max_chars.saturating_sub(kept);
+        match new_text.char_indices().nth(room) {
+            Some((ix, _)) => &new_text[..ix],
+            None => new_text,
+        }
     }
 
     pub fn with_text(mut self, text: impl Into<SharedString>) -> Self {
@@ -388,6 +408,9 @@ impl EntityInputHandler for TextInput {
     ) -> Option<String> {
         let range = self.range_from_utf16(&range_utf16);
         actual_range.replace(self.range_to_utf16(&range));
+        if self.masked {
+            return Some(MASK.repeat(self.content[range].chars().count()));
+        }
         Some(self.content[range].to_string())
     }
 
@@ -439,6 +462,7 @@ impl EntityInputHandler for TextInput {
             .map(|range_utf16| self.range_from_utf16(range_utf16))
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
+        let new_text = self.limit(&range, new_text);
         self.content =
             (self.content[0..range.start].to_owned() + new_text + &self.content[range.end..]).into();
         self.selected_range = range.start + new_text.len()..range.start + new_text.len();
@@ -452,14 +476,20 @@ impl EntityInputHandler for TextInput {
         range_utf16: Option<Range<usize>>,
         new_text: &str,
         new_selected_range_utf16: Option<Range<usize>>,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.masked {
+            // No composition in a secret field: commit the text directly.
+            self.replace_text_in_range(range_utf16, new_text, window, cx);
+            return;
+        }
         let range = range_utf16
             .as_ref()
             .map(|range_utf16| self.range_from_utf16(range_utf16))
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
+        let new_text = self.limit(&range, new_text);
         self.content =
             (self.content[0..range.start].to_owned() + new_text + &self.content[range.end..]).into();
         if !new_text.is_empty() {

@@ -11,7 +11,12 @@ sleep 2
 
 shot() { import -window root "$out/$1.png" 2>/dev/null; }
 win() { xdotool search --name '^Inlet' | head -1; }
-click() { xdotool mousemove --window "$(win)" "$1" "$2" click 1; sleep 1.5; }
+# Press and release with a pause: gpui's inline text (links, spoilers) registers its
+# mouse-up handler on the frame after the mouse-down, so an instant click is lost.
+click() {
+  xdotool mousemove --window "$(win)" "$1" "$2"; sleep 0.3
+  xdotool mousedown 1; sleep 0.3; xdotool mouseup 1; sleep 1.5
+}
 
 # 1. Sign-in screen (no saved session)
 "$bin" >"$out/signin.log" 2>&1 &
@@ -35,6 +40,27 @@ xdotool key Return
 sleep 5              # a live demo message arrives too
 shot 05-sent-and-live
 grep -E 'VmRSS|VmHWM' /proc/$pid/status > "$out/memory.txt"
+kill $pid; wait $pid 2>/dev/null
+
+# 3. Static demo (no live messages): spoiler, masked link, About
+INLET_DEMO=1 INLET_DEMO_LIVE_SECS=3600 "$bin" >>"$out/demo.log" 2>&1 &
+pid=$!
+sleep 6
+click 36 102
+click 192 172
+shot 06-general-static
+click 370 478        # the hidden spoiler
+shot 07-spoiler-revealed
+click 507 592        # the masked link
+shot 08-link-confirm
+kill $pid; wait $pid 2>/dev/null
+INLET_DEMO=1 "$bin" >>"$out/demo.log" 2>&1 &
+pid=$!
+sleep 6
+click 100 763        # "About" in the user panel
+shot 09-about
+click 122 306        # "Third-party licences"
+shot 10-licences
 kill $pid; wait $pid 2>/dev/null
 
 tail -n 20 "$out/signin.log" "$out/demo.log" >&2
