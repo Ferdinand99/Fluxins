@@ -1,24 +1,35 @@
 mod common;
 
-use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use common::*;
+use image::RgbaImage;
 use inlet_media::{
-    DiskCacheConfig, FetchError, Fit, MediaClient, MediaConfig, MediaError, MediaKind, MediaRequest,
+    DecodedImage, DiskCacheConfig, FetchError, FetchResponse, Fit, ImageSink, MediaClient,
+    MediaConfig, MediaError, MediaKind, MediaRequest, RawImages,
 };
 
-fn client(fetcher: &Arc<MockFetcher>, config: MediaConfig) -> MediaClient {
-    MediaClient::new(tokio::runtime::Handle::current(), fetcher.clone(), config)
+fn client(fetcher: &Arc<MockFetcher>, config: MediaConfig) -> MediaClient<RawImages> {
+    MediaClient::new(
+        tokio::runtime::Handle::current(),
+        fetcher.clone(),
+        RawImages,
+        config,
+    )
 }
 
 fn avatar(path: &str, size: u32) -> MediaRequest {
     MediaRequest::new(url(path), MediaKind::Avatar, Fit::square(size))
 }
 
+fn attachment(path: &str) -> MediaRequest {
+    MediaRequest::new(url(path), MediaKind::Attachment, Fit::square(32))
+}
+
 async fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
-    for _ in 0..200 {
+    for _ in 0..300 {
         if cond() {
             return;
         }
@@ -31,7 +42,7 @@ async fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
 async fn loads_and_caches_in_memory() {
     let fetcher = MockFetcher::new();
     fetcher.serve("a.png", png(&split(200, 200)));
-    let media = client(&fetcher, MediaConfig::default());
+    let media = client(&fetcher, config());
 
     assert!(media.cached(&avatar("a.png", 40)).is_none());
     let image = media.load(avatar("a.png", 40)).await.unwrap();
@@ -52,7 +63,7 @@ async fn loads_and_caches_in_memory() {
 async fn concurrent_requests_for_one_image_share_a_fetch_and_a_decode() {
     let fetcher = MockFetcher::gated();
     fetcher.serve("a.png", png(&split(100, 100)));
-    let media = client(&fetcher, MediaConfig::default());
+    let media = client(&fetcher, config());
 
     let tasks: Vec<_> = (0..25)
         .map(|_| {
@@ -77,7 +88,7 @@ async fn concurrent_requests_for_one_image_share_a_fetch_and_a_decode() {
 async fn different_sizes_are_separate_requests() {
     let fetcher = MockFetcher::new();
     fetcher.serve("a.png", png(&split(200, 200)));
-    let media = client(&fetcher, MediaConfig::default());
+    let media = client(&fetcher, config());
     let (small, big) = tokio::join!(
         media.load(avatar("a.png", 40)),
         media.load(avatar("a.png", 96))
@@ -88,10 +99,25 @@ async fn different_sizes_are_separate_requests() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_proxy_size_is_part_of_the_identity_and_tightens_the_limits() {
+    let fetcher = MockFetcher::new();
+    fetcher.serve("big.png", png(&solid(1000, 1000, RED)));
+    let media = client(&fetcher, config());
+    // Asked for 128 pixels, got 1000: that is not what the proxy does.
+    let err = media
+        .load(avatar("big.png", 40).with_proxy_size(128))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, MediaError::BadDimensions { .. }), "{err:?}");
+    // The same URL without the hint is fine, and is a separate entry.
+    assert!(media.load(avatar("big.png", 40)).await.is_ok());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dropping_the_only_waiter_cancels_the_fetch() {
     let fetcher = MockFetcher::gated();
     fetcher.serve("a.png", png(&split(20, 20)));
-    let media = client(&fetcher, MediaConfig::default());
+    let media = client(&fetcher, config());
 
     let task = {
         let media = media.clone();
@@ -108,7 +134,7 @@ async fn dropping_the_only_waiter_cancels_the_fetch() {
     .await;
     assert_eq!(media.stats().in_flight, 0);
 
-    // Asking again later starts over and works.
+    // Asking again later starts over and works. A cancel is not a failure.
     fetcher.open_gate();
     assert!(media.load(avatar("a.png", 40)).await.is_ok());
     assert_eq!(fetcher.calls(), 2);
@@ -118,7 +144,7 @@ async fn dropping_the_only_waiter_cancels_the_fetch() {
 async fn one_waiter_leaving_does_not_cancel_the_others() {
     let fetcher = MockFetcher::gated();
     fetcher.serve("a.png", png(&split(20, 20)));
-    let media = client(&fetcher, MediaConfig::default());
+    let media = client(&fetcher, config());
 
     let first = {
         let media = media.clone();
@@ -144,21 +170,48 @@ async fn one_waiter_leaving_does_not_cancel_the_others() {
     assert_eq!(fetcher.calls(), 1);
 }
 
+// ---- memory cache and the eviction callback ----------------------------------------
+
+/// Keeps the decoded pixels and records every handle the cache lets go of.
+#[derive(Default)]
+struct Tracking {
+    evicted: Mutex<Vec<Arc<DecodedImage>>>,
+}
+
+#[derive(Clone)]
+struct TrackingSink(Arc<Tracking>);
+
+impl ImageSink for TrackingSink {
+    type Handle = Arc<DecodedImage>;
+    fn make(&self, image: DecodedImage) -> (Self::Handle, u64) {
+        let bytes = image.byte_size();
+        (Arc::new(image), bytes)
+    }
+    fn evicted(&self, handle: Self::Handle) {
+        self.0.evicted.lock().unwrap().push(handle);
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_memory_cache_evicts_the_least_recently_used_image() {
+async fn the_memory_cache_evicts_the_least_recently_used_image_and_says_so() {
     let fetcher = MockFetcher::new();
     for name in ["a", "b", "c"] {
         fetcher.serve(&format!("{name}.png"), png(&split(64, 64)));
     }
     // Each 20x20 image is 1600 bytes; the cache holds two.
-    let config = MediaConfig {
-        memory_cache_bytes: 3500,
-        ..MediaConfig::default()
-    };
-    let media = client(&fetcher, config);
+    let sink = Arc::new(Tracking::default());
+    let media = MediaClient::new(
+        tokio::runtime::Handle::current(),
+        fetcher.clone(),
+        TrackingSink(sink.clone()),
+        MediaConfig {
+            memory_cache_bytes: 3500,
+            ..config()
+        },
+    );
 
     media.load(avatar("a.png", 20)).await.unwrap();
-    media.load(avatar("b.png", 20)).await.unwrap();
+    let b = media.load(avatar("b.png", 20)).await.unwrap();
     assert!(media.cached(&avatar("a.png", 20)).is_some()); // a is now newer than b
     media.load(avatar("c.png", 20)).await.unwrap();
 
@@ -171,29 +224,45 @@ async fn the_memory_cache_evicts_the_least_recently_used_image() {
     let stats = media.stats();
     assert_eq!(stats.memory_entries, 2);
     assert!(stats.memory_bytes <= 3500);
+    {
+        let evicted = sink.evicted.lock().unwrap();
+        assert_eq!(evicted.len(), 1);
+        assert!(Arc::ptr_eq(&evicted[0], &b));
+    }
 
     media.clear_memory();
     assert_eq!(media.stats().memory_entries, 0);
+    assert_eq!(sink.evicted.lock().unwrap().len(), 3);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_image_larger_than_the_whole_cache_is_returned_but_not_kept() {
+async fn an_image_larger_than_the_whole_cache_is_returned_and_reported_as_dropped() {
     let fetcher = MockFetcher::new();
     fetcher.serve("a.png", png(&split(64, 64)));
-    let config = MediaConfig {
-        memory_cache_bytes: 100,
-        ..MediaConfig::default()
-    };
-    let media = client(&fetcher, config);
-    assert!(media.load(avatar("a.png", 64)).await.is_ok());
+    let sink = Arc::new(Tracking::default());
+    let media = MediaClient::new(
+        tokio::runtime::Handle::current(),
+        fetcher.clone(),
+        TrackingSink(sink.clone()),
+        MediaConfig {
+            memory_cache_bytes: 100,
+            ..config()
+        },
+    );
+    let image = media.load(avatar("a.png", 64)).await.unwrap();
     assert_eq!(media.stats().memory_entries, 0);
+    let evicted = sink.evicted.lock().unwrap();
+    assert_eq!(evicted.len(), 1);
+    assert!(Arc::ptr_eq(&evicted[0], &image));
 }
+
+// ---- failures --------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bad_images_give_errors_and_are_not_retried_at_once() {
     let fetcher = MockFetcher::new();
     fetcher.serve("bad.png", b"this is not an image".to_vec());
-    let media = client(&fetcher, MediaConfig::default());
+    let media = client(&fetcher, config());
 
     let err = media.load(avatar("bad.png", 40)).await.unwrap_err();
     assert_eq!(err, MediaError::Unsupported);
@@ -204,12 +273,230 @@ async fn bad_images_give_errors_and_are_not_retried_at_once() {
         1,
         "a permanent failure must not be fetched again"
     );
+}
 
-    // A missing file is a fetch error and may be retried.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_failure_is_remembered_with_a_growing_back_off() {
+    let fetcher = MockFetcher::new();
+    let media = client(
+        &fetcher,
+        MediaConfig {
+            permanent_failure_backoff: Duration::from_millis(200),
+            failure_backoff: Duration::from_millis(200),
+            failure_backoff_max: Duration::from_millis(500),
+            ..config()
+        },
+    );
+
+    // 404 is permanent, but the back-off ends.
     let err = media.load(avatar("missing.png", 40)).await.unwrap_err();
     assert_eq!(err, MediaError::Fetch(FetchError::Status(404)));
+    assert!(err.is_permanent());
+    for _ in 0..5 {
+        assert_eq!(
+            media.load(avatar("missing.png", 40)).await.unwrap_err(),
+            err
+        );
+    }
+    assert_eq!(
+        fetcher.calls(),
+        1,
+        "a dead URL must not be fetched on every paint"
+    );
+    assert_eq!(media.stats().failures, 1);
+    tokio::time::sleep(Duration::from_millis(260)).await;
+    let _ = media.load(avatar("missing.png", 40)).await;
+    assert_eq!(fetcher.calls(), 2);
+    // The second failure doubled the wait (400 ms).
+    tokio::time::sleep(Duration::from_millis(260)).await;
+    let _ = media.load(avatar("missing.png", 40)).await;
+    assert_eq!(fetcher.calls(), 2);
+    tokio::time::sleep(Duration::from_millis(200)).await;
     let _ = media.load(avatar("missing.png", 40)).await;
     assert_eq!(fetcher.calls(), 3);
+
+    // A server error is transient but remembered the same way.
+    fetcher.serve_status("down.png", 503);
+    let err = media.load(avatar("down.png", 40)).await.unwrap_err();
+    assert_eq!(err, MediaError::Fetch(FetchError::Status(503)));
+    assert!(!err.is_permanent());
+    let _ = media.load(avatar("down.png", 40)).await;
+    assert_eq!(fetcher.calls(), 4);
+
+    // forget_failure ends the wait at once, and a success clears the record.
+    media.forget_failure(&avatar("down.png", 40));
+    fetcher.serve("down.png", png(&solid(8, 8, RED)));
+    fetcher.statuses.lock().unwrap().clear();
+    assert!(media.load(avatar("down.png", 40)).await.is_ok());
+    assert_eq!(fetcher.calls(), 5);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_slow_fetch_times_out_and_is_remembered() {
+    let fetcher = MockFetcher::gated(); // never opened
+    let media = client(
+        &fetcher,
+        MediaConfig {
+            fetch_timeout: Duration::from_millis(100),
+            ..config()
+        },
+    );
+    let err = media.load(avatar("a.png", 40)).await.unwrap_err();
+    assert_eq!(err, MediaError::FetchTimeout);
+    assert!(!err.is_permanent());
+    assert_eq!(
+        media.load(avatar("a.png", 40)).await.unwrap_err(),
+        MediaError::FetchTimeout
+    );
+    assert_eq!(fetcher.calls(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_panicking_fetcher_fails_the_request_instead_of_hanging_it() {
+    struct Panics;
+    impl inlet_media::Fetcher for Panics {
+        fn fetch<'a>(
+            &'a self,
+            _: &'a url::Url,
+        ) -> futures_util::future::BoxFuture<'a, Result<FetchResponse, FetchError>> {
+            Box::pin(async { panic!("fetcher bug") })
+        }
+    }
+    let media = MediaClient::new(
+        tokio::runtime::Handle::current(),
+        Arc::new(Panics),
+        RawImages,
+        config(),
+    );
+    let waiters = [
+        media.load(avatar("a.png", 40)),
+        media.load(avatar("a.png", 40)),
+    ];
+    for result in futures_util::future::join_all(waiters).await {
+        assert_eq!(result.unwrap_err(), MediaError::TaskFailed);
+    }
+    assert_eq!(media.stats().in_flight, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_panicking_sink_fails_the_request_instead_of_hanging_it() {
+    struct Panics;
+    impl ImageSink for Panics {
+        type Handle = Arc<DecodedImage>;
+        fn make(&self, _: DecodedImage) -> (Self::Handle, u64) {
+            panic!("sink bug")
+        }
+    }
+    let fetcher = MockFetcher::new();
+    fetcher.serve("a.png", png(&solid(8, 8, RED)));
+    let media = MediaClient::new(tokio::runtime::Handle::current(), fetcher, Panics, config());
+    assert_eq!(
+        media.load(avatar("a.png", 40)).await.unwrap_err(),
+        MediaError::TaskFailed
+    );
+}
+
+// ---- URL policy and the fetch contract ------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn only_https_urls_on_the_allow_list_are_fetched() {
+    let fetcher = MockFetcher::new();
+    let media = client(&fetcher, config());
+    for bad in [
+        "file:///etc/passwd",
+        "ftp://cdn.example/a.png",
+        "data:image/png;base64,AAAA",
+        "https://user:pass@cdn.example/a.png",
+        "http://cdn.example/a.png",
+    ] {
+        let req = MediaRequest::new(bad.parse().unwrap(), MediaKind::Avatar, Fit::square(40));
+        let err = media.load(req).await.unwrap_err();
+        assert!(matches!(err, MediaError::InvalidUrl(_)), "{bad}: {err:?}");
+    }
+    for elsewhere in [
+        "https://evil.example/a.png",
+        "https://10.0.0.1/a.png",
+        "https://cdn.example.evil.net/a.png",
+        "https://192.168.1.1/admin",
+    ] {
+        let req = MediaRequest::new(
+            elsewhere.parse().unwrap(),
+            MediaKind::Avatar,
+            Fit::square(40),
+        );
+        let err = media.load(req).await.unwrap_err();
+        assert!(
+            matches!(err, MediaError::HostNotAllowed(_)),
+            "{elsewhere}: {err:?}"
+        );
+    }
+    assert_eq!(fetcher.calls(), 0);
+
+    // With an empty list nothing is allowed.
+    let strict = client(&fetcher, MediaConfig::default());
+    assert!(matches!(
+        strict.load(avatar("a.png", 40)).await.unwrap_err(),
+        MediaError::HostNotAllowed(_)
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wildcard_hosts_match_subdomains_only() {
+    let fetcher = MockFetcher::new();
+    let media = client(
+        &fetcher,
+        MediaConfig {
+            allowed_hosts: vec!["*.cdn.example".into()],
+            ..MediaConfig::default()
+        },
+    );
+    let req = |u: &str| MediaRequest::new(u.parse().unwrap(), MediaKind::Avatar, Fit::square(40));
+    assert!(matches!(
+        media
+            .load(req("https://cdn.example/a.png"))
+            .await
+            .unwrap_err(),
+        MediaError::HostNotAllowed(_)
+    ));
+    // Allowed by the list, then a 404 from the mock: proves the fetcher was called.
+    assert_eq!(
+        media
+            .load(req("https://eu.cdn.example/a.png"))
+            .await
+            .unwrap_err(),
+        MediaError::Fetch(FetchError::Status(404))
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_body_that_never_ends_is_cut_at_the_limit_and_the_stream_is_dropped() {
+    let fetcher = MockFetcher::new();
+    fetcher.serve_endless("loop.png");
+    let media = client(&fetcher, config());
+    let err = media.load(avatar("loop.png", 40)).await.unwrap_err();
+    assert!(
+        matches!(err, MediaError::TooLargeEncoded { max, .. } if max == 2 * 1024 * 1024),
+        "{err:?}"
+    );
+    let sent = fetcher.sent.load(Ordering::SeqCst);
+    assert!(
+        sent <= 2 * 1024 * 1024 + 8192,
+        "{sent} bytes were read for a 2 MiB limit"
+    );
+    assert!(
+        fetcher.stream_dropped.load(Ordering::SeqCst),
+        "the download must be cancelled"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_announced_length_over_the_limit_is_refused_without_reading() {
+    let fetcher = MockFetcher::new();
+    fetcher.serve("big.bin", vec![0u8; 3 * 1024 * 1024]);
+    let media = client(&fetcher, config());
+    let err = media.load(avatar("big.bin", 40)).await.unwrap_err();
+    assert!(matches!(err, MediaError::TooLargeEncoded { .. }), "{err:?}");
+    assert_eq!(fetcher.sent.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -221,7 +508,7 @@ async fn the_encoded_limit_depends_on_the_kind() {
     png_chunk(&mut big, b"tEXt", &vec![b'a'; 700 * 1024]);
     png_chunk(&mut big, b"IEND", &[]);
     fetcher.serve("big.png", big);
-    let media = client(&fetcher, MediaConfig::default());
+    let media = client(&fetcher, config());
 
     let emoji = MediaRequest::new(url("big.png"), MediaKind::Emoji, Fit::square(48));
     let err = media.load(emoji).await.unwrap_err();
@@ -232,55 +519,158 @@ async fn the_encoded_limit_depends_on_the_kind() {
     assert!(media.load(avatar("big.png", 40)).await.is_ok());
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_fetcher_that_ignores_the_limit_is_caught() {
-    struct Liar;
-    impl inlet_media::Fetcher for Liar {
-        fn fetch<'a>(
-            &'a self,
-            _: &'a url::Url,
-            _: usize,
-        ) -> futures_util::future::BoxFuture<'a, Result<bytes::Bytes, FetchError>> {
-            Box::pin(async { Ok(bytes::Bytes::from(vec![0u8; 3 * 1024 * 1024])) })
+// ---- decode scheduling ------------------------------------------------------------------
+
+/// Blocks inside `make` of the first image until it is released. `make` runs
+/// while the decode permits are held, so this parks a decode.
+struct Gate {
+    made: AtomicUsize,
+    open: Mutex<bool>,
+    cv: Condvar,
+}
+
+impl Gate {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            made: AtomicUsize::new(0),
+            open: Mutex::new(false),
+            cv: Condvar::new(),
+        })
+    }
+
+    fn release(&self) {
+        *self.open.lock().unwrap() = true;
+        self.cv.notify_all();
+    }
+}
+
+#[derive(Clone)]
+struct GateSink(Arc<Gate>);
+
+impl ImageSink for GateSink {
+    type Handle = Arc<DecodedImage>;
+    fn make(&self, image: DecodedImage) -> (Self::Handle, u64) {
+        let gate = &self.0;
+        if gate.made.fetch_add(1, Ordering::SeqCst) == 0 {
+            let mut open = gate.open.lock().unwrap();
+            while !*open {
+                open = gate.cv.wait(open).unwrap();
+            }
         }
+        let bytes = image.byte_size();
+        (Arc::new(image), bytes)
     }
-    let media = MediaClient::new(
+}
+
+fn gated_client(
+    fetcher: &Arc<MockFetcher>,
+    gate: &Arc<Gate>,
+    config: MediaConfig,
+) -> MediaClient<GateSink> {
+    MediaClient::new(
         tokio::runtime::Handle::current(),
-        Arc::new(Liar),
-        MediaConfig::default(),
-    );
-    let err = media.load(avatar("a.png", 40)).await.unwrap_err();
-    assert!(matches!(err, MediaError::TooLargeEncoded { .. }), "{err:?}");
+        fetcher.clone(),
+        GateSink(gate.clone()),
+        config,
+    )
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_slow_fetch_times_out() {
-    let fetcher = MockFetcher::gated(); // never opened
-    let config = MediaConfig {
-        fetch_timeout: Duration::from_millis(100),
-        ..MediaConfig::default()
-    };
-    let media = client(&fetcher, config);
-    let err = media.load(avatar("a.png", 40)).await.unwrap_err();
-    assert_eq!(err, MediaError::FetchTimeout);
-    assert!(!err.is_permanent());
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn only_plain_http_urls_are_accepted() {
+async fn avatars_and_emoji_still_decode_while_big_attachments_hold_every_general_slot() {
     let fetcher = MockFetcher::new();
-    let media = client(&fetcher, MediaConfig::default());
-    for bad in [
-        "file:///etc/passwd",
-        "ftp://cdn.example/a.png",
-        "data:image/png;base64,AAAA",
-        "https://user:pass@cdn.example/a.png",
-    ] {
-        let req = MediaRequest::new(bad.parse().unwrap(), MediaKind::Avatar, Fit::square(40));
-        let err = media.load(req).await.unwrap_err();
-        assert!(matches!(err, MediaError::InvalidUrl(_)), "{bad}: {err:?}");
+    for name in ["a1", "a2", "x"] {
+        fetcher.serve(&format!("{name}.png"), png(&solid(300, 300, RED)));
     }
-    assert_eq!(fetcher.calls(), 0);
+    fetcher.serve("emoji.png", png(&solid(64, 64, RED)));
+    let gate = Gate::new();
+    let media = gated_client(
+        &fetcher,
+        &gate,
+        MediaConfig {
+            decode_concurrency: 1,
+            ..config()
+        },
+    );
+
+    // The first attachment parks inside the only general slot.
+    let first = tokio::spawn({
+        let media = media.clone();
+        async move { media.load(attachment("a1.png")).await }
+    });
+    wait_until("the first decode to park", || {
+        gate.made.load(Ordering::SeqCst) == 1
+    })
+    .await;
+
+    // A second attachment has to wait for it.
+    let second = tokio::spawn({
+        let media = media.clone();
+        async move { media.load(attachment("a2.png")).await }
+    });
+    // An avatar and an emoji use the reserved slot and finish.
+    let small = tokio::time::timeout(Duration::from_secs(10), async {
+        let a = media.load(avatar("x.png", 40)).await;
+        let e = media
+            .load(MediaRequest::new(
+                url("emoji.png"),
+                MediaKind::Emoji,
+                Fit::square(32),
+            ))
+            .await;
+        (a, e)
+    })
+    .await
+    .expect("small images were starved");
+    assert!(small.0.is_ok() && small.1.is_ok());
+    assert!(!second.is_finished(), "the second attachment must wait");
+
+    gate.release();
+    assert!(first.await.unwrap().is_ok());
+    assert!(second.await.unwrap().is_ok());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn decodes_wait_for_the_memory_budget_not_only_for_a_slot() {
+    let fetcher = MockFetcher::new();
+    for name in ["a", "b"] {
+        fetcher.serve(&format!("{name}.png"), png(&solid(2000, 2000, RED)));
+    }
+    let gate = Gate::new();
+    // Plenty of slots, but a budget for one big decode at a time (a 2000x2000
+    // image is estimated at 48 MiB and more; the general lane has 48 MiB).
+    let media = gated_client(
+        &fetcher,
+        &gate,
+        MediaConfig {
+            decode_concurrency: 4,
+            decode_memory_bytes: 64 * 1024 * 1024,
+            ..config()
+        },
+    );
+    let first = tokio::spawn({
+        let media = media.clone();
+        async move { media.load(attachment("a.png")).await }
+    });
+    wait_until("the first decode to park", || {
+        gate.made.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    let second = tokio::spawn({
+        let media = media.clone();
+        async move { media.load(attachment("b.png")).await }
+    });
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(
+        gate.made.load(Ordering::SeqCst),
+        1,
+        "the second decode started although the memory budget was used up"
+    );
+    assert_eq!(media.stats().decodes, 1);
+
+    gate.release();
+    assert!(first.await.unwrap().is_ok());
+    assert!(second.await.unwrap().is_ok());
+    assert_eq!(media.stats().decodes, 2);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -290,13 +680,15 @@ async fn decoding_is_capped_at_the_configured_concurrency() {
     for i in 0..6 {
         fetcher.serve(&format!("{i}.png"), png(&split(300, 300)));
     }
-    let config = MediaConfig {
-        decode_concurrency: 1,
-        ..MediaConfig::default()
-    };
-    let media = client(&fetcher, config);
+    let media = client(
+        &fetcher,
+        MediaConfig {
+            decode_concurrency: 1,
+            ..config()
+        },
+    );
     let loads: Vec<_> = (0..6)
-        .map(|i| media.load(avatar(&format!("{i}.png"), 40)))
+        .map(|i| media.load(attachment(&format!("{i}.png"))))
         .collect();
     for result in futures_util::future::join_all(loads).await {
         assert!(result.is_ok());
@@ -311,7 +703,7 @@ async fn animated_images_load_with_all_frames() {
         "a.gif",
         gif(&[(solid(64, 64, RED), 50), (solid(64, 64, GREEN), 50)]),
     );
-    let media = client(&fetcher, MediaConfig::default());
+    let media = client(&fetcher, config());
     let image = media.load(avatar("a.gif", 32)).await.unwrap();
     assert!(image.is_animated());
     assert_eq!(image.frames.len(), 2);
@@ -326,7 +718,7 @@ fn with_disk(dir: &std::path::Path, max_bytes: u64) -> MediaConfig {
             dir: dir.to_owned(),
             max_bytes,
         }),
-        ..MediaConfig::default()
+        ..config()
     }
 }
 
@@ -398,18 +790,47 @@ async fn the_disk_cache_stays_within_its_cap() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_tampered_disk_file_is_treated_like_any_download() {
+async fn a_damaged_disk_file_is_deleted_and_fetched_again_once() {
     let dir = tempfile::tempdir().unwrap();
     let fetcher = MockFetcher::new();
-    fetcher.serve("a.png", png(&split(50, 50)));
+    let good = png(&split(50, 50));
+    fetcher.serve("a.png", good.clone());
     let first = client(&fetcher, with_disk(dir.path(), 1 << 20));
     first.load(avatar("a.png", 40)).await.unwrap();
     let file = dir.path().join(&files(dir.path())[0]);
-    std::fs::write(&file, gif_claiming(65535, 65535)).unwrap();
 
-    let second = client(&fetcher, with_disk(dir.path(), 1 << 20));
-    let err = second.load(avatar("a.png", 40)).await.unwrap_err();
-    assert!(matches!(err, MediaError::BadDimensions { .. }), "{err:?}");
+    // An empty file (power cut before the data reached the disk) and a bomb.
+    for damage in [Vec::new(), gif_claiming(65535, 65535), b"garbage".to_vec()] {
+        std::fs::write(&file, damage).unwrap();
+        let before = fetcher.calls();
+        let second = client(&fetcher, with_disk(dir.path(), 1 << 20));
+        let image = second.load(avatar("a.png", 40)).await.unwrap();
+        assert_eq!(image.width, 40);
+        assert_eq!(fetcher.calls(), before + 1, "one fetch repairs it");
+        assert_eq!(
+            std::fs::read(&file).unwrap(),
+            good,
+            "the file was rewritten"
+        );
+    }
 }
 
-use image::RgbaImage;
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_kind_with_a_lower_limit_does_not_delete_a_file_that_is_too_big_for_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let fetcher = MockFetcher::new();
+    let mut big = png(&solid(8, 8, RED));
+    big.truncate(big.len() - 12);
+    png_chunk(&mut big, b"tEXt", &vec![b'a'; 700 * 1024]);
+    png_chunk(&mut big, b"IEND", &[]);
+    fetcher.serve("big.png", big.clone());
+
+    let media = client(&fetcher, with_disk(dir.path(), 4 << 20));
+    assert!(media.load(attachment("big.png")).await.is_ok());
+    let file = dir.path().join(&files(dir.path())[0]);
+
+    let emoji = MediaRequest::new(url("big.png"), MediaKind::Emoji, Fit::square(32));
+    let err = media.load(emoji).await.unwrap_err();
+    assert!(matches!(err, MediaError::TooLargeEncoded { .. }), "{err:?}");
+    assert_eq!(std::fs::read(&file).unwrap(), big, "the file must stay");
+}

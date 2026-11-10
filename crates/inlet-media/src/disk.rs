@@ -7,7 +7,10 @@
 //!   written to a temporary name and renamed, so a crash leaves no half file.
 //! - Total size is capped. The least recently used files go first.
 //! - Entries are re-checked and re-decoded with all limits on every read, so a
-//!   file that was changed on disk is no more dangerous than a download.
+//!   file that was changed on disk is no more dangerous than a download. The
+//!   client deletes an entry that does not decode and fetches it again.
+//! - The order for eviction is kept in memory. After a restart it is the order of
+//!   the file times, which are the times of writing.
 //! - Only files with our own naming scheme are ever read, counted or deleted.
 
 use std::collections::HashMap;
@@ -146,32 +149,32 @@ impl DiskCache {
         self.dir.join(file_name(key))
     }
 
-    /// Reads an entry, at most `max_len` bytes. Bigger or unreadable files are deleted.
+    /// Reads an entry, at most `max_len` bytes. An entry that is larger than the
+    /// caller accepts is left alone (another kind of image may accept it). A file
+    /// that is gone or not a plain file is forgotten. The lock is not held while
+    /// the file is read.
     pub fn get(&self, key: &str, max_len: usize) -> Option<Vec<u8>> {
         if !is_key(key) {
             return None;
         }
-        let mut state = self.lock();
-        let size = state.entries.get(key)?.size;
+        let size = self.lock().entries.get(key)?.size;
+        if size > max_len as u64 {
+            return None;
+        }
         let path = self.path(key);
-        let result = (|| -> io::Result<Option<Vec<u8>>> {
-            if !fs::symlink_metadata(&path)?.is_file() || size > max_len as u64 {
+        let read = (|| -> io::Result<Option<Vec<u8>>> {
+            if !fs::symlink_metadata(&path)?.is_file() {
                 return Ok(None);
             }
-            let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
             let mut data = Vec::with_capacity(size as usize);
-            (&mut file)
+            File::open(&path)?
                 .take(max_len as u64 + 1)
                 .read_to_end(&mut data)?;
-            if data.len() > max_len {
-                return Ok(None);
-            }
-            // Mark as recently used. Failing to do so only costs cache quality.
-            let _ = file.set_modified(SystemTime::now());
-            Ok(Some(data))
+            Ok((data.len() <= max_len).then_some(data))
         })();
-        match result {
+        match read {
             Ok(Some(data)) => {
+                let mut state = self.lock();
                 let tick = state.next_tick();
                 if let Some(meta) = state.entries.get_mut(key) {
                     meta.tick = tick;
@@ -179,21 +182,31 @@ impl DiskCache {
                 Some(data)
             }
             _ => {
-                if let Some(meta) = state.entries.remove(key) {
-                    state.used -= meta.size;
-                }
-                let _ = fs::remove_file(&path);
+                self.remove(key);
                 None
             }
         }
     }
 
-    /// Stores an entry and evicts old ones. Data larger than the whole cap is skipped.
+    /// Forgets an entry and deletes its file.
+    pub fn remove(&self, key: &str) {
+        if !is_key(key) {
+            return;
+        }
+        let mut state = self.lock();
+        if let Some(meta) = state.entries.remove(key) {
+            state.used -= meta.size;
+        }
+        let _ = fs::remove_file(self.path(key));
+    }
+
+    /// Stores an entry and evicts old ones. Data larger than the whole cap is
+    /// skipped. The file is written and synced under a temporary name without the
+    /// lock, then renamed into place.
     pub fn put(&self, key: &str, data: &[u8]) -> io::Result<()> {
         if !is_key(key) || data.len() as u64 > self.cap {
             return Ok(());
         }
-        let mut state = self.lock();
         let tmp = self.dir.join(format!(
             "{key}.{}.{}.tmp",
             std::process::id(),
@@ -202,9 +215,10 @@ impl DiskCache {
         let write = (|| -> io::Result<()> {
             let mut file = create_private_file(&tmp)?;
             file.write_all(data)?;
-            file.flush()?;
+            file.sync_all()?;
             Ok(())
         })();
+        let mut state = self.lock();
         if let Err(err) = write.and_then(|()| fs::rename(&tmp, self.path(key))) {
             let _ = fs::remove_file(&tmp);
             return Err(err);
@@ -260,11 +274,18 @@ impl DiskCache {
 fn create_private_dir(dir: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::DirBuilderExt;
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
         fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
-            .create(dir)
+            .create(dir)?;
+        // A directory that was there before may be more open. Close it if it is ours.
+        if let Ok(meta) = fs::metadata(dir) {
+            if meta.permissions().mode() & 0o077 != 0 {
+                let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+            }
+        }
+        Ok(())
     }
     #[cfg(not(unix))]
     {
@@ -313,9 +334,15 @@ mod tests {
         cache.put(&key, b"hello").unwrap();
         assert_eq!(cache.get(&key, 100).unwrap(), b"hello");
         assert_eq!(cache.used(), 5);
-        // A file larger than the caller accepts is refused and removed.
+        // A caller with a lower limit gets nothing, and the file stays for the others.
         assert!(cache.get(&key, 2).is_none());
+        assert_eq!(cache.len(), 1);
+        assert!(dir.path().join(file_name(&key)).exists());
+        assert_eq!(cache.get(&key, 100).unwrap(), b"hello");
+        // Removing deletes the file.
+        cache.remove(&key);
         assert_eq!(cache.len(), 0);
+        assert_eq!(cache.used(), 0);
         assert!(!dir.path().join(file_name(&key)).exists());
     }
 

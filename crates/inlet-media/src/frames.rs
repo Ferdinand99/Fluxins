@@ -6,11 +6,14 @@ use std::time::{Duration, Instant};
 /// carry a delay of zero and are meant to play at about 10 frames per second.
 pub const DEFAULT_FRAME_DELAY: Duration = Duration::from_millis(100);
 
-/// One frame: tightly packed RGBA8, straight (not premultiplied) alpha.
+/// One frame: tightly packed B, G, R, A bytes with straight (not premultiplied) alpha.
+///
+/// BGRA is the order gpui's `RenderImage` holds, so the pixels are decoded into
+/// that order once and never converted again.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageFrame {
-    /// `width * height * 4` bytes, in R, G, B, A order.
-    pub rgba: Vec<u8>,
+    /// `width * height * 4` bytes, in B, G, R, A order.
+    pub bgra: Vec<u8>,
     /// How long this frame stays on screen. Always above 10 ms.
     pub delay: Duration,
 }
@@ -32,9 +35,9 @@ impl DecodedImage {
         self.frames.len() > 1
     }
 
-    /// Memory the pixel data takes. This is what the cache counts.
+    /// Memory the pixel data takes.
     pub fn byte_size(&self) -> u64 {
-        self.frames.iter().map(|f| f.rgba.len() as u64).sum()
+        self.frames.iter().map(|f| f.bgra.len() as u64).sum()
     }
 
     /// The delay of every frame.
@@ -42,24 +45,21 @@ impl DecodedImage {
         self.frames.iter().map(|f| f.delay).collect()
     }
 
-    /// Frames in the form gpui wants, for `RenderImage::new(image.to_bgra_frames())`.
+    /// Moves the pixels into the frames gpui wants, without copying them. Use it in
+    /// [`ImageSink::make`](crate::ImageSink::make):
+    /// `RenderImage::new(image.into_gpui_frames())`.
     ///
-    /// gpui's `RenderImage` holds `image::Frame` values whose buffer is in **B, G,
-    /// R, A** order with straight alpha (the order its own GIF and WebP decoders
-    /// produce), so the red and blue bytes are swapped here. gpui plays the frames
-    /// by itself and holds them back while the window is inactive or the system
-    /// asks for reduced motion. Use [`Playback`] when you drive the frames yourself.
-    ///
-    /// This copies the pixels. Build the `RenderImage` once and keep it.
-    pub fn to_bgra_frames(&self) -> Vec<image::Frame> {
+    /// At the pinned Zed revision, `RenderImage` holds `image::Frame` values whose
+    /// buffer is in B, G, R, A order with straight alpha, which is what this crate
+    /// decodes to. gpui plays the frames by itself and holds them back while the
+    /// window is inactive or the system asks for reduced motion. Use [`Playback`]
+    /// when you drive the frames yourself.
+    pub fn into_gpui_frames(self) -> Vec<image::Frame> {
+        let (width, height) = (self.width, self.height);
         self.frames
-            .iter()
+            .into_iter()
             .map(|frame| {
-                let mut bgra = frame.rgba.clone();
-                for px in bgra.as_chunks_mut::<4>().0 {
-                    px.swap(0, 2);
-                }
-                let buffer = image::RgbaImage::from_raw(self.width, self.height, bgra)
+                let buffer = image::RgbaImage::from_raw(width, height, frame.bgra)
                     .expect("frame length matches the image size");
                 image::Frame::from_parts(
                     buffer,

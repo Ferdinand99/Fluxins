@@ -32,6 +32,9 @@ pub enum MediaError {
     /// The URL is not a plain `http` or `https` URL without credentials.
     #[error("invalid image URL: {0}")]
     InvalidUrl(String),
+    /// The host is not in `MediaConfig::allowed_hosts`.
+    #[error("host {0} is not allowed")]
+    HostNotAllowed(String),
     /// The fetch failed.
     #[error("fetch failed: {0}")]
     Fetch(FetchError),
@@ -78,23 +81,36 @@ pub enum MediaError {
     /// Nobody wants the image any more.
     #[error("request cancelled")]
     Cancelled,
+    /// The task that loads the image died, for example because the app's
+    /// [`Fetcher`](crate::Fetcher) or [`ImageSink`](crate::ImageSink) panicked.
+    #[error("the loading task failed")]
+    TaskFailed,
 }
 
 impl MediaError {
-    /// True when asking again cannot succeed, so the answer may be remembered.
+    /// True when asking again cannot succeed: the URL or the data is the problem.
+    /// Everything else (network, timeouts, load, a 429 or 5xx answer) may work later.
+    /// Both kinds are remembered with a growing back-off, see [`MediaConfig`](crate::MediaConfig).
     pub fn is_permanent(&self) -> bool {
-        matches!(
-            self,
+        match self {
             Self::InvalidUrl(_)
-                | Self::TooLargeEncoded { .. }
-                | Self::Unsupported
-                | Self::BadDimensions { .. }
-                | Self::TooManyFrames { .. }
-                | Self::AnimationTooLarge
-                | Self::Corrupt(_)
-                | Self::DecodeTimeout
-                | Self::DecoderPanic
-        )
+            | Self::HostNotAllowed(_)
+            | Self::TooLargeEncoded { .. }
+            | Self::Unsupported
+            | Self::BadDimensions { .. }
+            | Self::TooManyFrames { .. }
+            | Self::AnimationTooLarge
+            | Self::Corrupt(_)
+            | Self::DecoderPanic => true,
+            Self::Fetch(FetchError::Status(code)) => {
+                (400..500).contains(code) && !matches!(code, 408 | 429)
+            }
+            Self::Fetch(_)
+            | Self::FetchTimeout
+            | Self::DecodeTimeout
+            | Self::Cancelled
+            | Self::TaskFailed => false,
+        }
     }
 }
 

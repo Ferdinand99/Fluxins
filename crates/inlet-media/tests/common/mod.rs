@@ -9,7 +9,9 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures_util::future::BoxFuture;
 use image::{Delay, Frame, ImageFormat, Rgba, RgbaImage};
-use inlet_media::{DecodeControl, FetchError, Fetcher, Fit, KindLimits, MediaKind};
+use inlet_media::{
+    DecodeControl, FetchError, FetchResponse, Fetcher, Fit, KindLimits, MediaConfig, MediaKind,
+};
 use tokio::sync::watch;
 use url::Url;
 
@@ -188,6 +190,50 @@ pub fn gif_claiming(width: u16, height: u16) -> Vec<u8> {
     bytes
 }
 
+/// A GIF with this canvas and these frames (left, top, width, height). The pixel
+/// data is a stub, so it only gets past the structural scan.
+pub fn raw_gif(canvas: (u16, u16), frames: &[(u16, u16, u16, u16)]) -> Vec<u8> {
+    let mut out = b"GIF89a".to_vec();
+    out.extend_from_slice(&canvas.0.to_le_bytes());
+    out.extend_from_slice(&canvas.1.to_le_bytes());
+    out.extend_from_slice(&[0, 0, 0]);
+    for &(left, top, w, h) in frames {
+        out.push(0x2C);
+        for v in [left, top, w, h] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out.push(0);
+        out.extend_from_slice(&[0x02, 0x02, 0x4C, 0x01, 0x00]);
+    }
+    out.push(0x3B);
+    out
+}
+
+/// A WebP whose EXIF chunk claims `claimed` bytes and carries four.
+pub fn webp_claiming_exif(claimed: u32) -> Vec<u8> {
+    let mut body = b"WEBP".to_vec();
+    let mut vp8x = vec![0x08u8, 0, 0, 0];
+    vp8x.extend_from_slice(&9u32.to_le_bytes()[..3]);
+    vp8x.extend_from_slice(&9u32.to_le_bytes()[..3]);
+    body.extend_from_slice(b"VP8X");
+    body.extend_from_slice(&10u32.to_le_bytes());
+    body.extend_from_slice(&vp8x);
+    body.extend_from_slice(b"EXIF");
+    body.extend_from_slice(&claimed.to_le_bytes());
+    body.extend_from_slice(&[0, 0, 0, 0]);
+    let mut out = b"RIFF".to_vec();
+    out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    out.extend_from_slice(&body);
+    out
+}
+
+/// The RGBA value of a pixel. Decoded images are BGRA.
+pub fn rgba_at(img: &inlet_media::DecodedImage, frame: usize, x: u32, y: u32) -> [u8; 4] {
+    let i = ((y * img.width + x) * 4) as usize;
+    let p = &img.frames[frame].bgra[i..i + 4];
+    [p[2], p[1], p[0], p[3]]
+}
+
 pub fn control() -> DecodeControl {
     DecodeControl::with_budget(Duration::from_secs(30))
 }
@@ -207,36 +253,48 @@ pub fn url(path: &str) -> Url {
     Url::parse(&format!("https://cdn.example/{path}")).unwrap()
 }
 
-/// Serves fixed bodies. Counts calls. Can wait at a gate. Notices when a call is dropped.
+/// A config that allows the host of `url()`.
+pub fn config() -> MediaConfig {
+    MediaConfig {
+        allowed_hosts: vec!["cdn.example".into()],
+        ..MediaConfig::default()
+    }
+}
+
+/// Serves fixed bodies as streams. Counts calls and bytes sent. Can wait at a
+/// gate. Notices when a call or a stream is dropped before it finished.
 pub struct MockFetcher {
     pub bodies: std::sync::Mutex<std::collections::HashMap<String, Bytes>>,
+    pub endless: std::sync::Mutex<std::collections::HashSet<String>>,
+    pub statuses: std::sync::Mutex<std::collections::HashMap<String, u16>>,
     pub calls: AtomicUsize,
+    pub sent: Arc<AtomicUsize>,
     pub dropped: Arc<AtomicBool>,
+    pub stream_dropped: Arc<AtomicBool>,
     pub gate: watch::Sender<bool>,
-    pub delay: Duration,
 }
 
 impl MockFetcher {
     pub fn new() -> Arc<Self> {
-        let (gate, _) = watch::channel(true);
-        Arc::new(Self {
-            bodies: Default::default(),
-            calls: AtomicUsize::new(0),
-            dropped: Arc::new(AtomicBool::new(false)),
-            gate,
-            delay: Duration::ZERO,
-        })
+        Self::with_gate(true)
     }
 
     /// Like `new`, but every call waits until `open_gate` is called.
     pub fn gated() -> Arc<Self> {
-        let (gate, _) = watch::channel(false);
+        Self::with_gate(false)
+    }
+
+    fn with_gate(open: bool) -> Arc<Self> {
+        let (gate, _) = watch::channel(open);
         Arc::new(Self {
             bodies: Default::default(),
+            endless: Default::default(),
+            statuses: Default::default(),
             calls: AtomicUsize::new(0),
+            sent: Arc::new(AtomicUsize::new(0)),
             dropped: Arc::new(AtomicBool::new(false)),
+            stream_dropped: Arc::new(AtomicBool::new(false)),
             gate,
-            delay: Duration::ZERO,
         })
     }
 
@@ -245,6 +303,19 @@ impl MockFetcher {
             .lock()
             .unwrap()
             .insert(url(path).to_string(), Bytes::from(body));
+    }
+
+    /// A body that never ends and has no announced length.
+    pub fn serve_endless(&self, path: &str) {
+        self.endless.lock().unwrap().insert(url(path).to_string());
+    }
+
+    /// Answers with this HTTP status instead of a body.
+    pub fn serve_status(&self, path: &str, status: u16) {
+        self.statuses
+            .lock()
+            .unwrap()
+            .insert(url(path).to_string(), status);
     }
 
     pub fn open_gate(&self) {
@@ -258,6 +329,13 @@ impl MockFetcher {
 
 struct DropFlag(Arc<AtomicBool>, bool);
 
+impl DropFlag {
+    /// Marks that the owner finished normally, so dropping it is not a cancel.
+    fn finish(&mut self) {
+        self.1 = true;
+    }
+}
+
 impl Drop for DropFlag {
     fn drop(&mut self) {
         if !self.1 {
@@ -266,29 +344,54 @@ impl Drop for DropFlag {
     }
 }
 
+const CHUNK: usize = 4096;
+
 impl Fetcher for MockFetcher {
-    fn fetch<'a>(
-        &'a self,
-        url: &'a Url,
-        max_bytes: usize,
-    ) -> BoxFuture<'a, Result<Bytes, FetchError>> {
+    fn fetch<'a>(&'a self, url: &'a Url) -> BoxFuture<'a, Result<FetchResponse, FetchError>> {
         Box::pin(async move {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let mut flag = DropFlag(self.dropped.clone(), false);
             let mut rx = self.gate.subscribe();
             let _ = rx.wait_for(|open| *open).await;
-            if !self.delay.is_zero() {
-                tokio::time::sleep(self.delay).await;
+            flag.finish(); // finished normally, not dropped
+            if let Some(status) = self.statuses.lock().unwrap().get(url.as_str()) {
+                return Err(FetchError::Status(*status));
             }
-            flag.1 = true; // finished normally, not dropped
+            let sent = self.sent.clone();
+            let stream_flag = DropFlag(self.stream_dropped.clone(), false);
+            if self.endless.lock().unwrap().contains(url.as_str()) {
+                let body =
+                    futures_util::stream::unfold((sent, stream_flag), |(sent, flag)| async move {
+                        sent.fetch_add(CHUNK, Ordering::SeqCst);
+                        Some((Ok(Bytes::from(vec![0u8; CHUNK])), (sent, flag)))
+                    });
+                return Ok(FetchResponse::new(None, Box::pin(body)));
+            }
             let body = self.bodies.lock().unwrap().get(url.as_str()).cloned();
-            match body {
-                None => Err(FetchError::Status(404)),
-                Some(body) if body.len() > max_bytes => {
-                    Err(FetchError::TooLarge { max: max_bytes })
-                }
-                Some(body) => Ok(body),
-            }
+            let Some(body) = body else {
+                return Err(FetchError::Status(404));
+            };
+            let length = body.len() as u64;
+            let chunks: Vec<Bytes> = (0..body.len())
+                .step_by(CHUNK)
+                .map(|at| body.slice(at..(at + CHUNK).min(body.len())))
+                .collect();
+            let stream = futures_util::stream::unfold(
+                (chunks.into_iter(), sent, stream_flag),
+                |(mut chunks, sent, mut flag)| async move {
+                    match chunks.next() {
+                        Some(chunk) => {
+                            sent.fetch_add(chunk.len(), Ordering::SeqCst);
+                            Some((Ok(chunk), (chunks, sent, flag)))
+                        }
+                        None => {
+                            flag.finish(); // read to the end
+                            None
+                        }
+                    }
+                },
+            );
+            Ok(FetchResponse::new(Some(length), Box::pin(stream)))
         })
     }
 }

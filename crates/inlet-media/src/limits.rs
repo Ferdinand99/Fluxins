@@ -1,5 +1,7 @@
 //! Hard limits for untrusted images, and the sizes the UI can ask for.
 
+use std::time::Duration;
+
 /// What an image is used for. Decides the limits that apply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MediaKind {
@@ -29,42 +31,89 @@ pub struct KindLimits {
     /// Most source pixels an animation may cost to decode, summed over all frames.
     /// This bounds the work, because every frame is composed at full size first.
     pub max_animation_work_pixels: u64,
+    /// Longest time one decode may take. It is checked between steps and between
+    /// animation frames; a single still image cannot be interrupted, so the size
+    /// limits above are what bound it.
+    pub decode_budget: Duration,
 }
 
 impl KindLimits {
-    /// The defaults for a kind: emoji 512 KiB, avatars 2 MiB, attachments 20 MiB.
+    /// The defaults for a kind.
+    ///
+    /// | Kind | Encoded | Side | Pixels | Time |
+    /// |---|---|---|---|---|
+    /// | Emoji | 512 KiB | 1024 | 1 Mpx | 2 s |
+    /// | Avatar | 2 MiB | 2048 | 4.2 Mpx | 3 s |
+    /// | Attachment | 20 MiB | 8192 | 24 Mpx | 5 s |
     pub fn for_kind(kind: MediaKind) -> Self {
         const MIB: usize = 1024 * 1024;
         match kind {
             MediaKind::Emoji => Self {
                 max_encoded_bytes: MIB / 2,
+                max_width: 1024,
+                max_height: 1024,
+                max_pixels: 1024 * 1024,
+                max_frames: 512,
+                max_animation_bytes: 64 * MIB as u64,
+                max_animation_work_pixels: 64_000_000,
+                decode_budget: Duration::from_secs(2),
+            },
+            MediaKind::Avatar => Self {
+                max_encoded_bytes: 2 * MIB,
                 max_width: 2048,
                 max_height: 2048,
                 max_pixels: 2048 * 2048,
                 max_frames: 512,
                 max_animation_bytes: 64 * MIB as u64,
                 max_animation_work_pixels: 128_000_000,
-            },
-            MediaKind::Avatar => Self {
-                max_encoded_bytes: 2 * MIB,
-                max_width: 4096,
-                max_height: 4096,
-                max_pixels: 4096 * 4096,
-                max_frames: 512,
-                max_animation_bytes: 64 * MIB as u64,
-                max_animation_work_pixels: 256_000_000,
+                decode_budget: Duration::from_secs(3),
             },
             MediaKind::Attachment => Self {
                 max_encoded_bytes: 20 * MIB,
                 max_width: 8192,
                 max_height: 8192,
-                max_pixels: 40_000_000,
+                max_pixels: 24_000_000,
                 max_frames: 512,
                 max_animation_bytes: 64 * MIB as u64,
-                max_animation_work_pixels: 512_000_000,
+                max_animation_work_pixels: 256_000_000,
+                decode_budget: Duration::from_secs(5),
             },
         }
     }
+
+    /// The limits for an image that the app asked the media proxy to scale to
+    /// `proxy_size` pixels on its longest side.
+    ///
+    /// The proxy never enlarges, but it snaps the size to a ladder and clamps it
+    /// per asset class (an icon is never smaller than 128, a banner never smaller
+    /// than 480), so the answer can be larger than asked. The side limit becomes
+    /// four times the request, but at least 512, and never more than the kind
+    /// allows. A "scaled" image that is far larger is not from the proxy.
+    pub fn for_proxy_size(&self, proxy_size: u32) -> Self {
+        let side = proxy_size.saturating_mul(4).max(512);
+        let mut tight = self.clone();
+        tight.max_width = tight.max_width.min(side);
+        tight.max_height = tight.max_height.min(side);
+        tight.max_pixels = tight.max_pixels.min(u64::from(side) * u64::from(side));
+        tight
+    }
+}
+
+/// The sizes the media proxy snaps `size` to. A value between two rungs gets the
+/// next larger one.
+pub const PROXY_SIZE_LADDER: [u32; 33] = [
+    16, 20, 22, 24, 28, 32, 40, 44, 48, 56, 60, 64, 80, 96, 100, 128, 160, 240, 256, 300, 320, 480,
+    512, 600, 640, 1024, 1280, 1536, 2048, 3072, 4096, 8192, 16384,
+];
+
+/// The smallest proxy ladder size that is at least `pixels`. Use it for the `size`
+/// query parameter, so the cache key of the URL matches what the proxy serves.
+pub fn snap_proxy_size(pixels: u32) -> u32 {
+    PROXY_SIZE_LADDER
+        .iter()
+        .copied()
+        .find(|&rung| rung >= pixels)
+        .unwrap_or(16384)
 }
 
 /// Limits for every kind.
@@ -118,6 +167,17 @@ pub enum Fit {
 }
 
 impl Fit {
+    /// The longest side of the output, at most.
+    pub fn longest_side(self) -> u32 {
+        match self.sanitized() {
+            Self::Contain {
+                max_width,
+                max_height,
+            } => max_width.max(max_height),
+            Self::CoverSquare { size } => size,
+        }
+    }
+
     /// Largest side the UI may ask for. Larger requests are clamped.
     pub const MAX_SIDE: u32 = 4096;
 
