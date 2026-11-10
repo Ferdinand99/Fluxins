@@ -1,0 +1,77 @@
+[package]
+name = "inlet-platform"
+description = "Desktop integration for Inlet: tray icon, notifications, badges, autostart, single instance, deep links and idle time"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[features]
+# Glue for a gpui application: notifications, notification clicks, deep links from the
+# OS and window flashing go through gpui's own platform layer. gpui_platform is only
+# used by the tray_demo example; a dev-dependency would build gpui for every test run.
+gpui = ["dep:gpui", "dep:gpui_platform", "dep:raw-window-handle"]
+
+[dependencies]
+async-channel = "2"
+log = "0.4"
+png = "0.18"
+unicode-segmentation = "1"
+
+gpui = { workspace = true, optional = true }
+gpui_platform = { workspace = true, optional = true }
+raw-window-handle = { version = "0.6", optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Windows and macOS get their tray icon from tray-icon. Its default feature pulls in
+# GTK for Linux, which Inlet does not use: Linux has its own StatusNotifierItem.
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+tray-icon = { version = "0.26", default-features = false }
+
+[target.'cfg(windows)'.dependencies]
+windows-registry = "0.6"
+windows = { version = "0.62", features = [
+    "Data_Xml_Dom",
+    "Foundation",
+    "UI_Notifications",
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_System_WinRT",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "NSApplication",
+    "NSDockTile",
+    "NSResponder",
+] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSString"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+x11rb = { version = "0.13", features = ["screensaver"] }
+zbus = { version = "5", default-features = false, features = ["async-io", "blocking-api"] }
+
+[dev-dependencies]
+serde = "1"
+tempfile = "3"
+
+[[example]]
+name = "tray_demo"
+required-features = ["gpui"]
