@@ -6,6 +6,7 @@
 //! Parsing happens on the backend thread ([`parse`] returns plain data that is `Send`);
 //! the UI thread only draws.
 
+use std::cell::RefCell;
 use std::ops::Range;
 use std::rc::Rc;
 
@@ -16,7 +17,16 @@ use gpui::{
     SharedString, StrikethroughStyle, StyledText, UnderlineStyle, Window,
 };
 
+use crate::model::Names;
 use crate::theme;
+
+/// Prefix of the internal link a channel mention carries; clicking it opens the channel.
+pub const CHANNEL_LINK: &str = "inlet-channel:";
+
+thread_local! {
+    /// Names for the parse running on this thread (set by [`parse_with`]).
+    static NAMES: RefCell<Names> = RefCell::new(Names::default());
+}
 
 /// One block of a rendered message.
 #[derive(Clone, Debug)]
@@ -59,6 +69,8 @@ pub enum Style {
     Mention,
     /// The target host shown after a masked link.
     LinkTarget,
+    /// "(edited)" after the text.
+    Edited,
 }
 
 /// A URL that may be opened from a message: it parses and is http or https.
@@ -103,6 +115,33 @@ pub fn is_deceptive(url: &str) -> bool {
 }
 
 pub fn parse(input: &str) -> Vec<Block> {
+    parse_with(input, &Names::default())
+}
+
+/// Parses `input`, resolving channel, user and role mentions with `names`.
+pub fn parse_with(input: &str, names: &Names) -> Vec<Block> {
+    NAMES.with(|n| *n.borrow_mut() = names.clone());
+    let out = parse_inner(input);
+    NAMES.with(|n| *n.borrow_mut() = Names::default());
+    out
+}
+
+/// Appends a muted "(edited)" to the last text block, or as its own block.
+pub fn mark_edited(blocks: &mut Vec<Block>) {
+    if let Some(Block::Text(inline)) = blocks.last_mut() {
+        push_marked(inline, " (edited)", Style::Edited);
+    } else {
+        let mut inline = Inline::default();
+        push_marked(&mut inline, "(edited)", Style::Edited);
+        blocks.push(Block::Text(inline));
+    }
+}
+
+fn lookup(f: impl Fn(&Names) -> Option<String>) -> Option<String> {
+    NAMES.with(|n| f(&n.borrow()))
+}
+
+fn parse_inner(input: &str) -> Vec<Block> {
     let flags = ParserFlags::ALL;
     let mut parser = MarkdownParser::new(flags, EmojiContext::default());
     match parser.parse(input) {
@@ -276,10 +315,31 @@ fn push_inline(node: &Node, inline: &mut Inline) {
             }
         }
         Node::Mention { kind } => {
+            if let MentionKind::Channel { id } = kind {
+                let name = lookup(|n| n.channels.get(id).cloned());
+                let label = match &name {
+                    Some(name) => format!("#{name}"),
+                    None => "#unknown-channel".to_string(),
+                };
+                let start = inline.text.len();
+                push_marked(inline, &label, Style::Mention);
+                if name.is_some() {
+                    inline.links.push(Link {
+                        range: start..inline.text.len(),
+                        url: format!("{CHANNEL_LINK}{id}"),
+                        masked: false,
+                    });
+                }
+                return;
+            }
             let label = match kind {
-                MentionKind::User { id } => format!("@{id}"),
-                MentionKind::Channel { id } => format!("#{id}"),
-                MentionKind::Role { id } => format!("@role-{id}"),
+                MentionKind::User { id } => {
+                    format!("@{}", lookup(|n| n.users.get(id).cloned()).unwrap_or_else(|| "unknown-user".into()))
+                }
+                MentionKind::Channel { .. } => unreachable!("handled above"),
+                MentionKind::Role { id } => {
+                    format!("@{}", lookup(|n| n.roles.get(id).cloned()).unwrap_or_else(|| "unknown-role".into()))
+                }
                 MentionKind::Command { name, .. } => format!("/{name}"),
                 MentionKind::GuildNavigation { .. } => "#navigation".into(),
                 MentionKind::Everyone => "@everyone".into(),
@@ -394,6 +454,10 @@ fn highlight(style: Style, revealed: bool) -> HighlightStyle {
                 thickness: px(1.),
                 ..Default::default()
             }),
+            ..Default::default()
+        },
+        Style::Edited => HighlightStyle {
+            color: Some(theme::text_muted()),
             ..Default::default()
         },
         Style::LinkTarget => HighlightStyle {
@@ -651,6 +715,35 @@ mod tests {
         let inline = first_inline(&blocks);
         assert!(inline.links[0].masked);
         assert!(inline.text.contains("(evil.example)"));
+    }
+
+    #[test]
+    fn mentions_resolve_to_names() {
+        let mut names = Names::default();
+        names.channels.insert("1559859109744869376".into(), "general".into());
+        names.users.insert("42".into(), "ada".into());
+        names.roles.insert("7".into(), "Mods".into());
+        let blocks = parse_with("see <#1559859109744869376> <@42> <@!42> <@&7> <#999> <@1>", &names);
+        let inline = first_inline(&blocks);
+        assert_eq!(inline.text, "see #general @ada @ada @Mods #unknown-channel @unknown-user");
+        assert_eq!(inline.links.len(), 1);
+        assert_eq!(inline.links[0].url, format!("{CHANNEL_LINK}1559859109744869376"));
+        // Names do not leak into the next parse.
+        let plain = parse("<#1559859109744869376>");
+        assert_eq!(first_inline(&plain).text, "#unknown-channel");
+    }
+
+    #[test]
+    fn custom_emoji_show_their_name() {
+        let blocks = parse("hi <:wave:123456789012345678>");
+        assert_eq!(first_inline(&blocks).text, "hi :wave:");
+    }
+
+    #[test]
+    fn edited_mark_goes_after_the_text() {
+        let mut blocks = parse("hello");
+        mark_edited(&mut blocks);
+        assert_eq!(first_inline(&blocks).text, "hello (edited)");
     }
 
     #[test]

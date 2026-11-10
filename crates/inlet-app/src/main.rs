@@ -108,6 +108,13 @@ struct Inlet {
     notice: Option<String>,
     /// The gateway stopped and is not retried automatically.
     gateway_down: Option<String>,
+    /// Categories the person folded away in the channel list.
+    collapsed: std::collections::HashSet<String>,
+    /// A channel mention was clicked; opened on the next render (needs the window).
+    pending_channel_jump: Option<String>,
+    /// Demo screenshots: the channel to open once the guild's channels arrive.
+    #[cfg(feature = "demo")]
+    demo_channel: Option<String>,
 
     _subscriptions: Vec<Subscription>,
 }
@@ -195,6 +202,10 @@ impl Inlet {
             error: None,
             notice: None,
             gateway_down: None,
+            collapsed: std::collections::HashSet::new(),
+            pending_channel_jump: None,
+            #[cfg(feature = "demo")]
+            demo_channel: None,
             _subscriptions: subscriptions,
         }
     }
@@ -379,6 +390,12 @@ impl Inlet {
                 self.instance = instance;
                 self.screen = Screen::Main;
                 self.select_guild(None, cx);
+                // Demo screenshots (CI): open a guild and channel straight away.
+                #[cfg(feature = "demo")]
+                if let Ok(guild) = std::env::var("INLET_DEMO_GUILD") {
+                    self.select_guild(Some(guild), cx);
+                    self.demo_channel = std::env::var("INLET_DEMO_CHANNEL").ok();
+                }
             }
             Event::SessionEnded(message) => {
                 self.reset_main();
@@ -404,6 +421,12 @@ impl Inlet {
                     if self.selected_channel.is_some() && !open_still_exists {
                         self.notice = Some("The channel you had open was deleted.".into());
                         self.selected_channel = None;
+                    }
+                    #[cfg(feature = "demo")]
+                    if let Some(wanted) = self.demo_channel.take() {
+                        if self.channels.iter().any(|c| c.id == wanted) {
+                            self.select_channel(wanted, window, cx);
+                        }
                     }
                     if self.selected_channel.is_none() {
                         match self.channels.iter().find(|c| c.is_messageable()).cloned() {
@@ -499,7 +522,9 @@ impl Inlet {
     fn regroup(&mut self) {
         for i in 0..self.messages.len() {
             self.messages[i].grouped = i > 0
-                && model::should_group(&self.messages[i - 1].message, &self.messages[i].message);
+                && model::should_group(&self.messages[i - 1].message, &self.messages[i].message)
+                && self.messages[i].message.reply.is_none()
+                && self.messages[i - 1].message.day() == self.messages[i].message.day();
         }
     }
 
@@ -600,6 +625,11 @@ impl Inlet {
     }
 
     fn open_link(&mut self, url: &str, masked: bool, cx: &mut Context<Self>) {
+        if let Some(channel_id) = url.strip_prefix(markdown::CHANNEL_LINK) {
+            self.pending_channel_jump = Some(channel_id.to_string());
+            cx.notify();
+            return;
+        }
         if markdown::openable(url).is_none() {
             self.error = Some("Inlet only opens http and https links.".into());
         } else if masked {
@@ -1014,16 +1044,35 @@ impl Inlet {
                     .flex()
                     .flex_col()
                     .gap(px(2.))
-                    .children(self.channels.iter().map(|c| {
+                    .children(self.channels.iter().filter(|c| {
+                        // Folded categories hide their channels, except the open one.
+                        c.kind == ChannelKind::Category
+                            || c.parent_id.as_ref().is_none_or(|p| !self.collapsed.contains(p))
+                            || selected.as_deref() == Some(c.id.as_str())
+                    }).map(|c| {
                         if c.kind == ChannelKind::Category {
+                            let folded = self.collapsed.contains(&c.id);
+                            let cat = c.id.clone();
                             return div()
                                 .id(SharedString::from(format!("ch-{}", c.id)))
                                 .pt_4()
-                                .px_2()
+                                .px_1()
+                                .flex()
+                                .flex_row()
+                                .gap_1()
+                                .cursor_pointer()
                                 .text_size(px(12.))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(theme::text_muted())
-                                .child(c.name.to_uppercase());
+                                .hover(|s| s.text_color(theme::text()))
+                                .child(if folded { "\u{25B8}" } else { "\u{25BE}" })
+                                .child(c.name.to_uppercase())
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if !this.collapsed.remove(&cat) {
+                                        this.collapsed.insert(cat.clone());
+                                    }
+                                    cx.notify();
+                                }));
                         }
                         let active = selected.as_deref() == Some(c.id.as_str());
                         let messageable = c.is_messageable();
@@ -1031,11 +1080,14 @@ impl Inlet {
                         div()
                             .id(SharedString::from(format!("ch-{}", c.id)))
                             .px_2()
-                            .py_1()
+                            .py(px(5.))
                             .rounded_md()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
                             .whitespace_nowrap()
                             .overflow_hidden()
-                            .text_ellipsis()
                             .text_color(if active {
                                 theme::text_strong()
                             } else {
@@ -1049,7 +1101,8 @@ impl Inlet {
                                         this.select_channel(id.clone(), window, cx)
                                     }))
                             })
-                            .child(channel_label(c))
+                            .child(div().flex_none().w(px(18.)).text_color(theme::text_muted()).child(channel_icon(c.kind)))
+                            .child(div().flex_1().min_w_0().overflow_hidden().text_ellipsis().child(c.name.clone()))
                     })),
             )
             .child(
@@ -1149,13 +1202,11 @@ impl Inlet {
                     })),
             );
         }
-        if m.edited {
-            body = body.child(
-                div()
-                    .text_size(px(11.))
-                    .text_color(theme::text_muted())
-                    .child("(edited)"),
-            );
+        for (i, e) in m.embeds.iter().enumerate() {
+            body = body.child(render_embed(&format!("m{}-e{i}", m.id), e, &ctx, cx));
+        }
+        if m.is_empty() {
+            body = body.child(div().text_size(px(14.)).text_color(theme::text_muted()).child("(no text)"));
         }
         for (i, a) in m.attachments.iter().enumerate() {
             let url = a.url.clone();
@@ -1184,6 +1235,18 @@ impl Inlet {
                         .text_color(theme::text_strong())
                         .child(m.author.clone()),
                 )
+                .when(m.author_bot, |d| {
+                    d.child(
+                        div()
+                            .px_1()
+                            .rounded_sm()
+                            .bg(theme::accent())
+                            .text_size(px(10.))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(theme::text_strong())
+                            .child("BOT"),
+                    )
+                })
                 .when(m.author_username != m.author, |d| {
                     d.child(
                         div()
@@ -1194,20 +1257,72 @@ impl Inlet {
                 })
                 .child(
                     div()
-                        .text_size(px(11.))
+                        .text_size(px(12.))
                         .text_color(theme::text_muted())
                         .child(m.timestamp.clone()),
                 )
         });
+        let reply = m.reply.as_ref().map(|r| {
+            div()
+                .flex()
+                .flex_row()
+                .gap_1()
+                .text_size(px(13.))
+                .text_color(theme::text_muted())
+                .whitespace_nowrap()
+                .overflow_hidden()
+                .child("\u{21B1}")
+                .child(div().font_weight(FontWeight::SEMIBOLD).child(r.author.clone()))
+                .child(r.snippet.clone())
+        });
+        let new_day = match m.day() {
+            Some(day) => ix == 0 || self.messages.get(ix - 1).and_then(|p| p.message.day()) != Some(day),
+            None => false,
+        };
+        let separator = m.day().filter(|_| new_day).map(|day| {
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .px_4()
+                .pt_4()
+                .child(div().flex_1().h(px(1.)).bg(theme::quote_bar()))
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme::text_muted())
+                        .child(model::day_label(day)),
+                )
+                .child(div().flex_1().h(px(1.)).bg(theme::quote_bar()))
+        });
         div()
-            .px_4()
-            .when(!shown.grouped, |d| d.pt_3())
-            .pb(px(2.))
             .flex()
             .flex_col()
-            .text_color(theme::text())
-            .children(header)
-            .child(body)
+            .children(separator)
+            .child(
+                div()
+                    .px_4()
+                    .when(!shown.grouped, |d| d.pt_3())
+                    .pb(px(2.))
+                    .flex()
+                    .flex_row()
+                    .gap_3()
+                    .text_color(theme::text())
+                    // Room for the avatar column (avatars come in the next milestone).
+                    .child(div().w(px(AVATAR_COLUMN)).flex_none())
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .children(reply)
+                            .children(header)
+                            .child(body),
+                    ),
+            )
             .into_any_element()
     }
 
@@ -1218,6 +1333,11 @@ impl Inlet {
             .and_then(|id| self.channels.iter().find(|c| &c.id == id))
             .map(channel_label)
             .unwrap_or_default();
+        let topic = self
+            .selected_channel
+            .as_ref()
+            .and_then(|id| self.channels.iter().find(|c| &c.id == id))
+            .and_then(|c| c.topic.clone());
         let has_channel = self.selected_channel.is_some();
         let bar = |id: &'static str, text: String, bg| {
             div()
@@ -1248,12 +1368,35 @@ impl Inlet {
                     .border_color(theme::header_border())
                     .child(
                         div()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme::text_strong())
-                            .child(title),
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_row()
+                            .items_baseline()
+                            .gap_3()
+                            .whitespace_nowrap()
+                            .overflow_hidden()
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme::text_strong())
+                                    .child(title),
+                            )
+                            .children(topic.map(|t| {
+                                div()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .text_size(px(14.))
+                                    .text_color(theme::text_muted())
+                                    .child(t)
+                            })),
                     )
                     .child(
                         div()
+                            .flex_none()
+                            .pl_3()
                             .text_size(px(12.))
                             .text_color(theme::text_muted())
                             .child(self.status.clone()),
@@ -1410,13 +1553,81 @@ fn wrap_url(url: &str, width: usize, max_lines: usize) -> Vec<String> {
 struct CurrentBackend(BackendHandle);
 impl gpui::Global for CurrentBackend {}
 
-fn channel_label(c: &Channel) -> String {
-    match c.kind {
-        ChannelKind::Text => format!("# {}", c.name),
-        ChannelKind::Voice => format!("(voice) {}", c.name),
-        ChannelKind::Dm | ChannelKind::GroupDm => format!("@ {}", c.name),
-        _ => c.name.clone(),
+/// Width kept free left of every message for avatars (next milestone).
+const AVATAR_COLUMN: f32 = 40.;
+
+fn channel_icon(kind: ChannelKind) -> &'static str {
+    match kind {
+        ChannelKind::Text => "#",
+        ChannelKind::Voice => "\u{1F50A}",
+        ChannelKind::Dm | ChannelKind::GroupDm => "@",
+        _ => "\u{2022}",
     }
+}
+
+fn channel_label(c: &Channel) -> String {
+    format!("{} {}", channel_icon(c.kind), c.name)
+}
+
+/// Draws an embed: colour bar, author, title, description, fields, footer, media links.
+fn render_embed(id: &str, e: &model::Embed, ctx: &RenderCtx, cx: &mut Context<Inlet>) -> AnyElement {
+    let bar = e.color.map(|c| gpui::rgb(c).into()).unwrap_or(theme::quote_bar());
+    let mut content = div().flex().flex_col().gap_1().p_3().flex_1().min_w_0();
+    if let Some(author) = &e.author {
+        content = content.child(div().text_size(px(13.)).font_weight(FontWeight::SEMIBOLD).child(author.clone()));
+    }
+    if let Some(title) = &e.title {
+        let link = e.url.clone().filter(|u| markdown::openable(u).is_some());
+        let mut t = div()
+            .id(SharedString::from(format!("{id}-title")))
+            .font_weight(FontWeight::BOLD)
+            .text_color(if link.is_some() { theme::link() } else { theme::text_strong() })
+            .child(title.clone());
+        if let Some(url) = link {
+            t = t.cursor_pointer().on_click(cx.listener(move |this, _, _, cx| this.open_link(&url, true, cx)));
+        }
+        content = content.child(t);
+    }
+    if !e.description.is_empty() {
+        content = content.child(div().text_size(px(14.)).child(markdown::render(&format!("{id}-d"), &e.description, ctx)));
+    }
+    for (i, f) in e.fields.iter().enumerate() {
+        content = content.child(
+            div()
+                .pt_1()
+                .flex()
+                .flex_col()
+                .text_size(px(14.))
+                .child(div().font_weight(FontWeight::SEMIBOLD).text_color(theme::text_strong()).child(f.name.clone()))
+                .child(markdown::render(&format!("{id}-f{i}"), &f.value, ctx)),
+        );
+    }
+    for (i, a) in e.media.iter().enumerate() {
+        let url = a.url.clone();
+        content = content.child(
+            div()
+                .id(SharedString::from(format!("{id}-media{i}")))
+                .text_size(px(13.))
+                .text_color(theme::link())
+                .cursor_pointer()
+                .child(format!("{}: {}", a.filename, markdown::link_target_label(&a.url)))
+                .on_click(cx.listener(move |this, _, _, cx| this.open_link(&url, false, cx))),
+        );
+    }
+    if let Some(footer) = &e.footer {
+        content = content.child(div().pt_1().text_size(px(12.)).text_color(theme::text_muted()).child(footer.clone()));
+    }
+    div()
+        .mt_1()
+        .max_w(px(560.))
+        .flex()
+        .flex_row()
+        .rounded_md()
+        .overflow_hidden()
+        .bg(theme::code_bg())
+        .child(div().w(px(4.)).flex_none().bg(bar))
+        .child(content)
+        .into_any_element()
 }
 
 fn field(label: &'static str, input: Entity<TextInput>) -> impl IntoElement {
@@ -1460,7 +1671,14 @@ impl Focusable for Inlet {
 }
 
 impl Render for Inlet {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(channel_id) = self.pending_channel_jump.take() {
+            if self.channels.iter().any(|c| c.id == channel_id && c.is_messageable()) {
+                self.select_channel(channel_id, window, cx);
+            } else {
+                self.notice = Some("That channel is not in the list on screen.".into());
+            }
+        }
         let root = div()
             .relative()
             .size_full()
@@ -1468,7 +1686,7 @@ impl Render for Inlet {
             .on_action(|_: &FocusNext, window, cx| window.focus_next(cx))
             .on_action(|_: &FocusPrev, window, cx| window.focus_prev(cx))
             .text_color(theme::text())
-            .text_size(px(15.))
+            .text_size(px(16.))
             .font_family(ui_font());
         if self.show_about {
             return root
@@ -1537,7 +1755,14 @@ fn main() {
         .init();
     gpui_platform::application().run(|cx: &mut App| {
         text_input::bind_keys(cx);
-        let bounds = Bounds::centered(None, size(px(1200.), px(780.)), cx);
+        // Fit small screens (CI runners have 1024x768): at most 90 % of the display.
+        let (mut w, mut h) = (1200.0_f32, 780.0_f32);
+        if let Some(display) = cx.primary_display() {
+            let d = display.bounds().size;
+            w = w.min(d.width.as_f32() * 0.9);
+            h = h.min(d.height.as_f32() * 0.9);
+        }
+        let bounds = Bounds::centered(None, size(px(w), px(h)), cx);
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),

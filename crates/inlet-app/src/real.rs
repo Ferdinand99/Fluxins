@@ -13,7 +13,7 @@ use inlet_protocol as p;
 use inlet_protocol::models::channel_type;
 
 use crate::backend::{Event, Ui};
-use crate::model::{self, Attachment, Channel, ChannelKind, Guild, Message};
+use crate::model::{self, Attachment, Channel, ChannelKind, Embed, EmbedField, Guild, Message, Names, Reply};
 use crate::token_store;
 
 /// How long the start-up checks may take before Inlet treats the instance as unreachable.
@@ -22,6 +22,33 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(12);
 /// Channel lists per guild (`None` = direct messages), shared by REST tasks and the
 /// gateway forwarder.
 pub type ChannelCache = Arc<Mutex<HashMap<Option<String>, Vec<Channel>>>>;
+
+/// Channel, user and role names seen so far, for resolving mentions. Shared by the
+/// gateway forwarder and REST tasks of one session.
+pub type SharedNames = Arc<Mutex<Names>>;
+
+pub fn remember_channels(names: &SharedNames, list: &[Channel]) {
+    let mut n = names.lock().unwrap();
+    for c in list {
+        if c.kind != ChannelKind::Dm && c.kind != ChannelKind::GroupDm {
+            n.channels.insert(c.id.clone(), c.name.clone());
+        }
+    }
+}
+
+fn remember_user(n: &mut Names, u: &p::User) {
+    n.users.insert(u.id.clone(), model::clean_name(u.display_name()));
+}
+
+/// Roles from a READY or GUILD_CREATE guild (raw JSON objects with `id` and `name`).
+pub fn remember_roles(names: &SharedNames, roles: &[serde_json::Value]) {
+    let mut n = names.lock().unwrap();
+    for r in roles {
+        if let (Some(id), Some(name)) = (r.get("id").and_then(|v| v.as_str()), r.get("name").and_then(|v| v.as_str())) {
+            n.roles.insert(id.to_string(), model::clean_name(name));
+        }
+    }
+}
 
 /// A failure and what it means for the session.
 #[derive(Debug, Clone)]
@@ -269,19 +296,30 @@ pub fn to_channel(c: &p::Channel) -> Channel {
         kind: channel_kind(c.kind),
         parent_id: c.parent_id.clone(),
         position: c.position.unwrap_or(0),
+        topic: c.topic.as_deref().filter(|t| !t.trim().is_empty()).map(|t| model::snippet(t, 160)),
     }
 }
 
 /// Converts and parses a message. Runs on the backend thread, so markdown parsing never
 /// blocks the UI.
-pub fn to_message(m: &p::Message) -> Message {
+pub fn to_message(m: &p::Message, names: &SharedNames) -> Message {
     let (timestamp_ms, timestamp) = model::timestamp(&m.timestamp);
+    let reply = m.extra.get("referenced_message").and_then(to_reply);
+    let snapshot = {
+        let mut n = names.lock().unwrap();
+        remember_user(&mut n, &m.author);
+        for u in &m.mentions {
+            remember_user(&mut n, u);
+        }
+        n.clone()
+    };
     let mut out = Message {
         id: m.id.clone(),
         channel_id: m.channel_id.clone(),
         author_id: m.author.id.clone(),
         author: model::clean_name(m.author.display_name()),
         author_username: model::clean_name(&m.author.username),
+        author_bot: m.author.bot,
         timestamp_ms,
         timestamp,
         content: m.content.clone(),
@@ -299,10 +337,87 @@ pub fn to_message(m: &p::Message) -> Message {
                     .unwrap_or_default(),
             })
             .collect(),
+        embeds: m.embeds.iter().filter_map(|e| to_embed(e, &snapshot)).take(10).collect(),
+        reply,
         edited: m.edited_timestamp.is_some(),
     };
-    out.parse();
+    out.parse_with(&snapshot);
     out
+}
+
+fn to_reply(v: &serde_json::Value) -> Option<Reply> {
+    let author = v.get("author")?;
+    let name = author
+        .get("global_name")
+        .and_then(|n| n.as_str())
+        .filter(|n| !n.is_empty())
+        .or_else(|| author.get("username").and_then(|n| n.as_str()))?;
+    let content = v.get("content").and_then(|c| c.as_str()).unwrap_or("");
+    let snippet = if content.trim().is_empty() {
+        "(attachment or embed)".to_string()
+    } else {
+        model::snippet(content, 90)
+    };
+    Some(Reply { author: model::clean_name(name), snippet })
+}
+
+fn str_at<'a>(v: &'a serde_json::Value, path: &[&str]) -> Option<&'a str> {
+    let mut cur = v;
+    for key in path {
+        cur = cur.get(key)?;
+    }
+    cur.as_str().filter(|s| !s.trim().is_empty())
+}
+
+/// Longest embed text kept before parsing (Fluxer allows 4 096 for a description).
+const MAX_EMBED_TEXT: usize = 4_096;
+
+fn capped(s: &str) -> &str {
+    match s.char_indices().nth(MAX_EMBED_TEXT) {
+        Some((ix, _)) => &s[..ix],
+        None => s,
+    }
+}
+
+/// Converts an embed object. Images, thumbnails and videos become links.
+pub fn to_embed(v: &serde_json::Value, names: &Names) -> Option<Embed> {
+    if !v.is_object() {
+        return None;
+    }
+    let mut embed = Embed {
+        color: v.get("color").and_then(|c| c.as_u64()).map(|c| (c & 0xFF_FF_FF) as u32),
+        author: str_at(v, &["author", "name"]).map(model::clean_name),
+        title: str_at(v, &["title"]).map(|t| model::snippet(t, 256)),
+        url: str_at(v, &["url"]).map(str::to_string),
+        description: str_at(v, &["description"])
+            .map(|d| crate::markdown::parse_with(capped(d), names))
+            .unwrap_or_default(),
+        fields: Vec::new(),
+        footer: str_at(v, &["footer", "text"]).map(|t| model::snippet(t, 256)),
+        media: Vec::new(),
+    };
+    if let Some(fields) = v.get("fields").and_then(|f| f.as_array()) {
+        for f in fields.iter().take(25) {
+            let name = str_at(f, &["name"]).map(|n| model::snippet(n, 256)).unwrap_or_default();
+            let value = str_at(f, &["value"])
+                .map(|t| crate::markdown::parse_with(capped(t), names))
+                .unwrap_or_default();
+            let inline = f.get("inline").and_then(|i| i.as_bool()).unwrap_or(false);
+            embed.fields.push(EmbedField { name, value, inline });
+        }
+    }
+    for (key, label) in [("image", "Image"), ("thumbnail", "Thumbnail"), ("video", "Video")] {
+        if let Some(url) = str_at(v, &[key, "url"]) {
+            embed.media.push(Attachment { filename: label.into(), url: url.to_string() });
+        }
+    }
+    let empty = embed.title.is_none()
+        && embed.author.is_none()
+        && embed.description.is_empty()
+        && embed.fields.is_empty()
+        && embed.footer.is_none()
+        && embed.media.is_empty();
+    (!empty).then_some(embed)
 }
 
 /// Snowflakes compare as numbers; a shorter string is older.
@@ -366,6 +481,7 @@ pub async fn forward_gateway(
     events: Ui,
     guilds: Arc<Mutex<Vec<Guild>>>,
     cache: ChannelCache,
+    names: SharedNames,
     connected: impl Fn(),
 ) -> GatewayEnd {
     let send = |e: Event| {
@@ -417,11 +533,11 @@ pub async fn forward_gateway(
                     // (READY does not carry it), and show the result.
                     let mut map: HashMap<Option<String>, Vec<Channel>> = HashMap::new();
                     for g in &ready.guilds {
+                        remember_roles(&names, &g.roles);
                         if !g.unavailable && !g.channels.is_empty() {
-                            map.insert(
-                                Some(g.id.clone()),
-                                g.channels.iter().map(to_channel).collect(),
-                            );
+                            let list: Vec<Channel> = g.channels.iter().map(to_channel).collect();
+                            remember_channels(&names, &list);
+                            map.insert(Some(g.id.clone()), list);
                         }
                     }
                     let keys: Vec<Option<String>> = {
@@ -441,13 +557,18 @@ pub async fn forward_gateway(
                     }
                     ready_seen = true;
                 }
-                p::Dispatch::MessageCreate(m) => send(Event::MessageCreated(to_message(&m))),
-                p::Dispatch::MessageUpdate(m) => send(Event::MessageUpdated(to_message(&m))),
+                p::Dispatch::MessageCreate(m) => {
+                    send(Event::MessageCreated(to_message(&m, &names)))
+                }
+                p::Dispatch::MessageUpdate(m) => {
+                    send(Event::MessageUpdated(to_message(&m, &names)))
+                }
                 p::Dispatch::MessageDelete(d) => send(Event::MessageDeleted {
                     channel_id: d.channel_id,
                     message_id: d.id,
                 }),
                 p::Dispatch::ChannelCreate(c) | p::Dispatch::ChannelUpdate(c) => {
+                    remember_channels(&names, &[to_channel(&c)]);
                     if upsert_channel(&cache, &c) {
                         channels_event(c.guild_id.clone());
                     }
@@ -464,11 +585,11 @@ pub async fn forward_gateway(
                     }
                 }
                 p::Dispatch::GuildCreate(g) | p::Dispatch::GuildSync(g) => {
+                    remember_roles(&names, &g.roles);
                     if !g.unavailable && !g.channels.is_empty() {
-                        cache.lock().unwrap().insert(
-                            Some(g.id.clone()),
-                            g.channels.iter().map(to_channel).collect(),
-                        );
+                        let list: Vec<Channel> = g.channels.iter().map(to_channel).collect();
+                        remember_channels(&names, &list);
+                        cache.lock().unwrap().insert(Some(g.id.clone()), list);
                         channels_event(Some(g.id.clone()));
                     }
                     let mut list = guilds.lock().unwrap();
@@ -503,5 +624,44 @@ impl Credential {
             self,
             Credential::Pasted(_) | Credential::Stored { pasted: true, .. }
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embeds_become_cards() {
+        let v = serde_json::json!({
+            "title": "Welcome to IWGamin's Pack!",
+            "description": "React in <#100> to unlock the server.",
+            "color": 0xF1C40F,
+            "author": {"name": "Sylo"},
+            "fields": [{"name": "Rules", "value": "**Be kind**", "inline": false}],
+            "footer": {"text": "Sylo"},
+            "image": {"url": "https://example.com/banner.png"}
+        });
+        let mut names = Names::default();
+        names.channels.insert("100".into(), "verify".into());
+        let e = to_embed(&v, &names).expect("embed");
+        assert_eq!(e.title.as_deref(), Some("Welcome to IWGamin's Pack!"));
+        assert_eq!(e.color, Some(0xF1C40F));
+        assert_eq!(e.fields.len(), 1);
+        assert_eq!(e.media.len(), 1);
+        match &e.description[0] {
+            crate::markdown::Block::Text(i) => assert!(i.text.contains("#verify")),
+            other => panic!("{other:?}"),
+        }
+        assert!(to_embed(&serde_json::json!({}), &names).is_none());
+        assert!(to_embed(&serde_json::json!("x"), &names).is_none());
+    }
+
+    #[test]
+    fn reply_preview() {
+        let v = serde_json::json!({"author": {"username": "ferdinand", "global_name": "Ferdinand99"}, "content": "Hi! I can't see the #events channel anymore"});
+        let r = to_reply(&v).unwrap();
+        assert_eq!(r.author, "Ferdinand99");
+        assert!(r.snippet.starts_with("Hi! I can't see"));
     }
 }
