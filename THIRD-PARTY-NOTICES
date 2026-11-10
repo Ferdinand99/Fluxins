@@ -5,7 +5,7 @@ Inlet is licensed under the GNU Affero General Public License, version 3 or late
 (see LICENSE). It is built from the software listed below. Each licence text is
 reproduced, followed by the crates that use that text.
 
-- Apache License 2.0: 406 crate(s)
+- Apache License 2.0: 408 crate(s)
 - MIT License: 134 crate(s)
 - ISC License: 24 crate(s)
 - Unicode License v3: 23 crate(s)
@@ -6948,6 +6948,7 @@ Used by:
   - png 0.18.1 (https://github.com/image-rs/image-png)
   - polling 3.11.0 (https://github.com/smol-rs/polling)
   - pollster 0.4.0 (https://github.com/zesterer/pollster)
+  - psl-types 2.0.11 (https://github.com/addr-rs/psl-types)
   - rayon-core 1.13.0 (https://github.com/rayon-rs/rayon)
   - rayon 1.12.0 (https://github.com/rayon-rs/rayon)
   - regex-automata 0.4.18 (https://github.com/rust-lang/regex)
@@ -10627,6 +10628,7 @@ Used by:
   - proc-macro2 1.0.107 (https://github.com/dtolnay/proc-macro2)
   - profiling-procmacros 1.0.18 (https://github.com/aclysma/profiling)
   - profiling 1.0.18 (https://github.com/aclysma/profiling)
+  - psl 2.1.250 (https://github.com/addr-rs/psl)
   - quote 1.0.47 (https://github.com/dtolnay/quote)
   - rand 0.8.8 (https://github.com/rust-random/rand)
   - rand 0.9.5 (https://github.com/rust-random/rand)

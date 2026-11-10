@@ -28,7 +28,11 @@ impl Guild {
             .filter_map(|w| w.chars().next())
             .take(3)
             .collect();
-        if s.is_empty() { "?".into() } else { s }
+        if s.is_empty() {
+            "?".into()
+        } else {
+            s
+        }
     }
 }
 
@@ -53,7 +57,10 @@ pub struct Channel {
 
 impl Channel {
     pub fn is_messageable(&self) -> bool {
-        matches!(self.kind, ChannelKind::Text | ChannelKind::Dm | ChannelKind::GroupDm)
+        matches!(
+            self.kind,
+            ChannelKind::Text | ChannelKind::Dm | ChannelKind::GroupDm
+        )
     }
 }
 
@@ -130,7 +137,11 @@ pub fn clean_name(name: &str) -> String {
         .take(MAX_NAME_CHARS)
         .collect();
     let trimmed = cleaned.trim();
-    if trimmed.is_empty() { "(no name)".into() } else { trimmed.to_string() }
+    if trimmed.is_empty() {
+        "(no name)".into()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 fn is_hidden_or_control(c: char) -> bool {
@@ -151,12 +162,18 @@ pub fn sidebar_order(channels: &[Channel]) -> Vec<Channel> {
     let mut by_pos = channels.to_vec();
     by_pos.sort_by_key(|c| (c.position, c.id.clone()));
     let mut out = Vec::with_capacity(by_pos.len());
-    for c in by_pos.iter().filter(|c| c.parent_id.is_none() && c.kind != ChannelKind::Category) {
+    for c in by_pos
+        .iter()
+        .filter(|c| c.parent_id.is_none() && c.kind != ChannelKind::Category)
+    {
         out.push(c.clone());
     }
     for cat in by_pos.iter().filter(|c| c.kind == ChannelKind::Category) {
         out.push(cat.clone());
-        for c in by_pos.iter().filter(|c| c.parent_id.as_deref() == Some(cat.id.as_str())) {
+        for c in by_pos
+            .iter()
+            .filter(|c| c.parent_id.as_deref() == Some(cat.id.as_str()))
+        {
             out.push(c.clone());
         }
     }
@@ -174,7 +191,9 @@ pub fn timestamp(rfc3339: &str) -> (i64, String) {
     match chrono::DateTime::parse_from_rfc3339(rfc3339) {
         Ok(t) => (
             t.timestamp_millis(),
-            t.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string(),
+            t.with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M")
+                .to_string(),
         ),
         Err(_) => (0, clean_name(rfc3339)),
     }
@@ -185,7 +204,13 @@ mod tests {
     use super::*;
 
     fn ch(id: &str, kind: ChannelKind, parent: Option<&str>, pos: i64) -> Channel {
-        Channel { id: id.into(), name: id.into(), kind, parent_id: parent.map(Into::into), position: pos }
+        Channel {
+            id: id.into(),
+            name: id.into(),
+            kind,
+            parent_id: parent.map(Into::into),
+            position: pos,
+        }
     }
 
     pub(crate) fn msg(id: &str, author_id: &str, author: &str, t: i64) -> Message {
@@ -219,8 +244,22 @@ mod tests {
 
     #[test]
     fn initials() {
-        assert_eq!(Guild { id: "1".into(), name: "Inlet Dev Hub".into() }.initials(), "IDH");
-        assert_eq!(Guild { id: "1".into(), name: "".into() }.initials(), "?");
+        assert_eq!(
+            Guild {
+                id: "1".into(),
+                name: "Inlet Dev Hub".into()
+            }
+            .initials(),
+            "IDH"
+        );
+        assert_eq!(
+            Guild {
+                id: "1".into(),
+                name: "".into()
+            }
+            .initials(),
+            "?"
+        );
     }
 
     #[test]
@@ -236,8 +275,14 @@ mod tests {
     fn groups_only_within_the_time_window() {
         let a = msg("1", "100", "ada", 0);
         assert!(should_group(&a, &msg("2", "100", "ada", GROUP_WINDOW_MS)));
-        assert!(!should_group(&a, &msg("2", "100", "ada", GROUP_WINDOW_MS + 1)));
-        assert!(!should_group(&msg("2", "100", "ada", 10_000), &msg("1", "100", "ada", 0)));
+        assert!(!should_group(
+            &a,
+            &msg("2", "100", "ada", GROUP_WINDOW_MS + 1)
+        ));
+        assert!(!should_group(
+            &msg("2", "100", "ada", 10_000),
+            &msg("1", "100", "ada", 0)
+        ));
     }
 
     #[test]

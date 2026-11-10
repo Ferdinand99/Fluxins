@@ -12,8 +12,8 @@ use std::rc::Rc;
 use fluxer_markdown_parser::ast::{AlertType, EmojiKind, ListItem, MentionKind};
 use fluxer_markdown_parser::{EmojiContext, MarkdownParser, Node, ParserFlags};
 use gpui::{
-    AnyElement, App, FontStyle, FontWeight, HighlightStyle, InteractiveText, SharedString,
-    StrikethroughStyle, StyledText, UnderlineStyle, Window, div, prelude::*, px,
+    div, prelude::*, px, AnyElement, App, FontStyle, FontWeight, HighlightStyle, InteractiveText,
+    SharedString, StrikethroughStyle, StyledText, UnderlineStyle, Window,
 };
 
 use crate::theme;
@@ -85,6 +85,23 @@ pub fn is_masked(text: &str, url: &str) -> bool {
     norm(text) != norm(url)
 }
 
+/// A URL that can fool the reader even when shown in full: a non-ASCII (look-alike)
+/// host, or userinfo before the host (`https://fluxer.app@evil.example`).
+pub fn is_deceptive(url: &str) -> bool {
+    let authority = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    let authority = authority.split(['/', '?', '#']).next().unwrap_or("");
+    match url::Url::parse(url) {
+        Ok(u) => {
+            !u.username().is_empty()
+                || u.password().is_some()
+                || !authority.is_ascii()
+                || u.host_str()
+                    .is_some_and(|h| h.split('.').any(|label| label.starts_with("xn--")))
+        }
+        Err(_) => true,
+    }
+}
+
 pub fn parse(input: &str) -> Vec<Block> {
     let flags = ParserFlags::ALL;
     let mut parser = MarkdownParser::new(flags, EmojiContext::default());
@@ -92,7 +109,10 @@ pub fn parse(input: &str) -> Vec<Block> {
         Ok(nodes) => blocks(&nodes),
         Err(err) => {
             log::debug!("markdown parse failed, showing plain text: {err}");
-            vec![Block::Text(Inline { text: input.to_string(), ..Default::default() })]
+            vec![Block::Text(Inline {
+                text: input.to_string(),
+                ..Default::default()
+            })]
         }
     }
 }
@@ -123,13 +143,18 @@ fn blocks(nodes: &[Node]) -> Vec<Block> {
             }
             Node::CodeBlock { content, .. } => {
                 flush(&mut current, &mut out);
-                out.push(Block::Code { content: content.trim_end_matches('\n').to_string().into() });
+                out.push(Block::Code {
+                    content: content.trim_end_matches('\n').to_string().into(),
+                });
             }
             Node::Blockquote { children, .. } => {
                 flush(&mut current, &mut out);
                 out.push(Block::Quote(blocks(children)));
             }
-            Node::Alert { alert_type, children } => {
+            Node::Alert {
+                alert_type,
+                children,
+            } => {
                 flush(&mut current, &mut out);
                 let label = match alert_type {
                     AlertType::Note => "Note",
@@ -152,7 +177,9 @@ fn blocks(nodes: &[Node]) -> Vec<Block> {
                     inline.text.push('\n');
                     table_row(row, &mut inline);
                 }
-                out.push(Block::Code { content: inline.text.into() });
+                out.push(Block::Code {
+                    content: inline.text.into(),
+                });
             }
             other => push_inline(other, &mut current),
         }
@@ -166,7 +193,11 @@ fn list_items(ordered: bool, items: &[ListItem]) -> Vec<(String, Vec<Block>)> {
         .iter()
         .enumerate()
         .map(|(i, item)| {
-            let marker = if ordered { format!("{}.", item.ordinal.unwrap_or(i + 1)) } else { "\u{2022}".into() };
+            let marker = if ordered {
+                format!("{}.", item.ordinal.unwrap_or(i + 1))
+            } else {
+                "\u{2022}".into()
+            };
             (marker, blocks(&item.children))
         })
         .collect()
@@ -229,11 +260,19 @@ fn push_inline(node: &Node, inline: &mut Inline) {
                 None => inline.text.push_str(url),
             }
             let range = start..inline.text.len();
-            let masked = is_masked(&inline.text[range.clone()], url);
+            let masked = is_masked(&inline.text[range.clone()], url) || is_deceptive(url);
             inline.highlights.push((range.clone(), Style::Link));
-            inline.links.push(Link { range, url: url.clone(), masked });
+            inline.links.push(Link {
+                range,
+                url: url.clone(),
+                masked,
+            });
             if masked {
-                push_marked(inline, &format!(" ({})", link_target_label(url)), Style::LinkTarget);
+                push_marked(
+                    inline,
+                    &format!(" ({})", link_target_label(url)),
+                    Style::LinkTarget,
+                );
             }
         }
         Node::Mention { kind } => {
@@ -252,7 +291,11 @@ fn push_inline(node: &Node, inline: &mut Inline) {
             let text = i64::try_from(*timestamp)
                 .ok()
                 .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
-                .map(|t| t.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string())
+                .map(|t| {
+                    t.with_timezone(&chrono::Local)
+                        .format("%Y-%m-%d %H:%M")
+                        .to_string()
+                })
                 .unwrap_or_else(|| timestamp.to_string());
             push_marked(inline, &text, Style::Code);
         }
@@ -309,20 +352,36 @@ pub struct RenderCtx {
 
 fn highlight(style: Style, revealed: bool) -> HighlightStyle {
     match style {
-        Style::Bold => HighlightStyle { font_weight: Some(FontWeight::BOLD), ..Default::default() },
-        Style::Italic => HighlightStyle { font_style: Some(FontStyle::Italic), ..Default::default() },
+        Style::Bold => HighlightStyle {
+            font_weight: Some(FontWeight::BOLD),
+            ..Default::default()
+        },
+        Style::Italic => HighlightStyle {
+            font_style: Some(FontStyle::Italic),
+            ..Default::default()
+        },
         Style::Underline => HighlightStyle {
-            underline: Some(UnderlineStyle { thickness: px(1.), ..Default::default() }),
+            underline: Some(UnderlineStyle {
+                thickness: px(1.),
+                ..Default::default()
+            }),
             ..Default::default()
         },
         Style::Strike => HighlightStyle {
-            strikethrough: Some(StrikethroughStyle { thickness: px(1.), ..Default::default() }),
+            strikethrough: Some(StrikethroughStyle {
+                thickness: px(1.),
+                ..Default::default()
+            }),
             ..Default::default()
         },
-        Style::Code => HighlightStyle { background_color: Some(theme::code_bg()), ..Default::default() },
-        Style::Spoiler if revealed => {
-            HighlightStyle { background_color: Some(theme::code_bg()), ..Default::default() }
-        }
+        Style::Code => HighlightStyle {
+            background_color: Some(theme::code_bg()),
+            ..Default::default()
+        },
+        Style::Spoiler if revealed => HighlightStyle {
+            background_color: Some(theme::code_bg()),
+            ..Default::default()
+        },
         Style::Spoiler => HighlightStyle {
             background_color: Some(theme::rail_bg()),
             color: Some(theme::rail_bg()),
@@ -331,10 +390,16 @@ fn highlight(style: Style, revealed: bool) -> HighlightStyle {
         },
         Style::Link => HighlightStyle {
             color: Some(theme::link()),
-            underline: Some(UnderlineStyle { thickness: px(1.), ..Default::default() }),
+            underline: Some(UnderlineStyle {
+                thickness: px(1.),
+                ..Default::default()
+            }),
             ..Default::default()
         },
-        Style::LinkTarget => HighlightStyle { color: Some(theme::text_muted()), ..Default::default() },
+        Style::LinkTarget => HighlightStyle {
+            color: Some(theme::text_muted()),
+            ..Default::default()
+        },
         Style::Mention => HighlightStyle {
             background_color: Some(theme::mention_bg()),
             color: Some(theme::text_strong()),
@@ -349,21 +414,31 @@ fn flatten(inline: &Inline, revealed: bool) -> Vec<(Range<usize>, HighlightStyle
     if inline.highlights.is_empty() {
         return Vec::new();
     }
-    let mut cuts: Vec<usize> = inline.highlights.iter().flat_map(|(r, _)| [r.start, r.end]).collect();
+    let mut cuts: Vec<usize> = inline
+        .highlights
+        .iter()
+        .flat_map(|(r, _)| [r.start, r.end])
+        .collect();
     cuts.sort_unstable();
     cuts.dedup();
     let mut out = Vec::new();
     for w in cuts.windows(2) {
         let (a, b) = (w[0], w[1]);
-        let covering: Vec<Style> =
-            inline.highlights.iter().filter(|(r, _)| r.start <= a && b <= r.end).map(|(_, s)| *s).collect();
+        let covering: Vec<Style> = inline
+            .highlights
+            .iter()
+            .filter(|(r, _)| r.start <= a && b <= r.end)
+            .map(|(_, s)| *s)
+            .collect();
         if covering.is_empty() || a >= b {
             continue;
         }
         let style = if !revealed && covering.contains(&Style::Spoiler) {
             highlight(Style::Spoiler, false)
         } else {
-            covering.iter().fold(HighlightStyle::default(), |acc, s| acc.highlight(highlight(*s, revealed)))
+            covering.iter().fold(HighlightStyle::default(), |acc, s| {
+                acc.highlight(highlight(*s, revealed))
+            })
         };
         out.push((a..b, style));
     }
@@ -381,15 +456,22 @@ enum Click {
 }
 
 fn clickables(inline: &Inline, revealed: bool) -> Vec<(Range<usize>, Click)> {
-    let spoilers: Vec<&Range<usize>> =
-        inline.highlights.iter().filter(|(_, s)| *s == Style::Spoiler).map(|(r, _)| r).collect();
+    let spoilers: Vec<&Range<usize>> = inline
+        .highlights
+        .iter()
+        .filter(|(_, s)| *s == Style::Spoiler)
+        .map(|(r, _)| r)
+        .collect();
     let mut out = Vec::new();
     for link in &inline.links {
         // Links inside a hidden spoiler stay inert until it is revealed.
         if !revealed && spoilers.iter().any(|s| overlaps(s, &link.range)) {
             continue;
         }
-        out.push((link.range.clone(), Click::Link(link.url.clone(), link.masked)));
+        out.push((
+            link.range.clone(),
+            Click::Link(link.url.clone(), link.masked),
+        ));
     }
     if !revealed {
         for s in spoilers {
@@ -401,7 +483,8 @@ fn clickables(inline: &Inline, revealed: bool) -> Vec<(Range<usize>, Click)> {
 }
 
 fn inline_element(id: SharedString, inline: &Inline, ctx: &RenderCtx) -> AnyElement {
-    let text = StyledText::new(SharedString::from(inline.text.clone())).with_highlights(flatten(inline, ctx.revealed));
+    let text = StyledText::new(SharedString::from(inline.text.clone()))
+        .with_highlights(flatten(inline, ctx.revealed));
     let clicks = clickables(inline, ctx.revealed);
     if clicks.is_empty() {
         return div().child(text).into_any_element();
@@ -410,11 +493,15 @@ fn inline_element(id: SharedString, inline: &Inline, ctx: &RenderCtx) -> AnyElem
     let actions: Vec<Click> = clicks.into_iter().map(|(_, c)| c).collect();
     let ctx = ctx.clone();
     div()
-        .child(InteractiveText::new(id, text).on_click(ranges, move |ix, window, cx| match actions.get(ix) {
-            Some(Click::Link(url, masked)) => (ctx.on_link)(url, *masked, window, cx),
-            Some(Click::Reveal) => (ctx.on_reveal)(window, cx),
-            None => {}
-        }))
+        .child(
+            InteractiveText::new(id, text).on_click(ranges, move |ix, window, cx| {
+                match actions.get(ix) {
+                    Some(Click::Link(url, masked)) => (ctx.on_link)(url, *masked, window, cx),
+                    Some(Click::Reveal) => (ctx.on_reveal)(window, cx),
+                    None => {}
+                }
+            }),
+        )
         .into_any_element()
 }
 
@@ -424,7 +511,12 @@ pub fn render(id: &str, blocks: &[Block], ctx: &RenderCtx) -> AnyElement {
         .flex()
         .flex_col()
         .gap_1()
-        .children(blocks.iter().enumerate().map(|(i, b)| render_block(&format!("{id}-{i}"), b, ctx)))
+        .children(
+            blocks
+                .iter()
+                .enumerate()
+                .map(|(i, b)| render_block(&format!("{id}-{i}"), b, ctx)),
+        )
         .into_any_element()
 }
 
@@ -485,7 +577,11 @@ fn render_block(id: &str, block: &Block, ctx: &RenderCtx) -> AnyElement {
                     .flex_row()
                     .gap_2()
                     .child(div().text_color(theme::text_muted()).child(marker.clone()))
-                    .child(div().flex_1().child(render(&format!("{id}-l{i}"), children, ctx)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .child(render(&format!("{id}-l{i}"), children, ctx)),
+                    )
             }))
             .into_any_element(),
     }
@@ -507,8 +603,14 @@ mod tests {
         let blocks = parse("hello **world** `x` https://fluxer.app");
         let inline = first_inline(&blocks);
         assert!(inline.text.starts_with("hello world x"));
-        assert!(inline.highlights.iter().any(|(r, s)| *s == Style::Bold && &inline.text[r.clone()] == "world"));
-        assert!(inline.highlights.iter().any(|(r, s)| *s == Style::Code && &inline.text[r.clone()] == "x"));
+        assert!(inline
+            .highlights
+            .iter()
+            .any(|(r, s)| *s == Style::Bold && &inline.text[r.clone()] == "world"));
+        assert!(inline
+            .highlights
+            .iter()
+            .any(|(r, s)| *s == Style::Code && &inline.text[r.clone()] == "x"));
         assert_eq!(inline.links.len(), 1);
         assert_eq!(inline.links[0].url, "https://fluxer.app");
         assert!(!inline.links[0].masked);
@@ -525,7 +627,10 @@ mod tests {
 
     #[test]
     fn link_target_is_punycode_for_unicode_hosts() {
-        assert_eq!(link_target_label("https://flüxer.app/login"), "xn--flxer-lva.app");
+        assert_eq!(
+            link_target_label("https://flüxer.app/login"),
+            "xn--flxer-lva.app"
+        );
         assert_eq!(link_target_label("https://fluxer.app"), "fluxer.app");
         assert_eq!(link_target_label("not a url"), "invalid link");
     }
@@ -534,6 +639,18 @@ mod tests {
     fn masked_detection() {
         assert!(!is_masked("https://fluxer.app/", "https://fluxer.app"));
         assert!(is_masked("fluxer.app", "https://evil.example"));
+    }
+
+    #[test]
+    fn lookalike_and_userinfo_links_need_confirmation() {
+        assert!(is_deceptive("https://fluxer.\u{430}pp/login"));
+        assert!(is_deceptive("https://xn--flxer-lva.app/"));
+        assert!(is_deceptive("https://fluxer.app@evil.example/"));
+        assert!(!is_deceptive("https://fluxer.app/channels"));
+        let blocks = parse("<https://fluxer.app@evil.example>");
+        let inline = first_inline(&blocks);
+        assert!(inline.links[0].masked);
+        assert!(inline.text.contains("(evil.example)"));
     }
 
     #[test]
@@ -548,7 +665,9 @@ mod tests {
     #[test]
     fn code_block_and_quote() {
         let blocks = parse("before\n```rust\nfn main() {}\n```\n> quoted");
-        assert!(blocks.iter().any(|b| matches!(b, Block::Code { content } if content.contains("fn main"))));
+        assert!(blocks
+            .iter()
+            .any(|b| matches!(b, Block::Code { content } if content.contains("fn main"))));
         assert!(blocks.iter().any(|b| matches!(b, Block::Quote(_))));
     }
 

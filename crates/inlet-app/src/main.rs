@@ -8,6 +8,7 @@ mod markdown;
 mod mock;
 mod model;
 mod real;
+mod reconnect;
 mod text_input;
 mod theme;
 mod token_store;
@@ -17,12 +18,12 @@ use std::rc::Rc;
 
 use futures::StreamExt;
 use gpui::{
-    AnyElement, App, Bounds, ClickEvent, ClipboardItem, Context, Entity, FocusHandle, Focusable,
-    FollowMode, FontWeight, ListAlignment, ListState, SharedString, Subscription, TitlebarOptions,
-    Window, WindowBounds, WindowOptions, div, list, prelude::*, px, rgba, size,
+    div, list, prelude::*, px, rgba, size, AnyElement, App, Bounds, ClickEvent, ClipboardItem,
+    Context, Entity, FocusHandle, Focusable, FollowMode, FontWeight, ListAlignment, ListState,
+    SharedString, Subscription, TitlebarOptions, Window, WindowBounds, WindowOptions,
 };
 
-use backend::{BackendHandle, Command, DEFAULT_INSTANCE, Event};
+use backend::{BackendHandle, Command, Event, DEFAULT_INSTANCE};
 use markdown::RenderCtx;
 use model::{Channel, ChannelKind, Guild, Message};
 use text_input::{FocusNext, FocusPrev, InputEvent, TextInput};
@@ -30,12 +31,25 @@ use text_input::{FocusNext, FocusPrev, InputEvent, TextInput};
 #[derive(Clone, PartialEq)]
 enum Screen {
     /// Connecting with a saved session (or before the backend has answered).
-    Starting { instance: Option<String> },
+    Starting {
+        instance: Option<String>,
+    },
+    /// "Continue" was pressed after sign-in; no cancel from here.
+    Finishing,
     /// The saved session could not connect; the backend retries.
-    Offline { instance: String, message: String, retry_in_secs: u64 },
+    Offline {
+        instance: String,
+        message: String,
+        retry_in_secs: u64,
+    },
     SignIn,
     /// A new sign-in worked; the person confirms the account before it is stored.
-    Confirm { display_name: String, account: String, instance: String },
+    Confirm {
+        display_name: String,
+        account: String,
+        instance: String,
+        pasted: bool,
+    },
     Main,
     /// The backend thread stopped.
     Fatal,
@@ -92,6 +106,8 @@ struct Inlet {
     status: String,
     error: Option<String>,
     notice: Option<String>,
+    /// The gateway stopped and is not retried automatically.
+    gateway_down: Option<String>,
 
     _subscriptions: Vec<Subscription>,
 }
@@ -104,7 +120,9 @@ fn hash_text(text: &str) -> u64 {
 
 /// The handoff page may only be opened over https (http only for a loopback test instance).
 fn safe_handoff_url(url: &str) -> bool {
-    let Ok(u) = url::Url::parse(url) else { return false };
+    let Ok(u) = url::Url::parse(url) else {
+        return false;
+    };
     match u.scheme() {
         "https" => true,
         "http" => matches!(u.host_str(), Some("localhost" | "127.0.0.1" | "[::1]")),
@@ -114,28 +132,40 @@ fn safe_handoff_url(url: &str) -> bool {
 
 impl Inlet {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let instance_input = cx.new(|cx| TextInput::new("fluxer.opland.net", cx).with_text(DEFAULT_INSTANCE).max_chars(253));
-        let token_input = cx.new(|cx| TextInput::new("Paste your token", cx).masked().max_chars(512));
+        let instance_input = cx.new(|cx| {
+            TextInput::new("fluxer.opland.net", cx)
+                .with_text(DEFAULT_INSTANCE)
+                .max_chars(253)
+        });
+        let token_input = cx.new(|cx| {
+            TextInput::new("Paste your token", cx)
+                .masked()
+                .max_chars(512)
+        });
         let composer = cx.new(|cx| TextInput::new("Message", cx).max_chars(4_000));
 
         let mut subscriptions = Vec::new();
         for input in [&instance_input, &token_input] {
-            subscriptions.push(cx.subscribe_in(input, window, |this, _, event: &InputEvent, window, cx| {
-                match event {
+            subscriptions.push(cx.subscribe_in(
+                input,
+                window,
+                |this, _, event: &InputEvent, window, cx| match event {
                     InputEvent::Submit => this.submit_sign_in(window, cx),
-                }
-            }));
+                },
+            ));
         }
-        subscriptions.push(cx.subscribe_in(&composer, window, |this, _, event: &InputEvent, _window, cx| {
-            match event {
+        subscriptions.push(cx.subscribe_in(
+            &composer,
+            window,
+            |this, _, event: &InputEvent, _window, cx| match event {
                 InputEvent::Submit => this.send_message(cx),
-            }
-        }));
+            },
+        ));
 
         let message_list = ListState::new(0, ListAlignment::Bottom, px(800.));
         message_list.set_follow_mode(FollowMode::Tail);
 
-        let (backend, _) = Self::spawn_backend(0, window, cx);
+        let (backend, _) = Self::spawn_backend(0, true, window, cx);
         Self {
             backend,
             backend_epoch: 0,
@@ -164,14 +194,21 @@ impl Inlet {
             status: String::new(),
             error: None,
             notice: None,
+            gateway_down: None,
             _subscriptions: subscriptions,
         }
     }
 
     /// Starts a backend thread and the task that feeds its events into this view.
-    fn spawn_backend(epoch: u64, window: &mut Window, cx: &mut Context<Self>) -> (BackendHandle, u64) {
+    fn spawn_backend(
+        epoch: u64,
+        restore: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> (BackendHandle, u64) {
         let (events_tx, mut events_rx) = futures::channel::mpsc::unbounded();
         let backend = backend::start(events_tx);
+        cx.set_global(CurrentBackend(backend.clone()));
         cx.spawn_in(window, async move |this, cx| {
             while let Some(event) = events_rx.next().await {
                 let alive = this.update_in(cx, |this, window, cx| {
@@ -193,44 +230,93 @@ impl Inlet {
             });
         })
         .detach();
-        backend.send(Command::Restore);
+        if restore {
+            backend.send(Command::Restore);
+        }
         (backend, epoch)
     }
 
-    fn restart_backend(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn restart_backend(&mut self, restore: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.backend_epoch += 1;
-        let (backend, _) = Self::spawn_backend(self.backend_epoch, window, cx);
+        let (backend, _) = Self::spawn_backend(self.backend_epoch, restore, window, cx);
         self.backend = backend;
         self.reset_main();
         self.screen = Screen::Starting { instance: None };
         cx.notify();
     }
 
-    /// From the fatal screen: forget the stored token without the backend, then start over.
+    /// From the fatal screen: start a fresh backend that ends the stored session on the
+    /// server (best effort, with timeouts) and removes it, all off the UI thread.
     fn fatal_sign_out(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let instance = if self.instance.is_empty() { None } else { Some(self.instance.clone()) };
-        let done = std::thread::spawn(move || {
-            if let Some(instance) = instance.or_else(token_store::last_instance) {
-                if let Err(err) = token_store::delete_token(&instance) {
-                    log::warn!("could not remove the token: {err:#}");
+        self.restart_backend(false, window, cx);
+        self.backend.send(Command::ForgetStored);
+    }
+
+    /// Merges a REST page into the view, keeping live messages that arrived meanwhile and
+    /// what the person already revealed.
+    fn merge_messages(&mut self, loaded: Vec<Message>) {
+        let mut by_id: std::collections::HashMap<String, ShownMessage> = self
+            .messages
+            .drain(..)
+            .map(|m| (m.message.id.clone(), m))
+            .collect();
+        let newest_loaded = loaded
+            .iter()
+            .map(|m| real::snowflake_key(&m.id))
+            .max()
+            .map(|(l, s)| (l, s.to_string()));
+        let mut merged: Vec<ShownMessage> = loaded
+            .into_iter()
+            .map(|message| {
+                let revealed = by_id.remove(&message.id).is_some_and(|old| old.revealed);
+                ShownMessage {
+                    message,
+                    grouped: false,
+                    revealed,
                 }
+            })
+            .collect();
+        // Live messages newer than the page stay; older leftovers are what the page replaced.
+        for (_, old) in by_id {
+            let key = real::snowflake_key(&old.message.id);
+            let newer = newest_loaded
+                .as_ref()
+                .is_none_or(|(l, s)| (key.0, key.1) > (*l, s.as_str()));
+            if newer {
+                merged.push(old);
             }
+        }
+        merged.sort_by(|a, b| {
+            real::snowflake_key(&a.message.id).cmp(&real::snowflake_key(&b.message.id))
         });
-        let _ = done.join();
-        self.restart_backend(window, cx);
+        self.messages = merged;
+        self.regroup();
+        self.message_list.reset(self.messages.len());
+        self.message_list.set_follow_mode(FollowMode::Tail);
     }
 
     fn handle_event(&mut self, event: Event, window: &mut Window, cx: &mut Context<Self>) {
         match event {
             Event::Starting { instance } => {
-                self.screen = Screen::Starting { instance: Some(instance) };
+                self.screen = Screen::Starting {
+                    instance: Some(instance),
+                };
             }
-            Event::Offline { instance, message, retry_in_secs } => {
-                self.screen = Screen::Offline { instance, message, retry_in_secs };
+            Event::Offline {
+                instance,
+                message,
+                retry_in_secs,
+            } => {
+                self.screen = Screen::Offline {
+                    instance,
+                    message,
+                    retry_in_secs,
+                };
             }
             Event::NeedsSignIn { instance } => {
                 if let Some(instance) = instance {
-                    self.instance_input.update(cx, |i, cx| i.set_text(instance, cx));
+                    self.instance_input
+                        .update(cx, |i, cx| i.set_text(instance, cx));
                 }
                 self.screen = Screen::SignIn;
                 self.busy = false;
@@ -258,11 +344,22 @@ impl Inlet {
                 }
             }
             Event::Notice(message) => self.sign_in_notice = Some(message),
-            Event::ConfirmAccount { display_name, account, instance } => {
+            Event::ConfirmAccount {
+                display_name,
+                account,
+                instance,
+                pasted,
+            } => {
                 self.busy = false;
                 self.handoff = None;
-                self.screen = Screen::Confirm { display_name, account, instance };
+                self.screen = Screen::Confirm {
+                    display_name,
+                    account,
+                    instance,
+                    pasted,
+                };
             }
+            Event::GatewayDown(message) => self.gateway_down = Some(message),
             Event::SignedIn { username, instance } => {
                 self.busy = false;
                 self.handoff = None;
@@ -316,30 +413,51 @@ impl Inlet {
                     }
                 }
             }
-            Event::Messages { channel_id, messages } => {
+            Event::Messages {
+                channel_id,
+                messages,
+            } => {
                 if Some(&channel_id) == self.selected_channel.as_ref() {
-                    self.set_messages(messages);
+                    self.merge_messages(messages);
                 }
             }
             Event::MessageCreated(message) => {
                 if Some(&message.channel_id) == self.selected_channel.as_ref()
                     && !self.messages.iter().any(|m| m.message.id == message.id)
                 {
-                    let grouped = self.messages.last().is_some_and(|m| model::should_group(&m.message, &message));
+                    let grouped = self
+                        .messages
+                        .last()
+                        .is_some_and(|m| model::should_group(&m.message, &message));
                     let at = self.messages.len();
-                    self.messages.push(ShownMessage { message, grouped, revealed: false });
+                    self.messages.push(ShownMessage {
+                        message,
+                        grouped,
+                        revealed: false,
+                    });
                     self.message_list.splice(at..at, 1);
                 }
             }
             Event::MessageUpdated(message) => {
-                if let Some(ix) = self.messages.iter().position(|m| m.message.id == message.id) {
+                if let Some(ix) = self
+                    .messages
+                    .iter()
+                    .position(|m| m.message.id == message.id)
+                {
                     self.messages[ix].message = message;
                     self.message_list.splice(ix..ix + 1, 1);
                 }
             }
-            Event::MessageDeleted { channel_id, message_id } => {
+            Event::MessageDeleted {
+                channel_id,
+                message_id,
+            } => {
                 if Some(&channel_id) == self.selected_channel.as_ref() {
-                    if let Some(ix) = self.messages.iter().position(|m| m.message.id == message_id) {
+                    if let Some(ix) = self
+                        .messages
+                        .iter()
+                        .position(|m| m.message.id == message_id)
+                    {
                         self.messages.remove(ix);
                         self.regroup();
                         self.message_list.splice(ix..ix + 1, 0);
@@ -351,7 +469,12 @@ impl Inlet {
                     self.backend.send(Command::OpenChannel { channel_id });
                 }
             }
-            Event::Status(status) => self.status = status,
+            Event::Status(status) => {
+                if status == "Connected" {
+                    self.gateway_down = None;
+                }
+                self.status = status;
+            }
             Event::Error(message) => self.error = Some(message),
         }
         cx.notify();
@@ -370,16 +493,25 @@ impl Inlet {
         self.status.clear();
         self.error = None;
         self.notice = None;
+        self.gateway_down = None;
     }
 
     fn regroup(&mut self) {
         for i in 0..self.messages.len() {
-            self.messages[i].grouped = i > 0 && model::should_group(&self.messages[i - 1].message, &self.messages[i].message);
+            self.messages[i].grouped = i > 0
+                && model::should_group(&self.messages[i - 1].message, &self.messages[i].message);
         }
     }
 
     fn set_messages(&mut self, messages: Vec<Message>) {
-        self.messages = messages.into_iter().map(|message| ShownMessage { message, grouped: false, revealed: false }).collect();
+        self.messages = messages
+            .into_iter()
+            .map(|message| ShownMessage {
+                message,
+                grouped: false,
+                revealed: false,
+            })
+            .collect();
         self.regroup();
         self.message_list.reset(self.messages.len());
         self.message_list.set_follow_mode(FollowMode::Tail);
@@ -405,7 +537,10 @@ impl Inlet {
                     return;
                 }
                 self.pasted_token_hash = Some(hash_text(&token));
-                Command::SignInToken { instance, token: inlet_protocol::Token::new(token) }
+                Command::SignInToken {
+                    instance,
+                    token: inlet_protocol::Token::new(token),
+                }
             }
         };
         self.busy = true;
@@ -427,15 +562,23 @@ impl Inlet {
     fn select_channel(&mut self, channel_id: String, window: &mut Window, cx: &mut Context<Self>) {
         self.selected_channel = Some(channel_id.clone());
         self.set_messages(Vec::new());
-        let name = self.channels.iter().find(|c| c.id == channel_id).map(channel_label).unwrap_or_default();
-        self.composer.update(cx, |c, cx| c.set_placeholder(format!("Message {name}"), cx));
+        let name = self
+            .channels
+            .iter()
+            .find(|c| c.id == channel_id)
+            .map(channel_label)
+            .unwrap_or_default();
+        self.composer
+            .update(cx, |c, cx| c.set_placeholder(format!("Message {name}"), cx));
         self.composer.focus_handle(cx).focus(window, cx);
         self.backend.send(Command::OpenChannel { channel_id });
         cx.notify();
     }
 
     fn send_message(&mut self, cx: &mut Context<Self>) {
-        let Some(channel_id) = self.selected_channel.clone() else { return };
+        let Some(channel_id) = self.selected_channel.clone() else {
+            return;
+        };
         let text = self.composer.read(cx).text().trim().to_string();
         if text.is_empty() {
             return;
@@ -470,26 +613,42 @@ impl Inlet {
     // ---------- views ----------
 
     fn render_card(&self, body: impl IntoElement) -> impl IntoElement {
-        div().size_full().flex().items_center().justify_center().bg(theme::rail_bg()).child(
-            div()
-                .w(px(480.))
-                .p_8()
-                .rounded_lg()
-                .bg(theme::chat_bg())
-                .flex()
-                .flex_col()
-                .gap_4()
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .items_center()
-                        .gap_1()
-                        .child(div().text_size(px(24.)).font_weight(FontWeight::BOLD).text_color(theme::text_strong()).child("Inlet"))
-                        .child(div().text_color(theme::text_muted()).child("A desktop client that works with Fluxer")),
-                )
-                .child(body),
-        )
+        div()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(theme::rail_bg())
+            .child(
+                div()
+                    .w(px(480.))
+                    .p_8()
+                    .rounded_lg()
+                    .bg(theme::chat_bg())
+                    .flex()
+                    .flex_col()
+                    .gap_4()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_size(px(24.))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(theme::text_strong())
+                                    .child("Inlet"),
+                            )
+                            .child(
+                                div()
+                                    .text_color(theme::text_muted())
+                                    .child("A desktop client that works with Fluxer"),
+                            ),
+                    )
+                    .child(body),
+            )
     }
 
     fn about_link(label: &'static str, cx: &mut Context<Self>) -> impl IntoElement {
@@ -506,7 +665,11 @@ impl Inlet {
             }))
     }
 
-    fn render_starting(&self, instance: Option<String>, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_starting(
+        &self,
+        instance: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let text = match instance {
             Some(i) => format!("Connecting to {i}\u{2026}"),
             None => "Starting\u{2026}".to_string(),
@@ -517,35 +680,69 @@ impl Inlet {
                 .flex_col()
                 .gap_3()
                 .child(div().child(text))
-                .child(button("cancel-start", "Cancel", false).on_click(cx.listener(|this, _, _, cx| {
-                    this.backend.send(Command::CancelStartup);
-                    cx.notify();
-                }))),
+                .child(
+                    button("cancel-start", "Cancel", false).on_click(cx.listener(
+                        |this, _, _, cx| {
+                            this.backend.send(Command::CancelStartup);
+                            cx.notify();
+                        },
+                    )),
+                ),
         )
     }
 
-    fn render_offline(&self, instance: &str, message: &str, retry_in: u64, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_offline(
+        &self,
+        instance: &str,
+        message: &str,
+        retry_in: u64,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         self.render_card(
             div()
                 .flex()
                 .flex_col()
                 .gap_3()
-                .child(div().font_weight(FontWeight::SEMIBOLD).child(format!("Offline: {instance}")))
-                .child(div().text_color(theme::text_muted()).child(message.to_string()))
+                .child(
+                    div()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(format!("Offline: {instance}")),
+                )
+                .child(
+                    div()
+                        .text_color(theme::text_muted())
+                        .child(message.to_string()),
+                )
                 .child(div().text_color(theme::text_muted()).child(format!(
                     "You are still signed in. Inlet tries again in {retry_in} s."
                 )))
-                .child(button("retry", "Retry now", true).on_click(cx.listener(|this, _, _, cx| {
-                    this.backend.send(Command::RetryNow);
-                    cx.notify();
-                })))
-                .child(button("offline-sign-out", "Sign out", false).on_click(cx.listener(Self::sign_out)))
+                .child(button("retry", "Retry now", true).on_click(cx.listener(
+                    |this, _, _, cx| {
+                        this.backend.send(Command::RetryNow);
+                        cx.notify();
+                    },
+                )))
+                .child(
+                    button("offline-sign-out", "Sign out", false)
+                        .on_click(cx.listener(Self::sign_out)),
+                )
                 .child(Self::about_link("About Inlet and licences", cx)),
         )
     }
 
-    fn render_confirm(&self, display_name: &str, account: &str, instance: &str, cx: &mut Context<Self>) -> impl IntoElement {
-        let initials = Guild { id: String::new(), name: display_name.to_string() }.initials();
+    fn render_confirm(
+        &self,
+        display_name: &str,
+        account: &str,
+        instance: &str,
+        pasted: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let initials = Guild {
+            id: String::new(),
+            name: display_name.to_string(),
+        }
+        .initials();
         self.render_card(
             div()
                 .flex()
@@ -581,9 +778,14 @@ impl Inlet {
                         ),
                 )
                 .child(div().text_color(theme::text_muted()).child("Inlet stores the session in your system keychain only after you continue."))
+                .child(div().text_size(px(12.)).text_color(theme::text_muted()).child(if pasted {
+                    "Cancel only forgets the pasted token here. The app it came from stays signed in."
+                } else {
+                    "Cancel ends this new session on the server."
+                }))
                 .child(button("confirm-continue", "Continue", true).on_click(cx.listener(|this, _, _, cx| {
                     this.backend.send(Command::ConfirmAccount);
-                    this.screen = Screen::Starting { instance: None };
+                    this.screen = Screen::Finishing;
                     cx.notify();
                 })))
                 .child(button("confirm-cancel", "Cancel", false).on_click(cx.listener(|this, _, _, cx| {
@@ -600,15 +802,23 @@ impl Inlet {
                 .flex()
                 .flex_col()
                 .gap_3()
-                .child(div().text_color(theme::danger()).child("The network part of Inlet stopped."))
-                .child(div().text_color(theme::text_muted()).child("Restart it to reconnect. Your session is kept."))
                 .child(
-                    button("restart-backend", "Restart backend", true)
-                        .on_click(cx.listener(|this, _, window, cx| this.restart_backend(window, cx))),
+                    div()
+                        .text_color(theme::danger())
+                        .child("The network part of Inlet stopped."),
                 )
                 .child(
-                    button("fatal-sign-out", "Sign out", false)
-                        .on_click(cx.listener(|this, _, window, cx| this.fatal_sign_out(window, cx))),
+                    div()
+                        .text_color(theme::text_muted())
+                        .child("Restart it to reconnect. Your session is kept."),
+                )
+                .child(button("restart-backend", "Restart backend", true).on_click(
+                    cx.listener(|this, _, window, cx| this.restart_backend(true, window, cx)),
+                ))
+                .child(
+                    button("fatal-sign-out", "Sign out", false).on_click(
+                        cx.listener(|this, _, window, cx| this.fatal_sign_out(window, cx)),
+                    ),
                 ),
         )
     }
@@ -622,7 +832,11 @@ impl Inlet {
                 .py_1()
                 .rounded_md()
                 .cursor_pointer()
-                .text_color(if active { theme::text_strong() } else { theme::text_muted() })
+                .text_color(if active {
+                    theme::text_strong()
+                } else {
+                    theme::text_muted()
+                })
                 .when(active, |d| d.bg(theme::selected_bg()))
                 .hover(|s| s.bg(theme::hover_bg()))
                 .child(label)
@@ -649,24 +863,33 @@ impl Inlet {
                 }))
                 .child(button("cancel-wait", "Cancel", false).on_click(cx.listener(Self::cancel_wait)));
         } else {
-            form = form.child(field("Instance", self.instance_input.clone())).child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .gap_2()
-                    .child(tab("mode-browser", "Sign in with browser", mode == SignInMode::Browser).on_click(
-                        cx.listener(|this, _, _, cx| {
-                            this.sign_in_mode = SignInMode::Browser;
-                            cx.notify();
-                        }),
-                    ))
-                    .child(tab("mode-token", "Paste token", mode == SignInMode::Token).on_click(cx.listener(
-                        |this, _, _, cx| {
-                            this.sign_in_mode = SignInMode::Token;
-                            cx.notify();
-                        },
-                    ))),
-            );
+            form = form
+                .child(field("Instance", self.instance_input.clone()))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap_2()
+                        .child(
+                            tab(
+                                "mode-browser",
+                                "Sign in with browser",
+                                mode == SignInMode::Browser,
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.sign_in_mode = SignInMode::Browser;
+                                cx.notify();
+                            })),
+                        )
+                        .child(
+                            tab("mode-token", "Paste token", mode == SignInMode::Token).on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    this.sign_in_mode = SignInMode::Token;
+                                    cx.notify();
+                                }),
+                            ),
+                        ),
+                );
             form = match mode {
                 SignInMode::Browser => form.child(div().text_size(px(13.)).text_color(theme::text_muted()).child(
                     "Inlet opens the instance's sign-in page in your browser. Sign in there (passkeys, SSO and email codes all work) and enter the code Inlet shows.",
@@ -684,7 +907,8 @@ impl Inlet {
                 (false, SignInMode::Token) => "Sign in",
             };
             form = form.child(
-                button("sign-in", label, true).on_click(cx.listener(|this, _, window, cx| this.submit_sign_in(window, cx))),
+                button("sign-in", label, true)
+                    .on_click(cx.listener(|this, _, window, cx| this.submit_sign_in(window, cx))),
             );
         }
         if let Some(err) = &self.sign_in_error {
@@ -708,7 +932,11 @@ impl Inlet {
                 .items_center()
                 .justify_center()
                 .rounded(if active { px(16.) } else { px(24.) })
-                .bg(if active { theme::accent() } else { theme::chat_bg() })
+                .bg(if active {
+                    theme::accent()
+                } else {
+                    theme::chat_bg()
+                })
                 .text_color(theme::text_strong())
                 .font_weight(FontWeight::SEMIBOLD)
                 .cursor_pointer()
@@ -726,19 +954,33 @@ impl Inlet {
             .py_3()
             .bg(theme::rail_bg())
             .overflow_y_scroll()
-            .child(pill("home".into(), "DM".into(), selected.is_none()).on_click(cx.listener(|this, _, _, cx| this.select_guild(None, cx))))
+            .child(
+                pill("home".into(), "DM".into(), selected.is_none())
+                    .on_click(cx.listener(|this, _, _, cx| this.select_guild(None, cx))),
+            )
             .child(div().w(px(32.)).h(px(2.)).flex_none().bg(theme::chat_bg()))
             .children(self.guilds.iter().map(|g| {
                 let id = g.id.clone();
-                pill(format!("guild-{}", g.id).into(), g.initials(), selected.as_deref() == Some(g.id.as_str()))
-                    .on_click(cx.listener(move |this, _, _, cx| this.select_guild(Some(id.clone()), cx)))
+                pill(
+                    format!("guild-{}", g.id).into(),
+                    g.initials(),
+                    selected.as_deref() == Some(g.id.as_str()),
+                )
+                .on_click(
+                    cx.listener(move |this, _, _, cx| this.select_guild(Some(id.clone()), cx)),
+                )
             }))
     }
 
     fn render_channel_list(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let title = match &self.selected_guild {
             None => "Direct messages".to_string(),
-            Some(id) => self.guilds.iter().find(|g| &g.id == id).map(|g| g.name.clone()).unwrap_or_default(),
+            Some(id) => self
+                .guilds
+                .iter()
+                .find(|g| &g.id == id)
+                .map(|g| g.name.clone())
+                .unwrap_or_default(),
         };
         let selected = self.selected_channel.clone();
         div()
@@ -794,12 +1036,18 @@ impl Inlet {
                             .whitespace_nowrap()
                             .overflow_hidden()
                             .text_ellipsis()
-                            .text_color(if active { theme::text_strong() } else { theme::text_muted() })
+                            .text_color(if active {
+                                theme::text_strong()
+                            } else {
+                                theme::text_muted()
+                            })
                             .when(active, |d| d.bg(theme::selected_bg()))
                             .when(messageable, |d| {
                                 d.cursor_pointer()
                                     .hover(|s| s.bg(theme::hover_bg()).text_color(theme::text()))
-                                    .on_click(cx.listener(move |this, _, window, cx| this.select_channel(id.clone(), window, cx)))
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.select_channel(id.clone(), window, cx)
+                                    }))
                             })
                             .child(channel_label(c))
                     })),
@@ -819,16 +1067,30 @@ impl Inlet {
                             .flex()
                             .flex_col()
                             .overflow_hidden()
-                            .child(div().text_color(theme::text_strong()).font_weight(FontWeight::SEMIBOLD).child(self.username.clone()))
-                            .child(div().text_size(px(11.)).text_color(theme::text_muted()).child(self.instance.clone()))
+                            .child(
+                                div()
+                                    .text_color(theme::text_strong())
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(self.username.clone()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(theme::text_muted())
+                                    .child(self.instance.clone()),
+                            )
                             .child(Self::about_link("About", cx)),
                     )
-                    .child(button("sign-out", "Sign out", false).on_click(cx.listener(Self::sign_out))),
+                    .child(
+                        button("sign-out", "Sign out", false).on_click(cx.listener(Self::sign_out)),
+                    ),
             )
     }
 
     fn render_message(&mut self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
-        let Some(shown) = self.messages.get(ix) else { return div().into_any_element() };
+        let Some(shown) = self.messages.get(ix) else {
+            return div().into_any_element();
+        };
         let m = &shown.message;
         let weak = cx.entity().downgrade();
         let message_id = m.id.clone();
@@ -846,7 +1108,11 @@ impl Inlet {
                 let message_id = message_id.clone();
                 move |_window, cx| {
                     let _ = weak.update(cx, |this, cx| {
-                        if let Some(ix) = this.messages.iter().position(|s| s.message.id == message_id) {
+                        if let Some(ix) = this
+                            .messages
+                            .iter()
+                            .position(|s| s.message.id == message_id)
+                        {
                             this.messages[ix].revealed = true;
                             this.message_list.splice(ix..ix + 1, 1);
                             cx.notify();
@@ -855,7 +1121,11 @@ impl Inlet {
                 }
             }),
         };
-        let mut body = div().flex().flex_col().gap_1().child(markdown::render(&format!("m{}", m.id), &m.blocks, &ctx));
+        let mut body = div().flex().flex_col().gap_1().child(markdown::render(
+            &format!("m{}", m.id),
+            &m.blocks,
+            &ctx,
+        ));
         if m.truncated {
             let message_id = message_id.clone();
             body = body.child(
@@ -865,7 +1135,11 @@ impl Inlet {
                     .cursor_pointer()
                     .child("Show more")
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        if let Some(ix) = this.messages.iter().position(|s| s.message.id == message_id) {
+                        if let Some(ix) = this
+                            .messages
+                            .iter()
+                            .position(|s| s.message.id == message_id)
+                        {
                             let msg = &mut this.messages[ix].message;
                             msg.blocks = markdown::parse(&msg.content);
                             msg.truncated = false;
@@ -876,7 +1150,12 @@ impl Inlet {
             );
         }
         if m.edited {
-            body = body.child(div().text_size(px(11.)).text_color(theme::text_muted()).child("(edited)"));
+            body = body.child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(theme::text_muted())
+                    .child("(edited)"),
+            );
         }
         for (i, a) in m.attachments.iter().enumerate() {
             let url = a.url.clone();
@@ -885,7 +1164,11 @@ impl Inlet {
                     .id(SharedString::from(format!("att-{}-{i}", m.id)))
                     .text_color(theme::link())
                     .cursor_pointer()
-                    .child(format!("Attachment: {} ({})", a.filename, markdown::link_target_label(&a.url)))
+                    .child(format!(
+                        "Attachment: {} ({})",
+                        a.filename,
+                        markdown::link_target_label(&a.url)
+                    ))
                     .on_click(cx.listener(move |this, _, _, cx| this.open_link(&url, false, cx))),
             );
         }
@@ -895,11 +1178,26 @@ impl Inlet {
                 .flex_row()
                 .items_baseline()
                 .gap_2()
-                .child(div().font_weight(FontWeight::SEMIBOLD).text_color(theme::text_strong()).child(m.author.clone()))
+                .child(
+                    div()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme::text_strong())
+                        .child(m.author.clone()),
+                )
                 .when(m.author_username != m.author, |d| {
-                    d.child(div().text_size(px(12.)).text_color(theme::text_muted()).child(format!("@{}", m.author_username)))
+                    d.child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(theme::text_muted())
+                            .child(format!("@{}", m.author_username)),
+                    )
                 })
-                .child(div().text_size(px(11.)).text_color(theme::text_muted()).child(m.timestamp.clone()))
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(theme::text_muted())
+                        .child(m.timestamp.clone()),
+                )
         });
         div()
             .px_4()
@@ -922,7 +1220,14 @@ impl Inlet {
             .unwrap_or_default();
         let has_channel = self.selected_channel.is_some();
         let bar = |id: &'static str, text: String, bg| {
-            div().id(id).px_4().py_2().bg(bg).text_color(theme::text_strong()).cursor_pointer().child(format!("{text}  (click to dismiss)"))
+            div()
+                .id(id)
+                .px_4()
+                .py_2()
+                .bg(bg)
+                .text_color(theme::text_strong())
+                .cursor_pointer()
+                .child(format!("{text}  (click to dismiss)"))
         };
         div()
             .flex_1()
@@ -941,14 +1246,45 @@ impl Inlet {
                     .justify_between()
                     .border_b_1()
                     .border_color(theme::header_border())
-                    .child(div().font_weight(FontWeight::SEMIBOLD).text_color(theme::text_strong()).child(title))
-                    .child(div().text_size(px(12.)).text_color(theme::text_muted()).child(self.status.clone())),
+                    .child(
+                        div()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::text_strong())
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(theme::text_muted())
+                            .child(self.status.clone()),
+                    ),
             )
             .children(self.error.clone().map(|e| {
                 bar("error", e, theme::danger()).on_click(cx.listener(|this, _, _, cx| {
                     this.error = None;
                     cx.notify();
                 }))
+            }))
+            .children(self.gateway_down.clone().map(|message| {
+                div()
+                    .px_4()
+                    .py_2()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .bg(theme::selected_bg())
+                    .text_color(theme::text_strong())
+                    .child(format!("Disconnected. {message}"))
+                    .child(button("reconnect", "Reconnect", true).on_click(cx.listener(
+                        |this, _, _, cx| {
+                            this.gateway_down = None;
+                            this.status = "Reconnecting\u{2026}".into();
+                            this.backend.send(Command::Reconnect);
+                            cx.notify();
+                        },
+                    )))
             }))
             .children(self.notice.clone().map(|n| {
                 bar("notice", n, theme::selected_bg()).on_click(cx.listener(|this, _, _, cx| {
@@ -957,16 +1293,34 @@ impl Inlet {
                 }))
             }))
             .child(
-                list(self.message_list.clone(), cx.processor(|this, ix: usize, _window, cx| this.render_message(ix, cx)))
-                    .flex_1()
-                    .w_full(),
+                list(
+                    self.message_list.clone(),
+                    cx.processor(|this, ix: usize, _window, cx| this.render_message(ix, cx)),
+                )
+                .flex_1()
+                .w_full(),
             )
-            .when(has_channel, |d| d.child(div().flex_none().px_4().pb_4().pt_1().child(self.composer.clone())))
+            .when(has_channel, |d| {
+                d.child(
+                    div()
+                        .flex_none()
+                        .px_4()
+                        .pb_4()
+                        .pt_1()
+                        .child(self.composer.clone()),
+                )
+            })
     }
 
     fn render_link_confirm(&self, url: &str, cx: &mut Context<Self>) -> impl IntoElement {
         let host = markdown::link_target_label(url);
-        let open_url = url.to_string();
+        // Open exactly what was parsed and shown, never the raw text.
+        let parsed = markdown::openable(url);
+        let shown = parsed
+            .as_ref()
+            .map(|u| u.as_str().to_string())
+            .unwrap_or_else(|| url.to_string());
+        let lines = wrap_url(&shown, 64, 6);
         div()
             .id("link-confirm")
             .occlude()
@@ -987,30 +1341,74 @@ impl Inlet {
                     .flex()
                     .flex_col()
                     .gap_3()
-                    .child(div().font_weight(FontWeight::BOLD).text_color(theme::text_strong()).child("Open this link?"))
-                    .child(div().text_color(theme::text_muted()).child("The link text does not show where it goes. It opens:"))
-                    .child(div().font_weight(FontWeight::SEMIBOLD).text_color(theme::text_strong()).child(host))
-                    .child(div().text_size(px(12.)).font_family(markdown::mono_font()).text_color(theme::text()).child(url.to_string()))
+                    .child(
+                        div()
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(theme::text_strong())
+                            .child("Open this link?"),
+                    )
+                    .child(
+                        div()
+                            .text_color(theme::text_muted())
+                            .child("The link text does not show where it goes. It opens:"),
+                    )
+                    .child(
+                        div()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::text_strong())
+                            .child(host),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .text_size(px(12.))
+                            .font_family(markdown::mono_font())
+                            .text_color(theme::text())
+                            .children(lines),
+                    )
                     .child(
                         div()
                             .flex()
                             .flex_row()
                             .gap_2()
-                            .child(button("link-open", "Open", true).on_click(cx.listener(move |this, _, _, cx| {
-                                this.pending_link = None;
-                                if markdown::openable(&open_url).is_some() {
-                                    cx.open_url(&open_url);
-                                }
-                                cx.notify();
-                            })))
-                            .child(button("link-cancel", "Cancel", false).on_click(cx.listener(|this, _, _, cx| {
-                                this.pending_link = None;
-                                cx.notify();
-                            }))),
+                            .child(button("link-open", "Open", true).on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.pending_link = None;
+                                    if let Some(u) = &parsed {
+                                        cx.open_url(u.as_str());
+                                    }
+                                    cx.notify();
+                                },
+                            )))
+                            .child(button("link-cancel", "Cancel", false).on_click(cx.listener(
+                                |this, _, _, cx| {
+                                    this.pending_link = None;
+                                    cx.notify();
+                                },
+                            ))),
                     ),
             )
     }
 }
+
+/// Splits a URL into lines of `width` characters, at most `max_lines`, ending with "…"
+/// when cut. URLs have no spaces, so normal text wrapping would let them run out of the box.
+fn wrap_url(url: &str, width: usize, max_lines: usize) -> Vec<String> {
+    let chars: Vec<char> = url.chars().collect();
+    let mut lines: Vec<String> = chars.chunks(width).map(|c| c.iter().collect()).collect();
+    if lines.len() > max_lines {
+        lines.truncate(max_lines);
+        if let Some(last) = lines.last_mut() {
+            last.push('\u{2026}');
+        }
+    }
+    lines
+}
+
+/// The running backend, for the window-close handler.
+struct CurrentBackend(BackendHandle);
+impl gpui::Global for CurrentBackend {}
 
 fn channel_label(c: &Channel) -> String {
     match c.kind {
@@ -1026,7 +1424,13 @@ fn field(label: &'static str, input: Entity<TextInput>) -> impl IntoElement {
         .flex()
         .flex_col()
         .gap_1()
-        .child(div().text_size(px(12.)).font_weight(FontWeight::SEMIBOLD).text_color(theme::text_muted()).child(label.to_uppercase()))
+        .child(
+            div()
+                .text_size(px(12.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(theme::text_muted())
+                .child(label.to_uppercase()),
+        )
         .child(input)
 }
 
@@ -1040,7 +1444,11 @@ pub fn button(id: &'static str, label: &'static str, primary: bool) -> gpui::Sta
         .justify_center()
         .cursor_pointer()
         .text_color(theme::text_strong())
-        .bg(if primary { theme::accent() } else { theme::input_bg() })
+        .bg(if primary {
+            theme::accent()
+        } else {
+            theme::input_bg()
+        })
         .hover(|s| s.opacity(0.85))
         .child(label)
 }
@@ -1063,17 +1471,31 @@ impl Render for Inlet {
             .text_size(px(15.))
             .font_family(ui_font());
         if self.show_about {
-            return root.child(about::render(self.show_licences, cx)).into_any_element();
+            return root
+                .child(about::render(self.show_licences, cx))
+                .into_any_element();
         }
         let content = match self.screen.clone() {
             Screen::Starting { instance } => self.render_starting(instance, cx).into_any_element(),
-            Screen::Offline { instance, message, retry_in_secs } => {
-                self.render_offline(&instance, &message, retry_in_secs, cx).into_any_element()
-            }
+            Screen::Offline {
+                instance,
+                message,
+                retry_in_secs,
+            } => self
+                .render_offline(&instance, &message, retry_in_secs, cx)
+                .into_any_element(),
             Screen::Fatal => self.render_fatal(cx).into_any_element(),
-            Screen::Confirm { display_name, account, instance } => {
-                self.render_confirm(&display_name, &account, &instance, cx).into_any_element()
-            }
+            Screen::Confirm {
+                display_name,
+                account,
+                instance,
+                pasted,
+            } => self
+                .render_confirm(&display_name, &account, &instance, pasted, cx)
+                .into_any_element(),
+            Screen::Finishing => self
+                .render_card(div().child("Signing in\u{2026}"))
+                .into_any_element(),
             Screen::SignIn => self.render_sign_in(cx).into_any_element(),
             Screen::Main => div()
                 .size_full()
@@ -1084,7 +1506,10 @@ impl Render for Inlet {
                 .child(self.render_chat(cx))
                 .into_any_element(),
         };
-        let confirm = self.pending_link.clone().map(|url| self.render_link_confirm(&url, cx));
+        let confirm = self
+            .pending_link
+            .clone()
+            .map(|url| self.render_link_confirm(&url, cx));
         root.child(content).children(confirm).into_any_element()
     }
 }
@@ -1116,7 +1541,10 @@ fn main() {
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
-                titlebar: Some(TitlebarOptions { title: Some("Inlet \u{2013} works with Fluxer".into()), ..Default::default() }),
+                titlebar: Some(TitlebarOptions {
+                    title: Some("Inlet \u{2013} works with Fluxer".into()),
+                    ..Default::default()
+                }),
                 app_id: Some("no.opland.inlet".into()),
                 ..Default::default()
             },
@@ -1125,6 +1553,12 @@ fn main() {
         .expect("open the main window");
         cx.on_window_closed(|cx, _| {
             if cx.windows().is_empty() {
+                // Let the backend end an unconfirmed browser sign-in first (bounded wait).
+                if let Some(current) = cx.try_global::<CurrentBackend>() {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    current.0.send(Command::Shutdown(tx));
+                    let _ = rx.recv_timeout(std::time::Duration::from_secs(4));
+                }
                 cx.quit();
             }
         })
@@ -1136,6 +1570,19 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn long_urls_are_wrapped_and_capped() {
+        let url = format!("https://example.com/{}", "a".repeat(1000));
+        let lines = wrap_url(&url, 64, 6);
+        assert_eq!(lines.len(), 6);
+        assert!(lines.iter().all(|l| l.chars().count() <= 65));
+        assert!(lines.last().unwrap().ends_with('\u{2026}'));
+        assert_eq!(
+            wrap_url("https://a.b", 64, 6),
+            vec!["https://a.b".to_string()]
+        );
+    }
 
     #[test]
     fn handoff_page_must_be_https() {

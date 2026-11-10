@@ -1,5 +1,0 @@
-[toolchain]
-# Stable release that builds the pinned gpui revision (Zed itself pins 1.98.1).
-channel = "1.99.1"
-profile = "minimal"
-components = ["clippy", "rustfmt"]

@@ -9,11 +9,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use futures::channel::mpsc::UnboundedSender;
 use inlet_protocol as p;
 use inlet_protocol::models::channel_type;
 
-use crate::backend::Event;
+use crate::backend::{Event, Ui};
 use crate::model::{self, Attachment, Channel, ChannelKind, Guild, Message};
 use crate::token_store;
 
@@ -43,21 +42,27 @@ pub enum FailureKind {
 
 impl From<p::Error> for Failure {
     fn from(err: p::Error) -> Self {
-        Failure { kind: classify(&err), message: describe(&err) }
+        Failure {
+            kind: classify(&err),
+            message: describe(&err),
+        }
     }
 }
 
 impl Failure {
     fn timeout() -> Self {
-        Failure { message: "The instance did not answer in time.".into(), kind: FailureKind::Offline }
+        Failure {
+            message: "The instance did not answer in time.".into(),
+            kind: FailureKind::Offline,
+        }
     }
 }
 
 pub fn classify(err: &p::Error) -> FailureKind {
     match err {
-        p::Error::Unauthorized | p::Error::GlobalRateLimited | p::Error::EndpointsChanged { .. } => {
-            FailureKind::SessionEnded
-        }
+        p::Error::Unauthorized
+        | p::Error::GlobalRateLimited
+        | p::Error::EndpointsChanged { .. } => FailureKind::SessionEnded,
         p::Error::Http(_) | p::Error::RateLimited { .. } => FailureKind::Offline,
         p::Error::Api(api) if api.status >= 500 || api.status == 0 => FailureKind::Offline,
         _ => FailureKind::Other,
@@ -79,16 +84,27 @@ pub fn describe(err: &p::Error) -> String {
                 format!("{} ({code})", model::clean_name(&api.message))
             }
         }
-        p::Error::Http(_) => "Could not reach the instance. Check the address and your connection.".into(),
-        p::Error::EndpointsChanged { .. } => "This server's addresses changed. Sign in again.".into(),
-        p::Error::Url(msg) => format!("The instance address is not usable: {}", model::clean_name(msg)),
+        p::Error::Http(_) => {
+            "Could not reach the instance. Check the address and your connection.".into()
+        }
+        p::Error::EndpointsChanged { .. } => {
+            "This server's addresses changed. Sign in again.".into()
+        }
+        p::Error::Url(msg) => format!(
+            "The instance address is not usable: {}",
+            model::clean_name(msg)
+        ),
         p::Error::TooLarge { .. } => "The instance sent more data than Inlet accepts.".into(),
         other => other.to_string(),
     }
 }
 
-async fn with_timeout<T>(fut: impl std::future::Future<Output = Result<T, Failure>>) -> Result<T, Failure> {
-    tokio::time::timeout(CONNECT_TIMEOUT, fut).await.unwrap_or_else(|_| Err(Failure::timeout()))
+async fn with_timeout<T>(
+    fut: impl std::future::Future<Output = Result<T, Failure>>,
+) -> Result<T, Failure> {
+    tokio::time::timeout(CONNECT_TIMEOUT, fut)
+        .await
+        .unwrap_or_else(|_| Err(Failure::timeout()))
 }
 
 pub async fn discover(instance: &str) -> Result<p::Instance, Failure> {
@@ -102,13 +118,15 @@ pub async fn discover(instance: &str) -> Result<p::Instance, Failure> {
 #[derive(Clone)]
 pub enum Credential {
     /// From the keychain, with the hosts it was issued for.
-    Stored { token: p::Token, pins: p::EndpointPins },
+    Stored {
+        token: p::Token,
+        pins: p::EndpointPins,
+    },
     /// A finished browser sign-in.
     SignedIn(p::SignedIn),
     /// A token the person pasted.
     Pasted(p::Token),
 }
-
 
 /// A checked session: the token works and the guild list is loaded.
 pub struct Connected {
@@ -125,7 +143,9 @@ pub struct Connected {
 pub async fn connect(instance: p::Instance, credential: Credential) -> Result<Connected, Failure> {
     let session = match credential {
         // A stored token is only ever used with the hosts it was issued for.
-        Credential::Stored { token, pins } => p::Session::from_token_pinned(instance, token, &pins)?,
+        Credential::Stored { token, pins } => {
+            p::Session::from_token_pinned(instance, token, &pins)?
+        }
         // A pasted token has no pins yet; it is pinned to this instance when saved.
         Credential::Pasted(token) => p::Session::from_token_unpinned(instance, token),
         Credential::SignedIn(signed_in) => p::Session::from_signed_in(instance, signed_in),
@@ -137,7 +157,10 @@ pub async fn connect(instance: p::Instance, credential: Credential) -> Result<Co
             .guilds()
             .await?
             .into_iter()
-            .map(|g| Guild { id: g.id, name: model::clean_name(&g.name) })
+            .map(|g| Guild {
+                id: g.id,
+                name: model::clean_name(&g.name),
+            })
             .collect();
         Ok(Connected {
             username: model::clean_name(me.display_name()),
@@ -159,15 +182,23 @@ pub async fn run_handoff(
 ) -> Option<Result<(p::Instance, p::SignedIn), String>> {
     let deadline = chrono::DateTime::parse_from_rfc3339(handoff.expires_at())
         .ok()
-        .and_then(|t| (t.with_timezone(&chrono::Utc) - chrono::Utc::now()).to_std().ok())
+        .and_then(|t| {
+            (t.with_timezone(&chrono::Utc) - chrono::Utc::now())
+                .to_std()
+                .ok()
+        })
         .unwrap_or(Duration::from_secs(5 * 60));
     let poll = async {
         loop {
             match handoff.poll().await {
                 Ok(p::HandoffStatus::Pending) => {}
                 Ok(p::HandoffStatus::Completed(signed_in)) => return Ok(signed_in),
-                Ok(p::HandoffStatus::Denied) => return Err("The sign-in was denied in the browser.".to_string()),
-                Ok(p::HandoffStatus::Expired) => return Err("The code expired. Try again.".to_string()),
+                Ok(p::HandoffStatus::Denied) => {
+                    return Err("The sign-in was denied in the browser.".to_string())
+                }
+                Ok(p::HandoffStatus::Expired) => {
+                    return Err("The code expired. Try again.".to_string())
+                }
                 Err(err) if classify(&err) == FailureKind::Offline => {
                     log::info!("handoff poll failed, retrying: {}", describe(&err));
                 }
@@ -207,7 +238,9 @@ pub async fn revoke(session: &p::Session) -> bool {
 
 fn channel_kind(kind: i64) -> ChannelKind {
     match kind {
-        channel_type::GUILD_TEXT | channel_type::GUILD_ANNOUNCEMENT | channel_type::PERSONAL_NOTES => ChannelKind::Text,
+        channel_type::GUILD_TEXT
+        | channel_type::GUILD_ANNOUNCEMENT
+        | channel_type::PERSONAL_NOTES => ChannelKind::Text,
         channel_type::GUILD_VOICE => ChannelKind::Voice,
         channel_type::GUILD_CATEGORY => ChannelKind::Category,
         channel_type::DM => ChannelKind::Dm,
@@ -219,7 +252,12 @@ fn channel_kind(kind: i64) -> ChannelKind {
 pub fn to_channel(c: &p::Channel) -> Channel {
     let name = match (&c.name, c.recipients.is_empty()) {
         (Some(n), _) if !n.is_empty() => n.clone(),
-        (_, false) => c.recipients.iter().map(|u| u.display_name().to_string()).collect::<Vec<_>>().join(", "),
+        (_, false) => c
+            .recipients
+            .iter()
+            .map(|u| u.display_name().to_string())
+            .collect::<Vec<_>>()
+            .join(", "),
         _ if c.kind == channel_type::PERSONAL_NOTES => "personal notes".into(),
         _ => format!("channel {}", c.id),
     };
@@ -252,7 +290,11 @@ pub fn to_message(m: &p::Message) -> Message {
             .iter()
             .map(|a| Attachment {
                 filename: model::clean_name(&a.filename),
-                url: a.url.clone().or_else(|| a.proxy_url.clone()).unwrap_or_default(),
+                url: a
+                    .url
+                    .clone()
+                    .or_else(|| a.proxy_url.clone())
+                    .unwrap_or_default(),
             })
             .collect(),
         edited: m.edited_timestamp.is_some(),
@@ -270,7 +312,9 @@ pub fn snowflake_key(id: &str) -> (usize, &str) {
 /// list was never loaded (nothing to update).
 fn upsert_channel(cache: &ChannelCache, channel: &p::Channel) -> bool {
     let mut map = cache.lock().unwrap();
-    let Some(list) = map.get_mut(&channel.guild_id) else { return false };
+    let Some(list) = map.get_mut(&channel.guild_id) else {
+        return false;
+    };
     let converted = to_channel(channel);
     match list.iter_mut().find(|c| c.id == converted.id) {
         Some(existing) => *existing = converted,
@@ -279,14 +323,49 @@ fn upsert_channel(cache: &ChannelCache, channel: &p::Channel) -> bool {
     true
 }
 
+/// How a gateway's event stream ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GatewayEnd {
+    /// The token is no longer valid (4004): the session is over.
+    SessionEnded(String),
+    /// The protocol stopped on purpose and retrying would not help.
+    Terminal(String),
+    /// The stream closed without a close reason.
+    ChannelClosed,
+}
+
+/// What a terminal close reason means for the person.
+pub fn close_message(reason: &p::CloseReason) -> Option<String> {
+    Some(match reason {
+        p::CloseReason::ClientClosed => return None,
+        p::CloseReason::AuthenticationFailed => {
+            "The instance ended this session. Sign in again.".into()
+        }
+        p::CloseReason::InvalidApiVersion => {
+            "The instance uses a newer gateway version than this Inlet build supports.".into()
+        }
+        p::CloseReason::InvalidShard => {
+            "The instance refused the gateway connection (invalid shard).".into()
+        }
+        p::CloseReason::InvalidUrl(url) => {
+            format!(
+                "The instance's gateway address is not usable: {}",
+                model::clean_name(url)
+            )
+        }
+        other => format!("The gateway stopped: {other:?}"),
+    })
+}
+
 /// Forwards gateway events to the UI and keeps the guild and channel caches current.
-/// Returns when the gateway stops; `Some(message)` means the session ended for good.
+/// `connected` is called on every READY/RESUMED. Returns how the gateway stopped.
 pub async fn forward_gateway(
     mut rx: tokio::sync::mpsc::Receiver<p::GatewayEvent>,
-    events: UnboundedSender<Event>,
+    events: Ui,
     guilds: Arc<Mutex<Vec<Guild>>>,
     cache: ChannelCache,
-) -> Option<String> {
+    connected: impl Fn(),
+) -> GatewayEnd {
     let send = |e: Event| {
         let _ = events.unbounded_send(e);
     };
@@ -301,40 +380,59 @@ pub async fn forward_gateway(
         match event {
             p::GatewayEvent::State(state) => {
                 let text = match state {
-                    p::ConnectionState::Connecting { attempt: 0 } => "Connecting\u{2026}".to_string(),
+                    p::ConnectionState::Connecting { attempt: 0 } => {
+                        "Connecting\u{2026}".to_string()
+                    }
                     p::ConnectionState::Connecting { attempt } => {
                         format!("Connecting (attempt {})\u{2026}", attempt + 1)
                     }
-                    p::ConnectionState::Identifying | p::ConnectionState::Resuming => "Connecting\u{2026}".into(),
-                    p::ConnectionState::Connected => "Connected".into(),
+                    p::ConnectionState::Identifying | p::ConnectionState::Resuming => {
+                        "Connecting\u{2026}".into()
+                    }
+                    p::ConnectionState::Connected => {
+                        connected();
+                        "Connected".into()
+                    }
                     p::ConnectionState::Reconnecting { delay, .. } => {
                         format!("Reconnecting in {} s\u{2026}", delay.as_secs())
                     }
-                    p::ConnectionState::Closed(p::CloseReason::AuthenticationFailed) => {
+                    p::ConnectionState::Closed(reason) => {
                         send(Event::Status("Disconnected".into()));
-                        return Some("The instance ended this session. Sign in again.".into());
+                        return match (&reason, close_message(&reason)) {
+                            (p::CloseReason::AuthenticationFailed, Some(m)) => {
+                                GatewayEnd::SessionEnded(m)
+                            }
+                            (_, Some(m)) => GatewayEnd::Terminal(m),
+                            (_, None) => GatewayEnd::Terminal(String::new()),
+                        };
                     }
-                    p::ConnectionState::Closed(p::CloseReason::InvalidUrl(url)) => {
-                        send(Event::Error(format!(
-                            "The instance's gateway address is not usable: {}",
-                            model::clean_name(&url)
-                        )));
-                        "Disconnected".into()
-                    }
-                    p::ConnectionState::Closed(reason) => format!("Disconnected ({reason:?})"),
                 };
                 send(Event::Status(text));
             }
             p::GatewayEvent::Dispatch { event, .. } => match event {
                 p::Dispatch::Ready(ready) => {
-                    // A fresh Identify: rebuild the channel cache from the guild list.
-                    let mut map = HashMap::new();
+                    // A fresh Identify: rebuild the guild channel lists, keep the DM list
+                    // (READY does not carry it), and show the result.
+                    let mut map: HashMap<Option<String>, Vec<Channel>> = HashMap::new();
                     for g in &ready.guilds {
                         if !g.unavailable && !g.channels.is_empty() {
-                            map.insert(Some(g.id.clone()), g.channels.iter().map(to_channel).collect());
+                            map.insert(
+                                Some(g.id.clone()),
+                                g.channels.iter().map(to_channel).collect(),
+                            );
                         }
                     }
-                    *cache.lock().unwrap() = map;
+                    let keys: Vec<Option<String>> = {
+                        let mut cache = cache.lock().unwrap();
+                        if let Some(dms) = cache.remove(&None) {
+                            map.insert(None, dms);
+                        }
+                        *cache = map;
+                        cache.keys().cloned().collect()
+                    };
+                    for key in keys {
+                        channels_event(key);
+                    }
                     if ready_seen {
                         // Messages may have been missed while disconnected.
                         send(Event::Reconnected);
@@ -343,9 +441,10 @@ pub async fn forward_gateway(
                 }
                 p::Dispatch::MessageCreate(m) => send(Event::MessageCreated(to_message(&m))),
                 p::Dispatch::MessageUpdate(m) => send(Event::MessageUpdated(to_message(&m))),
-                p::Dispatch::MessageDelete(d) => {
-                    send(Event::MessageDeleted { channel_id: d.channel_id, message_id: d.id })
-                }
+                p::Dispatch::MessageDelete(d) => send(Event::MessageDeleted {
+                    channel_id: d.channel_id,
+                    message_id: d.id,
+                }),
                 p::Dispatch::ChannelCreate(c) | p::Dispatch::ChannelUpdate(c) => {
                     if upsert_channel(&cache, &c) {
                         channels_event(c.guild_id.clone());
@@ -354,7 +453,9 @@ pub async fn forward_gateway(
                 p::Dispatch::ChannelDelete(c) => {
                     let removed = {
                         let mut map = cache.lock().unwrap();
-                        map.get_mut(&c.guild_id).map(|list| list.retain(|x| x.id != c.id)).is_some()
+                        map.get_mut(&c.guild_id)
+                            .map(|list| list.retain(|x| x.id != c.id))
+                            .is_some()
                     };
                     if removed {
                         channels_event(c.guild_id.clone());
@@ -362,13 +463,19 @@ pub async fn forward_gateway(
                 }
                 p::Dispatch::GuildCreate(g) | p::Dispatch::GuildSync(g) => {
                     if !g.unavailable && !g.channels.is_empty() {
-                        cache.lock().unwrap().insert(Some(g.id.clone()), g.channels.iter().map(to_channel).collect());
+                        cache.lock().unwrap().insert(
+                            Some(g.id.clone()),
+                            g.channels.iter().map(to_channel).collect(),
+                        );
                         channels_event(Some(g.id.clone()));
                     }
                     let mut list = guilds.lock().unwrap();
                     if !list.iter().any(|x| x.id == g.id) {
                         if let Some(name) = g.name() {
-                            list.push(Guild { id: g.id.clone(), name: model::clean_name(name) });
+                            list.push(Guild {
+                                id: g.id.clone(),
+                                name: model::clean_name(name),
+                            });
                             send(Event::Guilds(list.clone()));
                         }
                     }
@@ -383,5 +490,5 @@ pub async fn forward_gateway(
             },
         }
     }
-    None
+    GatewayEnd::ChannelClosed
 }

@@ -36,10 +36,15 @@ pub fn save_session(
     token: &inlet_protocol::Token,
     pins: &inlet_protocol::EndpointPins,
 ) -> Result<()> {
-    let blob = Blob { token: token.expose_secret().to_string(), pins: Some(pins.clone()) };
+    let blob = Blob {
+        token: token.expose_secret().to_string(),
+        pins: Some(pins.clone()),
+    };
     let json = Zeroizing::new(serde_json::to_string(&blob).context("encode the session")?);
     drop(Zeroizing::new(blob.token));
-    entry(instance)?.set_password(&json).context("store the token")
+    entry(instance)?
+        .set_password(&json)
+        .context("store the token")
 }
 
 pub fn load_session(instance: &str) -> Result<Option<StoredSession>> {
@@ -49,8 +54,14 @@ pub fn load_session(instance: &str) -> Result<Option<StoredSession>> {
         Err(err) => return Err(err).context("read the token"),
     };
     Ok(Some(match serde_json::from_str::<Blob>(&raw) {
-        Ok(blob) => StoredSession { pins: blob.pins, token: inlet_protocol::Token::new(blob.token) },
-        Err(_) => StoredSession { token: inlet_protocol::Token::new(raw.trim().to_string()), pins: None },
+        Ok(blob) => StoredSession {
+            pins: blob.pins,
+            token: inlet_protocol::Token::new(blob.token),
+        },
+        Err(_) => StoredSession {
+            token: inlet_protocol::Token::new(raw.trim().to_string()),
+            pins: None,
+        },
     }))
 }
 
@@ -88,7 +99,9 @@ fn installation_id_file() -> Option<std::path::PathBuf> {
 /// same between starts (it identifies this install in the account's session list).
 pub fn client_info() -> inlet_protocol::ClientInfo {
     let mut info = inlet_protocol::ClientInfo::default();
-    let Some(path) = installation_id_file() else { return info };
+    let Some(path) = installation_id_file() else {
+        return info;
+    };
     match std::fs::read_to_string(&path) {
         Ok(id) if !id.trim().is_empty() => info.installation_id = id.trim().to_string(),
         _ => {

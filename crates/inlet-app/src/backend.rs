@@ -15,15 +15,16 @@
 
 use std::future::Future;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::channel::mpsc::UnboundedSender;
 use inlet_protocol as p;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender as TokioSender, unbounded_channel};
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender as TokioSender};
 use tokio::task::AbortHandle;
 
 use crate::model::{Channel, Guild, Message};
-use crate::real::{self, ChannelCache, Credential, Failure, FailureKind};
+use crate::real::{self, ChannelCache, Credential, Failure, FailureKind, GatewayEnd};
+use crate::reconnect::{Decision, ReconnectPolicy, Stop};
 use crate::token_store;
 
 /// Default instance shown on the sign-in screen.
@@ -36,8 +37,13 @@ pub enum Command {
     RetryNow,
     /// Stop connecting with the saved session and show sign-in. The token stays stored.
     CancelStartup,
-    SignInBrowser { instance: String },
-    SignInToken { instance: String, token: p::Token },
+    SignInBrowser {
+        instance: String,
+    },
+    SignInToken {
+        instance: String,
+        token: p::Token,
+    },
     /// Stop a browser sign-in that is waiting. Also tells the server to drop the code.
     CancelSignIn,
     /// The account shown after sign-in is the right one: store the token and continue.
@@ -45,43 +51,166 @@ pub enum Command {
     /// Wrong account: end the new token on the server and discard it.
     RejectAccount,
     SignOut,
+    /// From the recovery screen: end the stored session on the server (best effort) and
+    /// remove it from the keychain, without connecting first.
+    ForgetStored,
+    /// The gateway stopped and is not retried automatically: try again now.
+    Reconnect,
+    /// The app is closing: end an unconfirmed browser sign-in, then answer.
+    Shutdown(std::sync::mpsc::Sender<()>),
     /// Load channels for a guild, or DMs when `guild_id` is `None`.
-    OpenGuild { guild_id: Option<String> },
-    OpenChannel { channel_id: String },
-    Send { channel_id: String, text: String },
+    OpenGuild {
+        guild_id: Option<String>,
+    },
+    OpenChannel {
+        channel_id: String,
+    },
+    Send {
+        channel_id: String,
+        text: String,
+    },
 }
 
 pub enum Event {
     /// Connecting with a saved session.
-    Starting { instance: String },
+    Starting {
+        instance: String,
+    },
     /// The saved session could not connect (network, server error). It is kept, and the
     /// backend tries again after `retry_in_secs`.
-    Offline { instance: String, message: String, retry_in_secs: u64 },
+    Offline {
+        instance: String,
+        message: String,
+        retry_in_secs: u64,
+    },
     /// No saved session; show the sign-in screen.
-    NeedsSignIn { instance: Option<String> },
+    NeedsSignIn {
+        instance: Option<String>,
+    },
     /// Browser sign-in started: the page to open and the code to enter there.
-    HandoffStarted { url: String, code: String },
+    HandoffStarted {
+        url: String,
+        code: String,
+    },
     SignInFailed(String),
     /// A new sign-in worked; show which account it is before anything is stored.
-    ConfirmAccount { display_name: String, account: String, instance: String },
+    /// `pasted`: the token came from the paste field (cancelling only forgets it).
+    ConfirmAccount {
+        display_name: String,
+        account: String,
+        instance: String,
+        pasted: bool,
+    },
+    /// The gateway stopped and Inlet will not retry on its own; offer "Reconnect".
+    GatewayDown(String),
     /// Something to tell the person on the sign-in screen (not an error).
     Notice(String),
-    SignedIn { username: String, instance: String },
+    SignedIn {
+        username: String,
+        instance: String,
+    },
     SignedOut,
     /// The session ended on the server side (token rejected or revoked); show sign-in.
     SessionEnded(String),
     Guilds(Vec<Guild>),
-    Channels { guild_id: Option<String>, channels: Vec<Channel> },
-    Messages { channel_id: String, messages: Vec<Message> },
+    Channels {
+        guild_id: Option<String>,
+        channels: Vec<Channel>,
+    },
+    Messages {
+        channel_id: String,
+        messages: Vec<Message>,
+    },
     MessageCreated(Message),
     MessageUpdated(Message),
-    MessageDeleted { channel_id: String, message_id: String },
+    MessageDeleted {
+        channel_id: String,
+        message_id: String,
+    },
     /// The gateway identified again after a drop; reload what is on screen.
     Reconnected,
     /// Connection state for the status line ("Connected", "Reconnecting…").
     Status(String),
     /// Something failed that the user should see.
     Error(String),
+}
+
+/// The sender for UI events. Errors and status lines are coalesced: the same text again
+/// within a few seconds is dropped, and at most a handful of errors pass per window, so
+/// no loop can flood the UI.
+#[derive(Clone)]
+pub struct Ui {
+    tx: UnboundedSender<Event>,
+    throttle: Arc<Mutex<Throttle>>,
+}
+
+#[derive(Default)]
+struct Throttle {
+    last_error: Option<(String, Instant)>,
+    last_status: Option<String>,
+    window_start: Option<Instant>,
+    errors_in_window: u32,
+}
+
+const ERROR_REPEAT: Duration = Duration::from_secs(5);
+const ERROR_WINDOW: Duration = Duration::from_secs(10);
+const ERRORS_PER_WINDOW: u32 = 5;
+
+impl Ui {
+    pub fn new(tx: UnboundedSender<Event>) -> Self {
+        Self {
+            tx,
+            throttle: Arc::default(),
+        }
+    }
+
+    /// Sends an event unless it is a repeated or excess error or an unchanged status.
+    pub fn unbounded_send(&self, event: Event) -> Result<(), ()> {
+        let now = Instant::now();
+        {
+            let mut t = self.throttle.lock().unwrap();
+            if !t.admit(&event, now) {
+                return Ok(());
+            }
+        }
+        self.tx.unbounded_send(event).map_err(|_| ())
+    }
+}
+
+impl Throttle {
+    fn admit(&mut self, event: &Event, now: Instant) -> bool {
+        match event {
+            Event::Error(message) => {
+                if let Some((last, at)) = &self.last_error {
+                    if last == message && now.saturating_duration_since(*at) < ERROR_REPEAT {
+                        return false;
+                    }
+                }
+                match self.window_start {
+                    Some(start) if now.saturating_duration_since(start) < ERROR_WINDOW => {
+                        if self.errors_in_window >= ERRORS_PER_WINDOW {
+                            return false;
+                        }
+                        self.errors_in_window += 1;
+                    }
+                    _ => {
+                        self.window_start = Some(now);
+                        self.errors_in_window = 1;
+                    }
+                }
+                self.last_error = Some((message.clone(), now));
+                true
+            }
+            Event::Status(text) => {
+                if self.last_status.as_deref() == Some(text) {
+                    return false;
+                }
+                self.last_status = Some(text.clone());
+                true
+            }
+            _ => true,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -100,6 +229,7 @@ impl BackendHandle {
 /// Starts the backend thread. Events arrive on `events`. When the thread ends (a panic in
 /// the loop itself), `events` is dropped and the UI's receiver ends.
 pub fn start(events: UnboundedSender<Event>) -> BackendHandle {
+    let events = Ui::new(events);
     let (tx, rx) = unbounded_channel();
     std::thread::Builder::new()
         .name("inlet-backend".into())
@@ -124,13 +254,35 @@ enum Internal {
         credential: Credential,
         result: Result<real::Connected, Failure>,
     },
-    HandoffDone { id: u64, result: Result<(p::Instance, p::SignedIn), String> },
+    HandoffDone {
+        id: u64,
+        result: Result<(p::Instance, p::SignedIn), String>,
+    },
     /// The session `gen` ended for good (auth failure).
-    Ended { gen: u64, message: String },
+    Ended {
+        gen: u64,
+        message: String,
+    },
     /// The gateway of session `gen` stopped without an auth failure.
-    GatewayStopped { gen: u64 },
-    Retry { attempt: u64 },
-    TaskPanicked { what: &'static str, gateway_of: Option<u64> },
+    GatewayEnded {
+        gen: u64,
+        end: GatewayEnd,
+    },
+    /// The gateway of session `gen` reached READY or RESUMED.
+    GatewayConnected {
+        gen: u64,
+    },
+    /// Time to start the gateway of session `gen` again.
+    GatewayRestart {
+        gen: u64,
+    },
+    Retry {
+        attempt: u64,
+    },
+    TaskPanicked {
+        what: &'static str,
+        gateway_of: Option<u64>,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -159,6 +311,17 @@ struct RealActive {
     guilds: Arc<Mutex<Vec<Guild>>>,
     cache: ChannelCache,
     active_guild: Option<String>,
+    /// Restart bookkeeping; lives with the session so spacing survives restarts.
+    policy: ReconnectPolicy,
+    restart_timer: Option<AbortHandle>,
+}
+
+/// A new sign-in waiting for "Continue".
+struct PendingConfirm {
+    connected: real::Connected,
+    /// Issued to Inlet by the browser handoff. A pasted token belongs to another client
+    /// and is only forgotten, never signed out.
+    from_handoff: bool,
 }
 
 enum Active {
@@ -175,23 +338,25 @@ struct Offline {
 }
 
 struct Backend {
-    events: UnboundedSender<Event>,
+    events: Ui,
     internal: TokioSender<Internal>,
     next_gen: u64,
     active: Option<Active>,
     attempt: u64,
-    connecting: Option<(u64, AbortHandle)>,
+    connecting: Option<(u64, AbortHandle, Mode)>,
     offline: Option<Offline>,
     handoff_seq: u64,
     handoff: Option<(u64, tokio::sync::oneshot::Sender<()>)>,
     /// A new sign-in waiting for the person to confirm the account.
-    pending_confirm: Option<real::Connected>,
+    pending_confirm: Option<PendingConfirm>,
+    /// The task writing a new token to the keychain; sign-out waits for it.
+    saving: Option<tokio::task::JoinHandle<()>>,
     open_guild: Option<AbortHandle>,
     open_channel: Option<AbortHandle>,
 }
 
 impl Backend {
-    fn new(events: UnboundedSender<Event>) -> Self {
+    fn new(events: Ui) -> Self {
         let (internal, _) = unbounded_channel();
         Self {
             events,
@@ -204,6 +369,7 @@ impl Backend {
             handoff_seq: 0,
             handoff: None,
             pending_confirm: None,
+            saving: None,
             open_guild: None,
             open_channel: None,
         }
@@ -270,6 +436,10 @@ impl Backend {
                 }
             }
             Command::CancelStartup => {
+                if self.active.is_some() || self.pending_confirm.is_some() {
+                    // Already connected: the UI gets SignedIn (or the confirm screen).
+                    return;
+                }
                 self.stop_connecting();
                 let instance = self.offline.take().map(|o| {
                     if let Some(t) = o.timer {
@@ -292,26 +462,57 @@ impl Backend {
                 self.drop_pending_confirm();
             }
             Command::ConfirmAccount => {
-                if let Some(connected) = self.pending_confirm.take() {
-                    self.install(connected, true);
+                if let Some(pending) = self.pending_confirm.take() {
+                    self.install(pending.connected, true);
                 }
             }
             Command::RejectAccount => {
-                if let Some(connected) = self.pending_confirm.take() {
-                    let instance = connected.session.instance().origin().to_string();
-                    let events = self.events.clone();
-                    self.spawn_guarded("reject account", None, async move {
-                        if !real::revoke(&connected.session).await {
-                            let _ = events.unbounded_send(Event::Notice(
-                                "The instance could not be told to end that session. End it under Devices in Fluxer's settings."
-                                    .into(),
-                            ));
-                        }
+                if let Some(pending) = self.pending_confirm.take() {
+                    let instance = pending.connected.session.instance().origin().to_string();
+                    if pending.from_handoff {
+                        let events = self.events.clone();
+                        self.spawn_guarded("reject account", None, async move {
+                            if !real::revoke(&pending.connected.session).await {
+                                let _ = events.unbounded_send(Event::Notice(
+                                    "The instance could not be told to end that session. End it under Devices in Fluxer's settings."
+                                        .into(),
+                                ));
+                            }
+                        });
+                    }
+                    self.emit(Event::NeedsSignIn {
+                        instance: Some(instance),
                     });
-                    self.emit(Event::NeedsSignIn { instance: Some(instance) });
                 }
             }
             Command::SignOut => self.sign_out(),
+            Command::ForgetStored => self.forget_stored(),
+            Command::Reconnect => {
+                if let Some(Active::Real(r)) = &mut self.active {
+                    if let Some(t) = r.restart_timer.take() {
+                        t.abort();
+                    }
+                    let delay = r.policy.manual(Instant::now());
+                    let gen = r.gen;
+                    self.schedule_restart(gen, delay);
+                }
+            }
+            Command::Shutdown(reply) => {
+                if let Some((_, cancel)) = self.handoff.take() {
+                    let _ = cancel.send(());
+                }
+                let pending = self.pending_confirm.take().filter(|p| p.from_handoff);
+                tokio::spawn(async move {
+                    if let Some(pending) = pending {
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(3),
+                            real::revoke(&pending.connected.session),
+                        )
+                        .await;
+                    }
+                    let _ = reply.send(());
+                });
+            }
             Command::OpenGuild { guild_id } => self.open_guild(guild_id),
             Command::OpenChannel { channel_id } => self.open_channel(channel_id),
             Command::Send { channel_id, text } => self.send(channel_id, text),
@@ -321,7 +522,9 @@ impl Backend {
     fn restore(&mut self) {
         #[cfg(feature = "demo")]
         if std::env::var_os("INLET_DEMO").is_some() {
-            self.active = Some(Active::Demo(crate::mock::MockSession::start(self.events.clone())));
+            self.active = Some(Active::Demo(crate::mock::MockSession::start(
+                self.events.clone(),
+            )));
             return;
         }
         let events = self.events.clone();
@@ -373,28 +576,47 @@ impl Backend {
                 }
             }
         });
-        self.connecting = Some((attempt, task));
+        self.connecting = Some((attempt, task, Mode::Restore));
     }
 
+    /// Stops waiting for a connect. A restore is aborted. A new sign-in is left to finish
+    /// in the background so its result arrives as stale and the new token is ended
+    /// on the server instead of being lost.
     fn stop_connecting(&mut self) {
-        if let Some((_, task)) = self.connecting.take() {
-            task.abort();
+        if let Some((_, task, mode)) = self.connecting.take() {
+            if mode == Mode::Restore {
+                task.abort();
+            }
         }
     }
 
-    fn start_connect(&mut self, instance: String, discovered: Option<p::Instance>, credential: Credential, mode: Mode) {
+    fn start_connect(
+        &mut self,
+        instance: String,
+        discovered: Option<p::Instance>,
+        credential: Credential,
+        mode: Mode,
+    ) {
         self.stop_connecting();
         self.attempt += 1;
         let attempt = self.attempt;
         if mode == Mode::Restore {
-            self.emit(Event::Starting { instance: instance.clone() });
+            self.emit(Event::Starting {
+                instance: instance.clone(),
+            });
         }
         let internal = self.internal.clone();
         let task = self.spawn_guarded("connect", None, async move {
             let result = connect_task(&instance, discovered, credential.clone()).await;
-            let _ = internal.send(Internal::Connected { attempt, mode, instance, credential, result });
+            let _ = internal.send(Internal::Connected {
+                attempt,
+                mode,
+                instance,
+                credential,
+                result,
+            });
         });
-        self.connecting = Some((attempt, task));
+        self.connecting = Some((attempt, task, mode));
     }
 
     fn start_handoff(&mut self, instance: String) {
@@ -409,17 +631,26 @@ impl Backend {
         let internal = self.internal.clone();
         self.spawn_guarded("handoff", None, async move {
             let started = match real::discover(&instance).await {
-                Ok(inst) => p::Handoff::start(&inst).await.map(|h| (inst, h)).map_err(Failure::from),
+                Ok(inst) => p::Handoff::start(&inst)
+                    .await
+                    .map(|h| (inst, h))
+                    .map_err(Failure::from),
                 Err(err) => Err(err),
             };
             let (inst, handoff) = match started {
                 Ok(v) => v,
                 Err(err) => {
-                    let _ = internal.send(Internal::HandoffDone { id, result: Err(err.message) });
+                    let _ = internal.send(Internal::HandoffDone {
+                        id,
+                        result: Err(err.message),
+                    });
                     return;
                 }
             };
-            let _ = events.unbounded_send(Event::HandoffStarted { url: handoff.browser_url(), code: handoff.display_code() });
+            let _ = events.unbounded_send(Event::HandoffStarted {
+                url: handoff.browser_url(),
+                code: handoff.display_code(),
+            });
             if let Some(result) = real::run_handoff(inst, handoff, cancel_rx).await {
                 let _ = internal.send(Internal::HandoffDone { id, result });
             }
@@ -428,27 +659,39 @@ impl Backend {
 
     fn internal(&mut self, msg: Internal) {
         match msg {
-            Internal::Connected { attempt, mode, instance, credential, result } => {
-                if self.connecting.as_ref().map(|(a, _)| *a) != Some(attempt) {
-                    // Cancelled meanwhile. A fresh token nobody will use is ended on the server.
-                    if mode == Mode::Fresh {
-                        if let Ok(c) = result {
-                            self.spawn_guarded("revoke", None, async move {
-                                real::revoke(&c.session).await;
-                            });
-                        }
+            Internal::Connected {
+                attempt,
+                mode,
+                instance,
+                credential,
+                result,
+            } => {
+                if self.connecting.as_ref().map(|(a, _, _)| *a) != Some(attempt) {
+                    // Cancelled meanwhile. A token Inlet got from the browser is ended on
+                    // the server; a pasted one is only forgotten.
+                    if let (Mode::Fresh, Credential::SignedIn(_), Ok(c)) =
+                        (mode, &credential, result)
+                    {
+                        self.spawn_guarded("revoke", None, async move {
+                            real::revoke(&c.session).await;
+                        });
                     }
                     return;
                 }
                 self.connecting = None;
                 match result {
                     Ok(connected) if mode == Mode::Fresh => {
+                        let from_handoff = matches!(credential, Credential::SignedIn(_));
                         self.emit(Event::ConfirmAccount {
                             display_name: connected.username.clone(),
                             account: connected.account.clone(),
                             instance: connected.session.instance().origin().to_string(),
+                            pasted: !from_handoff,
                         });
-                        self.pending_confirm = Some(connected);
+                        self.pending_confirm = Some(PendingConfirm {
+                            connected,
+                            from_handoff,
+                        });
                     }
                     Ok(connected) => self.install(connected, false),
                     Err(failure) => self.connect_failed(failure, mode, instance, credential),
@@ -461,7 +704,12 @@ impl Backend {
                         self.handoff = None;
                         self.offline = None;
                         let name = inst.origin().to_string();
-                        self.start_connect(name, Some(inst), Credential::SignedIn(signed_in), Mode::Fresh);
+                        self.start_connect(
+                            name,
+                            Some(inst),
+                            Credential::SignedIn(signed_in),
+                            Mode::Fresh,
+                        );
                     }
                     Ok((inst, signed_in)) => {
                         // Cancelled after the browser approved: end that token again.
@@ -498,9 +746,29 @@ impl Backend {
                     });
                 }
             }
-            Internal::GatewayStopped { gen } => {
+            Internal::GatewayEnded { gen, end } => {
+                if !same_session(self.active_gen(), gen) {
+                    return;
+                }
+                let stop = match end {
+                    GatewayEnd::SessionEnded(message) => {
+                        return self.internal(Internal::Ended { gen, message });
+                    }
+                    GatewayEnd::Terminal(message) if message.is_empty() => return,
+                    GatewayEnd::Terminal(message) => Stop::Terminal(message),
+                    GatewayEnd::ChannelClosed => Stop::Unexpected,
+                };
+                self.gateway_stopped(gen, stop);
+            }
+            Internal::GatewayConnected { gen } => {
+                if let Some(Active::Real(r)) = &mut self.active {
+                    if r.gen == gen {
+                        r.policy.connected();
+                    }
+                }
+            }
+            Internal::GatewayRestart { gen } => {
                 if same_session(self.active_gen(), gen) {
-                    self.emit(Event::Status("Disconnected, reconnecting\u{2026}".into()));
                     self.restart_gateway();
                 }
             }
@@ -513,10 +781,12 @@ impl Backend {
                 }
             }
             Internal::TaskPanicked { what, gateway_of } => {
-                self.emit(Event::Error(format!("Part of Inlet stopped unexpectedly ({what}). Try again.")));
+                self.emit(Event::Error(format!(
+                    "Part of Inlet stopped unexpectedly ({what}). Try again."
+                )));
                 if let Some(gen) = gateway_of {
                     if same_session(self.active_gen(), gen) {
-                        self.restart_gateway();
+                        self.gateway_stopped(gen, Stop::Panicked);
                     }
                 }
                 if what == "connect" || what == "restore" {
@@ -527,15 +797,24 @@ impl Backend {
         }
     }
 
-    fn connect_failed(&mut self, failure: Failure, mode: Mode, instance: String, credential: Credential) {
+    fn connect_failed(
+        &mut self,
+        failure: Failure,
+        mode: Mode,
+        instance: String,
+        credential: Credential,
+    ) {
         match (mode, failure.kind) {
             (Mode::Restore, FailureKind::SessionEnded) => {
                 self.offline = None;
                 let inst = instance.clone();
                 self.spawn_guarded("forget token", None, async move {
-                    let _ = tokio::task::spawn_blocking(move || token_store::delete_token(&inst)).await;
+                    let _ =
+                        tokio::task::spawn_blocking(move || token_store::delete_token(&inst)).await;
                 });
-                self.emit(Event::NeedsSignIn { instance: Some(instance) });
+                self.emit(Event::NeedsSignIn {
+                    instance: Some(instance),
+                });
                 self.emit(Event::SignInFailed(failure.message));
             }
             (Mode::Restore, _) => {
@@ -549,8 +828,17 @@ impl Backend {
                     tokio::time::sleep(Duration::from_secs(wait)).await;
                     let _ = internal.send(Internal::Retry { attempt });
                 });
-                self.offline = Some(Offline { instance: instance.clone(), credential, failures, timer: Some(timer) });
-                self.emit(Event::Offline { instance, message: failure.message, retry_in_secs: wait });
+                self.offline = Some(Offline {
+                    instance: instance.clone(),
+                    credential,
+                    failures,
+                    timer: Some(timer),
+                });
+                self.emit(Event::Offline {
+                    instance,
+                    message: failure.message,
+                    retry_in_secs: wait,
+                });
             }
             (Mode::Fresh, _) => self.emit(Event::SignInFailed(failure.message)),
         }
@@ -571,8 +859,13 @@ impl Backend {
         let guilds = Arc::new(Mutex::new(connected.guilds.clone()));
         let cache: ChannelCache = Arc::default();
         let (gateway, forward) = self.spawn_gateway(gen, &session, &guilds, &cache);
+        let mut policy = ReconnectPolicy::default();
+        policy.started(Instant::now());
 
-        self.emit(Event::SignedIn { username: connected.username, instance: instance.clone() });
+        self.emit(Event::SignedIn {
+            username: connected.username,
+            instance: instance.clone(),
+        });
         self.emit(Event::Guilds(connected.guilds));
 
         if save {
@@ -580,10 +873,14 @@ impl Backend {
             let pins = session.pins();
             let old_instance = session.instance().clone();
             let events = self.events.clone();
-            self.spawn_guarded("store token", None, async move {
+            // Not guarded through spawn_guarded: sign-out needs the JoinHandle to wait on.
+            self.saving = Some(tokio::spawn(async move {
                 let inst = instance.clone();
                 let stored = tokio::task::spawn_blocking(move || {
-                    let old = token_store::load_session(&inst).ok().flatten().and_then(|s| Some((s.token, s.pins?)));
+                    let old = token_store::load_session(&inst)
+                        .ok()
+                        .flatten()
+                        .and_then(|s| Some((s.token, s.pins?)));
                     let saved = token_store::save_session(&inst, &token, &pins);
                     if saved.is_ok() {
                         token_store::set_last_instance(&inst);
@@ -595,7 +892,9 @@ impl Backend {
                     Ok((old, Ok(()))) => {
                         // An older token for this instance would otherwise live on forever.
                         if let Some((old, old_pins)) = old {
-                            if let Ok(old_session) = p::Session::from_token_pinned(old_instance, old, &old_pins) {
+                            if let Ok(old_session) =
+                                p::Session::from_token_pinned(old_instance, old, &old_pins)
+                            {
                                 real::revoke(&old_session).await;
                             }
                         }
@@ -607,7 +906,7 @@ impl Backend {
                         ));
                     }
                 }
-            });
+            }));
         }
 
         self.active = Some(Active::Real(RealActive {
@@ -618,6 +917,8 @@ impl Backend {
             guilds,
             cache,
             active_guild: None,
+            policy,
+            restart_timer: None,
         }));
     }
 
@@ -633,47 +934,142 @@ impl Backend {
         let internal = self.internal.clone();
         let (guilds, cache) = (guilds.clone(), cache.clone());
         let forward = self.spawn_guarded("gateway", Some(gen), async move {
-            match real::forward_gateway(rx, events, guilds, cache).await {
-                Some(message) => {
-                    let _ = internal.send(Internal::Ended { gen, message });
+            let on_connected = {
+                let internal = internal.clone();
+                move || {
+                    let _ = internal.send(Internal::GatewayConnected { gen });
                 }
-                None => {
-                    let _ = internal.send(Internal::GatewayStopped { gen });
-                }
-            }
+            };
+            let end = real::forward_gateway(rx, events, guilds, cache, on_connected).await;
+            let _ = internal.send(Internal::GatewayEnded { gen, end });
         });
         (gateway, forward)
     }
 
+    /// The gateway of the active session stopped: restart it later, or ask the user.
+    fn gateway_stopped(&mut self, gen: u64, stop: Stop) {
+        let Some(Active::Real(r)) = &mut self.active else {
+            return;
+        };
+        if r.gen != gen {
+            return;
+        }
+        r.gateway.close();
+        r.forward.abort();
+        match r.policy.on_stop(stop, Instant::now()) {
+            Decision::RestartAfter(delay) => {
+                self.emit(Event::Status(format!(
+                    "Disconnected, reconnecting in {} s\u{2026}",
+                    delay.as_secs()
+                )));
+                self.schedule_restart(gen, delay);
+            }
+            Decision::WaitForUser(message) => {
+                self.emit(Event::Status("Disconnected".into()));
+                self.emit(Event::GatewayDown(message));
+            }
+        }
+    }
+
+    fn schedule_restart(&mut self, gen: u64, delay: Duration) {
+        let internal = self.internal.clone();
+        let timer = self.spawn_guarded("reconnect timer", None, async move {
+            tokio::time::sleep(delay).await;
+            let _ = internal.send(Internal::GatewayRestart { gen });
+        });
+        if let Some(Active::Real(r)) = &mut self.active {
+            if let Some(old) = r.restart_timer.replace(timer) {
+                old.abort();
+            }
+        }
+    }
+
     fn restart_gateway(&mut self) {
-        let Some(Active::Real(r)) = &self.active else { return };
+        let Some(Active::Real(r)) = &self.active else {
+            return;
+        };
         r.forward.abort();
         r.gateway.close();
         let (gateway, forward) = self.spawn_gateway(r.gen, &r.session, &r.guilds, &r.cache);
+        // A new gateway handle does not know the guild on screen yet.
         if let Some(guild) = &r.active_guild {
             gateway.set_guild_active(guild, true);
         }
         if let Some(Active::Real(r)) = &mut self.active {
             r.gateway = gateway;
             r.forward = forward;
+            r.restart_timer = None;
+            r.policy.started(Instant::now());
         }
     }
 
     fn teardown(&mut self, r: &RealActive) {
         r.gateway.close();
         r.forward.abort();
-        for task in [self.open_guild.take(), self.open_channel.take()].into_iter().flatten() {
+        if let Some(t) = &r.restart_timer {
+            t.abort();
+        }
+        for task in [self.open_guild.take(), self.open_channel.take()]
+            .into_iter()
+            .flatten()
+        {
             task.abort();
         }
     }
 
-    /// Ends an unconfirmed new sign-in on the server and forgets it.
+    /// Forgets an unconfirmed new sign-in; a token from the browser is also ended on the
+    /// server.
     fn drop_pending_confirm(&mut self) {
-        if let Some(connected) = self.pending_confirm.take() {
-            self.spawn_guarded("revoke", None, async move {
-                real::revoke(&connected.session).await;
-            });
+        if let Some(pending) = self.pending_confirm.take() {
+            if pending.from_handoff {
+                self.spawn_guarded("revoke", None, async move {
+                    real::revoke(&pending.connected.session).await;
+                });
+            }
         }
+    }
+
+    /// Recovery-screen sign-out: no session is running. Ends the stored token on the
+    /// server if it can be reached within the timeouts, then removes it.
+    fn forget_stored(&mut self) {
+        let events = self.events.clone();
+        self.spawn_guarded("forget stored", None, async move {
+            let stored = tokio::task::spawn_blocking(|| {
+                let instance = token_store::last_instance()?;
+                Some((
+                    instance.clone(),
+                    token_store::load_session(&instance).ok().flatten(),
+                ))
+            })
+            .await
+            .ok()
+            .flatten();
+            let Some((instance, stored)) = stored else {
+                let _ = events.unbounded_send(Event::NeedsSignIn { instance: None });
+                return;
+            };
+            let mut told_server = false;
+            if let Some(token_store::StoredSession {
+                token,
+                pins: Some(pins),
+            }) = stored
+            {
+                if let Ok(inst) = real::discover(&instance).await {
+                    if let Ok(session) = p::Session::from_token_pinned(inst, token, &pins) {
+                        told_server = real::revoke(&session).await;
+                    }
+                }
+            }
+            let inst = instance.clone();
+            let deleted = tokio::task::spawn_blocking(move || token_store::delete_token(&inst))
+                .await
+                .map(|r| r.is_ok())
+                .unwrap_or(false);
+            let _ = events.unbounded_send(Event::NeedsSignIn {
+                instance: Some(instance),
+            });
+            notice_sign_out(&events, told_server, deleted);
+        });
     }
 
     fn sign_out(&mut self) {
@@ -689,6 +1085,9 @@ impl Backend {
         let active = self.active.take();
         self.emit(Event::SignedOut);
         let events = self.events.clone();
+        // A keychain write still running must finish first, or it could store the token
+        // this sign-out is about to revoke.
+        let saving = self.saving.take();
         match active {
             Some(Active::Real(r)) => {
                 // Close the gateway first, so the server's reaction to the revoked token
@@ -696,12 +1095,16 @@ impl Backend {
                 self.teardown(&r);
                 let session = r.session.clone();
                 self.spawn_guarded("sign out", None, async move {
+                    if let Some(saving) = saving {
+                        let _ = saving.await;
+                    }
                     let told_server = real::revoke(&session).await;
                     let instance = session.instance().origin().to_string();
-                    let deleted = tokio::task::spawn_blocking(move || token_store::delete_token(&instance))
-                        .await
-                        .map(|r| r.is_ok())
-                        .unwrap_or(false);
+                    let deleted =
+                        tokio::task::spawn_blocking(move || token_store::delete_token(&instance))
+                            .await
+                            .map(|r| r.is_ok())
+                            .unwrap_or(false);
                     notice_sign_out(&events, told_server, deleted);
                 });
             }
@@ -710,6 +1113,9 @@ impl Backend {
             None => {
                 if let Some(off) = offline {
                     self.spawn_guarded("sign out", None, async move {
+                        if let Some(saving) = saving {
+                            let _ = saving.await;
+                        }
                         let instance = off.instance.clone();
                         let told_server = match real::discover(&off.instance).await {
                             Ok(inst) => match &off.credential {
@@ -723,10 +1129,12 @@ impl Backend {
                             },
                             Err(_) => false,
                         };
-                        let deleted = tokio::task::spawn_blocking(move || token_store::delete_token(&instance))
-                            .await
-                            .map(|r| r.is_ok())
-                            .unwrap_or(false);
+                        let deleted = tokio::task::spawn_blocking(move || {
+                            token_store::delete_token(&instance)
+                        })
+                        .await
+                        .map(|r| r.is_ok())
+                        .unwrap_or(false);
                         notice_sign_out(&events, told_server, deleted);
                     });
                 }
@@ -764,11 +1172,17 @@ impl Backend {
                     };
                     match result {
                         Ok(list) => {
-                            let channels: Vec<Channel> = list.iter().map(real::to_channel).collect();
-                            cache.lock().unwrap().insert(guild_id.clone(), channels.clone());
+                            let channels: Vec<Channel> =
+                                list.iter().map(real::to_channel).collect();
+                            cache
+                                .lock()
+                                .unwrap()
+                                .insert(guild_id.clone(), channels.clone());
                             let _ = events.unbounded_send(Event::Channels { guild_id, channels });
                         }
-                        Err(err) => report(&events, &internal, gen, "Could not load channels: ", err),
+                        Err(err) => {
+                            report(&events, &internal, gen, "Could not load channels: ", err)
+                        }
                     }
                 }));
             }
@@ -784,17 +1198,29 @@ impl Backend {
             #[cfg(feature = "demo")]
             Some(Active::Demo(m)) => m.open_channel(channel_id),
             Some(Active::Real(r)) => {
-                let (session, events, internal, gen) =
-                    (r.session.clone(), self.events.clone(), self.internal.clone(), r.gen);
+                let (session, events, internal, gen) = (
+                    r.session.clone(),
+                    self.events.clone(),
+                    self.internal.clone(),
+                    r.gen,
+                );
                 self.open_channel = Some(self.spawn_guarded("open channel", None, async move {
                     match session.client().messages(&channel_id, None, 50).await {
                         Ok(list) => {
                             // The API returns newest first; the view wants oldest first.
-                            let mut messages: Vec<Message> = list.iter().map(real::to_message).collect();
-                            messages.sort_by(|a, b| real::snowflake_key(&a.id).cmp(&real::snowflake_key(&b.id)));
-                            let _ = events.unbounded_send(Event::Messages { channel_id, messages });
+                            let mut messages: Vec<Message> =
+                                list.iter().map(real::to_message).collect();
+                            messages.sort_by(|a, b| {
+                                real::snowflake_key(&a.id).cmp(&real::snowflake_key(&b.id))
+                            });
+                            let _ = events.unbounded_send(Event::Messages {
+                                channel_id,
+                                messages,
+                            });
                         }
-                        Err(err) => report(&events, &internal, gen, "Could not load messages: ", err),
+                        Err(err) => {
+                            report(&events, &internal, gen, "Could not load messages: ", err)
+                        }
                     }
                 }));
             }
@@ -807,13 +1233,22 @@ impl Backend {
             #[cfg(feature = "demo")]
             Some(Active::Demo(m)) => m.send(channel_id, text),
             Some(Active::Real(r)) => {
-                let (session, events, internal, gen) =
-                    (r.session.clone(), self.events.clone(), self.internal.clone(), r.gen);
+                let (session, events, internal, gen) = (
+                    r.session.clone(),
+                    self.events.clone(),
+                    self.internal.clone(),
+                    r.gen,
+                );
                 self.spawn_guarded("send", None, async move {
                     let nonce = p::new_nonce();
-                    match session.client().send_message(&channel_id, &text, Some(&nonce)).await {
+                    match session
+                        .client()
+                        .send_message(&channel_id, &text, Some(&nonce))
+                        .await
+                    {
                         Ok(message) => {
-                            let _ = events.unbounded_send(Event::MessageCreated(real::to_message(&message)));
+                            let _ = events
+                                .unbounded_send(Event::MessageCreated(real::to_message(&message)));
                         }
                         Err(err) => report(&events, &internal, gen, "Could not send: ", err),
                     }
@@ -838,16 +1273,19 @@ async fn connect_task(
 }
 
 /// Sends a REST failure to the UI, or ends the session when the token is gone.
-fn report(events: &UnboundedSender<Event>, internal: &TokioSender<Internal>, gen: u64, prefix: &str, err: p::Error) {
+fn report(events: &Ui, internal: &TokioSender<Internal>, gen: u64, prefix: &str, err: p::Error) {
     let failure = Failure::from(err);
     if failure.kind == FailureKind::SessionEnded {
-        let _ = internal.send(Internal::Ended { gen, message: failure.message });
+        let _ = internal.send(Internal::Ended {
+            gen,
+            message: failure.message,
+        });
     } else {
         let _ = events.unbounded_send(Event::Error(format!("{prefix}{}", failure.message)));
     }
 }
 
-fn notice_sign_out(events: &UnboundedSender<Event>, told_server: bool, deleted: bool) {
+fn notice_sign_out(events: &Ui, told_server: bool, deleted: bool) {
     let mut parts = Vec::new();
     if !told_server {
         parts.push(
@@ -865,6 +1303,24 @@ fn notice_sign_out(events: &UnboundedSender<Event>, told_server: bool, deleted: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repeated_errors_are_coalesced() {
+        let mut t = Throttle::default();
+        let now = Instant::now();
+        let err = |m: &str| Event::Error(m.to_string());
+        assert!(t.admit(&err("a"), now));
+        assert!(!t.admit(&err("a"), now + Duration::from_secs(1)));
+        assert!(t.admit(&err("a"), now + ERROR_REPEAT));
+        // A loop producing new texts is capped per window.
+        let later = now + Duration::from_secs(60);
+        let passed = (0..100)
+            .filter(|i| t.admit(&err(&format!("e{i}")), later))
+            .count();
+        assert_eq!(passed as u32, ERRORS_PER_WINDOW);
+        assert!(t.admit(&Event::Status("Connected".into()), later));
+        assert!(!t.admit(&Event::Status("Connected".into()), later));
+    }
 
     #[test]
     fn messages_from_an_old_session_are_ignored() {
