@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Inlet: a native desktop client that works with Fluxer.
+// Release builds on Windows are GUI apps: no console window next to Inlet.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod about;
 mod assets;
