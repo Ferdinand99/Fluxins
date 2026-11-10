@@ -249,7 +249,7 @@ async fn concurrent_requests_respect_the_shared_cap() {
     // Two clients for the same token share one limiter.
     let a = Client::with_rate_limit(instance.clone(), Token::new("tok-cap"), config);
     let b = Client::with_rate_limit(instance, Token::new("tok-cap"), config);
-    assert!(std::sync::Arc::ptr_eq(a.rate_limiter(), b.rate_limiter()));
+    assert!(std::sync::Arc::ptr_eq(&a.rate_limiter(), &b.rate_limiter()));
 
     let start = Instant::now();
     let mut tasks = Vec::new();

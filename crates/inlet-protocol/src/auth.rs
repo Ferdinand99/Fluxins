@@ -327,7 +327,7 @@ pub enum HandoffStatus {
     Expired,
 }
 
-//// How long a handoff code lives on the server.
+/// How long a handoff code lives on the server.
 const HANDOFF_LIFETIME: Duration = Duration::from_secs(5 * 60);
 /// Failed polls in a row that [`Handoff::wait`] tolerates.
 const HANDOFF_MAX_FAILURES: u32 = 3;
