@@ -282,7 +282,7 @@ pub(super) fn compose(inline: &Inline, names: &MentionNames, now_s: i64) -> Comp
     }
 }
 
-fn highlight(paint: Paint, revealed: bool) -> HighlightStyle {
+pub(super) fn highlight(paint: Paint, revealed: bool) -> HighlightStyle {
     let style = match paint {
         Paint::Pill { text, fill } => {
             return HighlightStyle {
@@ -326,11 +326,17 @@ fn highlight(paint: Paint, revealed: bool) -> HighlightStyle {
             background_color: Some(theme::spoiler_revealed()),
             ..Default::default()
         },
-        Style::Spoiler => HighlightStyle {
-            background_color: Some(theme::spoiler_hidden()),
-            color: Some(gpui::transparent_black()),
-            ..Default::default()
-        },
+        // gpui blends a highlight colour over the text colour, so a transparent one
+        // leaves the text visible. Text and fill share one opaque colour instead: the
+        // spoiler fill as it looks on the chat background.
+        Style::Spoiler => {
+            let cover = theme::bg_chat().blend(theme::spoiler_hidden());
+            HighlightStyle {
+                background_color: Some(cover),
+                color: Some(cover),
+                ..Default::default()
+            }
+        }
         // Links have no underline at rest, as in Fluxer.
         Style::Link => HighlightStyle {
             color: Some(theme::link()),

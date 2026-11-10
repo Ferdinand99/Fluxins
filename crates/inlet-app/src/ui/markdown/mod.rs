@@ -84,7 +84,7 @@ pub struct Code {
     /// for code block actions.
     #[allow(dead_code)]
     pub language: Option<String>,
-    /// A KaTeX block (`math`, `latex`, `tex`, `katex`), shown as code with a label.
+    /// A KaTeX block (`latex`, `tex`, `katex`), shown as code with a label.
     pub math: bool,
     /// Coloured ranges of `content`, sorted; the rest is plain.
     pub spans: Vec<(Range<usize>, CodeColor)>,
@@ -246,7 +246,7 @@ pub fn is_deceptive(url: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::inline::{clickables, compose, Click};
+    use super::inline::{self, clickables, compose, Click};
     use super::*;
     use crate::model::Names;
 
@@ -451,6 +451,17 @@ mod tests {
         assert!(hidden.iter().all(|(_, c)| matches!(c, Click::Reveal)));
         let shown = clickables(&c, true);
         assert!(shown.iter().any(|(_, c)| matches!(c, Click::Link(..))));
+    }
+
+    #[test]
+    fn hidden_spoiler_text_is_covered() {
+        // gpui blends a highlight colour over the text colour: the hidden text must be
+        // painted in an opaque colour that equals its fill, or it shows through.
+        let hidden = inline::highlight(inline::Paint::Style(Style::Spoiler), false);
+        let color = hidden.color.expect("a text colour");
+        assert_eq!(color.a, 1.0);
+        assert_eq!(hidden.background_color, Some(color));
+        assert_eq!(crate::theme::text().blend(color), color);
     }
 
     #[test]
