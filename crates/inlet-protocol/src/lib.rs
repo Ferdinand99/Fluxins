@@ -24,8 +24,8 @@
 //! };
 //! // (Or: sign_in_password -> NeedsMfa -> sign_in_totp. See the auth module.)
 //!
-//! // 3. Session: REST + gateway. Store signed_in.token in the OS keychain and
-//! //    use Session::from_token next time.
+//! // 3. Session: REST + gateway. Store signed_in.token and session.pins()
+//! //    together in the OS keychain, and use Session::from_token_pinned next time.
 //! let session = Session::from_signed_in(instance, signed_in);
 //! let me = session.client().me().await?;
 //! let guilds = session.client().guilds().await?;

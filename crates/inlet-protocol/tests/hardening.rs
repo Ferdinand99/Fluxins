@@ -199,7 +199,7 @@ async fn global_pause_survives_dropping_the_client() {
 #[tokio::test]
 async fn pinned_session_refuses_moved_endpoints() {
     let (server, instance) = common::instance().await;
-    let session = Session::from_token(instance.clone(), Token::new("tok-pin"));
+    let session = Session::from_token_unpinned(instance.clone(), Token::new("tok-pin"));
     let pins = session.pins();
     assert!(Session::from_token_pinned(instance.clone(), Token::new("tok-pin"), &pins).is_ok());
 
