@@ -28,6 +28,8 @@ const MAX_SEARCHES: usize = 16;
 const SEARCH_LIMIT: u8 = 25;
 /// Sent messages remembered for Retry.
 const MAX_OUTBOX: usize = 50;
+/// Server messages already counted as the copy of a sent message.
+const MAX_CLAIMED: usize = 50;
 /// How long Fluxer recognises a nonce (`MESSAGE_NONCE_TTL`): a repeat with the same
 /// nonce within it is dropped by the server.
 pub const NONCE_MEMORY: Duration = Duration::from_secs(5 * 60);
@@ -124,6 +126,8 @@ struct Inner {
     /// Open member searches: nonce and guild, oldest first.
     searches: VecDeque<(String, String)>,
     outbox: VecDeque<SentMessage>,
+    /// IDs of server messages a late Retry took as its copy.
+    claimed: VecDeque<String>,
 }
 
 /// Whether a Retry must first look for the message: the failure was unclear and the
@@ -203,6 +207,22 @@ impl State {
         if let Some(mut inner) = self.of(gen) {
             inner.outbox.retain(|s| s.message.nonce != nonce);
         }
+    }
+
+    /// Takes server message `id` as the copy of a sent message. `false` when another
+    /// send has taken it already (or the session is gone).
+    pub fn claim_copy(&self, gen: u64, id: &str) -> bool {
+        let Some(mut inner) = self.of(gen) else {
+            return false;
+        };
+        if inner.claimed.iter().any(|c| c == id) {
+            return false;
+        }
+        if inner.claimed.len() >= MAX_CLAIMED {
+            inner.claimed.pop_front();
+        }
+        inner.claimed.push_back(id.to_owned());
+        true
     }
 
     /// The message to send again for a Retry at `now`, and whether to look for it
@@ -344,6 +364,18 @@ mod tests {
         assert!(
             plan.look_since_ms.is_some(),
             "the first attempt may still have arrived"
+        );
+    }
+
+    #[test]
+    fn a_copy_counts_for_one_sent_message() {
+        let state = State::default();
+        assert!(state.claim_copy(1, "900"));
+        assert!(!state.claim_copy(1, "900"), "already taken");
+        assert!(state.claim_copy(1, "901"));
+        assert!(
+            !state.claim_copy(0, "902"),
+            "an older session takes nothing"
         );
     }
 

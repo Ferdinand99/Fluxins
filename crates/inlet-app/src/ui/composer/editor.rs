@@ -647,21 +647,26 @@ impl ComposerView {
         }
     }
 
+    /// Escape closes what the composer has open: the list, an edit, a reply. Only when
+    /// nothing is open does it go on to the app (which marks the channel read); while an
+    /// input method composes, or an edit is open or saving, it never does.
     fn on_cancel(&mut self, _: &Cancel, window: &mut Window, cx: &mut Context<Self>) {
-        // Escape belongs to an input method while it composes.
         let composing = self.editor.read(cx).marked_range().is_some()
             || self
                 .edit
                 .as_ref()
                 .is_some_and(|e| e.editor.read(cx).marked_range().is_some());
         if composing {
-            cx.propagate();
+            // The input method's key: nothing here acts on it.
             return;
         }
         if let Some(open) = self.autocomplete.take() {
             self.dismissed_at = Some(open.start);
-        } else if self.edit.as_ref().is_some_and(|e| !e.saving) {
-            // A saved edit stays until the server answered, so its text is not lost.
+        } else if let Some(edit) = &self.edit {
+            if edit.saving {
+                // A saved edit stays until the server answered, so its text is not lost.
+                return;
+            }
             self.cancel_edit(window, cx);
         } else if self.reply.is_some() {
             self.reply = None;
@@ -1311,9 +1316,11 @@ mod tests {
         });
         cx.simulate_keystrokes("enter");
         assert_eq!(edits(&host, cx).len(), 1);
-        // Escape while the server has not answered keeps the text.
+        // Escape while the server has not answered keeps the text, and never marks the
+        // channel read.
         cx.simulate_keystrokes("escape");
         assert!(view.read_with(cx, |v, _| v.edit.is_some()));
+        assert_eq!(host.read_with(cx, |h, _| h.marked_read), 0);
         let id = (4u64 << 22).to_string();
         view.update(cx, |v, cx| v.on_edit_failed(&id, "too fast", cx));
         let (open_edit, text, error) = view.read_with(cx, |v, cx| {

@@ -101,6 +101,7 @@ pub fn pending_of(message: &Outgoing) -> messages::Pending {
         channel_id: message.channel_id.clone(),
         nonce: message.nonce.clone(),
         text: message.content.clone(),
+        reply_to: message.reply_to.clone(),
         failed: None,
     }
 }

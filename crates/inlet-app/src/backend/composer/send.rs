@@ -19,7 +19,7 @@ use super::directory::RetryPlan;
 use super::Ev;
 use super::State;
 use crate::backend::messages;
-use crate::backend::messages::outbox::{is_own_copy, CLOCK_SLACK_MS};
+use crate::backend::messages::outbox::{is_own_copy, Sent, CLOCK_SLACK_MS};
 use crate::backend::session::{Failure, FailureKind};
 use crate::backend::{Active, Backend, Internal, Ui};
 
@@ -185,6 +185,7 @@ fn report_failure(events: &Ui, message: &Outgoing, e: SendError) {
         channel_id: message.channel_id.clone(),
         nonce: message.nonce.clone(),
         text: message.content.clone(),
+        reply_to: message.reply_to.clone(),
         failed: Some(e.reason),
     }));
 }
@@ -292,13 +293,19 @@ impl Ctx {
             .client
             .messages_after(&message.channel_id, &after, COPY_LOOKBACK)
             .await?;
-        Ok(list.iter().any(|m| {
-            is_own_copy(m, &me, &message.content, 0, since_ms)
-                && message
-                    .reply_to
-                    .as_deref()
-                    .is_none_or(|r| replied_to(m) == Some(r))
-        }))
+        let sent = Sent {
+            me: &me,
+            content: &message.content,
+            reply_to: message.reply_to.as_deref(),
+            attachments: 0,
+            sent_ms: since_ms,
+        };
+        // A copy counts for one sent message only: two failed rows with the same text
+        // cannot both take the same message.
+        Ok(list
+            .iter()
+            .filter(|m| is_own_copy(m, &sent))
+            .any(|m| self.state.claim_copy(self.gen, &m.id)))
     }
 
     /// A retry long after an unclear failure: the server only recognises a nonce for a
@@ -317,14 +324,6 @@ impl Ctx {
             }
         }
     }
-}
-
-/// The message a listed message replies to.
-fn replied_to(m: &p::Message) -> Option<&str> {
-    m.extra
-        .get("message_reference")?
-        .get("message_id")?
-        .as_str()
 }
 
 /// Why a send, a Retry or an edit could not even start.

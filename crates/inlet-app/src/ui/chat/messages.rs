@@ -31,7 +31,7 @@ use serde_json::Value;
 
 use super::time;
 use crate::app::Inlet;
-use crate::backend::messages::outbox::is_own_copy;
+use crate::backend::messages::outbox::{is_own_copy, Sent};
 use crate::backend::messages::parse::{self, SharedNames};
 use crate::backend::messages::{Cmd, Ev, Pending};
 use crate::model::{self, Message, Names};
@@ -924,13 +924,23 @@ impl MessageView {
 
     /// Rows of `channel_id` whose message a page already has. Fluxer's lists carry no
     /// nonce, so a row goes when the page has a message of `me` with the same wire text
-    /// that is not older than the row ([`is_own_copy`]). Each message clears at most
+    /// and reply that is not older than the row ([`is_own_copy`]). Each message clears at most
     /// one row. Whether any went.
     pub fn clear_arrived(&mut self, me: &str, channel_id: &str, messages: &[p::Message]) -> bool {
         let before = self.outbox.len();
         for m in messages {
             if let Some(ix) = self.outbox.iter().position(|o| {
-                o.out.channel_id == channel_id && is_own_copy(m, me, &o.out.text, 0, o.queued_ms)
+                o.out.channel_id == channel_id
+                    && is_own_copy(
+                        m,
+                        &Sent {
+                            me,
+                            content: &o.out.text,
+                            reply_to: o.out.reply_to.as_deref(),
+                            attachments: 0,
+                            sent_ms: o.queued_ms,
+                        },
+                    )
             }) {
                 self.outbox.remove(ix);
             }

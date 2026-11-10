@@ -60,6 +60,8 @@ pub struct Pending {
     /// The nonce sent with the message; the gateway's MESSAGE_CREATE carries it back.
     pub nonce: String,
     pub text: String,
+    /// The message it replies to.
+    pub reply_to: Option<String>,
     /// `None` while sending; the reason once sending failed.
     pub failed: Option<String>,
 }
