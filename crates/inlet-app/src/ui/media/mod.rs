@@ -61,6 +61,9 @@ pub struct State {
     pub scale: f32,
     /// The window size, for the viewer.
     pub viewport: Size<Pixels>,
+    /// Width of the message list at the last layout, read once per frame before the
+    /// list lays out (the list's state is borrowed while it draws its rows).
+    column_width: f32,
     /// The message under the pointer: its author's avatar plays if animated.
     pub hovered_message: Option<String>,
     /// Spoilers and explicit media the person chose to show.
@@ -86,6 +89,7 @@ impl Default for State {
             pending_drop: Vec::new(),
             scale: 1.,
             viewport: Size::default(),
+            column_width: 0.,
             hovered_message: None,
             revealed: HashSet::new(),
             revealed_order: VecDeque::new(),
@@ -137,6 +141,8 @@ impl Inlet {
     pub(crate) fn media_frame(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.media.scale = window.scale_factor();
         self.media.viewport = window.viewport_size();
+        // Here, not while rows are drawn: the list holds its state borrowed then.
+        self.media.column_width = self.chat.message_list.viewport_bounds().size.width.as_f32();
         self.media.images.next_frame();
         if let Some(setup) = &self.media.setup {
             self.media.pending_drop.extend(setup.evicted.try_iter());
@@ -159,7 +165,7 @@ impl Inlet {
     /// `chrome`, the width of a card around it) so a narrow window never clips it. The
     /// request keeps its own size, so resizing the window loads nothing again.
     pub(crate) fn fit_column(&self, size: (f32, f32), chrome: f32) -> (f32, f32) {
-        let list = self.chat.message_list.viewport_bounds().size.width.as_f32();
+        let list = self.media.column_width;
         if list <= 0. {
             return size;
         }

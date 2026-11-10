@@ -30,6 +30,7 @@ function Run-Demo([string]$Name, [hashtable]$Env, [int]$Seconds) {
     if ($p.HasExited) {
         Write-Host "inlet.exe exited early with code $($p.ExitCode)"
         Get-Content $log | Select-Object -Last 40
+        $script:Failed += $Name
     }
     Save-Screen $Name
     if (-not $p.HasExited) {
@@ -41,6 +42,7 @@ function Run-Demo([string]$Name, [hashtable]$Env, [int]$Seconds) {
     Start-Sleep -Seconds 1
 }
 
+$script:Failed = @()
 $env:RUST_LOG = "info"
 # Sign-in screen (no saved session, no demo).
 Run-Demo "01-sign-in" @{} 8
@@ -58,3 +60,10 @@ Run-Demo "07-chat-replies" @{ INLET_DEMO = "1"; INLET_DEMO_LIVE_SECS = "3600"; I
 Run-Demo "08-attachments" @{ INLET_DEMO = "1"; INLET_DEMO_LIVE_SECS = "3600"; INLET_DEMO_SCENE = "attachments"; INLET_DEMO_GUILD = "g1"; INLET_DEMO_CHANNEL = "c-attachments" } 10
 Run-Demo "09-embed-all-types" @{ INLET_DEMO = "1"; INLET_DEMO_LIVE_SECS = "3600"; INLET_DEMO_SCENE = "embed-all-types"; INLET_DEMO_GUILD = "g1"; INLET_DEMO_CHANNEL = "c-embeds" } 10
 Run-Demo "10-image-viewer" @{ INLET_DEMO = "1"; INLET_DEMO_LIVE_SECS = "3600"; INLET_DEMO_SCENE = "image-viewer"; INLET_DEMO_GUILD = "g1"; INLET_DEMO_CHANNEL = "c-attachments" } 10
+
+# A demo that quit before its screenshot crashed: fail the job, the pictures are not
+# worth checking.
+if ($script:Failed.Count -gt 0) {
+    Write-Host "exited early: $($script:Failed -join ', ')"
+    exit 1
+}
