@@ -147,9 +147,11 @@ pub fn escape_markup(text: &str) -> String {
     out
 }
 
-/// Shows a notification. Windows only: the toast is shown from this crate's own
-/// notification thread, so it is safe to call from anywhere, also while gpui's app
-/// is borrowed. A click arrives as [`crate::PlatformEvent::NotificationClicked`].
+/// Shows a notification. Windows only: the toast is queued for this crate's own
+/// notification thread and this returns at once, so it is safe to call from
+/// anywhere, also while gpui's app is borrowed, and never makes the caller wait.
+/// The queue holds 64; beyond that the newest is dropped and logged. Errors from
+/// showing the toast are logged on that thread. A click arrives as [`crate::PlatformEvent::NotificationClicked`].
 /// Elsewhere this returns [`Error::Unsupported`]; use `gpui_glue::notify`, which
 /// picks the right path on every system.
 pub fn notify(notification: &Notification) -> Result<()> {

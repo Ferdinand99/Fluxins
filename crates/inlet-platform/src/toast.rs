@@ -10,7 +10,6 @@
 use std::collections::VecDeque;
 use std::sync::mpsc;
 use std::sync::OnceLock;
-use std::time::Duration;
 
 use windows::core::{h, HSTRING};
 use windows::Data::Xml::Dom::XmlDocument;
@@ -25,19 +24,20 @@ use crate::{Error, Notification, PlatformEvent, Result};
 const GROUP: &str = "inlet";
 /// Toasts kept alive so their click handlers stay registered.
 const KEEP: usize = 64;
-/// How long a caller waits for the notification thread.
-const REPLY_TIMEOUT: Duration = Duration::from_secs(3);
+/// Commands waiting for the notification thread. Beyond this the newest is dropped:
+/// the UI thread never waits for a toast.
+const QUEUE: usize = 64;
 
 enum Command {
-    Show(Notification, mpsc::Sender<Result<()>>),
-    Dismiss(String, mpsc::Sender<Result<()>>),
+    Show(Notification),
+    Dismiss(String),
 }
 
-fn worker() -> Result<&'static mpsc::Sender<Command>> {
-    static WORKER: OnceLock<Option<mpsc::Sender<Command>>> = OnceLock::new();
+fn worker() -> Result<&'static mpsc::SyncSender<Command>> {
+    static WORKER: OnceLock<Option<mpsc::SyncSender<Command>>> = OnceLock::new();
     WORKER
         .get_or_init(|| {
-            let (tx, rx) = mpsc::channel();
+            let (tx, rx) = mpsc::sync_channel(QUEUE);
             std::thread::Builder::new()
                 .name("inlet-notifications".into())
                 .spawn(move || run(rx))
@@ -51,24 +51,27 @@ fn worker() -> Result<&'static mpsc::Sender<Command>> {
         ))
 }
 
-fn ask(command: impl FnOnce(mpsc::Sender<Result<()>>) -> Command) -> Result<()> {
-    let (reply, answer) = mpsc::channel();
-    worker()?
-        .send(command(reply))
-        .map_err(|_| Error::Os("the notification thread has stopped".into()))?;
-    answer
-        .recv_timeout(REPLY_TIMEOUT)
-        .map_err(|_| Error::Os("the notification thread did not answer".into()))?
+/// Queues a command without waiting. A full queue drops it (logged); errors from
+/// showing the toast are logged on the notification thread.
+fn enqueue(command: Command) -> Result<()> {
+    match worker()?.try_send(command) {
+        Ok(()) => Ok(()),
+        Err(mpsc::TrySendError::Full(_)) => {
+            log::warn!("notification queue full; dropped the newest notification");
+            Ok(())
+        }
+        Err(mpsc::TrySendError::Disconnected(_)) => {
+            Err(Error::Os("the notification thread has stopped".into()))
+        }
+    }
 }
 
 pub(crate) fn show(notification: &Notification) -> Result<()> {
-    let notification = notification.clone();
-    ask(|reply| Command::Show(notification, reply))
+    enqueue(Command::Show(notification.clone()))
 }
 
 pub(crate) fn dismiss(tag: &str) -> Result<()> {
-    let tag = tag.to_string();
-    ask(|reply| Command::Dismiss(tag, reply))
+    enqueue(Command::Dismiss(tag.to_string()))
 }
 
 struct State {
@@ -76,23 +79,23 @@ struct State {
     shown: VecDeque<(String, ToastNotification)>,
 }
 
-fn run(commands: mpsc::Receiver<Command>) {
+fn init_thread() {
     // SAFETY: initialises WinRT for this thread only, in the multithreaded apartment.
     if let Err(err) = unsafe { RoInitialize(RO_INIT_MULTITHREADED) } {
         log::warn!("could not initialise WinRT for notifications: {err}");
     }
-    let mut state = State {
-        notifier: None,
-        shown: VecDeque::new(),
-    };
+}
+
+fn run(commands: mpsc::Receiver<Command>) {
+    init_thread();
+    let mut state = State::new();
     for command in commands {
-        match command {
-            Command::Show(notification, reply) => {
-                let _ = reply.send(state.show(&notification));
-            }
-            Command::Dismiss(tag, reply) => {
-                let _ = reply.send(state.dismiss(&tag));
-            }
+        let result = match command {
+            Command::Show(notification) => state.show(&notification),
+            Command::Dismiss(tag) => state.dismiss(&tag),
+        };
+        if let Err(err) = result {
+            log::warn!("notification failed: {err}");
         }
     }
 }
@@ -109,6 +112,13 @@ fn register_app_id() -> Result<()> {
 }
 
 impl State {
+    fn new() -> Self {
+        Self {
+            notifier: None,
+            shown: VecDeque::new(),
+        }
+    }
+
     fn notifier(&mut self) -> Result<ToastNotifier> {
         if let Some(notifier) = &self.notifier {
             return Ok(notifier.clone());
@@ -188,9 +198,31 @@ mod tests {
     #[test]
     #[ignore = "shows a real toast; run in CI with --include-ignored"]
     fn windows_toast_can_be_shown_and_dismissed() {
-        let n =
-            Notification::new("inlet-test:1", "Inlet test", "From the platform tests.").unwrap();
+        // The same steps the notification thread runs, here with their results.
+        std::thread::spawn(|| {
+            init_thread();
+            let mut state = State::new();
+            let n = Notification::new("inlet-test:1", "Inlet test", "From the platform tests.")
+                .unwrap();
+            state.show(&n).unwrap();
+            state.dismiss("inlet-test:1").unwrap();
+        })
+        .join()
+        .unwrap();
+        // The public calls only queue and never wait.
+        let n = Notification::new("inlet-test:2", "Inlet test", "Queued.").unwrap();
         show(&n).unwrap();
-        dismiss("inlet-test:1").unwrap();
+        dismiss("inlet-test:2").unwrap();
+    }
+
+    #[test]
+    fn a_full_queue_drops_instead_of_waiting() {
+        let started = std::time::Instant::now();
+        let n = Notification::new("inlet-test:q", "Inlet test", "Queue.").unwrap();
+        for _ in 0..(QUEUE * 3) {
+            // Dismissing an unknown tag is harmless; showing is not needed here.
+            let _ = enqueue(Command::Dismiss(n.tag().to_string()));
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 }

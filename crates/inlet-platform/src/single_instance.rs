@@ -448,9 +448,9 @@ mod imp {
 
     use windows::core::{HSTRING, PCWSTR, PWSTR};
     use windows::Win32::Foundation::{
-        CloseHandle, LocalFree, ERROR_ACCESS_DENIED, ERROR_BROKEN_PIPE, ERROR_IO_PENDING,
-        ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, GENERIC_READ, GENERIC_WRITE, HANDLE, HLOCAL,
-        WAIT_OBJECT_0,
+        CloseHandle, LocalFree, ERROR_ACCESS_DENIED, ERROR_BROKEN_PIPE, ERROR_IO_INCOMPLETE,
+        ERROR_IO_PENDING, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, GENERIC_READ, GENERIC_WRITE,
+        HANDLE, HLOCAL, WAIT_OBJECT_0,
     };
     use windows::Win32::Security::Authorization::{
         ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
@@ -523,7 +523,23 @@ mod imp {
         }
 
         /// Starts an operation with `start` and waits for it within the deadline.
+        /// Once the deadline has passed no new operation is started, so there is
+        /// nothing to cancel.
         fn run(
+            &self,
+            start: impl FnOnce(&mut OVERLAPPED) -> windows::core::Result<()>,
+        ) -> io::Result<u32> {
+            if let Some(until) = self.until {
+                remaining(until)?;
+            }
+            self.run_started(start)
+        }
+
+        /// Starts the operation and waits for it. Every started operation ends in
+        /// completion, or in `CancelIoEx` plus `GetOverlappedResult(wait = TRUE)`
+        /// through [`InFlight`], before `ov` (and the caller's buffer) can go away,
+        /// also on an early return or a panic.
+        fn run_started(
             &self,
             start: impl FnOnce(&mut OVERLAPPED) -> windows::core::Result<()>,
         ) -> io::Result<u32> {
@@ -531,35 +547,82 @@ mod imp {
                 hEvent: self.event.0,
                 ..Default::default()
             };
-            match start(&mut ov) {
+            let started = start(&mut ov);
+            let mut in_flight = InFlight {
+                pipe: self.pipe.0,
+                ov: &ov,
+                finished: false,
+            };
+            match started {
                 Ok(()) => {}
                 Err(err) if err.code() == ERROR_IO_PENDING.to_hresult() => {
+                    // Saturating: a deadline that has just passed waits 0 ms and then
+                    // cancels below; nothing here may return early.
                     let wait_ms = match self.until {
-                        Some(until) => remaining(until)?.as_millis().clamp(1, 60_000) as u32,
+                        Some(until) => until
+                            .saturating_duration_since(Instant::now())
+                            .as_millis()
+                            .min(60_000) as u32,
                         None => INFINITE,
                     };
                     // SAFETY: the event belongs to this operation and stays alive.
                     let woke = unsafe { WaitForSingleObject(self.event.0, wait_ms) };
                     if woke != WAIT_OBJECT_0 {
-                        // SAFETY: cancels only this operation, then waits for the
-                        // cancellation to finish so `ov` is no longer in use.
-                        unsafe {
-                            let _ = CancelIoEx(self.pipe.0, Some(&ov));
-                            let mut ignored = 0u32;
-                            let _ = GetOverlappedResult(self.pipe.0, &ov, &mut ignored, true);
-                        }
+                        // Cancels the operation and waits until the kernel is done
+                        // with `ov` and the buffer.
+                        drop(in_flight);
                         return Err(io::Error::new(
                             io::ErrorKind::TimedOut,
                             "pipe deadline passed",
                         ));
                     }
                 }
-                Err(err) => return Err(os_error(err)),
+                Err(err) => {
+                    // Failed at once: nothing was started.
+                    in_flight.finished = true;
+                    return Err(os_error(err));
+                }
             }
             let mut done = 0u32;
-            // SAFETY: the operation on `ov` has completed.
-            unsafe { GetOverlappedResult(self.pipe.0, &ov, &mut done, false) }.map_err(os_error)?;
-            Ok(done)
+            // SAFETY: the operation on `ov` has signalled completion.
+            let result =
+                unsafe { GetOverlappedResult(self.pipe.0, in_flight.ov, &mut done, false) };
+            match result {
+                Err(err) if err.code() == ERROR_IO_INCOMPLETE.to_hresult() => {
+                    // Not actually done: the guard cancels and waits.
+                    Err(os_error(err))
+                }
+                result => {
+                    in_flight.finished = true;
+                    result.map_err(os_error)?;
+                    Ok(done)
+                }
+            }
+        }
+    }
+
+    /// A started overlapped operation. Unless it was seen to finish, dropping this
+    /// cancels it and waits for the cancellation, so the `OVERLAPPED` and the buffer
+    /// it points to are never freed while the kernel still owns them.
+    struct InFlight<'o> {
+        pipe: HANDLE,
+        ov: &'o OVERLAPPED,
+        finished: bool,
+    }
+
+    impl Drop for InFlight<'_> {
+        fn drop(&mut self) {
+            if self.finished {
+                return;
+            }
+            let mut ignored = 0u32;
+            // SAFETY: cancels only this operation, then blocks until it has
+            // completed (cancelled or not), after which the kernel no longer uses
+            // `ov` or the buffer.
+            unsafe {
+                let _ = CancelIoEx(self.pipe, Some(self.ov));
+                let _ = GetOverlappedResult(self.pipe, self.ov, &mut ignored, true);
+            }
         }
     }
 
@@ -671,6 +734,73 @@ mod imp {
         SilentClient(Handle(
             open_client(&pipe_name(app_id, &sid), false).unwrap(),
         ))
+    }
+
+    /// Runs a pending read and a pending write whose deadline has already passed
+    /// (tests only): both must come back `TimedOut` after being cancelled, and the
+    /// pipe must still work afterwards.
+    #[cfg(test)]
+    pub(super) fn pending_io_after_the_deadline() {
+        let name = HSTRING::from(format!(
+            r"\\.\pipe\inlet-test-{}-pending",
+            std::process::id()
+        ));
+        // SAFETY: a test pipe with tiny buffers, so a large write stays pending.
+        let server = unsafe {
+            CreateNamedPipeW(
+                PCWSTR(name.as_ptr()),
+                PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+                1,
+                1,
+                1,
+                0,
+                None,
+            )
+        };
+        assert!(!server.is_invalid());
+        let server = Handle(server);
+        let client = Handle(open_client(&name, false).unwrap());
+        accept(&server).unwrap();
+
+        let past = Instant::now()
+            .checked_sub(Duration::from_millis(10))
+            .unwrap_or_else(Instant::now);
+        let io = Overlapped::new(&server, Some(past)).unwrap();
+        let handle = server.0;
+
+        // A read with nothing to read stays pending; the deadline has passed.
+        let mut buf = [0u8; 16];
+        // SAFETY: `buf` outlives the call; run_started waits for the operation.
+        let err = io
+            .run_started(|ov| unsafe { ReadFile(handle, Some(&mut buf), None, Some(ov)) })
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+
+        // A write larger than the pipe buffer with nobody reading stays pending.
+        let big = vec![7u8; 256 * 1024];
+        // SAFETY: `big` outlives the call; run_started waits for the operation.
+        let err = io
+            .run_started(|ov| unsafe { WriteFile(handle, Some(&big), None, Some(ov)) })
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+
+        // Through the public path nothing is even started after the deadline.
+        let mut late = Overlapped::new(&server, Some(past)).unwrap();
+        assert_eq!(
+            late.read(&mut buf).unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+
+        // The pipe still works: the client writes, a fresh deadline reads it.
+        let mut written = 0u32;
+        // SAFETY: synchronous write on the client handle from a valid buffer.
+        unsafe { WriteFile(client.0, Some(b"x"), Some(&mut written), None) }.unwrap();
+        let mut fresh =
+            Overlapped::new(&server, Some(Instant::now() + Duration::from_secs(2))).unwrap();
+        let mut one = [0u8; 1];
+        assert_eq!(fresh.read(&mut one).unwrap(), 1);
+        assert_eq!(one[0], b'x');
     }
 
     pub(super) fn start(opts: &SingleInstance, message: &[u8]) -> Result<Instance> {
@@ -905,6 +1035,14 @@ mod tests {
             rx.recv_timeout(Duration::from_secs(5)).unwrap(),
             args(&["x"])
         );
+    }
+
+    /// A pending read and a pending write whose deadline has passed are cancelled
+    /// and waited for before their memory goes away.
+    #[cfg(windows)]
+    #[test]
+    fn pending_pipe_io_after_the_deadline_is_cancelled() {
+        imp::pending_io_after_the_deadline();
     }
 
     #[test]
