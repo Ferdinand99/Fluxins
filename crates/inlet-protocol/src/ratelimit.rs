@@ -505,9 +505,15 @@ mod tests {
             Instant::now() - start
         });
         let waited_b = b.await.unwrap();
-        assert!(waited_b < Duration::from_secs(2), "route B waited {waited_b:?}");
+        assert!(
+            waited_b < Duration::from_secs(2),
+            "route B waited {waited_b:?}"
+        );
         let waited_a = a.await.unwrap();
-        assert!(waited_a >= Duration::from_secs(60), "route A waited {waited_a:?}");
+        assert!(
+            waited_a >= Duration::from_secs(60),
+            "route A waited {waited_a:?}"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -516,7 +522,10 @@ mod tests {
         let key = |n: u8| LimiterKey::Token("https://evict".into(), [n; 32]);
         let held = Arc::new(RateLimiter::new(RateLimitConfig::default()));
         map.insert(key(1), held.clone());
-        map.insert(key(2), Arc::new(RateLimiter::new(RateLimitConfig::default())));
+        map.insert(
+            key(2),
+            Arc::new(RateLimiter::new(RateLimitConfig::default())),
+        );
         let paused = Arc::new(RateLimiter::new(RateLimitConfig::default()));
         paused.record_429("GET /x", MAX_SERVER_WAIT, true);
         map.insert(key(3), paused);

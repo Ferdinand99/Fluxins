@@ -536,7 +536,9 @@ impl Session {
     }
 
     /// Old name of [`Session::from_token_unpinned`].
-    #[deprecated(note = "use `from_token_pinned`, or `from_token_unpinned` for a token without pins")]
+    #[deprecated(
+        note = "use `from_token_pinned`, or `from_token_unpinned` for a token without pins"
+    )]
     pub fn from_token(instance: Instance, token: Token) -> Session {
         Self::from_token_unpinned(instance, token)
     }

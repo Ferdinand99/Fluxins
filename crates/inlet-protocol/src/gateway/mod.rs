@@ -1176,7 +1176,10 @@ mod tests {
     async fn pacer_limits_bounded_commands_and_presence() {
         let mut pacer = Pacer::default();
         for i in 0..10 {
-            pacer.push(lazy_request(std::iter::once((format!("{i}").as_str(), true))));
+            pacer.push(lazy_request(std::iter::once((
+                format!("{i}").as_str(),
+                true,
+            ))));
         }
         for _ in 0..7 {
             pacer.push(presence("idle"));
