@@ -32,7 +32,6 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use rand::Rng;
-use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, watch};
 use tokio::time::{sleep, timeout, Instant};
@@ -731,10 +730,10 @@ impl Task {
                     let _ = close(&mut ws, 1000).await;
                     return Outcome::Stop(CloseReason::ClientClosed);
                 }
-                permit = self.events.reserve(), if !self.pending.is_empty() => match permit {
+                permit = self.events.clone().reserve_owned(), if !self.pending.is_empty() => match permit {
                     Ok(p) => {
                         if let Some(ev) = self.pending.pop_front() {
-                            p.send(ev);
+                            let _ = p.send(ev);
                         }
                     }
                     Err(_) => {
