@@ -734,3 +734,132 @@ async fn new_events_arrive_typed() {
     assert!(matches!(&got[8], Dispatch::MessageDeleteBulk(b) if b.ids.len() == 2));
     assert!(matches!(&got[9], Dispatch::Other { name, .. } if name == "CALL_CREATE"));
 }
+
+#[tokio::test]
+async fn thread_subscriptions_and_forum_unreads_are_sent() {
+    use inlet_protocol::ForumUnreadRequest;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (handle, _events) = Gateway::connect(
+        instance_for(port),
+        Token::new("gw-threads"),
+        fast_options(false),
+    );
+    handle.set_guild_active("100", true);
+    // Remembered before READY; invalid thread IDs are dropped, and an
+    // invalid guild ID is refused (Fluxer would close with 4002).
+    assert!(!handle.subscribe_threads("../1", &["300"]));
+    assert!(!handle.subscribe_threads("@me", &[]));
+    assert!(handle.subscribe_threads("100", &["300", "../x"]));
+    // A forum unread request before READY is dropped, not sent later.
+    let early = [ForumUnreadRequest {
+        thread_id: "999".into(),
+        ack_message_id: None,
+    }];
+    assert!(handle.request_forum_unreads("100", "400", &early));
+    let mut c = Conn::accept(&listener).await;
+    c.hello(45_000).await;
+    let identify = c.recv(false).await;
+    assert_eq!(identify["op"], 2);
+    // Identify asks for thread events.
+    let flags = identify["d"]["flags"].as_u64().unwrap();
+    assert_ne!(
+        flags & u64::from(inlet_protocol::gateway::FLAG_CHANNEL_THREADS),
+        0
+    );
+    c.dispatch(1, "READY", ready("sess-threads")).await;
+    let lazy = c.recv(false).await;
+    assert_eq!(lazy["op"], 14, "{lazy}");
+    assert_eq!(
+        lazy["d"]["subscriptions"]["100"],
+        json!({"active": true, "typing": true, "threads": true, "thread_member_lists": ["300"]})
+    );
+
+    // Forum unreads: bad post IDs are left out; none valid sends nothing.
+    let none = [ForumUnreadRequest {
+        thread_id: "nope".into(),
+        ack_message_id: None,
+    }];
+    assert!(!handle.request_forum_unreads("100", "400", &none));
+    let posts = [
+        ForumUnreadRequest {
+            thread_id: "500".into(),
+            ack_message_id: Some("501".into()),
+        },
+        ForumUnreadRequest {
+            thread_id: "x".into(),
+            ack_message_id: None,
+        },
+        ForumUnreadRequest {
+            thread_id: "502".into(),
+            ack_message_id: Some("bad".into()),
+        },
+    ];
+    assert!(handle.request_forum_unreads("100", "400", &posts));
+    let op28 = c.recv(false).await;
+    assert_eq!(
+        op28,
+        json!({"op": 28, "d": {"guild_id": "100", "channel_id": "400", "threads": [
+            {"thread_id": "500", "ack_message_id": "501"}, {"thread_id": "502"}]}})
+    );
+    // Guild and channel IDs must be snowflakes; nothing is sent otherwise
+    // (the next frame is the Identify below, not another op 28).
+    assert!(!handle.request_forum_unreads("@me", "400", &posts));
+    assert!(!handle.request_forum_unreads("100", "4 00", &posts));
+    assert!(!handle.request_forum_unreads("", "400", &posts));
+
+    // After a fresh Identify the thread subscription is replayed.
+    c.send(json!({"op": 9, "d": false})).await;
+    assert_eq!(c.recv(false).await["op"], 2);
+    c.dispatch(1, "READY", ready("sess-threads-2")).await;
+    let lazy = c.recv(false).await;
+    assert_eq!(lazy["d"]["subscriptions"]["100"]["threads"], true);
+    assert_eq!(
+        lazy["d"]["subscriptions"]["100"]["thread_member_lists"],
+        json!(["300"])
+    );
+
+    // Unsubscribing tells the server and stops the replay.
+    assert!(!handle.unsubscribe_threads("x"));
+    assert!(handle.unsubscribe_threads("100"));
+    let lazy = c.recv(false).await;
+    assert_eq!(
+        lazy["d"]["subscriptions"]["100"],
+        json!({"active": true, "typing": true, "threads": false, "thread_member_lists": []})
+    );
+}
+
+/// Without the `CHANNEL_THREADS` session flag Fluxer closes op 28 with 4001
+/// and ignores the thread options, so neither is sent.
+#[tokio::test]
+async fn thread_commands_need_the_channel_threads_flag() {
+    use inlet_protocol::gateway::FLAG_CHANNEL_THREADS;
+    use inlet_protocol::ForumUnreadRequest;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let options = GatewayOptions {
+        flags: GatewayOptions::default().flags & !FLAG_CHANNEL_THREADS,
+        ..fast_options(false)
+    };
+    let (handle, _events) = Gateway::connect(instance_for(port), Token::new("gw-noflag"), options);
+    let mut c = Conn::accept(&listener).await;
+    c.hello(45_000).await;
+    let identify = c.recv(false).await;
+    assert_eq!(identify["op"], 2);
+    assert_eq!(
+        identify["d"]["flags"].as_u64().unwrap() & u64::from(FLAG_CHANNEL_THREADS),
+        0
+    );
+    c.dispatch(1, "READY", ready("sess-noflag")).await;
+
+    let posts = [ForumUnreadRequest {
+        thread_id: "500".into(),
+        ack_message_id: None,
+    }];
+    assert!(!handle.request_forum_unreads("100", "400", &posts));
+    assert!(!handle.subscribe_threads("100", &["300"]));
+    assert!(!handle.unsubscribe_threads("100"));
+    // The next frame is the status, not op 28 or op 14.
+    handle.set_status("idle");
+    assert_eq!(c.recv(false).await["op"], 3);
+}

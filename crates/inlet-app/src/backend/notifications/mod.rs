@@ -1,132 +1,108 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! Unread state, mention badges, muting and notification levels.
+//! The network side of unread state and notification settings: sending read
+//! acknowledgements and writing settings. What is read, what is unread and what the
+//! settings are is decided on the UI thread, from the one account state (`ui/notifications`);
+//! this domain only talks to the server.
 //!
-//! A [`ReadTracker`] per session feeds the gateway's events into `inlet-state`
-//! (which applies Fluxer's unread and mention rules), tells the UI what changed as
-//! small [`BadgeUpdate`]s, sends acknowledgements through the protocol's coalesced
-//! `ack` (behind the gate in `messages/ack.rs`), and writes notification settings
-//! in batches. The UI only ever sees plain values keyed by the IDs it already has.
+//! Request budget (all through the protocol's limiter, which also coalesces
+//! acknowledgements into one batched request per second for the account, up to 100
+//! channels per request):
+//!
+//! - Acknowledgements: `Cmd::Ack` hands each channel and message to `Client::ack`. The UI
+//!   side decides when (at most one per channel per 3 s for reading, at once for "mark as
+//!   read"), and never sends one for a channel that is already read.
+//! - Settings: one `PATCH` per `Cmd::WriteSettings`; the UI keeps at most one in flight
+//!   per guild.
 
-mod settings;
-mod tracker;
+use inlet_protocol as p;
+use inlet_state::GuildId;
+use serde_json::Value;
 
-use inlet_state::{ChannelId, GuildId};
-
+use super::session::Failure;
 use super::{Active, Backend};
-
-pub use settings::{Change, SettingsView, Target};
-pub use tracker::{Now, ReadHandle, ReadTracker};
-
-/// What the sidebar and the guild rail show for one channel, category or guild.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Badge {
-    /// Unread messages: the white pill and bold name (not for a muted guild).
-    pub unread: bool,
-    /// Unread mentions: the red count.
-    pub mentions: u32,
-    /// Muted at some level (the channel, its category or the guild).
-    pub muted: bool,
-    /// The channel or category is muted itself: its row is drawn dimmed.
-    pub dimmed: bool,
-}
-
-impl Badge {
-    /// Nothing to show: the UI keeps no entry for it.
-    pub fn is_default(&self) -> bool {
-        *self == Badge::default()
-    }
-}
-
-/// A change to the badges the UI holds. Entries with a default badge are removals.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct BadgeUpdate {
-    /// Drop every badge first (a new READY).
-    pub reset: bool,
-    /// Channel and category ID to its badge.
-    pub channels: Vec<(String, Badge)>,
-    /// Guild ID to its badge; `None` is the direct messages button.
-    pub guilds: Vec<(Option<String>, Badge)>,
-}
-
-impl BadgeUpdate {
-    pub fn is_empty(&self) -> bool {
-        !self.reset && self.channels.is_empty() && self.guilds.is_empty()
-    }
-}
 
 /// Commands of this domain.
 pub enum Cmd {
-    /// The channel on screen: open, window in front, and the person at the bottom of it.
-    /// `None` when nothing is being read (another window in front, scrolled up, no
-    /// channel). Messages that arrive in a watched channel are read at once, and opening
-    /// one reads what it holds.
-    Watch { channel_id: Option<String> },
-    /// "Mark as read" for one channel.
-    MarkChannelRead { channel_id: String },
-    /// "Mark as read" for every channel of a guild (`None`: every direct message).
-    MarkGuildRead { guild_id: Option<String> },
-    /// "Mark as read" for everything.
-    MarkAllRead,
-    /// Changes a mute, a notification level or a suppression.
-    Change { target: Target, change: Change },
-    /// The settings window is open for this guild and channel: send their settings now
-    /// and again whenever they change.
-    ShowSettings {
+    /// Channels read up to a message: `(channel ID, message ID)`.
+    Ack { items: Vec<(String, String)> },
+    /// A settings write for a guild (`None`: the direct messages).
+    WriteSettings {
         guild_id: Option<String>,
-        channel_id: Option<String>,
+        body: Value,
     },
-    /// The settings window closed.
-    HideSettings,
 }
 
 /// Events of this domain.
 pub enum Ev {
-    /// Badges changed.
-    Badges(BadgeUpdate),
-    /// A channel was opened for reading. `last_read` is the message the account had read
-    /// up to just before, for the "new messages" divider.
-    Opened {
-        channel_id: String,
-        last_read: Option<String>,
-        mentions: u32,
+    /// A settings write ended: the settings the server answered with, or why it failed.
+    SettingsWritten {
+        guild_id: Option<String>,
+        result: Result<Value, String>,
     },
-    /// The settings of the guild and channel the settings window shows.
-    Settings(SettingsView),
+}
+
+/// The gateway event that carries a guild's notification settings.
+pub const SETTINGS_UPDATE: &str = "USER_GUILD_SETTINGS_UPDATE";
+
+/// The route of a guild's (or the direct messages') settings.
+pub fn settings_route(guild: Option<GuildId>) -> String {
+    match guild {
+        Some(g) => format!("/users/@me/guilds/{g}/settings"),
+        None => "/users/@me/guilds/@me/settings".to_string(),
+    }
+}
+
+/// Hands the acknowledgements to the protocol, which sends them as batches.
+pub fn send_acks(client: &p::Client, items: &[(String, String)]) {
+    for (channel, message) in items {
+        client.ack(channel, message);
+    }
+}
+
+/// One settings `PATCH`.
+pub async fn write_settings(
+    client: &p::Client,
+    guild: Option<GuildId>,
+    body: &Value,
+) -> Result<Value, String> {
+    client
+        .request_json(p::Method::PATCH, &settings_route(guild), Some(body))
+        .await
+        .map_err(|err| Failure::from(err).message)
 }
 
 pub(super) fn handle(backend: &mut Backend, cmd: Cmd) {
-    let Some(Active::Real(r)) = &backend.active else {
-        return;
-    };
-    let read = r.read.clone();
-    let mut tracker = read.lock().unwrap_or_else(|e| e.into_inner());
-    let now = Now::current();
     match cmd {
-        Cmd::Watch { channel_id } => {
-            tracker.watch(channel_id.as_deref().and_then(ChannelId::parse), now)
-        }
-        Cmd::MarkChannelRead { channel_id } => {
-            if let Some(ch) = ChannelId::parse(&channel_id) {
-                tracker.mark_channel_read(ch, now);
+        Cmd::Ack { items } => {
+            if let Some(Active::Real(r)) = &backend.active {
+                send_acks(r.session.client(), &items);
             }
         }
-        Cmd::MarkGuildRead { guild_id } => match guild_id.as_deref() {
-            None => tracker.mark_guild_read(None, now),
-            Some(g) => {
-                if let Some(g) = GuildId::parse(g) {
-                    tracker.mark_guild_read(Some(g), now);
+        Cmd::WriteSettings { guild_id, body } => {
+            // Only a guild ID that is one; anything else is answered with a failure, as
+            // the UI waits for an answer to every write.
+            let guild = match guild_id.as_deref() {
+                None => Some(None),
+                Some(g) => GuildId::parse(g).map(Some),
+            };
+            let events = backend.events.clone();
+            let answer = move |result: Result<Value, String>| {
+                let _ = events.unbounded_send(Ev::SettingsWritten { guild_id, result });
+            };
+            match (&backend.active, guild) {
+                (Some(Active::Real(r)), Some(guild)) => {
+                    let client = r.session.client().clone();
+                    backend.spawn_guarded("write settings", None, async move {
+                        answer(write_settings(&client, guild, &body).await);
+                    });
                 }
+                #[cfg(feature = "demo")]
+                (Some(Active::Demo(_)), Some(_)) => answer(Ok(Value::Null)),
+                _ => answer(Err(t!("error-settings-not-saved"))),
             }
-        },
-        Cmd::MarkAllRead => tracker.mark_all_read(now),
-        Cmd::Change { target, change } => tracker.change(target, change, now),
-        Cmd::ShowSettings {
-            guild_id,
-            channel_id,
-        } => tracker.show_settings(
-            guild_id.as_deref().and_then(GuildId::parse),
-            channel_id.as_deref().and_then(ChannelId::parse),
-        ),
-        Cmd::HideSettings => tracker.hide_settings(),
+        }
     }
 }
+
+#[cfg(test)]
+mod tests;

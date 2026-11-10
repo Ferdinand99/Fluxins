@@ -33,6 +33,14 @@ pub fn channels(channels: &mut HashMap<Option<String>, Vec<Channel>>) {
             channel("c-text", "Text channels", ChannelKind::Category, None, 1),
             channel("c-general", "general", ChannelKind::Text, Some("c-text"), 0),
             channel("c-dev", "development", ChannelKind::Text, Some("c-text"), 1),
+            channel(
+                "c-system",
+                "system-messages",
+                ChannelKind::Text,
+                Some("c-text"),
+                2,
+            ),
+            channel("c-replies", "replies", ChannelKind::Text, Some("c-text"), 3),
             channel("c-voice", "Voice", ChannelKind::Category, None, 2),
             channel("c-lounge", "Lounge", ChannelKind::Voice, Some("c-voice"), 0),
             channel(

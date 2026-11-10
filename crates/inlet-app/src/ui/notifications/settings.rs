@@ -217,7 +217,11 @@ pub fn compose(
     for intent in intents {
         obj.extend(intent.fields.clone());
     }
-    obj.insert("channel_overrides".into(), overrides_json(base, intents));
+    // A map that is known to be cut is left out: the state keeps its flag, and a later
+    // read of the map would otherwise look whole.
+    if !base.lossy {
+        obj.insert("channel_overrides".into(), overrides_json(base, intents));
+    }
     Value::Object(obj)
 }
 
@@ -232,12 +236,13 @@ fn body(base: &GuildNotificationSettings, intent: &Intent) -> Value {
     Value::Object(obj)
 }
 
-/// The route of a guild's (or the direct messages') settings.
-pub fn route(guild: Option<GuildId>) -> String {
-    match guild {
-        Some(g) => format!("/users/@me/guilds/{g}/settings"),
-        None => "/users/@me/guilds/@me/settings".to_string(),
-    }
+/// What `SettingsBatch::start_due` starts.
+#[derive(Debug, Default, PartialEq)]
+pub struct Started {
+    /// Requests to send: the guild and the body.
+    pub send: Vec<(Option<GuildId>, Value)>,
+    /// Guilds whose channel changes were dropped because the local override map is cut.
+    pub refused: Vec<Option<GuildId>>,
 }
 
 /// One guild's write state.
@@ -333,14 +338,17 @@ impl SettingsBatch {
     }
 
     /// A new READY: what the server holds now is the confirmed settings of every guild
-    /// that has a write going on, and versions start over. Returns those guilds.
+    /// that has a write going on, with the versions READY carries (an answer to a write
+    /// that was out before READY and is older than what READY shows is then old news).
+    /// Returns those guilds.
     pub fn reset(
         &mut self,
         settings: impl Fn(Option<GuildId>) -> GuildNotificationSettings,
+        versions: &BTreeMap<Option<GuildId>, i64>,
     ) -> Vec<Option<GuildId>> {
         for (g, w) in &mut self.guilds {
             w.confirmed = settings(*g);
-            w.version = None;
+            w.version = versions.get(g).copied();
         }
         self.guilds
             .iter()
@@ -353,7 +361,7 @@ impl SettingsBatch {
     /// change is at least [`QUIET`] old, the oldest first, at most [`MAX_PER_TICK`].
     /// What they carry moves to "in flight"; the body is built here, from the settings
     /// the server has confirmed by now.
-    pub fn start_due(&mut self, now: Instant) -> Vec<(Option<GuildId>, Value)> {
+    pub fn start_due(&mut self, now: Instant) -> Started {
         let mut ready: Vec<(Option<GuildId>, Instant)> = self
             .guilds
             .iter()
@@ -365,16 +373,29 @@ impl SettingsBatch {
             .collect();
         ready.sort_by_key(|(_, at)| *at);
         ready.truncate(MAX_PER_TICK);
-        ready
-            .into_iter()
-            .filter_map(|(g, _)| {
-                let w = self.guilds.get_mut(&g)?;
-                let (intent, _) = w.pending.take()?;
-                let b = body(&w.confirmed, &intent);
-                w.in_flight = Some(intent);
-                Some((g, b))
-            })
-            .collect()
+        let mut started = Started::default();
+        for (g, _) in ready {
+            let Some(w) = self.guilds.get_mut(&g) else {
+                continue;
+            };
+            let Some((mut intent, _)) = w.pending.take() else {
+                continue;
+            };
+            // A channel change replaces the server's whole override map: with a local map
+            // that is not the whole map it would delete what is missing. Dropped here too,
+            // so a change that got in before the map was known to be cut is not sent.
+            if w.confirmed.lossy && !intent.channels.is_empty() {
+                intent.channels.clear();
+                started.refused.push(g);
+            }
+            if intent == Intent::default() {
+                continue;
+            }
+            let b = body(&w.confirmed, &intent);
+            w.in_flight = Some(intent);
+            started.send.push((g, b));
+        }
+        started
     }
 
     /// The write in flight for a guild ended. When the server took it (`ok`), returns
@@ -386,8 +407,8 @@ impl SettingsBatch {
         ok.then(|| compose(&w.confirmed, guild, &[&intent]))
     }
 
-    #[cfg(test)]
-    pub fn in_flight(&self, guild: Option<GuildId>) -> bool {
+    /// Whether a write is in flight for a guild (a late answer for none is ignored).
+    pub fn is_in_flight(&self, guild: Option<GuildId>) -> bool {
         self.guilds
             .get(&guild)
             .is_some_and(|w| w.in_flight.is_some())
@@ -591,14 +612,14 @@ mod tests {
             intent(g, None, Change::SuppressRoles(true)),
             at(60),
         );
-        assert!(b.start_due(at(400)).is_empty(), "merging");
-        let sent = b.start_due(at(600));
+        assert!(b.start_due(at(400)).send.is_empty(), "merging");
+        let sent = b.start_due(at(600)).send;
         assert_eq!(sent.len(), 1, "one request for 51 changes");
         assert_eq!(
             sent[0].1,
             json!({"message_notifications": 1, "suppress_roles": true})
         );
-        assert!(b.in_flight(g));
+        assert!(b.is_in_flight(g));
 
         // More changes while it is out wait, however long.
         b.add(
@@ -607,12 +628,12 @@ mod tests {
             intent(g, None, Change::SuppressEveryone(true)),
             at(700),
         );
-        assert!(b.start_due(at(60_000)).is_empty());
-        assert!(b.in_flight(g));
+        assert!(b.start_due(at(60_000)).send.is_empty());
+        assert!(b.is_in_flight(g));
 
         // The answer comes: the waiting change goes out, built from what is confirmed.
         b.finish(g, true);
-        let sent = b.start_due(at(60_000));
+        let sent = b.start_due(at(60_000)).send;
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].1, json!({"suppress_everyone": true}));
     }
@@ -632,11 +653,11 @@ mod tests {
             );
         }
         let now = t + Duration::from_secs(5);
-        let first: Vec<_> = b.start_due(now).into_iter().map(|(g, _)| g).collect();
+        let first: Vec<_> = b.start_due(now).send.into_iter().map(|(g, _)| g).collect();
         assert_eq!(first, vec![Some(GuildId(0)), Some(GuildId(1))]);
-        assert_eq!(b.start_due(now).len(), 2);
-        assert_eq!(b.start_due(now).len(), 1);
-        assert!(b.start_due(now).is_empty());
+        assert_eq!(b.start_due(now).send.len(), 2);
+        assert_eq!(b.start_due(now).send.len(), 1);
+        assert!(b.start_due(now).send.is_empty());
     }
 
     #[test]
@@ -646,7 +667,7 @@ mod tests {
         let t = Instant::now();
         let mut b = SettingsBatch::default();
         b.add(g, &base, intent(g, None, Change::Level(2)), t);
-        b.start_due(t + QUIET);
+        let _ = b.start_due(t + QUIET);
         b.add(
             g,
             &base,
@@ -661,7 +682,7 @@ mod tests {
         assert_eq!(v["message_notifications"], json!(3));
         assert_eq!(v["suppress_roles"], json!(true));
         // Nothing waits any more once that one is sent and done.
-        b.start_due(t + QUIET * 3);
+        let _ = b.start_due(t + QUIET * 3);
         b.finish(g, true);
         assert!(b.effective(g).is_none());
     }
@@ -682,8 +703,46 @@ mod tests {
     }
 
     #[test]
-    fn routes_name_the_guild_or_the_direct_messages() {
-        assert_eq!(route(Some(GuildId(7))), "/users/@me/guilds/7/settings");
-        assert_eq!(route(None), "/users/@me/guilds/@me/settings");
+    fn a_cut_override_map_is_never_replaced_not_even_by_a_change_made_before_it_was_known() {
+        // The server's map has an entry that cannot be read: the local map is cut.
+        let cut = settings(json!({"guild_id": "1", "channel_overrides": {
+            "5": {"muted": true}, "not-an-id": {"muted": true}}}));
+        assert!(cut.lossy);
+        let g = Some(GuildId(1));
+        let t = Instant::now();
+        let mut b = SettingsBatch::default();
+        // A guild field and a channel change, queued while the map still looked whole.
+        let mut i = intent(g, None, Change::SuppressRoles(true));
+        i.merge(intent(g, Some(ChannelId(6)), Change::Level(2)));
+        b.add(g, &settings(json!({"guild_id": "1"})), i, t);
+        // READY then shows the cut map as the confirmed one.
+        b.reset(|_| cut.clone(), &BTreeMap::new());
+
+        let started = b.start_due(t + QUIET);
+        assert_eq!(started.refused, vec![g]);
+        // The guild field goes out; the channel part, which would delete "not-an-id", does not.
+        assert_eq!(started.send, vec![(g, json!({"suppress_roles": true}))]);
+
+        // What the UI shows leaves the cut map alone, so it stays marked as cut.
+        let shown = compose(&cut, g, &[&intent(g, None, Change::SuppressRoles(true))]);
+        assert!(shown.get("channel_overrides").is_none());
+    }
+
+    #[test]
+    fn versions_from_ready_make_an_older_answer_old_news() {
+        let base = settings(json!({"guild_id": "1"}));
+        let g = Some(GuildId(1));
+        let mut b = SettingsBatch::default();
+        b.add(g, &base, intent(g, None, Change::Level(1)), Instant::now());
+        // READY shows version 7 (for example a change from another client).
+        let busy = b.reset(|_| base.clone(), &BTreeMap::from([(g, 7)]));
+        assert_eq!(busy, vec![g]);
+        assert!(b.is_stale(g, Some(6)));
+        assert!(!b.is_stale(g, Some(7)));
+        // A guild READY says nothing about starts without a version.
+        let h = Some(GuildId(2));
+        b.add(h, &base, intent(h, None, Change::Level(1)), Instant::now());
+        b.reset(|_| base.clone(), &BTreeMap::new());
+        assert!(!b.is_stale(h, Some(1)));
     }
 }

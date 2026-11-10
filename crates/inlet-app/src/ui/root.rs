@@ -10,7 +10,6 @@ use crate::{about, assets, theme};
 impl Render for Inlet {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.take_channel_jump(window, cx);
-        self.sync_watching(window);
         let root = div()
             .relative()
             .size_full()

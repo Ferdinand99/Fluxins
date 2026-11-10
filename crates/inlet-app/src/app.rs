@@ -4,7 +4,8 @@
 //! event handlers live in the `ui` domains.
 
 use futures::StreamExt;
-use gpui::{App, Context, FocusHandle, Focusable, Subscription, Window};
+use gpui::{App, Context, Entity, FocusHandle, Focusable, Subscription, Window};
+use inlet_state::AccountState;
 
 use crate::backend::{self, accounts, BackendHandle, Event};
 use crate::model::{Channel, Guild};
@@ -54,6 +55,9 @@ pub struct Inlet {
     pub selected_guild: Option<String>,
     pub channels: Vec<Channel>,
     pub selected_channel: Option<String>,
+    /// What the signed-in account knows (guilds, channels, members, read state and the
+    /// message windows), fed with gateway events and REST pages. `None` until READY.
+    pub account: Option<Entity<AccountState>>,
 
     // View state, one per domain. The empty ones are slots for later tasks.
     pub sign_in: ui::accounts::SignInState,
@@ -98,6 +102,13 @@ impl Inlet {
         let mut subscriptions = Vec::new();
         let sign_in = ui::accounts::SignInState::new(window, cx, &mut subscriptions);
         let composer = ui::composer::ComposerState::new(window, cx, &mut subscriptions);
+        // The window getting focus again reads the open channel, if it is at the bottom.
+        subscriptions.push(cx.observe_window_activation(window, |this, window, cx| {
+            if window.is_window_active() {
+                let at_bottom = this.chat.message_list.is_following_tail();
+                this.read_if_watched(true, at_bottom, cx);
+            }
+        }));
 
         let (backend, _) = Self::spawn_backend(0, true, window, cx);
         Self {
@@ -113,6 +124,7 @@ impl Inlet {
             selected_guild: None,
             channels: Vec::new(),
             selected_channel: None,
+            account: None,
             sign_in,
             sidebar: Default::default(),
             chat: ui::chat::ChatState::new(),
@@ -217,7 +229,7 @@ impl Inlet {
         self.channels.clear();
         self.selected_guild = None;
         self.selected_channel = None;
-        self.set_messages(Vec::new());
+        self.reset_messages();
         self.notifications.clear();
         self.chat.status.clear();
         self.chat.error = None;

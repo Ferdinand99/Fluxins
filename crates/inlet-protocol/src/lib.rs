@@ -98,11 +98,32 @@
 //!   [`models::MemberList`]), presences, reactions, acks, settings, roles,
 //!   members and voice states arrive typed in [`Dispatch`].
 //!
+//! # Threads, search, saved messages and mentions
+//!
+//! The [`api`] module adds, as more [`Client`] methods:
+//!
+//! - Threads and forums ([`api::threads`]): [`Client::start_thread`],
+//!   [`Client::start_thread_from_message`], [`Client::create_forum_post`]
+//!   (with tags), [`Client::join_thread`], [`Client::leave_thread`],
+//!   [`Client::edit_thread`] (archive, lock, tags), archived lists and
+//!   [`Client::search_threads`]. On the gateway: `THREAD_*` events,
+//!   [`GatewayHandle::subscribe_threads`] and Request Forum Unreads (op 28,
+//!   [`GatewayHandle::request_forum_unreads`], paced with the other bounded commands).
+//! - Message search with filters ([`api::search::MessageSearch`],
+//!   [`Client::search_messages`]), at most one search per second per account.
+//! - Saved messages ([`Client::saved_messages`]) and recent mentions
+//!   ([`Client::recent_mentions`]), with their gateway events.
+//! - Jumping to a message ([`Client::messages_around`]), forwarding
+//!   ([`Client::forward`]), hiding embeds ([`Client::set_embeds_suppressed`]),
+//!   silent messages ([`OutgoingMessage::silent`]) and `allowed_mentions`
+//!   ([`models::AllowedMentions`]).
+//!
 //! # Not covered yet
 //!
-//! Voice, pre-signed uploads, threads and forums, WebAuthn.
+//! Voice, pre-signed uploads, forum posts with files, WebAuthn.
 
 pub mod altcha;
+pub mod api;
 pub mod auth;
 pub mod coalesce;
 pub mod error;
@@ -125,11 +146,21 @@ compile_error!(
     "the `test-extra-ca` feature is for tests against a private instance and must not be in a release build"
 );
 
+pub use api::inbox::MentionsQuery;
+pub use api::messages::ForwardSource;
+pub use api::saved::SavedMessage;
+pub use api::search::{MessageSearch, MessageSearchResults};
+pub use api::threads::{
+    ForumPost, ForumTag, NewForumPost, NewThread, ThreadEdit, ThreadList, ThreadMember,
+    ThreadMetadata, ThreadSearch, ThreadSearchResults,
+};
+pub use api::SearchOutcome;
 pub use auth::{
     poll_ip_authorization, sign_in_password, sign_in_totp, Handoff, HandoffStatus, IpAuthorization,
     MfaMethod, Session, SignInResult, SignedIn, Ticket,
 };
 pub use error::{ApiError, Error, Result};
+pub use gateway::events::ForumUnreadRequest;
 pub use gateway::{
     CloseReason, ConnectionState, Dispatch, Gateway, GatewayEvent, GatewayHandle, GatewayOptions,
     IdentifyProperties,
@@ -137,10 +168,11 @@ pub use gateway::{
 pub use instance::{ClientInfo, Discovery, EndpointPins, Endpoints, Instance, SessionPins};
 pub use media::{ImageFormat, ImageOptions, Media, Transform};
 pub use models::{
-    Attachment, Channel, CurrentUser, Embed, Emoji, FullUserProfile, Guild, GuildEmoji,
-    GuildMember, GuildMemberListUpdate, GuildReady, GuildSticker, MemberList, MemberListItem,
-    Message, MessageEdit, OutgoingMessage, Presence, Reaction, ReadState, Ready, ReferencedMessage,
-    Role, Snowflake, User, UserSettings, UserSettingsUpdate, VoiceState,
+    AllowedMentions, AllowedMentionsError, Attachment, Channel, CurrentUser, Embed, Emoji,
+    FullUserProfile, Guild, GuildEmoji, GuildMember, GuildMemberListUpdate, GuildReady,
+    GuildSticker, MemberList, MemberListItem, Message, MessageEdit, OutgoingMessage, Presence,
+    Reaction, ReadState, Ready, ReferencedMessage, Role, Snowflake, User, UserSettings,
+    UserSettingsUpdate, VoiceState,
 };
 pub use permissions::PermissionContext;
 pub use ratelimit::{RateLimitConfig, RateLimiter};

@@ -63,7 +63,7 @@ impl Inlet {
             if self.selected_channel.is_none() {
                 match self.channels.iter().find(|c| c.is_messageable()).cloned() {
                     Some(first) => self.select_channel(first.id, window, cx),
-                    None => self.set_messages(Vec::new()),
+                    None => self.clear_messages(),
                 }
             }
         }
@@ -73,7 +73,7 @@ impl Inlet {
         self.selected_guild = guild_id.clone();
         self.selected_channel = None;
         self.channels.clear();
-        self.set_messages(Vec::new());
+        self.clear_messages();
         self.backend.send(messages::Cmd::OpenGuild { guild_id });
         cx.notify();
     }
@@ -85,7 +85,6 @@ impl Inlet {
         cx: &mut Context<Self>,
     ) {
         self.selected_channel = Some(channel_id.clone());
-        self.set_messages(Vec::new());
         let name = self
             .channels
             .iter()
@@ -96,7 +95,7 @@ impl Inlet {
             c.set_placeholder(t!("composer-placeholder", channel = name), cx)
         });
         self.composer.input.focus_handle(cx).focus(window, cx);
-        self.backend.send(messages::Cmd::OpenChannel { channel_id });
+        self.open_channel_messages(cx);
         cx.notify();
     }
 

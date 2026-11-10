@@ -53,6 +53,19 @@ sleep 6
 shot 05-direct-messages
 kill $pid; wait $pid 2>/dev/null
 
+# 5. The message list scenes.
+scene() {
+  INLET_DEMO=1 INLET_DEMO_LIVE_SECS=3600 INLET_DEMO_SCENE="$2" INLET_DEMO_GUILD=g1 INLET_DEMO_CHANNEL="$3" "$bin" >>"$out/demo.log" 2>&1 &
+  pid=$!
+  sleep 6
+  shot "$1"
+  kill $pid; wait $pid 2>/dev/null
+}
+scene 06-chat-cozy chat-cozy c-general
+scene 07-chat-compact chat-compact c-general
+scene 08-chat-system chat-system c-system
+scene 09-chat-replies chat-replies c-replies
+
 tail -n 20 "$out/signin.log" "$out/demo.log" >&2
 cat "$out/memory.txt" >&2
 rm -rf "$out/config"

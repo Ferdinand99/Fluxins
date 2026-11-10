@@ -114,7 +114,9 @@ pub enum Credential {
 /// A checked session: the token works and the guild list is loaded.
 pub struct Connected {
     pub session: p::Session,
-    /// The signed-in account's ID.
+    /// The signed-in account's ID. Not read since the account state takes it from READY;
+    /// kept for the keychain entry of each account.
+    #[allow(dead_code)]
     pub user_id: String,
     /// Display name.
     pub username: String,

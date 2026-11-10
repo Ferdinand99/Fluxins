@@ -14,7 +14,6 @@ use super::messages::{
     self,
     parse::{ChannelCache, SharedNames},
 };
-use super::notifications;
 use super::session::{self, Credential, Failure, FailureKind};
 use super::{
     backoff_secs, same_session, Active, Backend, Internal, Mode, Offline, PendingConfirm,
@@ -587,11 +586,7 @@ impl Backend {
             .and_then(crate::theme::parse_hex);
         crate::theme::set_accent(accent);
         let names: SharedNames = Arc::default();
-        names.lock().unwrap().me = Some(connected.user_id.clone());
-        let read: notifications::ReadHandle = Arc::new(Mutex::new(
-            notifications::ReadTracker::new(session.client().clone(), self.events.clone()),
-        ));
-        let (gateway, forward) = self.spawn_gateway(gen, &session, &guilds, &cache, &names, &read);
+        let (gateway, forward) = self.spawn_gateway(gen, &session, &guilds, &cache, &names);
         let mut policy = ReconnectPolicy::default();
         policy.started(Instant::now());
 
@@ -650,7 +645,6 @@ impl Backend {
             guilds,
             cache,
             names,
-            read,
             active_guild: None,
             policy,
             restart_timer: None,

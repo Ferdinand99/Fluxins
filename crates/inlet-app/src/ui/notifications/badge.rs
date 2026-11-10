@@ -4,8 +4,27 @@
 
 use gpui::{div, prelude::*, px, Div, FontWeight, Hsla};
 
-use crate::backend::notifications::Badge;
 use crate::theme;
+
+/// What the sidebar and the guild rail show for one channel, category or guild.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Badge {
+    /// Unread messages: the white pill and bold name (not for a muted guild).
+    pub unread: bool,
+    /// Unread mentions: the red count.
+    pub mentions: u32,
+    /// Muted at some level (the channel, its category or the guild).
+    pub muted: bool,
+    /// The channel or category is muted itself: its row is drawn dimmed.
+    pub dimmed: bool,
+}
+
+impl Badge {
+    /// Nothing to show: the UI keeps no entry for it.
+    pub fn is_default(&self) -> bool {
+        *self == Badge::default()
+    }
+}
 
 /// What a channel or DM row shows.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

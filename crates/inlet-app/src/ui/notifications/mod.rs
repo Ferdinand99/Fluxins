@@ -1,28 +1,38 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Unread state, mention badges, muting and notification levels, as the UI holds and
-//! draws them. The backend (`backend/notifications`) applies Fluxer's rules and sends
-//! plain [`Badge`]s keyed by the channel and guild IDs the views already use; the
-//! channel list, the guild rail and the settings window read them from here.
+//! draws them. There is one account state (`Inlet.account`, on the UI thread): the unread
+//! rules, the badges and the settings all read and change that, never a copy. The backend
+//! (`backend/notifications`) only sends acknowledgements and settings writes.
 //!
-//! For the message view: tell this domain what is being read with [`Inlet::set_scrolled_up`]
-//! (the person left the bottom of the list, so new messages stay unread) and read where the
-//! account had read to when a channel was opened from `State::opened`. Opening a channel in
-//! a window that is in front reads it up to its newest message; messages that arrive while
-//! it is open and at the bottom are read as they come, and acknowledged at most once every
-//! three seconds.
+//! - `unread`: the badges the channel list and the rail show, brought up to date from the
+//!   [`Changes`](inlet_state::Changes) of every update of the state.
+//! - `reading`: what is read when, and the acknowledgements (at most one per channel per
+//!   three seconds for reading, at once for "mark as read"). Nothing is read or
+//!   acknowledged while the chat is out of sight.
+//! - `writes`: notification settings. What the person asked for is kept apart from what
+//!   the server confirmed, so an echo cannot undo a click and a failed write rolls back.
+//! - `badge`: the pill and the count, and the rules for what a row shows.
+//!
+//! For the message view: its read marks call [`Inlet::read_channel`], which decides and
+//! sends the acknowledgement; [`Inlet::read_if_watched`] reads the open channel when the
+//! window gets focus or the list comes back to the bottom. The "NEW" divider keeps using
+//! the position the view captured when the channel was opened.
 
 pub mod badge;
+mod reading;
+pub mod settings;
+mod unread;
+mod writes;
 
-use std::collections::HashMap;
-
-use gpui::{actions, div, prelude::*, px, AnyElement, App, Context, KeyBinding, Window};
+use gpui::{actions, div, prelude::*, px, AnyElement, App, Context, KeyBinding};
 
 use crate::app::{Inlet, Screen};
 use crate::assets::Icon;
-use crate::backend::notifications::{
-    self as backend, Badge, BadgeUpdate, Change, SettingsView, Target,
-};
+use crate::backend::messages::ack::AckGate;
 use crate::theme;
+use badge::Badge;
+use settings::SettingsBatch;
+use unread::Badges;
 
 actions!(notifications, [MarkChannelRead, MarkGuildRead]);
 
@@ -36,52 +46,38 @@ pub fn bind_keys(cx: &mut App) {
     ]);
 }
 
-/// Where the account had read to when a channel was opened.
-#[allow(dead_code)] // read by the message view for the "new messages" divider
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct OpenedRead {
-    pub channel_id: String,
-    /// The last message the account had read, before opening read it.
-    pub last_read: Option<String>,
-    /// Unread mentions there were.
-    pub mentions: u32,
-}
-
-/// The settings window: for which guild and channel, and their settings once they arrive.
+/// The settings window: for which guild and channel (or category). Its values are read
+/// from the account state when it is drawn.
 pub struct SettingsWindow {
     pub guild_id: Option<String>,
     pub channel_id: Option<String>,
-    pub view: Option<SettingsView>,
 }
 
 /// This domain's view state.
 #[derive(Default)]
 pub struct State {
-    channels: HashMap<String, Badge>,
-    guilds: HashMap<String, Badge>,
-    dm: Badge,
-    /// Set when a channel is opened.
-    #[allow(dead_code)] // read by the message view for the "new messages" divider
-    pub opened: Option<OpenedRead>,
-    /// The channel the backend was last told is being read.
-    watching: Option<String>,
-    /// The message list is not at the bottom.
-    scrolled_up: bool,
+    badges: Badges,
+    /// When the open channel's acknowledgement may go out.
+    gate: AckGate,
+    /// Settings changes that are not confirmed yet.
+    writes: SettingsBatch,
     pub settings: Option<SettingsWindow>,
 }
 
-/// The channel that is being read: the open one, while the chat is on screen, the window
-/// is in front and the message list is at the bottom. Nothing otherwise, so nothing is
-/// acknowledged for a channel nobody can see.
-pub fn watch_target(
-    chat_visible: bool,
-    window_active: bool,
-    scrolled_up: bool,
-    selected: Option<&str>,
-) -> Option<String> {
-    (chat_visible && window_active && !scrolled_up)
-        .then(|| selected.map(str::to_string))
-        .flatten()
+impl State {
+    /// Brings the badges up to date after the account state changed.
+    pub fn refresh_badges(
+        &mut self,
+        state: &inlet_state::AccountState,
+        changes: &inlet_state::Changes,
+    ) {
+        self.badges.refresh(state, changes);
+    }
+
+    /// Forgets everything (signed out).
+    pub fn clear(&mut self) {
+        *self = State::default();
+    }
 }
 
 /// What Escape and Shift+Escape do.
@@ -112,40 +108,6 @@ fn escape_action(
     }
 }
 
-impl State {
-    /// Applies what the backend says changed.
-    pub fn apply(&mut self, update: BadgeUpdate) {
-        if update.reset {
-            self.channels.clear();
-            self.guilds.clear();
-            self.dm = Badge::default();
-        }
-        for (id, badge) in update.channels {
-            if badge.is_default() {
-                self.channels.remove(&id);
-            } else {
-                self.channels.insert(id, badge);
-            }
-        }
-        for (id, badge) in update.guilds {
-            match id {
-                None => self.dm = badge,
-                Some(id) if badge.is_default() => {
-                    self.guilds.remove(&id);
-                }
-                Some(id) => {
-                    self.guilds.insert(id, badge);
-                }
-            }
-        }
-    }
-
-    /// Forgets everything (signed out, or a new backend).
-    pub fn clear(&mut self) {
-        *self = State::default();
-    }
-}
-
 /// The notification settings button in the channel header (see `ui/chat/header_buttons.rs`).
 pub fn header_button(this: &Inlet, cx: &mut Context<Inlet>) -> Option<AnyElement> {
     let channel = this.selected_channel.as_deref()?;
@@ -171,103 +133,22 @@ pub fn header_button(this: &Inlet, cx: &mut Context<Inlet>) -> Option<AnyElement
 impl Inlet {
     /// What a channel, category or direct message shows. Nothing for one that is read.
     pub fn badge(&self, channel_id: &str) -> Badge {
-        self.notifications
-            .channels
-            .get(channel_id)
-            .copied()
-            .unwrap_or_default()
+        self.notifications.badges.channel(channel_id)
     }
 
     /// What a guild's rail entry shows; `None` is the direct messages button.
     pub fn guild_badge(&self, guild_id: Option<&str>) -> Badge {
-        match guild_id {
-            Some(id) => self
-                .notifications
-                .guilds
-                .get(id)
-                .copied()
-                .unwrap_or_default(),
-            None => self.notifications.dm,
-        }
+        self.notifications.badges.guild(guild_id)
     }
 
-    /// Events from the backend's notifications domain.
-    pub(crate) fn on_notifications_event(
-        &mut self,
-        event: backend::Ev,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) {
-        match event {
-            backend::Ev::Badges(update) => self.notifications.apply(update),
-            backend::Ev::Opened {
-                channel_id,
-                last_read,
-                mentions,
-            } => {
-                self.notifications.opened = Some(OpenedRead {
-                    channel_id,
-                    last_read,
-                    mentions,
-                })
-            }
-            backend::Ev::Settings(view) => {
-                if let Some(w) = &mut self.notifications.settings {
-                    if w.guild_id == view.guild_id && w.channel_id == view.channel_id {
-                        w.view = Some(view);
-                    }
-                }
-            }
-        }
+    /// Whether the chat is on screen: signed in, and not under the About view. A view
+    /// that replaces the chat (the settings view when it exists) must be added here, so
+    /// nothing is read or marked as read behind it.
+    pub(crate) fn chat_is_visible(&self) -> bool {
+        self.screen == Screen::Main && !self.show_about
     }
 
-    /// Tells the backend which channel is being read: the open one while the window is in
-    /// front and the message list is at the bottom. Called every frame; it only sends when
-    /// the answer changes.
-    pub(crate) fn sync_watching(&mut self, window: &Window) {
-        let want = watch_target(
-            self.chat_is_visible(),
-            window.is_window_active(),
-            self.notifications.scrolled_up,
-            self.selected_channel.as_deref(),
-        );
-        if want != self.notifications.watching {
-            self.notifications.watching = want.clone();
-            self.backend.send(backend::Cmd::Watch { channel_id: want });
-        }
-    }
-
-    /// The message list left (or came back to) the bottom. While it is away, new messages
-    /// stay unread.
-    #[allow(dead_code)] // called by the message view
-    pub fn set_scrolled_up(&mut self, scrolled_up: bool, cx: &mut Context<Self>) {
-        if self.notifications.scrolled_up != scrolled_up {
-            self.notifications.scrolled_up = scrolled_up;
-            cx.notify();
-        }
-    }
-
-    /// "Mark as read" for the open channel.
-    pub(crate) fn mark_channel_read(&mut self) {
-        if let Some(channel_id) = self.selected_channel.clone() {
-            self.backend
-                .send(backend::Cmd::MarkChannelRead { channel_id });
-        }
-    }
-
-    /// "Mark as read" for every channel of the open server, or every direct message.
-    pub(crate) fn mark_guild_read(&mut self) {
-        self.backend.send(backend::Cmd::MarkGuildRead {
-            guild_id: self.selected_guild.clone(),
-        });
-    }
-
-    /// "Mark as read" for everything.
-    pub(crate) fn mark_all_read(&mut self) {
-        self.backend.send(backend::Cmd::MarkAllRead);
-    }
-
-    /// Escape (`shift` false) or Shift+Escape. A window over the app takes the key first.
+    /// Escape (`shift` false) or Shift+Escape.
     fn on_escape(&mut self, shift: bool, cx: &mut Context<Self>) {
         let action = escape_action(
             self.notifications.settings.is_some(),
@@ -277,17 +158,10 @@ impl Inlet {
         );
         match action {
             EscapeAction::CloseSettings => self.close_notification_settings(cx),
-            EscapeAction::MarkChannel => self.mark_channel_read(),
-            EscapeAction::MarkGuild => self.mark_guild_read(),
+            EscapeAction::MarkChannel => self.mark_channel_read(cx),
+            EscapeAction::MarkGuild => self.mark_guild_read(cx),
             EscapeAction::Nothing => {}
         }
-    }
-
-    /// Whether the chat is on screen: signed in, and not under the About view. A view
-    /// that replaces the chat (the settings view when it exists) must be added here, so
-    /// nothing is read or marked as read behind it.
-    fn chat_is_visible(&self) -> bool {
-        self.screen == Screen::Main && !self.show_about
     }
 
     /// Adds the Escape handlers to the window's root element.
@@ -313,14 +187,8 @@ impl Inlet {
         channel_id: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        let guild_id = self.selected_guild.clone();
         self.notifications.settings = Some(SettingsWindow {
-            guild_id: guild_id.clone(),
-            channel_id: channel_id.clone(),
-            view: None,
-        });
-        self.backend.send(backend::Cmd::ShowSettings {
-            guild_id,
+            guild_id: self.selected_guild.clone(),
             channel_id,
         });
         cx.notify();
@@ -328,75 +196,14 @@ impl Inlet {
 
     pub(crate) fn close_notification_settings(&mut self, cx: &mut Context<Self>) {
         if self.notifications.settings.take().is_some() {
-            self.backend.send(backend::Cmd::HideSettings);
             cx.notify();
         }
-    }
-
-    /// A choice in the settings window.
-    pub(crate) fn notification_change(&mut self, target: Target, change: Change) {
-        self.backend.send(backend::Cmd::Change { target, change });
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn unread() -> Badge {
-        Badge {
-            unread: true,
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn updates_set_replace_and_remove_badges() {
-        let mut s = State::default();
-        s.apply(BadgeUpdate {
-            reset: false,
-            channels: vec![("1".into(), unread()), ("2".into(), unread())],
-            guilds: vec![(Some("9".into()), unread()), (None, unread())],
-        });
-        assert_eq!(s.channels.len(), 2);
-        assert!(s.guilds.contains_key("9") && s.dm.unread);
-
-        // A default badge is a removal.
-        s.apply(BadgeUpdate {
-            reset: false,
-            channels: vec![("1".into(), Badge::default())],
-            guilds: vec![
-                (Some("9".into()), Badge::default()),
-                (None, Badge::default()),
-            ],
-        });
-        assert!(!s.channels.contains_key("1") && s.channels.contains_key("2"));
-        assert!(s.guilds.is_empty() && !s.dm.unread);
-
-        // A reset drops everything first.
-        s.apply(BadgeUpdate {
-            reset: true,
-            channels: vec![("3".into(), unread())],
-            guilds: vec![],
-        });
-        assert_eq!(s.channels.len(), 1);
-        assert!(s.channels.contains_key("3"));
-    }
-
-    #[test]
-    fn nothing_is_read_while_the_chat_is_out_of_sight() {
-        // Open, in front, at the bottom: read.
-        assert_eq!(
-            watch_target(true, true, false, Some("7")),
-            Some("7".to_string())
-        );
-        // The About view (or any view that hides the chat) is not the chat.
-        assert_eq!(watch_target(false, true, false, Some("7")), None);
-        // Another window in front, or the list scrolled up, or no channel.
-        assert_eq!(watch_target(true, false, false, Some("7")), None);
-        assert_eq!(watch_target(true, true, true, Some("7")), None);
-        assert_eq!(watch_target(true, true, false, None), None);
-    }
 
     #[test]
     fn escape_marks_read_only_where_the_chat_is_seen() {
@@ -411,18 +218,5 @@ mod tests {
         // The settings window closes first, with or without Shift.
         assert_eq!(escape_action(true, true, false, false), CloseSettings);
         assert_eq!(escape_action(true, true, false, true), CloseSettings);
-    }
-
-    #[test]
-    fn clear_forgets_everything() {
-        let mut s = State::default();
-        s.apply(BadgeUpdate {
-            reset: false,
-            channels: vec![("1".into(), unread())],
-            guilds: vec![],
-        });
-        s.watching = Some("1".into());
-        s.clear();
-        assert!(s.channels.is_empty() && s.watching.is_none());
     }
 }

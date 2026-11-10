@@ -174,6 +174,22 @@ pub fn mention_me_bar() -> Hsla {
 pub fn mention_me_bg() -> Hsla {
     h(rgba(0xeac5321a))
 }
+/// The background of a message that was jumped to (`rgb(59 130 246 / 0.1)`).
+pub fn jumped_bg() -> Hsla {
+    h(rgba(0x3b82f61a))
+}
+/// The bar of a message that was jumped to (`--brand-primary-light`).
+pub fn jumped_bar() -> Hsla {
+    h(rgb(0xb0adff))
+}
+/// The reply spine: `--text-chat-muted` 82 % mixed with black.
+pub fn reply_spine() -> Hsla {
+    h(rgb(0xa9a7ae))
+}
+/// Text on the brand colour (`--brand-primary-fill`).
+pub fn on_brand() -> Hsla {
+    h(rgb(0xffffff))
+}
 
 // ---- Lines and states -------------------------------------------------------
 

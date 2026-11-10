@@ -12,7 +12,6 @@ use tokio::task::AbortHandle;
 use super::messages::parse::{
     remember_channels, remember_roles, to_channel, to_message, ChannelCache, SharedNames,
 };
-use super::notifications::{self, Now};
 use super::{accounts, messages, Active, Backend, Internal, Ui};
 use crate::model::{self, Channel, Guild};
 use crate::reconnect::{Decision, Stop};
@@ -25,13 +24,11 @@ impl Backend {
         guilds: &Arc<Mutex<Vec<Guild>>>,
         cache: &ChannelCache,
         names: &SharedNames,
-        read: &notifications::ReadHandle,
     ) -> (p::GatewayHandle, AbortHandle) {
         let (gateway, rx) = session.connect_gateway(p::GatewayOptions::default());
         let events = self.events.clone();
         let internal = self.internal.clone();
-        let (guilds, cache, names, read) =
-            (guilds.clone(), cache.clone(), names.clone(), read.clone());
+        let (guilds, cache, names) = (guilds.clone(), cache.clone(), names.clone());
         let forward = self.spawn_guarded("gateway", Some(gen), async move {
             let on_connected = {
                 let internal = internal.clone();
@@ -39,7 +36,7 @@ impl Backend {
                     let _ = internal.send(Internal::GatewayConnected { gen });
                 }
             };
-            let end = forward_gateway(rx, events, guilds, cache, names, read, on_connected).await;
+            let end = forward_gateway(rx, events, guilds, cache, names, on_connected).await;
             let _ = internal.send(Internal::GatewayEnded { gen, end });
         });
         (gateway, forward)
@@ -90,7 +87,7 @@ impl Backend {
         r.forward.abort();
         r.gateway.close();
         let (gateway, forward) =
-            self.spawn_gateway(r.gen, &r.session, &r.guilds, &r.cache, &r.names, &r.read);
+            self.spawn_gateway(r.gen, &r.session, &r.guilds, &r.cache, &r.names);
         // A new gateway handle does not know the guild on screen yet.
         if let Some(guild) = &r.active_guild {
             gateway.set_guild_active(guild, true);
@@ -158,7 +155,6 @@ pub async fn forward_gateway(
     guilds: Arc<Mutex<Vec<Guild>>>,
     cache: ChannelCache,
     names: SharedNames,
-    read: notifications::ReadHandle,
     connected: impl Fn(),
 ) -> GatewayEnd {
     macro_rules! send {
@@ -173,27 +169,7 @@ pub async fn forward_gateway(
         }
     };
     let mut ready_seen = false;
-    // The read tracker's clock: mutes end, acknowledgements and settings writes are due.
-    // It runs only while this task does (not while the gateway waits to restart).
-    let mut tick = tokio::time::interval(Duration::from_secs(1));
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    loop {
-        let event = tokio::select! {
-            event = rx.recv() => match event {
-                Some(event) => event,
-                None => break,
-            },
-            _ = tick.tick() => {
-                read.lock().unwrap_or_else(|e| e.into_inner()).tick(Now::current());
-                continue;
-            }
-        };
-        // Unread state follows every event (see `notifications`).
-        if let p::GatewayEvent::Dispatch { event, .. } = &event {
-            read.lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .on_dispatch(event, Now::current());
-        }
+    while let Some(event) = rx.recv().await {
         match event {
             p::GatewayEvent::State(state) => {
                 let text = match state {
@@ -224,90 +200,104 @@ pub async fn forward_gateway(
                 };
                 send!(accounts::Ev::Status(text));
             }
-            p::GatewayEvent::Dispatch { event, .. } => match event {
-                p::Dispatch::Ready(ready) => {
-                    // A fresh Identify: rebuild the guild channel lists, keep the DM list
-                    // (READY does not carry it), and show the result.
-                    let mut map: HashMap<Option<String>, Vec<Channel>> = HashMap::new();
-                    for g in &ready.guilds {
+            p::GatewayEvent::Dispatch { event, .. } => {
+                let mut reconnected = false;
+                // Messages the event carries, converted and parsed here, off the UI thread.
+                let mut rendered = Vec::new();
+                // Channel lists and the guild list to send once the account state has the
+                // event, so a channel picked from a list is always known to the state.
+                let mut lists: Vec<Option<String>> = Vec::new();
+                let mut guild_list = None;
+                match &event {
+                    p::Dispatch::Ready(ready) => {
+                        // A fresh Identify: rebuild the guild channel lists, keep the DM
+                        // list (READY does not carry it), and show the result.
+                        let mut map: HashMap<Option<String>, Vec<Channel>> = HashMap::new();
+                        for g in &ready.guilds {
+                            remember_roles(&names, &g.roles);
+                            if !g.unavailable && !g.channels.is_empty() {
+                                let list: Vec<Channel> =
+                                    g.channels.iter().map(to_channel).collect();
+                                remember_channels(&names, &list);
+                                map.insert(Some(g.id.clone()), list);
+                            }
+                        }
+                        let keys: Vec<Option<String>> = {
+                            let mut cache = cache.lock().unwrap();
+                            if let Some(dms) = cache.remove(&None) {
+                                map.insert(None, dms);
+                            }
+                            *cache = map;
+                            cache.keys().cloned().collect()
+                        };
+                        lists.extend(keys);
+                        // Messages may have been missed while disconnected.
+                        reconnected = ready_seen;
+                        ready_seen = true;
+                    }
+                    p::Dispatch::MessageCreate(m) | p::Dispatch::MessageUpdate(m) => {
+                        rendered.push(to_message(m, &names));
+                    }
+                    p::Dispatch::ChannelCreate(c) | p::Dispatch::ChannelUpdate(c) => {
+                        remember_channels(&names, &[to_channel(c)]);
+                        if upsert_channel(&cache, c) {
+                            lists.push(c.guild_id.clone());
+                        }
+                    }
+                    p::Dispatch::ChannelDelete(c) => {
+                        let removed = {
+                            let mut map = cache.lock().unwrap();
+                            map.get_mut(&c.guild_id)
+                                .map(|list| list.retain(|x| x.id != c.id))
+                                .is_some()
+                        };
+                        if removed {
+                            lists.push(c.guild_id.clone());
+                        }
+                    }
+                    p::Dispatch::GuildCreate(g) | p::Dispatch::GuildSync(g) => {
                         remember_roles(&names, &g.roles);
                         if !g.unavailable && !g.channels.is_empty() {
                             let list: Vec<Channel> = g.channels.iter().map(to_channel).collect();
                             remember_channels(&names, &list);
-                            map.insert(Some(g.id.clone()), list);
+                            cache.lock().unwrap().insert(Some(g.id.clone()), list);
+                            lists.push(Some(g.id.clone()));
+                        }
+                        let mut list = guilds.lock().unwrap();
+                        if !list.iter().any(|x| x.id == g.id) {
+                            if let Some(name) = g.name() {
+                                list.push(Guild {
+                                    id: g.id.clone(),
+                                    name: model::clean_name(name),
+                                });
+                                guild_list = Some(list.clone());
+                            }
                         }
                     }
-                    let keys: Vec<Option<String>> = {
-                        let mut cache = cache.lock().unwrap();
-                        if let Some(dms) = cache.remove(&None) {
-                            map.insert(None, dms);
-                        }
-                        *cache = map;
-                        cache.keys().cloned().collect()
-                    };
-                    for key in keys {
-                        channels_event(key);
+                    p::Dispatch::GuildDelete(d) if !d.unavailable => {
+                        cache.lock().unwrap().remove(&Some(d.id.clone()));
+                        let mut list = guilds.lock().unwrap();
+                        list.retain(|g| g.id != d.id);
+                        guild_list = Some(list.clone());
                     }
-                    if ready_seen {
-                        // Messages may have been missed while disconnected.
-                        send!(accounts::Ev::Reconnected);
-                    }
-                    ready_seen = true;
+                    _ => {}
                 }
-                p::Dispatch::MessageCreate(m) => {
-                    send!(messages::Ev::MessageCreated(to_message(&m, &names)))
+                // Every event goes to the account state on the UI thread first (and READY
+                // before `Reconnected`), then the lists the sidebar shows.
+                send!(messages::Ev::Dispatch {
+                    dispatch: Box::new(event),
+                    rendered,
+                });
+                for key in lists {
+                    channels_event(key);
                 }
-                p::Dispatch::MessageUpdate(m) => {
-                    send!(messages::Ev::MessageUpdated(to_message(&m, &names)))
+                if let Some(list) = guild_list {
+                    send!(messages::Ev::Guilds(list));
                 }
-                p::Dispatch::MessageDelete(d) => send!(messages::Ev::MessageDeleted {
-                    channel_id: d.channel_id,
-                    message_id: d.id,
-                }),
-                p::Dispatch::ChannelCreate(c) | p::Dispatch::ChannelUpdate(c) => {
-                    remember_channels(&names, &[to_channel(&c)]);
-                    if upsert_channel(&cache, &c) {
-                        channels_event(c.guild_id.clone());
-                    }
+                if reconnected {
+                    send!(accounts::Ev::Reconnected);
                 }
-                p::Dispatch::ChannelDelete(c) => {
-                    let removed = {
-                        let mut map = cache.lock().unwrap();
-                        map.get_mut(&c.guild_id)
-                            .map(|list| list.retain(|x| x.id != c.id))
-                            .is_some()
-                    };
-                    if removed {
-                        channels_event(c.guild_id.clone());
-                    }
-                }
-                p::Dispatch::GuildCreate(g) | p::Dispatch::GuildSync(g) => {
-                    remember_roles(&names, &g.roles);
-                    if !g.unavailable && !g.channels.is_empty() {
-                        let list: Vec<Channel> = g.channels.iter().map(to_channel).collect();
-                        remember_channels(&names, &list);
-                        cache.lock().unwrap().insert(Some(g.id.clone()), list);
-                        channels_event(Some(g.id.clone()));
-                    }
-                    let mut list = guilds.lock().unwrap();
-                    if !list.iter().any(|x| x.id == g.id) {
-                        if let Some(name) = g.name() {
-                            list.push(Guild {
-                                id: g.id.clone(),
-                                name: model::clean_name(name),
-                            });
-                            send!(messages::Ev::Guilds(list.clone()));
-                        }
-                    }
-                }
-                p::Dispatch::GuildDelete(d) if !d.unavailable => {
-                    cache.lock().unwrap().remove(&Some(d.id.clone()));
-                    let mut list = guilds.lock().unwrap();
-                    list.retain(|g| g.id != d.id);
-                    send!(messages::Ev::Guilds(list.clone()));
-                }
-                _ => {}
-            },
+            }
         }
     }
     GatewayEnd::ChannelClosed

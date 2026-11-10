@@ -3,8 +3,10 @@
 
 use std::collections::HashMap;
 
+use inlet_protocol as p;
+
 use super::{channel, msg};
-use crate::model::{Channel, ChannelKind, Message};
+use crate::model::{Channel, ChannelKind};
 
 /// Adds the DM list (the `None` guild).
 pub fn dm_channels(channels: &mut HashMap<Option<String>, Vec<Channel>>) {
@@ -24,7 +26,7 @@ pub fn dm_channels(channels: &mut HashMap<Option<String>, Vec<Channel>>) {
 }
 
 /// Adds the messages of the DMs.
-pub fn dm_messages(messages: &mut HashMap<String, Vec<Message>>) {
+pub fn dm_messages(messages: &mut HashMap<String, Vec<p::Message>>) {
     messages.insert(
         "dm-ada".into(),
         vec![msg(

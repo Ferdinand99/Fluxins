@@ -287,8 +287,6 @@ struct RealActive {
     guilds: Arc<Mutex<Vec<Guild>>>,
     cache: ChannelCache,
     names: SharedNames,
-    /// Unread state, acknowledgements and notification settings of this session.
-    read: notifications::ReadHandle,
     active_guild: Option<String>,
     /// Restart bookkeeping; lives with the session so spacing survives restarts.
     policy: ReconnectPolicy,
@@ -332,6 +330,8 @@ struct Backend {
     saving: Option<tokio::task::JoinHandle<()>>,
     open_guild: Option<AbortHandle>,
     open_channel: Option<AbortHandle>,
+    /// The request for older messages of the open channel.
+    older: messages::OlderPages,
 }
 
 impl Backend {
@@ -351,6 +351,7 @@ impl Backend {
             saving: None,
             open_guild: None,
             open_channel: None,
+            older: Default::default(),
         }
     }
 

@@ -8,10 +8,12 @@ use gpui::{div, prelude::*, px, AnyElement, Context, Div, FontWeight, SharedStri
 use super::modal::modal;
 use crate::app::Inlet;
 use crate::assets::Icon;
-use crate::backend::notifications::{Change, Target};
+use crate::model::ChannelKind;
 use crate::theme;
+use crate::ui::notifications::settings::{self, Change, Target};
 use crate::ui::sidebar::channel_list::channel_label;
 use crate::ui::widgets::button;
+use inlet_state::{ChannelId, GuildId};
 
 // Fluxer's notification levels.
 const ALL: i64 = 0;
@@ -197,11 +199,14 @@ impl Inlet {
             return div().into_any_element();
         };
         let (guild_id, channel_id) = (window.guild_id.clone(), window.channel_id.clone());
-        let view = window.view.clone();
-        let Some(view) = view else {
-            // The backend has not answered yet: an empty frame, replaced a moment later.
+        let Some(account) = &self.account else {
             return self.settings_frame(Vec::new(), cx);
         };
+        let view = settings::view(
+            account.read(cx),
+            guild_id.as_deref().and_then(GuildId::parse),
+            channel_id.as_deref().and_then(ChannelId::parse),
+        );
 
         let channel = channel_id
             .as_ref()
@@ -275,7 +280,20 @@ impl Inlet {
         } else {
             t!("notifications-mark-dms-read")
         };
-        let has_channel = self.selected_channel.is_some();
+        // The channel button reads the window's own channel: the open one, or a category.
+        let category = self.notifications.settings.as_ref().and_then(|w| {
+            let id = w.channel_id.as_ref()?;
+            self.channels
+                .iter()
+                .find(|c| &c.id == id && c.kind == ChannelKind::Category)
+                .map(|c| c.id.clone())
+        });
+        let has_channel = category.is_some() || self.selected_channel.is_some();
+        let mark_channel = if category.is_some() {
+            t!("notifications-mark-category-read")
+        } else {
+            t!("notifications-mark-channel-read")
+        };
         modal(
             "notification-settings-window",
             if columns.len() > 1 { 720. } else { 400. },
@@ -302,22 +320,20 @@ impl Inlet {
                     .flex_wrap()
                     .gap_2()
                     .when(has_channel, |d| {
-                        d.child(
-                            button(
-                                "mark-channel-read",
-                                t!("notifications-mark-channel-read"),
-                                false,
-                            )
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.mark_channel_read();
+                        d.child(button("mark-channel-read", mark_channel, false).on_click(
+                            cx.listener(move |this, _, _, cx| {
+                                match &category {
+                                    Some(id) => this.mark_category_read(id.clone(), cx),
+                                    None => this.mark_channel_read(cx),
+                                }
                                 cx.notify();
-                            })),
-                        )
+                            }),
+                        ))
                     })
                     .child(
                         button("mark-server-read", mark_server, false).on_click(cx.listener(
                             |this, _, _, cx| {
-                                this.mark_guild_read();
+                                this.mark_guild_read(cx);
                                 cx.notify();
                             },
                         )),
@@ -325,7 +341,7 @@ impl Inlet {
                     .child(
                         button("mark-all-read", t!("notifications-mark-all-read"), false).on_click(
                             cx.listener(|this, _, _, cx| {
-                                this.mark_all_read();
+                                this.mark_all_read(cx);
                                 cx.notify();
                             }),
                         ),
@@ -368,7 +384,7 @@ impl Inlet {
                   _: &gpui::ClickEvent,
                   _: &mut gpui::Window,
                   cx: &mut Context<Inlet>| {
-                this.notification_change(target.clone(), change);
+                this.notification_change(target.clone(), change, cx);
                 cx.notify();
             }
         };

@@ -5,6 +5,7 @@ count-millions = { $count }M
 
 error-notification-settings = Could not save the notification settings. { $error }
 error-notification-too-many = This server has more channel settings than Inlet can change safely. Change them in another client.
+error-settings-not-saved = The notification settings could not be saved.
 
 ## The notification settings window
 
@@ -34,6 +35,7 @@ notifications-level-server-default = Server default
 notifications-suppress-everyone = Suppress @everyone and @here
 notifications-suppress-roles = Suppress all role @mentions
 notifications-mark-channel-read = Mark channel as read
+notifications-mark-category-read = Mark category as read
 notifications-mark-server-read = Mark server as read
 notifications-mark-dms-read = Mark all direct messages as read
 notifications-mark-all-read = Mark everything as read

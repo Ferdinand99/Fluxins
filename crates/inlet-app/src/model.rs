@@ -64,11 +64,12 @@ pub struct Channel {
 /// Names for resolving mentions (`<#id>`, `<@id>`, `<@&id>`) while parsing.
 #[derive(Clone, Debug, Default)]
 pub struct Names {
-    /// The signed-in account, to mark messages that mention it.
-    pub me: Option<String>,
     pub channels: HashMap<String, String>,
     pub users: HashMap<String, String>,
     pub roles: HashMap<String, String>,
+    /// User IDs in the order they were first seen, so the oldest go first past the cap
+    /// (see `backend::messages::parse::remember_user`).
+    pub user_order: std::collections::VecDeque<String>,
 }
 
 /// A rich embed (bots post these), drawn as a card.
@@ -120,7 +121,6 @@ pub struct Attachment {
 pub struct Message {
     pub id: String,
     pub channel_id: String,
-    pub author_id: String,
     /// Display name, cleaned.
     pub author: String,
     /// Account name, cleaned; shown next to the display name when they differ.
@@ -139,8 +139,6 @@ pub struct Message {
     pub attachments: Vec<Attachment>,
     pub embeds: Vec<Embed>,
     pub reply: Option<Reply>,
-    /// The message mentions the signed-in account (or everyone).
-    pub mentions_me: bool,
     pub edited: bool,
 }
 
@@ -148,13 +146,6 @@ impl Message {
     /// Whether there is anything to show under the header.
     pub fn is_empty(&self) -> bool {
         self.blocks.is_empty() && self.embeds.is_empty() && self.attachments.is_empty()
-    }
-
-    /// Local calendar day of the message, for date separators.
-    pub fn day(&self) -> Option<chrono::NaiveDate> {
-        chrono::DateTime::from_timestamp_millis(self.timestamp_ms)
-            .filter(|_| self.timestamp_ms > 0)
-            .map(|t| t.with_timezone(&chrono::Local).date_naive())
     }
 
     /// Fills `blocks` and `truncated` from `content`, without mention names.
@@ -192,14 +183,6 @@ fn floor_char_boundary(s: &str, mut ix: usize) -> usize {
         ix -= 1;
     }
     ix
-}
-
-/// Whether `next` is drawn under `prev`'s header: same account, close in time.
-/// Grouping is by account ID, never by display name, so a look-alike name gets its own header.
-pub fn should_group(prev: &Message, next: &Message) -> bool {
-    prev.author_id == next.author_id
-        && next.timestamp_ms >= prev.timestamp_ms
-        && next.timestamp_ms - prev.timestamp_ms <= GROUP_WINDOW_MS
 }
 
 /// Removes characters that can fake or break a name: control characters, line breaks,
@@ -275,15 +258,14 @@ pub fn snippet(text: &str, max: usize) -> String {
     }
 }
 
-/// Parses an RFC 3339 timestamp into (milliseconds since epoch, local display text).
+/// Parses an RFC 3339 timestamp into (milliseconds since epoch, local display text in
+/// the system locale's format).
 pub fn timestamp(rfc3339: &str) -> (i64, String) {
     match chrono::DateTime::parse_from_rfc3339(rfc3339) {
-        Ok(t) => (
-            t.timestamp_millis(),
-            t.with_timezone(&chrono::Local)
-                .format("%d/%m/%Y, %H:%M")
-                .to_string(),
-        ),
+        Ok(t) => {
+            let ms = t.timestamp_millis();
+            (ms, crate::ui::chat::time::full(ms))
+        }
         Err(_) => (0, clean_name(rfc3339)),
     }
 }
@@ -303,11 +285,10 @@ mod tests {
         }
     }
 
-    pub(crate) fn msg(id: &str, author_id: &str, author: &str, t: i64) -> Message {
+    fn msg(id: &str, author: &str, t: i64) -> Message {
         Message {
             id: id.into(),
             channel_id: "c".into(),
-            author_id: author_id.into(),
             author: author.into(),
             author_username: author.into(),
             author_bot: false,
@@ -319,7 +300,6 @@ mod tests {
             attachments: vec![],
             embeds: vec![],
             reply: None,
-            mentions_me: false,
             edited: false,
         }
     }
@@ -365,29 +345,6 @@ mod tests {
     }
 
     #[test]
-    fn groups_by_account_not_by_name() {
-        let a = msg("1", "100", "ada", 0);
-        let same = msg("2", "100", "ada", 60_000);
-        let impostor = msg("3", "200", "ada", 60_000);
-        assert!(should_group(&a, &same));
-        assert!(!should_group(&a, &impostor));
-    }
-
-    #[test]
-    fn groups_only_within_the_time_window() {
-        let a = msg("1", "100", "ada", 0);
-        assert!(should_group(&a, &msg("2", "100", "ada", GROUP_WINDOW_MS)));
-        assert!(!should_group(
-            &a,
-            &msg("2", "100", "ada", GROUP_WINDOW_MS + 1)
-        ));
-        assert!(!should_group(
-            &msg("2", "100", "ada", 10_000),
-            &msg("1", "100", "ada", 0)
-        ));
-    }
-
-    #[test]
     fn clean_name_strips_bidi_control_and_zero_width() {
         assert_eq!(clean_name("ad\u{202E}a"), "ada");
         assert_eq!(clean_name("a\u{200B}d\u{2066}a\u{2069}"), "ada");
@@ -399,11 +356,11 @@ mod tests {
 
     #[test]
     fn long_content_is_truncated_for_display() {
-        let mut m = msg("1", "1", "a", 0);
+        let mut m = msg("1", "a", 0);
         m.content = "ø".repeat(DISPLAY_CHARS + 10);
         m.parse();
         assert!(m.truncated);
-        let mut big = msg("2", "1", "a", 0);
+        let mut big = msg("2", "a", 0);
         big.content = "x".repeat(MAX_CONTENT_BYTES * 2);
         big.parse();
         assert_eq!(big.content.len(), MAX_CONTENT_BYTES);

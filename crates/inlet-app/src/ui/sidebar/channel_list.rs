@@ -85,6 +85,8 @@ impl Inlet {
                                         .overflow_hidden()
                                         .whitespace_nowrap()
                                         .text_ellipsis()
+                                        // Room for the bell, so it never covers the end of a long name.
+                                        .mr(px(22.))
                                         .child(c.name.clone()),
                                 )
                                 .child(
