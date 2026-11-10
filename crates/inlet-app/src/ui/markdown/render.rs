@@ -1,0 +1,275 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+//! Draws [`Block`]s as gpui elements.
+
+use std::ops::Range;
+use std::rc::Rc;
+
+use gpui::{
+    div, prelude::*, px, AnyElement, App, FontStyle, FontWeight, HighlightStyle, InteractiveText,
+    SharedString, StrikethroughStyle, StyledText, UnderlineStyle, Window,
+};
+
+use super::{Block, Inline, Style};
+use crate::theme;
+
+pub fn mono_font() -> &'static str {
+    crate::assets::mono_font()
+}
+
+/// Called when a link is clicked: the URL and whether its text hides the target.
+pub type OnLink = Rc<dyn Fn(&str, bool, &mut Window, &mut App)>;
+/// Called when a hidden spoiler is clicked.
+pub type OnReveal = Rc<dyn Fn(&mut Window, &mut App)>;
+
+/// Callbacks and state for drawing one message.
+#[derive(Clone)]
+pub struct RenderCtx {
+    /// Spoilers of this message are shown.
+    pub revealed: bool,
+    /// A link was clicked: the URL and whether its text hides the target.
+    pub on_link: OnLink,
+    /// A hidden spoiler was clicked.
+    pub on_reveal: OnReveal,
+}
+
+fn highlight(style: Style, revealed: bool) -> HighlightStyle {
+    match style {
+        Style::Bold => HighlightStyle {
+            font_weight: Some(FontWeight::BOLD),
+            ..Default::default()
+        },
+        Style::Italic => HighlightStyle {
+            font_style: Some(FontStyle::Italic),
+            ..Default::default()
+        },
+        Style::Underline => HighlightStyle {
+            underline: Some(UnderlineStyle {
+                thickness: px(1.),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        Style::Strike => HighlightStyle {
+            strikethrough: Some(StrikethroughStyle {
+                thickness: px(1.),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        Style::Code => HighlightStyle {
+            background_color: Some(theme::code_inline_bg()),
+            color: Some(theme::code_text()),
+            ..Default::default()
+        },
+        Style::Spoiler if revealed => HighlightStyle {
+            background_color: Some(theme::code_inline_bg()),
+            ..Default::default()
+        },
+        Style::Spoiler => HighlightStyle {
+            background_color: Some(theme::guild_item()),
+            color: Some(theme::guild_item()),
+            underline: None,
+            ..Default::default()
+        },
+        Style::Link => HighlightStyle {
+            color: Some(theme::link()),
+            underline: Some(UnderlineStyle {
+                thickness: px(1.),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        Style::Edited => HighlightStyle {
+            color: Some(theme::text_muted()),
+            ..Default::default()
+        },
+        Style::LinkTarget => HighlightStyle {
+            color: Some(theme::text_muted()),
+            ..Default::default()
+        },
+        Style::Mention => HighlightStyle {
+            background_color: Some(theme::mention_fill()),
+            color: Some(theme::mention_text()),
+            ..Default::default()
+        },
+    }
+}
+
+/// Merges overlapping highlights: gpui wants sorted, non-overlapping ranges. A hidden
+/// spoiler wins over everything inside it, so nothing leaks through its colour.
+pub(super) fn flatten(inline: &Inline, revealed: bool) -> Vec<(Range<usize>, HighlightStyle)> {
+    if inline.highlights.is_empty() {
+        return Vec::new();
+    }
+    let mut cuts: Vec<usize> = inline
+        .highlights
+        .iter()
+        .flat_map(|(r, _)| [r.start, r.end])
+        .collect();
+    cuts.sort_unstable();
+    cuts.dedup();
+    let mut out = Vec::new();
+    for w in cuts.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        let covering: Vec<Style> = inline
+            .highlights
+            .iter()
+            .filter(|(r, _)| r.start <= a && b <= r.end)
+            .map(|(_, s)| *s)
+            .collect();
+        if covering.is_empty() || a >= b {
+            continue;
+        }
+        let style = if !revealed && covering.contains(&Style::Spoiler) {
+            highlight(Style::Spoiler, false)
+        } else {
+            covering.iter().fold(HighlightStyle::default(), |acc, s| {
+                acc.highlight(highlight(*s, revealed))
+            })
+        };
+        out.push((a..b, style));
+    }
+    out
+}
+
+fn overlaps(a: &Range<usize>, b: &Range<usize>) -> bool {
+    a.start < b.end && b.start < a.end
+}
+
+/// What a click on a range of an inline does.
+pub(super) enum Click {
+    Link(String, bool),
+    Reveal,
+}
+
+pub(super) fn clickables(inline: &Inline, revealed: bool) -> Vec<(Range<usize>, Click)> {
+    let spoilers: Vec<&Range<usize>> = inline
+        .highlights
+        .iter()
+        .filter(|(_, s)| *s == Style::Spoiler)
+        .map(|(r, _)| r)
+        .collect();
+    let mut out = Vec::new();
+    for link in &inline.links {
+        // Links inside a hidden spoiler stay inert until it is revealed.
+        if !revealed && spoilers.iter().any(|s| overlaps(s, &link.range)) {
+            continue;
+        }
+        out.push((
+            link.range.clone(),
+            Click::Link(link.url.clone(), link.masked),
+        ));
+    }
+    if !revealed {
+        for s in spoilers {
+            out.push((s.clone(), Click::Reveal));
+        }
+    }
+    out.sort_by_key(|(r, _)| r.start);
+    out
+}
+
+fn inline_element(id: SharedString, inline: &Inline, ctx: &RenderCtx) -> AnyElement {
+    let text = StyledText::new(SharedString::from(inline.text.clone()))
+        .with_highlights(flatten(inline, ctx.revealed));
+    let clicks = clickables(inline, ctx.revealed);
+    if clicks.is_empty() {
+        return div().child(text).into_any_element();
+    }
+    let ranges: Vec<Range<usize>> = clicks.iter().map(|(r, _)| r.clone()).collect();
+    let actions: Vec<Click> = clicks.into_iter().map(|(_, c)| c).collect();
+    let ctx = ctx.clone();
+    div()
+        .child(
+            InteractiveText::new(id, text).on_click(ranges, move |ix, window, cx| {
+                match actions.get(ix) {
+                    Some(Click::Link(url, masked)) => (ctx.on_link)(url, *masked, window, cx),
+                    Some(Click::Reveal) => (ctx.on_reveal)(window, cx),
+                    None => {}
+                }
+            }),
+        )
+        .into_any_element()
+}
+
+/// Draws the blocks of one message. `id` must be unique per message.
+pub fn render(id: &str, blocks: &[Block], ctx: &RenderCtx) -> AnyElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .children(
+            blocks
+                .iter()
+                .enumerate()
+                .map(|(i, b)| render_block(&format!("{id}-{i}"), b, ctx)),
+        )
+        .into_any_element()
+}
+
+fn render_block(id: &str, block: &Block, ctx: &RenderCtx) -> AnyElement {
+    match block {
+        Block::Text(inline) => inline_element(id.to_string().into(), inline, ctx),
+        Block::Heading(level, inline) => div()
+            .font_weight(FontWeight::BOLD)
+            .text_size(px(match level {
+                1 => 22.,
+                2 => 19.,
+                _ => 16.,
+            }))
+            .child(inline_element(id.to_string().into(), inline, ctx))
+            .into_any_element(),
+        Block::Subtext(inline) => div()
+            .text_size(px(12.))
+            .text_color(theme::text_muted())
+            .child(inline_element(id.to_string().into(), inline, ctx))
+            .into_any_element(),
+        Block::Code { content } => div()
+            .bg(theme::code_bg())
+            .border_1()
+            .border_color(theme::accent_border())
+            .rounded(px(6.))
+            .p(px(14.))
+            .font_family(mono_font())
+            .text_size(px(13.))
+            .child(content.clone())
+            .into_any_element(),
+        Block::Quote(children) => div()
+            .flex()
+            .flex_row()
+            .gap_2()
+            .child(div().w(px(4.)).rounded_sm().bg(theme::quote_bar()))
+            .child(div().flex_1().child(render(id, children, ctx)))
+            .into_any_element(),
+        Block::Alert(label, children) => div()
+            .flex()
+            .flex_row()
+            .gap_2()
+            .child(div().w(px(4.)).rounded_sm().bg(theme::brand()))
+            .child(
+                div()
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .child(div().font_weight(FontWeight::BOLD).child(label.clone()))
+                    .child(render(id, children, ctx)),
+            )
+            .into_any_element(),
+        Block::List(items) => div()
+            .flex()
+            .flex_col()
+            .children(items.iter().enumerate().map(|(i, (marker, children))| {
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap_2()
+                    .child(div().text_color(theme::text_muted()).child(marker.clone()))
+                    .child(
+                        div()
+                            .flex_1()
+                            .child(render(&format!("{id}-l{i}"), children, ctx)),
+                    )
+            }))
+            .into_any_element(),
+    }
+}
