@@ -18,6 +18,7 @@ mod user;
 
 pub use events::*;
 pub use guild::*;
+pub(crate) use message::lenient_opt;
 pub use message::*;
 pub use time::parse_timestamp_ms;
 pub use user::*;
@@ -32,6 +33,14 @@ pub const FLUXER_EPOCH_MS: u64 = 1_420_070_400_000;
 pub fn snowflake_timestamp_ms(id: &str) -> Option<u64> {
     let raw: u64 = id.parse().ok()?;
     Some((raw >> 22) + FLUXER_EPOCH_MS)
+}
+
+/// The lowest snowflake for a Unix time in milliseconds (times before
+/// Fluxer's epoch give `0`). Use it for date filters, such as
+/// [`crate::api::search::MessageSearch::before_time`].
+pub fn snowflake_at_ms(unix_ms: u64) -> Snowflake {
+    let since = unix_ms.saturating_sub(FLUXER_EPOCH_MS).min(u64::MAX >> 22);
+    (since << 22).to_string()
 }
 
 /// A user as other people see them (`UserPartialResponse`).
@@ -640,6 +649,10 @@ mod tests {
     fn snowflake_time() {
         // 1 << 22 is one millisecond after the epoch.
         assert_eq!(snowflake_timestamp_ms("4194304"), Some(FLUXER_EPOCH_MS + 1));
+        assert_eq!(snowflake_at_ms(FLUXER_EPOCH_MS + 1), "4194304");
+        assert_eq!(snowflake_at_ms(0), "0");
+        let id = snowflake_at_ms(1_800_000_000_000);
+        assert_eq!(snowflake_timestamp_ms(&id), Some(1_800_000_000_000));
     }
     #[test]
     fn nulls_count_as_missing() {

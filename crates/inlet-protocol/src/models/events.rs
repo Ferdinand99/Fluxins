@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{
-    lenient_bool, lenient_vec, null_as_default, opt_sf, sf, sf_list, u64_or_zero, Channel, Emoji,
-    GuildEmoji, GuildMember, GuildSticker, Presence, Role, Snowflake, User, VoiceState,
+    lenient_bool, lenient_vec, null_as_default, opt_sf, opt_u64, sf, sf_list, u64_or_zero, Channel,
+    Emoji, GuildEmoji, GuildMember, GuildSticker, Presence, Role, Snowflake, User, VoiceState,
 };
 
 /// MESSAGE_ACK: the account's read state moved, usually from another session.
@@ -19,12 +19,28 @@ pub struct MessageAck {
     /// The read state now points at this message.
     #[serde(deserialize_with = "sf")]
     pub message_id: Snowflake,
-    /// Mentions left.
-    #[serde(default, deserialize_with = "u64_or_zero")]
-    pub mention_count: u64,
+    /// Mentions left. `None` when the event has no usable count: keep the
+    /// stored count then (Fluxer's client does), do not treat it as 0.
+    #[serde(default, deserialize_with = "opt_u64")]
+    pub mention_count: Option<u64>,
     /// Marked by hand (for example "mark unread").
     #[serde(default, deserialize_with = "lenient_bool")]
     pub manual: bool,
+    /// Read state version, a decimal string (also read from a number).
+    /// Compare with [`MessageAck::version_number`] to drop stale acks.
+    #[serde(default, deserialize_with = "opt_sf")]
+    pub version: Option<String>,
+    /// Read state flags (`IS_GUILD_CHANNEL` 1, `IS_THREAD` 2), on threads,
+    /// forum and media channels.
+    #[serde(default, deserialize_with = "opt_u64")]
+    pub flags: Option<u64>,
+}
+
+impl MessageAck {
+    /// [`MessageAck::version`] as a number, when it is one.
+    pub fn version_number(&self) -> Option<u64> {
+        self.version.as_deref()?.trim().parse().ok()
+    }
 }
 
 /// MESSAGE_REACTION_ADD and MESSAGE_REACTION_REMOVE.
@@ -574,6 +590,23 @@ mod tests {
         }))
         .unwrap();
         assert!(!ack.manual);
+        assert_eq!(ack.mention_count, Some(0));
+        assert_eq!(ack.version_number(), Some(1));
+        // A missing or broken count stays unknown instead of becoming 0.
+        for d in [
+            json!({"channel_id": "2", "message_id": "3"}),
+            json!({"channel_id": "2", "message_id": "3", "mention_count": null, "version": 7}),
+            json!({"channel_id": "2", "message_id": "3", "mention_count": "x", "flags": 2}),
+        ] {
+            let ack: MessageAck = serde_json::from_value(d).unwrap();
+            assert_eq!(ack.mention_count, None);
+        }
+        let ack: MessageAck = serde_json::from_value(
+            json!({"channel_id": "2", "message_id": "3", "version": 7, "flags": 2}),
+        )
+        .unwrap();
+        assert_eq!(ack.version.as_deref(), Some("7"));
+        assert_eq!(ack.flags, Some(2));
         let p: PassiveUpdates = serde_json::from_value(json!({
             "guild_id": "1", "channels": {"2": "30", "3": 40, "4": null}
         }))

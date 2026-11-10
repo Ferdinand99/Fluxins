@@ -292,9 +292,14 @@ fn thread_flag(channel: &Channel, name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Whether the account joined the thread (`member` on the thread channel).
+/// Whether the account joined the thread: `member` on the thread channel.
+/// Fluxer sends it in READY/GUILD_CREATE `threads`, THREAD_CREATE, THREAD_LIST_SYNC
+/// and REST answers (a missing `member` there means "not a member"; store
+/// those with [`Channel::replace_thread`]), but strips it from THREAD_UPDATE,
+/// so the stored thread must keep it across one ([`Channel::merge_thread_update`],
+/// [`Channel::set_thread_member`]).
 fn thread_member(channel: &Channel) -> bool {
-    channel.extra.get("member").is_some_and(|m| m.is_object())
+    channel.is_thread_member()
 }
 
 impl PermissionContext<'_> {
@@ -342,8 +347,11 @@ impl PermissionContext<'_> {
     }
 
     /// Whether a timeout blocks writing: not for the owner or an administrator.
+    /// The administrator exemption holds without MFA too: Fluxer checks the
+    /// computed permissions, where `ADMINISTRATOR` stays set (only the
+    /// elevated actions need the second factor).
     fn communication_blocked(&self) -> bool {
-        self.timed_out && !self.is_owner() && !self.is_admin()
+        self.timed_out && !self.is_owner() && !self.has_admin_role()
     }
 
     /// The member has a role with `ADMINISTRATOR` (before the MFA rule).
@@ -798,6 +806,27 @@ mod tests {
             ..ctx(&roles, &admins, "11")
         };
         assert_eq!(a.guild(), ALL & !ELEVATED);
+        // A timed-out administrator without MFA is still exempt from the
+        // timeout (Fluxer checks the computed bits, which keep ADMINISTRATOR).
+        let text = channel("302", channel_type::GUILD_TEXT, None, json!([]));
+        let a_timed_out = PermissionContext {
+            timed_out: true,
+            ..a
+        };
+        assert!(a_timed_out.can_send(&text, None));
+        assert!(a_timed_out.can_react(&text, None));
+        let edit: Message = serde_json::from_value(json!({
+            "id": "1", "channel_id": "302", "author": {"id": "11"}, "type": 0, "content": "x",
+            "timestamp": "2026-01-01T00:00:00Z"
+        }))
+        .unwrap();
+        assert!(a_timed_out.can_edit_message(&edit, &text, None));
+        // A timed-out moderator is still blocked.
+        let m_timed_out = PermissionContext {
+            timed_out: true,
+            ..m
+        };
+        assert!(!m_timed_out.can_send(&text, None));
         let owner = PermissionContext {
             mfa_missing: true,
             ..ctx(&roles, &[], "1")
@@ -896,6 +925,17 @@ mod tests {
             .extra
             .insert("member".into(), json!({"id": "402", "user_id": "10"}));
         assert!(member.can_view(&joined, Some(&parent)));
+        // THREAD_UPDATE carries no `member`; merging keeps the membership.
+        let mut stored = joined.clone();
+        let mut update = private.clone();
+        update.name = Some("renamed".into());
+        stored.merge_thread_update(update.clone());
+        assert!(member.can_view(&stored, Some(&parent)));
+        // Replacing it outright would hide the thread (fails closed).
+        assert!(!member.can_view(&update, Some(&parent)));
+        // Leaving (THREAD_MEMBERS_UPDATE removes the account) hides it again.
+        stored.set_thread_member(None);
+        assert!(!member.can_view(&stored, Some(&parent)));
 
         // Pinning in a thread is blocked during a timeout; outside threads it is not.
         let open = thread("403", channel_type::PUBLIC_THREAD, "302", json!({}));
