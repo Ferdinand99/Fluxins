@@ -79,6 +79,10 @@ pub enum Error {
         /// What the instance says now.
         new: String,
     },
+    /// An argument cannot be sent (for example an emoji that is not valid in a
+    /// reaction path, or too many files). Nothing was sent.
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
     /// A response or gateway payload was larger than the limit.
     #[error("response too large (over {limit} bytes)")]
     TooLarge {

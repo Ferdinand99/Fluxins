@@ -159,6 +159,7 @@ async fn post_with_captcha(
                 path,
                 body: Some(body),
                 headers: &headers,
+                upload: None,
             },
         )
         .await?;
@@ -309,6 +310,7 @@ async fn anon(
             path,
             body,
             headers: &headers,
+            upload: None,
         },
     )
     .await

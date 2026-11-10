@@ -42,7 +42,14 @@ use tokio_tungstenite::tungstenite::protocol::{CloseFrame, WebSocketConfig};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use crate::instance::{require_scheme, Instance};
-use crate::models::{Channel, GuildDelete, GuildReady, Message, MessageDelete, Ready, TypingStart};
+use crate::models::{
+    Channel, ChannelPinsUpdate, ChannelUpdateBulk, CurrentUser, Guild, GuildDelete,
+    GuildEmojisUpdate, GuildMember, GuildMemberListUpdate, GuildMemberRemove, GuildMembersChunk,
+    GuildReady, GuildRoleDelete, GuildRoleEvent, GuildRolesUpdate, GuildStickersUpdate, Message,
+    MessageAck, MessageDelete, MessageDeleteBulk, PassiveUpdates, Presence, PresenceUpdateBulk,
+    ReactionAddMany, ReactionClear, ReactionEvent, Ready, SessionPresence, TypingStart,
+    UserSettings, VoiceState,
+};
 use crate::token::Token;
 use codec::ZstdStream;
 
@@ -66,6 +73,10 @@ const READY_TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_PENDING: usize = 4_096;
 /// Commands kept while disconnected.
 const MAX_QUEUED: usize = 64;
+/// Member list subscriptions remembered for replay (one per guild).
+const MAX_MEMBER_LISTS: usize = 5;
+/// Ranges per member list channel Fluxer keeps.
+const MAX_MEMBER_LIST_RANGES: usize = 10;
 /// Capacity of the command channel.
 const COMMAND_BUFFER: usize = 256;
 /// Active guilds remembered for replay (the UI shows one at a time). They go
@@ -215,6 +226,62 @@ pub enum Dispatch {
     MessageDelete(MessageDelete),
     /// Someone started typing.
     TypingStart(TypingStart),
+    /// Several messages were deleted.
+    MessageDeleteBulk(Box<MessageDeleteBulk>),
+    /// The account's read state moved (another session read the channel).
+    MessageAck(Box<MessageAck>),
+    /// A reaction was added.
+    MessageReactionAdd(Box<ReactionEvent>),
+    /// DM reactions grouped over 650 ms.
+    MessageReactionAddMany(Box<ReactionAddMany>),
+    /// A reaction was removed.
+    MessageReactionRemove(Box<ReactionEvent>),
+    /// Every reaction on a message was removed.
+    MessageReactionRemoveAll(Box<ReactionClear>),
+    /// Every reaction with one emoji was removed (`emoji` is set).
+    MessageReactionRemoveEmoji(Box<ReactionClear>),
+    /// A channel's newest pin changed.
+    ChannelPinsUpdate(Box<ChannelPinsUpdate>),
+    /// Several channels changed (reorder).
+    ChannelUpdateBulk(Box<ChannelUpdateBulk>),
+    /// A guild's settings changed (`guild_id` is in `extra`).
+    GuildUpdate(Box<Guild>),
+    /// A role was created.
+    GuildRoleCreate(Box<GuildRoleEvent>),
+    /// A role changed.
+    GuildRoleUpdate(Box<GuildRoleEvent>),
+    /// Several roles changed.
+    GuildRoleUpdateBulk(Box<GuildRolesUpdate>),
+    /// A role was deleted.
+    GuildRoleDelete(Box<GuildRoleDelete>),
+    /// Someone joined a guild ([`GuildMember::guild_id`]).
+    GuildMemberAdd(Box<GuildMember>),
+    /// A member changed ([`GuildMember::guild_id`]).
+    GuildMemberUpdate(Box<GuildMember>),
+    /// Someone left a guild.
+    GuildMemberRemove(Box<GuildMemberRemove>),
+    /// Answer to [`GatewayHandle::request_guild_members`].
+    GuildMembersChunk(Box<GuildMembersChunk>),
+    /// A subscribed member list changed; apply it to a [`crate::MemberList`].
+    GuildMemberListUpdate(Box<GuildMemberListUpdate>),
+    /// A guild's custom emoji changed.
+    GuildEmojisUpdate(Box<GuildEmojisUpdate>),
+    /// A guild's stickers changed.
+    GuildStickersUpdate(Box<GuildStickersUpdate>),
+    /// A presence changed.
+    PresenceUpdate(Box<Presence>),
+    /// Presences of a guild that came back.
+    PresenceUpdateBulk(Box<PresenceUpdateBulk>),
+    /// New `last_message_id`s in a passive large guild.
+    PassiveUpdates(Box<PassiveUpdates>),
+    /// The account changed.
+    UserUpdate(Box<CurrentUser>),
+    /// The account settings changed.
+    UserSettingsUpdate(Box<UserSettings>),
+    /// The account's live sessions changed.
+    SessionsReplace(Vec<SessionPresence>),
+    /// A voice state changed (`channel_id` `None` means the participant left).
+    VoiceStateUpdate(Box<VoiceState>),
     /// Any other event, or a known one whose payload did not parse.
     Other {
         /// Event name, for example `PRESENCE_UPDATE`.
@@ -256,6 +323,68 @@ impl Dispatch {
             "MESSAGE_UPDATE" => typed(name, data, |v| Dispatch::MessageUpdate(Box::new(v))),
             "MESSAGE_DELETE" => typed(name, data, Dispatch::MessageDelete),
             "TYPING_START" => typed(name, data, Dispatch::TypingStart),
+            "MESSAGE_DELETE_BULK" => {
+                typed(name, data, |v| Dispatch::MessageDeleteBulk(Box::new(v)))
+            }
+            "MESSAGE_ACK" => typed(name, data, |v| Dispatch::MessageAck(Box::new(v))),
+            "MESSAGE_REACTION_ADD" => {
+                typed(name, data, |v| Dispatch::MessageReactionAdd(Box::new(v)))
+            }
+            "MESSAGE_REACTION_ADD_MANY" => typed(name, data, |v| {
+                Dispatch::MessageReactionAddMany(Box::new(v))
+            }),
+            "MESSAGE_REACTION_REMOVE" => {
+                typed(name, data, |v| Dispatch::MessageReactionRemove(Box::new(v)))
+            }
+            "MESSAGE_REACTION_REMOVE_ALL" => typed(name, data, |v| {
+                Dispatch::MessageReactionRemoveAll(Box::new(v))
+            }),
+            "MESSAGE_REACTION_REMOVE_EMOJI" => typed(name, data, |v| {
+                Dispatch::MessageReactionRemoveEmoji(Box::new(v))
+            }),
+            "CHANNEL_PINS_UPDATE" => {
+                typed(name, data, |v| Dispatch::ChannelPinsUpdate(Box::new(v)))
+            }
+            "CHANNEL_UPDATE_BULK" => {
+                typed(name, data, |v| Dispatch::ChannelUpdateBulk(Box::new(v)))
+            }
+            "GUILD_UPDATE" => typed(name, data, |v| Dispatch::GuildUpdate(Box::new(v))),
+            "GUILD_ROLE_CREATE" => typed(name, data, |v| Dispatch::GuildRoleCreate(Box::new(v))),
+            "GUILD_ROLE_UPDATE" => typed(name, data, |v| Dispatch::GuildRoleUpdate(Box::new(v))),
+            "GUILD_ROLE_UPDATE_BULK" => {
+                typed(name, data, |v| Dispatch::GuildRoleUpdateBulk(Box::new(v)))
+            }
+            "GUILD_ROLE_DELETE" => typed(name, data, |v| Dispatch::GuildRoleDelete(Box::new(v))),
+            "GUILD_MEMBER_ADD" => typed(name, data, |v| Dispatch::GuildMemberAdd(Box::new(v))),
+            "GUILD_MEMBER_UPDATE" => {
+                typed(name, data, |v| Dispatch::GuildMemberUpdate(Box::new(v)))
+            }
+            "GUILD_MEMBER_REMOVE" => {
+                typed(name, data, |v| Dispatch::GuildMemberRemove(Box::new(v)))
+            }
+            "GUILD_MEMBERS_CHUNK" => {
+                typed(name, data, |v| Dispatch::GuildMembersChunk(Box::new(v)))
+            }
+            "GUILD_MEMBER_LIST_UPDATE" => {
+                typed(name, data, |v| Dispatch::GuildMemberListUpdate(Box::new(v)))
+            }
+            "GUILD_EMOJIS_UPDATE" => {
+                typed(name, data, |v| Dispatch::GuildEmojisUpdate(Box::new(v)))
+            }
+            "GUILD_STICKERS_UPDATE" => {
+                typed(name, data, |v| Dispatch::GuildStickersUpdate(Box::new(v)))
+            }
+            "PRESENCE_UPDATE" => typed(name, data, |v| Dispatch::PresenceUpdate(Box::new(v))),
+            "PRESENCE_UPDATE_BULK" => {
+                typed(name, data, |v| Dispatch::PresenceUpdateBulk(Box::new(v)))
+            }
+            "PASSIVE_UPDATES" => typed(name, data, |v| Dispatch::PassiveUpdates(Box::new(v))),
+            "USER_UPDATE" => typed(name, data, |v| Dispatch::UserUpdate(Box::new(v))),
+            "USER_SETTINGS_UPDATE" => {
+                typed(name, data, |v| Dispatch::UserSettingsUpdate(Box::new(v)))
+            }
+            "SESSIONS_REPLACE" => typed(name, data, Dispatch::SessionsReplace),
+            "VOICE_STATE_UPDATE" => typed(name, data, |v| Dispatch::VoiceStateUpdate(Box::new(v))),
             _ => Dispatch::Other {
                 name: name.to_owned(),
                 data,
@@ -282,6 +411,8 @@ enum Command {
     Raw(Value),
     GuildActive(String, bool),
     Status(String),
+    /// Guild, channel, ranges (empty: unsubscribe).
+    MemberList(String, String, Vec<[u32; 2]>),
 }
 
 impl std::fmt::Debug for Command {
@@ -290,6 +421,7 @@ impl std::fmt::Debug for Command {
             Command::Raw(v) => write!(f, "Raw(op {})", v.get("op").unwrap_or(&Value::Null)),
             Command::GuildActive(g, a) => write!(f, "GuildActive({g}, {a})"),
             Command::Status(s) => write!(f, "Status({s})"),
+            Command::MemberList(g, c, r) => write!(f, "MemberList({g}, {c}, {r:?})"),
         }
     }
 }
@@ -326,6 +458,58 @@ impl GatewayHandle {
         self.push(Command::Status(status.to_owned()));
     }
 
+    /// Lazy Request (op 14) for a guild's member list: the rows in `ranges`
+    /// (inclusive `[start, end]`, each at most 100 rows, ending by 100,000,
+    /// at most 10) of `channel_id`'s list. GUILD_MEMBER_LIST_UPDATE events
+    /// follow; feed them to a [`crate::MemberList`]. Subscribing one channel
+    /// drops the guild's other member list. Remembered and sent again after
+    /// a reconnect; pass no ranges to stop remembering it. Needs
+    /// `VIEW_CHANNEL` and `VIEW_CHANNEL_MEMBERS` in the channel.
+    pub fn subscribe_member_list(&self, guild_id: &str, channel_id: &str, ranges: &[[u32; 2]]) {
+        let valid: Vec<[u32; 2]> = ranges
+            .iter()
+            .copied()
+            .filter(|[s, e]| s <= e && e - s <= 99 && *e <= 100_000)
+            .take(MAX_MEMBER_LIST_RANGES)
+            .collect();
+        self.push(Command::MemberList(
+            guild_id.to_owned(),
+            channel_id.to_owned(),
+            valid,
+        ));
+    }
+
+    /// Request Guild Members (op 8): members whose name starts with `query`
+    /// (`limit` 1-100), or the members in `user_ids` (at most 100; then
+    /// `query` is ignored). Answers come as GUILD_MEMBERS_CHUNK with `nonce`.
+    /// An empty query with no IDs is refused here, because it would ask for
+    /// the whole guild.
+    pub fn request_guild_members(
+        &self,
+        guild_id: &str,
+        query: &str,
+        user_ids: &[&str],
+        limit: u8,
+        presences: bool,
+        nonce: Option<&str>,
+    ) -> bool {
+        if (query.is_empty() && user_ids.is_empty()) || user_ids.len() > 100 {
+            return false;
+        }
+        let mut d = json!({ "guild_id": guild_id, "presences": presences });
+        if user_ids.is_empty() {
+            d["query"] = json!(query);
+            d["limit"] = json!(limit.clamp(1, 100));
+        } else {
+            d["user_ids"] = json!(user_ids);
+        }
+        if let Some(n) = nonce.filter(|n| n.len() <= 32) {
+            d["nonce"] = json!(n);
+        }
+        self.send_raw(8, d);
+        true
+    }
+
     /// Closes the connection and ends the session (no resume).
     pub fn close(&self) {
         let _ = self.close.send(true);
@@ -360,6 +544,7 @@ impl Gateway {
             seq: None,
             last_identify: None,
             active_guilds: BTreeMap::new(),
+            member_lists: BTreeMap::new(),
             status: None,
             queued: VecDeque::new(),
             pending: VecDeque::new(),
@@ -417,6 +602,8 @@ struct Task {
     last_identify: Option<Instant>,
     /// Guilds the UI made active; replayed after Identify and Resume.
     active_guilds: BTreeMap<String, bool>,
+    /// Member list subscriptions per guild: channel and ranges.
+    member_lists: BTreeMap<String, (String, Vec<[u32; 2]>)>,
     /// Last status the UI set; replayed after Identify and Resume.
     status: Option<String>,
     /// Raw commands sent while disconnected.
@@ -586,6 +773,17 @@ impl Task {
                 self.active_guilds.remove(&g);
             }
             Command::Status(s) => self.status = Some(s),
+            Command::MemberList(g, _, ranges) if ranges.is_empty() => {
+                self.member_lists.remove(&g);
+            }
+            Command::MemberList(g, c, ranges) => {
+                if !self.member_lists.contains_key(&g)
+                    && self.member_lists.len() >= MAX_MEMBER_LISTS
+                {
+                    self.member_lists.pop_first();
+                }
+                self.member_lists.insert(g, (c, ranges));
+            }
             Command::Raw(v) => {
                 if self.queued.len() >= MAX_QUEUED {
                     tracing::warn!("gateway command queue full; dropping the oldest");
@@ -598,27 +796,66 @@ impl Task {
 
     /// Payloads for a command while connected (and records the wanted state).
     fn live(&mut self, cmd: Command) -> Option<Value> {
-        let payload = match &cmd {
-            Command::GuildActive(g, a) => Some(lazy_request(std::iter::once((g.as_str(), *a)))),
-            Command::Status(s) => Some(presence(s)),
-            Command::Raw(v) => Some(v.clone()),
-        };
-        if !matches!(cmd, Command::Raw(_)) {
-            self.remember(cmd);
+        match cmd {
+            Command::Raw(v) => Some(v),
+            Command::Status(s) => {
+                let payload = presence(&s);
+                self.remember(Command::Status(s));
+                Some(payload)
+            }
+            Command::GuildActive(g, a) => {
+                self.remember(Command::GuildActive(g.clone(), a));
+                let mut sub = self.subscription(&g);
+                sub.insert("active".into(), json!(a));
+                sub.insert("typing".into(), json!(a));
+                Some(lazy_request_subs(vec![(g, sub)]))
+            }
+            Command::MemberList(g, c, ranges) => {
+                let unsubscribe = ranges.is_empty();
+                self.remember(Command::MemberList(g.clone(), c.clone(), ranges));
+                let mut sub = self.subscription(&g);
+                if unsubscribe {
+                    sub.insert("member_list_channels".into(), one_entry(c, json!([])));
+                }
+                Some(lazy_request_subs(vec![(g, sub)]))
+            }
         }
-        payload
+    }
+
+    /// The remembered Lazy Request options of one guild.
+    fn subscription(&self, guild_id: &str) -> serde_json::Map<String, Value> {
+        let mut sub = serde_json::Map::new();
+        if let Some(a) = self.active_guilds.get(guild_id) {
+            sub.insert("active".into(), json!(a));
+            sub.insert("typing".into(), json!(a));
+        }
+        if let Some((c, ranges)) = self.member_lists.get(guild_id) {
+            sub.insert(
+                "member_list_channels".into(),
+                one_entry(c.clone(), json!(ranges)),
+            );
+        }
+        sub
     }
 
     /// What to send after READY or RESUMED: subscriptions, status, queued commands.
     fn replay(&mut self) -> Vec<Value> {
         let mut out = Vec::new();
-        let active: Vec<(String, bool)> = self
+        let guilds: std::collections::BTreeSet<String> = self
             .active_guilds
-            .iter()
-            .map(|(g, a)| (g.clone(), *a))
+            .keys()
+            .chain(self.member_lists.keys())
+            .cloned()
             .collect();
-        if !active.is_empty() {
-            out.push(lazy_request(active.iter().map(|(g, a)| (g.as_str(), *a))));
+        if !guilds.is_empty() {
+            let subs = guilds
+                .into_iter()
+                .map(|g| {
+                    let sub = self.subscription(&g);
+                    (g, sub)
+                })
+                .collect();
+            out.push(lazy_request_subs(subs));
         }
         if let Some(s) = &self.status {
             out.push(presence(s));
@@ -1032,6 +1269,21 @@ async fn flush(
     Ok(())
 }
 
+fn one_entry(key: String, value: Value) -> Value {
+    let mut m = serde_json::Map::new();
+    m.insert(key, value);
+    Value::Object(m)
+}
+
+fn lazy_request_subs(subs: Vec<(String, serde_json::Map<String, Value>)>) -> Value {
+    let map: serde_json::Map<String, Value> = subs
+        .into_iter()
+        .map(|(g, s)| (g, Value::Object(s)))
+        .collect();
+    json!({ "op": 14, "d": { "subscriptions": map } })
+}
+
+#[cfg(test)]
 fn lazy_request<'a>(guilds: impl Iterator<Item = (&'a str, bool)>) -> Value {
     let mut subs = serde_json::Map::new();
     for (g, active) in guilds {
@@ -1148,11 +1400,11 @@ mod tests {
 
     #[test]
     fn unknown_event_passes_through() {
-        let d = Dispatch::parse("PRESENCE_UPDATE", json!({"x": 1}));
+        let d = Dispatch::parse("CALL_CREATE", json!({"x": 1}));
         assert_eq!(
             d,
             Dispatch::Other {
-                name: "PRESENCE_UPDATE".into(),
+                name: "CALL_CREATE".into(),
                 data: json!({"x": 1})
             }
         );

@@ -502,7 +502,8 @@ impl Instance {
     }
 
     /// Media proxy URL of a user avatar, or `None` when the user has no avatar.
-    /// `size` is a power of two from 16 to 4096; Fluxer serves WebP.
+    /// `size` is a power of two from 16 to 4096; Fluxer serves WebP. See
+    /// [`Instance::media`] for animated variants and other assets.
     pub fn avatar_url(
         &self,
         user_id: &str,
@@ -511,6 +512,9 @@ impl Instance {
     ) -> Option<String> {
         let media = self.inner.media.as_deref()?;
         let hash = avatar_hash?;
+        if !crate::media::is_snowflake(user_id) || !crate::media::is_hash(hash) {
+            return None;
+        }
         Some(format!("{media}/avatars/{user_id}/{hash}.webp?size={size}"))
     }
 
@@ -523,6 +527,9 @@ impl Instance {
     ) -> Option<String> {
         let media = self.inner.media.as_deref()?;
         let hash = icon_hash?;
+        if !crate::media::is_snowflake(guild_id) || !crate::media::is_hash(hash) {
+            return None;
+        }
         Some(format!("{media}/icons/{guild_id}/{hash}.webp?size={size}"))
     }
 }
