@@ -81,20 +81,49 @@
 //! [`tokio::sync::mpsc::Receiver`]; `Receiver::blocking_recv` works from a
 //! plain thread too.
 //!
+//! # Chat features
+//!
+//! - Messages: [`Client::send`] (replies, stickers, flags), [`Client::edit_message`],
+//!   [`Client::delete_message`], [`Client::send_with_files`] (uploads with progress).
+//! - Reactions: [`Client::add_reaction`], [`Client::remove_reaction`],
+//!   [`Client::reaction_users`]; pins: [`Client::pins`], [`Client::pin_message`].
+//! - Typing and read state: [`Client::trigger_typing`] is debounced (one request
+//!   per channel per 8 s) and [`Client::ack`] is coalesced (one batched request
+//!   per second at most), so the UI can call both freely ([`coalesce`]).
+//! - Permissions: [`permissions::PermissionContext`] hides channels and
+//!   disables the composer.
+//! - Media: [`Instance::media`] builds avatar, icon, emoji, sticker and
+//!   attachment URLs from the instance's checked media endpoint only.
+//! - Gateway: member lists ([`GatewayHandle::subscribe_member_list`],
+//!   [`models::MemberList`]), presences, reactions, acks, settings, roles,
+//!   members and voice states arrive typed in [`Dispatch`].
+//!
 //! # Not covered yet
 //!
-//! Uploads, reactions, edits/deletes (use [`Client::request_json`]), voice,
-//! member lists, read states, WebAuthn.
+//! Voice, pre-signed uploads, threads and forums, WebAuthn.
 
 pub mod altcha;
 pub mod auth;
+pub mod coalesce;
 pub mod error;
 pub mod gateway;
 pub mod instance;
+pub mod limits;
+pub mod media;
 pub mod models;
+pub mod permissions;
 pub mod ratelimit;
 pub mod rest;
+#[cfg(feature = "test-extra-ca")]
+pub mod test_ca;
 pub mod token;
+pub mod upload;
+
+// The extra test CA must never ship.
+#[cfg(all(feature = "test-extra-ca", not(debug_assertions)))]
+compile_error!(
+    "the `test-extra-ca` feature is for tests against a private instance and must not be in a release build"
+);
 
 pub use auth::{
     poll_ip_authorization, sign_in_password, sign_in_totp, Handoff, HandoffStatus, IpAuthorization,
@@ -105,10 +134,16 @@ pub use gateway::{
     CloseReason, ConnectionState, Dispatch, Gateway, GatewayEvent, GatewayHandle, GatewayOptions,
     IdentifyProperties,
 };
-pub use instance::{ClientInfo, Discovery, EndpointPins, Endpoints, Instance};
+pub use instance::{ClientInfo, Discovery, EndpointPins, Endpoints, Instance, SessionPins};
+pub use media::{ImageFormat, ImageOptions, Media, Transform};
 pub use models::{
-    Attachment, Channel, CurrentUser, Guild, GuildReady, Message, Ready, Snowflake, User,
+    Attachment, Channel, CurrentUser, Embed, Emoji, FullUserProfile, Guild, GuildEmoji,
+    GuildMember, GuildMemberListUpdate, GuildReady, GuildSticker, MemberList, MemberListItem,
+    Message, MessageEdit, OutgoingMessage, Presence, Reaction, ReadState, Ready, ReferencedMessage,
+    Role, Snowflake, User, UserSettings, UserSettingsUpdate, VoiceState,
 };
+pub use permissions::PermissionContext;
 pub use ratelimit::{RateLimitConfig, RateLimiter};
 pub use rest::{new_nonce, Client};
 pub use token::Token;
+pub use upload::{ProgressFn, UploadFile, UploadLimits};

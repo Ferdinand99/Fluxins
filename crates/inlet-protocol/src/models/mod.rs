@@ -10,6 +10,18 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+mod events;
+mod guild;
+mod message;
+mod time;
+mod user;
+
+pub use events::*;
+pub use guild::*;
+pub use message::*;
+pub use time::parse_timestamp_ms;
+pub use user::*;
+
 /// A Fluxer snowflake ID. The API sends them as decimal strings.
 pub type Snowflake = String;
 
@@ -366,6 +378,120 @@ pub(crate) fn lenient_list<T: serde::de::DeserializeOwned>(
         }
     }
     out
+}
+
+/// An unsigned number sent as a JSON number or a decimal string; anything else is `None`.
+pub(crate) fn opt_u64<'de, D>(d: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(value_u64(&Value::deserialize(d)?))
+}
+
+/// Like [`opt_u64`], with a missing or bad value as 0.
+pub(crate) fn u64_or_zero<'de, D>(d: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(value_u64(&Value::deserialize(d)?).unwrap_or(0))
+}
+
+/// A signed number, or `None`.
+pub(crate) fn opt_i64<'de, D>(d: D) -> Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match Value::deserialize(d)? {
+        Value::Number(n) => n.as_i64(),
+        Value::String(s) => s.trim().parse().ok(),
+        _ => None,
+    })
+}
+
+pub(crate) fn value_u64(v: &Value) -> Option<u64> {
+    match v {
+        Value::Number(n) => n.as_u64(),
+        Value::String(s) => s.trim().parse().ok(),
+        _ => None,
+    }
+}
+
+/// A boolean where `null` or any other type is `false`.
+pub(crate) fn lenient_bool<'de, D>(d: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(matches!(Value::deserialize(d)?, Value::Bool(true)))
+}
+
+/// A list of snowflakes (strings or numbers); other elements are skipped.
+pub(crate) fn sf_list<'de, D>(d: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match Value::deserialize(d)? {
+        Value::Array(items) => items
+            .into_iter()
+            .filter_map(|v| match v {
+                Value::String(s) => Some(s),
+                Value::Number(n) if n.is_u64() => Some(n.to_string()),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    })
+}
+
+/// Parses an optional field of `extra` into `T`, or `None` when absent, null or unparsable.
+pub(crate) fn extra_field<T: serde::de::DeserializeOwned>(
+    extra: &Map<String, Value>,
+    key: &str,
+) -> Option<T> {
+    let v = extra.get(key)?;
+    if v.is_null() {
+        return None;
+    }
+    match T::deserialize(v) {
+        Ok(t) => Some(t),
+        Err(e) => {
+            tracing::warn!(field = key, error = %e, "field did not parse");
+            None
+        }
+    }
+}
+
+/// Parses a list field of `extra`, skipping elements that do not parse.
+pub(crate) fn extra_list<T: serde::de::DeserializeOwned>(
+    extra: &Map<String, Value>,
+    key: &str,
+) -> Vec<T> {
+    match extra.get(key) {
+        Some(Value::Array(items)) => parse_values(items, key),
+        _ => Vec::new(),
+    }
+}
+
+/// Parses a list of raw values, skipping elements that do not parse.
+pub(crate) fn parse_values<T: serde::de::DeserializeOwned>(items: &[Value], what: &str) -> Vec<T> {
+    let mut out = Vec::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        match T::deserialize(item) {
+            Ok(v) => out.push(v),
+            Err(e) => {
+                tracing::warn!(what, index, error = %e, "skipping an element that did not parse")
+            }
+        }
+    }
+    out
+}
+
+/// Compares two snowflakes numerically. IDs that are not numbers compare by
+/// length, then as text.
+pub fn snowflake_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    match (a.parse::<u64>(), b.parse::<u64>()) {
+        (Ok(x), Ok(y)) => x.cmp(&y),
+        _ => a.len().cmp(&b.len()).then_with(|| a.cmp(b)),
+    }
 }
 
 fn nonce_as_string<'de, D>(d: D) -> Result<Option<String>, D::Error>

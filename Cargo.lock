@@ -2760,8 +2760,10 @@ name = "inlet-protocol"
 version = "0.0.1"
 dependencies = [
  "base64 0.22.1",
+ "bytes",
  "futures-util",
  "hex",
+ "http-body",
  "pbkdf2",
  "psl",
  "rand 0.8.8",

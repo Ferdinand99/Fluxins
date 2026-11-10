@@ -225,10 +225,13 @@ async fn identify_dispatch_and_resume_with_zstd() {
         other => panic!("{other:?}"),
     }
     let (_, ev) = next_dispatch(&mut events, &mut states).await;
-    assert!(
-        matches!(ev, Dispatch::Other { ref name, .. } if name == "PRESENCE_UPDATE"),
-        "{ev:?}"
-    );
+    match ev {
+        Dispatch::PresenceUpdate(p) => {
+            assert_eq!(p.user_id(), Some("11"));
+            assert_eq!(p.status, "online");
+        }
+        other => panic!("{other:?}"),
+    }
     assert!(states.contains(&ConnectionState::Identifying));
     assert!(states.contains(&ConnectionState::Connected));
     drop(c1);
@@ -543,4 +546,191 @@ async fn hostile_heartbeat_interval_does_not_panic() {
     let mut states = Vec::new();
     let (_, ev) = next_dispatch(&mut events, &mut states).await;
     assert!(matches!(ev, Dispatch::Ready(_)));
+}
+
+#[tokio::test]
+async fn member_list_subscription_is_sent_and_replayed() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (handle, mut events) = Gateway::connect(
+        instance_for(port),
+        Token::new("gw-members"),
+        fast_options(false),
+    );
+    handle.set_guild_active("100", true);
+    // Only invalid ranges: refused, nothing is sent (it would unsubscribe).
+    assert!(!handle.subscribe_member_list("100", "200", &[[0, 150], [10, 5]]));
+    // A search before READY is dropped, not sent after connecting.
+    assert!(handle.request_guild_members("100", "early", &[], 5, false, None));
+    // Invalid ranges are dropped: too wide, reversed, past 100,000.
+    handle.subscribe_member_list(
+        "100",
+        "200",
+        &[[0, 99], [0, 150], [10, 5], [100_000, 100_050]],
+    );
+    let mut c = Conn::accept(&listener).await;
+    c.hello(45_000).await;
+    assert_eq!(c.recv(false).await["op"], 2);
+    c.dispatch(1, "READY", ready("sess-members")).await;
+    let lazy = c.recv(false).await;
+    assert_eq!(lazy["op"], 14, "{lazy}");
+    let sub = &lazy["d"]["subscriptions"]["100"];
+    assert_eq!(sub["active"], true);
+    assert_eq!(sub["member_list_channels"], json!({"200": [[0, 99]]}));
+
+    // Live: a new window keeps the guild's active flag.
+    handle.subscribe_member_list("100", "200", &[[0, 99], [100, 199]]);
+    let lazy = c.recv(false).await;
+    assert_eq!(
+        lazy["d"]["subscriptions"]["100"],
+        json!({"active": true, "typing": true, "member_list_channels": {"200": [[0, 99], [100, 199]]}})
+    );
+
+    // Request Guild Members: a search, and a refused full-list request.
+    assert!(handle.request_guild_members("100", "an", &[], 0, true, Some("n1")));
+    let op8 = c.recv(false).await;
+    assert_eq!(op8["op"], 8);
+    assert_eq!(
+        op8["d"],
+        json!({"guild_id": "100", "presences": true, "query": "an", "limit": 1, "nonce": "n1"})
+    );
+    assert!(!handle.request_guild_members("100", "", &[], 0, false, None));
+
+    // The update arrives typed and applies to a MemberList.
+    c.dispatch(
+        2,
+        "GUILD_MEMBER_LIST_UPDATE",
+        json!({"guild_id": "100", "id": "200", "member_count": 1, "online_count": 1,
+               "groups": [{"id": "online", "count": 1}],
+               "ops": [{"op": "SYNC", "range": [0, 1], "items": [
+                   {"group": {"id": "online", "count": 1}},
+                   {"member": {"user": common::user_json("10", "ana"), "roles": [],
+                               "presence": {"status": "online", "mobile": false, "afk": false}}}]}]}),
+    )
+    .await;
+    let mut states = Vec::new();
+    let mut list = inlet_protocol::MemberList::default();
+    loop {
+        match next_dispatch(&mut events, &mut states).await.1 {
+            Dispatch::GuildMemberListUpdate(u) => {
+                assert!(list.apply(&u));
+                break;
+            }
+            Dispatch::Ready(_) => continue,
+            other => panic!("{other:?}"),
+        }
+    }
+    assert_eq!(list.members().next().unwrap().user_id(), Some("10"));
+
+    // After a fresh Identify (op 9), the subscription is replayed.
+    c.send(json!({"op": 9, "d": false})).await;
+    let identify = c.recv(false).await;
+    assert_eq!(identify["op"], 2);
+    c.dispatch(1, "READY", ready("sess-members-2")).await;
+    let lazy = c.recv(false).await;
+    assert_eq!(
+        lazy["d"]["subscriptions"]["100"]["member_list_channels"],
+        json!({"200": [[0, 99], [100, 199]]})
+    );
+
+    // Unsubscribing stops the replay.
+    handle.unsubscribe_member_list("100", "200");
+    let lazy = c.recv(false).await;
+    assert_eq!(
+        lazy["d"]["subscriptions"]["100"]["member_list_channels"],
+        json!({"200": []})
+    );
+}
+
+#[tokio::test]
+async fn new_events_arrive_typed() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (_handle, mut events) = Gateway::connect(
+        instance_for(port),
+        Token::new("gw-events"),
+        fast_options(true),
+    );
+    let mut c = Conn::accept(&listener).await;
+    c.hello(45_000).await;
+    assert_eq!(c.recv(false).await["op"], 2);
+    c.dispatch(1, "READY", ready("sess-ev")).await;
+    let sends = [
+        (
+            "MESSAGE_REACTION_ADD",
+            json!({"user_id": "10", "channel_id": "200", "message_id": "5",
+            "emoji": {"name": "👍"}, "guild_id": "100"}),
+        ),
+        (
+            "MESSAGE_REACTION_REMOVE_EMOJI",
+            json!({"channel_id": "200", "message_id": "5",
+            "emoji": {"id": "55", "name": "party"}}),
+        ),
+        (
+            "MESSAGE_ACK",
+            json!({"channel_id": "200", "message_id": "5", "mention_count": 0, "version": "3"}),
+        ),
+        (
+            "USER_SETTINGS_UPDATE",
+            json!({"theme": "light", "locale": "en-US", "message_display_compact": true}),
+        ),
+        (
+            "GUILD_ROLE_UPDATE",
+            json!({"guild_id": "100", "role": {"id": "7", "name": "Mod", "color": 1,
+            "position": 2, "permissions": "8"}}),
+        ),
+        (
+            "GUILD_MEMBER_UPDATE",
+            json!({"guild_id": "100", "user": common::user_json("10", "ana"),
+            "nick": "A", "roles": ["7"]}),
+        ),
+        (
+            "VOICE_STATE_UPDATE",
+            json!({"guild_id": "100", "channel_id": null, "user_id": "10",
+            "self_mute": true, "version": 4}),
+        ),
+        (
+            "PRESENCE_UPDATE",
+            json!({"user": {"id": "11"}, "status": "idle", "mobile": false, "afk": true,
+            "custom_status": {"text": "brb", "emoji_animated": false}}),
+        ),
+        (
+            "MESSAGE_DELETE_BULK",
+            json!({"ids": ["1", "2"], "channel_id": "200"}),
+        ),
+        ("CALL_CREATE", json!({"channel_id": "9"})),
+    ];
+    for (i, (name, d)) in sends.iter().enumerate() {
+        c.dispatch(i as u64 + 2, name, d.clone()).await;
+    }
+    let mut states = Vec::new();
+    let mut got = Vec::new();
+    while got.len() < sends.len() {
+        let (_, ev) = next_dispatch(&mut events, &mut states).await;
+        if !matches!(ev, Dispatch::Ready(_)) {
+            got.push(ev);
+        }
+    }
+    assert!(
+        matches!(&got[0], Dispatch::MessageReactionAdd(r) if r.emoji.name == "👍" && r.user_id == "10")
+    );
+    assert!(
+        matches!(&got[1], Dispatch::MessageReactionRemoveEmoji(r) if r.emoji.as_ref().unwrap().is_custom())
+    );
+    assert!(matches!(&got[2], Dispatch::MessageAck(a) if a.message_id == "5"));
+    assert!(
+        matches!(&got[3], Dispatch::UserSettingsUpdate(s) if s.theme == "light" && s.message_display_compact)
+    );
+    assert!(matches!(&got[4], Dispatch::GuildRoleUpdate(r) if r.role.permissions == 8));
+    assert!(
+        matches!(&got[5], Dispatch::GuildMemberUpdate(m) if m.guild_id().as_deref() == Some("100"))
+    );
+    assert!(
+        matches!(&got[6], Dispatch::VoiceStateUpdate(v) if v.channel_id.is_none() && v.self_mute)
+    );
+    assert!(
+        matches!(&got[7], Dispatch::PresenceUpdate(p) if p.afk && p.custom_status.as_ref().unwrap().text.as_deref() == Some("brb"))
+    );
+    assert!(matches!(&got[8], Dispatch::MessageDeleteBulk(b) if b.ids.len() == 2));
+    assert!(matches!(&got[9], Dispatch::Other { name, .. } if name == "CALL_CREATE"));
 }

@@ -23,7 +23,7 @@ use reqwest::Method;
 use serde_json::{json, Value};
 
 use crate::error::{ApiError, Error, Result};
-use crate::instance::{EndpointPins, Instance};
+use crate::instance::{EndpointPins, Instance, SessionPins};
 use crate::models::{Snowflake, User};
 use crate::rest::{send, Client, RawResponse, Request};
 use crate::token::Token;
@@ -159,6 +159,7 @@ async fn post_with_captcha(
                 path,
                 body: Some(body),
                 headers: &headers,
+                upload: None,
             },
         )
         .await?;
@@ -309,6 +310,7 @@ async fn anon(
             path,
             body,
             headers: &headers,
+            upload: None,
         },
     )
     .await
@@ -560,6 +562,24 @@ impl Session {
         Session {
             client: Client::for_user(instance, signed_in.token.clone(), &signed_in.user_id),
         }
+    }
+
+    /// A session from a stored token and [`SessionPins`] (API, gateway and
+    /// media hosts). Like [`Session::from_token_pinned`], and a changed media
+    /// host fails too. Pins stored by [`Session::pins`] (no media) work here.
+    pub fn from_token_session_pinned(
+        instance: Instance,
+        token: Token,
+        pins: &SessionPins,
+    ) -> Result<Session> {
+        instance.verify_session_pins(pins)?;
+        Ok(Self::from_token_unpinned(instance, token))
+    }
+
+    /// The API, gateway and media hosts of this session. Prefer storing these
+    /// over [`Session::pins`].
+    pub fn session_pins(&self) -> SessionPins {
+        self.instance().session_pins()
     }
 
     /// The API and gateway hosts this session's token belongs to.

@@ -27,7 +27,7 @@
 
 pub mod codec;
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -42,7 +42,14 @@ use tokio_tungstenite::tungstenite::protocol::{CloseFrame, WebSocketConfig};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use crate::instance::{require_scheme, Instance};
-use crate::models::{Channel, GuildDelete, GuildReady, Message, MessageDelete, Ready, TypingStart};
+use crate::models::{
+    Channel, ChannelPinsUpdate, ChannelUpdateBulk, CurrentUser, Guild, GuildDelete,
+    GuildEmojisUpdate, GuildMember, GuildMemberListUpdate, GuildMemberRemove, GuildMembersChunk,
+    GuildReady, GuildRoleDelete, GuildRoleEvent, GuildRolesUpdate, GuildStickersUpdate, Message,
+    MessageAck, MessageDelete, MessageDeleteBulk, PassiveUpdates, Presence, PresenceUpdateBulk,
+    ReactionAddMany, ReactionClear, ReactionEvent, Ready, SessionPresence, TypingStart,
+    UserSettings, VoiceState,
+};
 use crate::token::Token;
 use codec::ZstdStream;
 
@@ -66,6 +73,16 @@ const READY_TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_PENDING: usize = 4_096;
 /// Commands kept while disconnected.
 const MAX_QUEUED: usize = 64;
+/// Member list subscriptions remembered for replay (one per guild).
+const MAX_MEMBER_LISTS: usize = 5;
+/// Member searches (op 8) per window. Fluxer drops more than 12 per 10 s
+/// without an answer; stay below that.
+const SEARCH_PER_WINDOW: usize = 10;
+const SEARCH_WINDOW: Duration = Duration::from_secs(10);
+/// Member searches waiting for the window; older ones are dropped.
+const MAX_WAITING_SEARCHES: usize = 4;
+/// Ranges per member list channel Fluxer keeps.
+const MAX_MEMBER_LIST_RANGES: usize = 10;
 /// Capacity of the command channel.
 const COMMAND_BUFFER: usize = 256;
 /// Active guilds remembered for replay (the UI shows one at a time). They go
@@ -215,6 +232,62 @@ pub enum Dispatch {
     MessageDelete(MessageDelete),
     /// Someone started typing.
     TypingStart(TypingStart),
+    /// Several messages were deleted.
+    MessageDeleteBulk(Box<MessageDeleteBulk>),
+    /// The account's read state moved (another session read the channel).
+    MessageAck(Box<MessageAck>),
+    /// A reaction was added.
+    MessageReactionAdd(Box<ReactionEvent>),
+    /// DM reactions grouped over 650 ms.
+    MessageReactionAddMany(Box<ReactionAddMany>),
+    /// A reaction was removed.
+    MessageReactionRemove(Box<ReactionEvent>),
+    /// Every reaction on a message was removed.
+    MessageReactionRemoveAll(Box<ReactionClear>),
+    /// Every reaction with one emoji was removed (`emoji` is set).
+    MessageReactionRemoveEmoji(Box<ReactionClear>),
+    /// A channel's newest pin changed.
+    ChannelPinsUpdate(Box<ChannelPinsUpdate>),
+    /// Several channels changed (reorder).
+    ChannelUpdateBulk(Box<ChannelUpdateBulk>),
+    /// A guild's settings changed (`guild_id` is in `extra`).
+    GuildUpdate(Box<Guild>),
+    /// A role was created.
+    GuildRoleCreate(Box<GuildRoleEvent>),
+    /// A role changed.
+    GuildRoleUpdate(Box<GuildRoleEvent>),
+    /// Several roles changed.
+    GuildRoleUpdateBulk(Box<GuildRolesUpdate>),
+    /// A role was deleted.
+    GuildRoleDelete(Box<GuildRoleDelete>),
+    /// Someone joined a guild ([`GuildMember::guild_id`]).
+    GuildMemberAdd(Box<GuildMember>),
+    /// A member changed ([`GuildMember::guild_id`]).
+    GuildMemberUpdate(Box<GuildMember>),
+    /// Someone left a guild.
+    GuildMemberRemove(Box<GuildMemberRemove>),
+    /// Answer to [`GatewayHandle::request_guild_members`].
+    GuildMembersChunk(Box<GuildMembersChunk>),
+    /// A subscribed member list changed; apply it to a [`crate::MemberList`].
+    GuildMemberListUpdate(Box<GuildMemberListUpdate>),
+    /// A guild's custom emoji changed.
+    GuildEmojisUpdate(Box<GuildEmojisUpdate>),
+    /// A guild's stickers changed.
+    GuildStickersUpdate(Box<GuildStickersUpdate>),
+    /// A presence changed.
+    PresenceUpdate(Box<Presence>),
+    /// Presences of a guild that came back.
+    PresenceUpdateBulk(Box<PresenceUpdateBulk>),
+    /// New `last_message_id`s in a passive large guild.
+    PassiveUpdates(Box<PassiveUpdates>),
+    /// The account changed.
+    UserUpdate(Box<CurrentUser>),
+    /// The account settings changed.
+    UserSettingsUpdate(Box<UserSettings>),
+    /// The account's live sessions changed.
+    SessionsReplace(Vec<SessionPresence>),
+    /// A voice state changed (`channel_id` `None` means the participant left).
+    VoiceStateUpdate(Box<VoiceState>),
     /// Any other event, or a known one whose payload did not parse.
     Other {
         /// Event name, for example `PRESENCE_UPDATE`.
@@ -256,6 +329,68 @@ impl Dispatch {
             "MESSAGE_UPDATE" => typed(name, data, |v| Dispatch::MessageUpdate(Box::new(v))),
             "MESSAGE_DELETE" => typed(name, data, Dispatch::MessageDelete),
             "TYPING_START" => typed(name, data, Dispatch::TypingStart),
+            "MESSAGE_DELETE_BULK" => {
+                typed(name, data, |v| Dispatch::MessageDeleteBulk(Box::new(v)))
+            }
+            "MESSAGE_ACK" => typed(name, data, |v| Dispatch::MessageAck(Box::new(v))),
+            "MESSAGE_REACTION_ADD" => {
+                typed(name, data, |v| Dispatch::MessageReactionAdd(Box::new(v)))
+            }
+            "MESSAGE_REACTION_ADD_MANY" => typed(name, data, |v| {
+                Dispatch::MessageReactionAddMany(Box::new(v))
+            }),
+            "MESSAGE_REACTION_REMOVE" => {
+                typed(name, data, |v| Dispatch::MessageReactionRemove(Box::new(v)))
+            }
+            "MESSAGE_REACTION_REMOVE_ALL" => typed(name, data, |v| {
+                Dispatch::MessageReactionRemoveAll(Box::new(v))
+            }),
+            "MESSAGE_REACTION_REMOVE_EMOJI" => typed(name, data, |v| {
+                Dispatch::MessageReactionRemoveEmoji(Box::new(v))
+            }),
+            "CHANNEL_PINS_UPDATE" => {
+                typed(name, data, |v| Dispatch::ChannelPinsUpdate(Box::new(v)))
+            }
+            "CHANNEL_UPDATE_BULK" => {
+                typed(name, data, |v| Dispatch::ChannelUpdateBulk(Box::new(v)))
+            }
+            "GUILD_UPDATE" => typed(name, data, |v| Dispatch::GuildUpdate(Box::new(v))),
+            "GUILD_ROLE_CREATE" => typed(name, data, |v| Dispatch::GuildRoleCreate(Box::new(v))),
+            "GUILD_ROLE_UPDATE" => typed(name, data, |v| Dispatch::GuildRoleUpdate(Box::new(v))),
+            "GUILD_ROLE_UPDATE_BULK" => {
+                typed(name, data, |v| Dispatch::GuildRoleUpdateBulk(Box::new(v)))
+            }
+            "GUILD_ROLE_DELETE" => typed(name, data, |v| Dispatch::GuildRoleDelete(Box::new(v))),
+            "GUILD_MEMBER_ADD" => typed(name, data, |v| Dispatch::GuildMemberAdd(Box::new(v))),
+            "GUILD_MEMBER_UPDATE" => {
+                typed(name, data, |v| Dispatch::GuildMemberUpdate(Box::new(v)))
+            }
+            "GUILD_MEMBER_REMOVE" => {
+                typed(name, data, |v| Dispatch::GuildMemberRemove(Box::new(v)))
+            }
+            "GUILD_MEMBERS_CHUNK" => {
+                typed(name, data, |v| Dispatch::GuildMembersChunk(Box::new(v)))
+            }
+            "GUILD_MEMBER_LIST_UPDATE" => {
+                typed(name, data, |v| Dispatch::GuildMemberListUpdate(Box::new(v)))
+            }
+            "GUILD_EMOJIS_UPDATE" => {
+                typed(name, data, |v| Dispatch::GuildEmojisUpdate(Box::new(v)))
+            }
+            "GUILD_STICKERS_UPDATE" => {
+                typed(name, data, |v| Dispatch::GuildStickersUpdate(Box::new(v)))
+            }
+            "PRESENCE_UPDATE" => typed(name, data, |v| Dispatch::PresenceUpdate(Box::new(v))),
+            "PRESENCE_UPDATE_BULK" => {
+                typed(name, data, |v| Dispatch::PresenceUpdateBulk(Box::new(v)))
+            }
+            "PASSIVE_UPDATES" => typed(name, data, |v| Dispatch::PassiveUpdates(Box::new(v))),
+            "USER_UPDATE" => typed(name, data, |v| Dispatch::UserUpdate(Box::new(v))),
+            "USER_SETTINGS_UPDATE" => {
+                typed(name, data, |v| Dispatch::UserSettingsUpdate(Box::new(v)))
+            }
+            "SESSIONS_REPLACE" => typed(name, data, Dispatch::SessionsReplace),
+            "VOICE_STATE_UPDATE" => typed(name, data, |v| Dispatch::VoiceStateUpdate(Box::new(v))),
             _ => Dispatch::Other {
                 name: name.to_owned(),
                 data,
@@ -282,6 +417,10 @@ enum Command {
     Raw(Value),
     GuildActive(String, bool),
     Status(String),
+    /// Guild, channel, ranges (empty: unsubscribe).
+    MemberList(String, String, Vec<[u32; 2]>),
+    /// Request Guild Members: sent only while connected, never replayed.
+    Search(Value),
 }
 
 impl std::fmt::Debug for Command {
@@ -290,6 +429,8 @@ impl std::fmt::Debug for Command {
             Command::Raw(v) => write!(f, "Raw(op {})", v.get("op").unwrap_or(&Value::Null)),
             Command::GuildActive(g, a) => write!(f, "GuildActive({g}, {a})"),
             Command::Status(s) => write!(f, "Status({s})"),
+            Command::MemberList(g, c, r) => write!(f, "MemberList({g}, {c}, {r:?})"),
+            Command::Search(_) => write!(f, "Search"),
         }
     }
 }
@@ -326,6 +467,80 @@ impl GatewayHandle {
         self.push(Command::Status(status.to_owned()));
     }
 
+    /// Lazy Request (op 14) for a guild's member list: the rows in `ranges`
+    /// (inclusive `[start, end]`, each at most 100 rows, ending by 100,000,
+    /// at most 10) of `channel_id`'s list. GUILD_MEMBER_LIST_UPDATE events
+    /// follow; feed them to a [`crate::MemberList`] made with the same ranges.
+    /// Subscribing one channel drops the guild's other member list. Remembered
+    /// (the 5 most recently used guilds) and sent again after a reconnect.
+    /// Needs `VIEW_CHANNEL` and `VIEW_CHANNEL_MEMBERS` in the channel.
+    ///
+    /// Invalid ranges are dropped. Returns `false` and sends nothing when no
+    /// range is valid (Fluxer would read an empty list as "unsubscribe"); use
+    /// [`GatewayHandle::unsubscribe_member_list`] for that.
+    pub fn subscribe_member_list(
+        &self,
+        guild_id: &str,
+        channel_id: &str,
+        ranges: &[[u32; 2]],
+    ) -> bool {
+        let valid = valid_ranges(ranges);
+        if valid.is_empty() {
+            return false;
+        }
+        self.push(Command::MemberList(
+            guild_id.to_owned(),
+            channel_id.to_owned(),
+            valid,
+        ));
+        true
+    }
+
+    /// Stops a member list subscription (Fluxer removes the list on an empty
+    /// range list) and forgets it for reconnects.
+    pub fn unsubscribe_member_list(&self, guild_id: &str, channel_id: &str) {
+        self.push(Command::MemberList(
+            guild_id.to_owned(),
+            channel_id.to_owned(),
+            Vec::new(),
+        ));
+    }
+
+    /// Request Guild Members (op 8): members whose name starts with `query`
+    /// (`limit` 1-100), or the members in `user_ids` (at most 100; then
+    /// `query` is ignored). Answers come as GUILD_MEMBERS_CHUNK with `nonce`.
+    /// An empty query with no IDs is refused here, because it would ask for
+    /// the whole guild.
+    ///
+    /// Searches go out at most 10 per 10 s (Fluxer drops more than 12); when
+    /// more wait, only the newest 4 are kept. A search made while the gateway
+    /// is not connected is dropped, not sent after the reconnect.
+    pub fn request_guild_members(
+        &self,
+        guild_id: &str,
+        query: &str,
+        user_ids: &[&str],
+        limit: u8,
+        presences: bool,
+        nonce: Option<&str>,
+    ) -> bool {
+        if (query.is_empty() && user_ids.is_empty()) || user_ids.len() > 100 {
+            return false;
+        }
+        let mut d = json!({ "guild_id": guild_id, "presences": presences });
+        if user_ids.is_empty() {
+            d["query"] = json!(query);
+            d["limit"] = json!(limit.clamp(1, 100));
+        } else {
+            d["user_ids"] = json!(user_ids);
+        }
+        if let Some(n) = nonce.filter(|n| n.len() <= 32) {
+            d["nonce"] = json!(n);
+        }
+        self.push(Command::Search(json!({ "op": 8, "d": d })));
+        true
+    }
+
     /// Closes the connection and ends the session (no resume).
     pub fn close(&self) {
         let _ = self.close.send(true);
@@ -359,7 +574,8 @@ impl Gateway {
             session: None,
             seq: None,
             last_identify: None,
-            active_guilds: BTreeMap::new(),
+            active_guilds: Recent::new(MAX_ACTIVE_GUILDS),
+            member_lists: Recent::new(MAX_MEMBER_LISTS),
             status: None,
             queued: VecDeque::new(),
             pending: VecDeque::new(),
@@ -416,7 +632,9 @@ struct Task {
     seq: Option<u64>,
     last_identify: Option<Instant>,
     /// Guilds the UI made active; replayed after Identify and Resume.
-    active_guilds: BTreeMap<String, bool>,
+    active_guilds: Recent<bool>,
+    /// Member list subscriptions per guild: channel and ranges.
+    member_lists: Recent<(String, Vec<[u32; 2]>)>,
     /// Last status the UI set; replayed after Identify and Resume.
     status: Option<String>,
     /// Raw commands sent while disconnected.
@@ -432,6 +650,8 @@ type Ws =
 pub fn tls_connector() -> Option<tokio_tungstenite::Connector> {
     let mut roots = rustls::RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    #[cfg(feature = "test-extra-ca")]
+    crate::test_ca::add_to_store(&mut roots);
     let config = rustls::ClientConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))
@@ -574,18 +794,18 @@ impl Task {
     /// Records a command while disconnected.
     fn remember(&mut self, cmd: Command) {
         match cmd {
-            Command::GuildActive(g, true) => {
-                if !self.active_guilds.contains_key(&g)
-                    && self.active_guilds.len() >= MAX_ACTIVE_GUILDS
-                {
-                    self.active_guilds.pop_first();
-                }
-                self.active_guilds.insert(g, true);
-            }
+            Command::GuildActive(g, true) => self.active_guilds.insert(g, true),
             Command::GuildActive(g, false) => {
                 self.active_guilds.remove(&g);
             }
             Command::Status(s) => self.status = Some(s),
+            Command::MemberList(g, _, ranges) if ranges.is_empty() => {
+                self.member_lists.remove(&g);
+            }
+            Command::MemberList(g, c, ranges) => self.member_lists.insert(g, (c, ranges)),
+            Command::Search(_) => {
+                tracing::debug!("member search while disconnected; dropped");
+            }
             Command::Raw(v) => {
                 if self.queued.len() >= MAX_QUEUED {
                     tracing::warn!("gateway command queue full; dropping the oldest");
@@ -598,27 +818,66 @@ impl Task {
 
     /// Payloads for a command while connected (and records the wanted state).
     fn live(&mut self, cmd: Command) -> Option<Value> {
-        let payload = match &cmd {
-            Command::GuildActive(g, a) => Some(lazy_request(std::iter::once((g.as_str(), *a)))),
-            Command::Status(s) => Some(presence(s)),
-            Command::Raw(v) => Some(v.clone()),
-        };
-        if !matches!(cmd, Command::Raw(_)) {
-            self.remember(cmd);
+        match cmd {
+            Command::Raw(v) | Command::Search(v) => Some(v),
+            Command::Status(s) => {
+                let payload = presence(&s);
+                self.remember(Command::Status(s));
+                Some(payload)
+            }
+            Command::GuildActive(g, a) => {
+                self.remember(Command::GuildActive(g.clone(), a));
+                let mut sub = self.subscription(&g);
+                sub.insert("active".into(), json!(a));
+                sub.insert("typing".into(), json!(a));
+                Some(lazy_request_subs(vec![(g, sub)]))
+            }
+            Command::MemberList(g, c, ranges) => {
+                let unsubscribe = ranges.is_empty();
+                self.remember(Command::MemberList(g.clone(), c.clone(), ranges));
+                let mut sub = self.subscription(&g);
+                if unsubscribe {
+                    sub.insert("member_list_channels".into(), one_entry(c, json!([])));
+                }
+                Some(lazy_request_subs(vec![(g, sub)]))
+            }
         }
-        payload
+    }
+
+    /// The remembered Lazy Request options of one guild.
+    fn subscription(&self, guild_id: &str) -> serde_json::Map<String, Value> {
+        let mut sub = serde_json::Map::new();
+        if let Some(a) = self.active_guilds.get(guild_id) {
+            sub.insert("active".into(), json!(a));
+            sub.insert("typing".into(), json!(a));
+        }
+        if let Some((c, ranges)) = self.member_lists.get(guild_id) {
+            sub.insert(
+                "member_list_channels".into(),
+                one_entry(c.clone(), json!(ranges)),
+            );
+        }
+        sub
     }
 
     /// What to send after READY or RESUMED: subscriptions, status, queued commands.
     fn replay(&mut self) -> Vec<Value> {
         let mut out = Vec::new();
-        let active: Vec<(String, bool)> = self
+        let guilds: std::collections::BTreeSet<String> = self
             .active_guilds
-            .iter()
-            .map(|(g, a)| (g.clone(), *a))
+            .keys()
+            .chain(self.member_lists.keys())
+            .map(str::to_owned)
             .collect();
-        if !active.is_empty() {
-            out.push(lazy_request(active.iter().map(|(g, a)| (g.as_str(), *a))));
+        if !guilds.is_empty() {
+            let subs = guilds
+                .into_iter()
+                .map(|g| {
+                    let sub = self.subscription(&g);
+                    (g, sub)
+                })
+                .collect();
+            out.push(lazy_request_subs(subs));
         }
         if let Some(s) = &self.status {
             out.push(presence(s));
@@ -945,6 +1204,9 @@ struct Pacer {
     presence_sent: VecDeque<Instant>,
     /// A Presence Update is wanted; the latest status is sent when allowed.
     presence_due: bool,
+    /// Member searches waiting for their window.
+    searches: VecDeque<Value>,
+    search_sent: VecDeque<Instant>,
 }
 
 fn is_bounded(payload: &Value) -> bool {
@@ -970,6 +1232,13 @@ impl Pacer {
             self.presence_due = true;
             return;
         }
+        if payload.get("op").and_then(Value::as_u64) == Some(8) {
+            if self.searches.len() >= MAX_WAITING_SEARCHES {
+                self.searches.pop_front();
+            }
+            self.searches.push_back(payload);
+            return;
+        }
         if self.outbox.len() >= MAX_QUEUED {
             tracing::warn!("gateway outbox full; dropping the oldest command");
             self.outbox.pop_front();
@@ -982,6 +1251,7 @@ impl Pacer {
         let now = Instant::now();
         prune(&mut self.bounded_sent, BOUNDED_WINDOW, now);
         prune(&mut self.presence_sent, PRESENCE_WINDOW, now);
+        prune(&mut self.search_sent, SEARCH_WINDOW, now);
         let mut out = Vec::new();
         while let Some(front) = self.outbox.front() {
             if is_bounded(front) {
@@ -991,6 +1261,14 @@ impl Pacer {
                 self.bounded_sent.push_back(now);
             }
             out.extend(self.outbox.pop_front());
+        }
+        while !self.searches.is_empty()
+            && self.search_sent.len() < SEARCH_PER_WINDOW
+            && self.bounded_sent.len() < BOUNDED_PER_WINDOW
+        {
+            self.search_sent.push_back(now);
+            self.bounded_sent.push_back(now);
+            out.extend(self.searches.pop_front());
         }
         if self.presence_due && self.presence_sent.len() < PRESENCE_PER_WINDOW {
             if let Some(s) = status {
@@ -1013,10 +1291,16 @@ impl Pacer {
         let presence = (self.presence_due && self.presence_sent.len() >= PRESENCE_PER_WINDOW)
             .then(|| self.presence_sent.front().map(|t| *t + PRESENCE_WINDOW))
             .flatten();
-        match (bounded, presence) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        }
+        let search = if self.searches.is_empty() {
+            None
+        } else if self.search_sent.len() >= SEARCH_PER_WINDOW {
+            self.search_sent.front().map(|t| *t + SEARCH_WINDOW)
+        } else if self.bounded_sent.len() >= BOUNDED_PER_WINDOW {
+            self.bounded_sent.front().map(|t| *t + BOUNDED_WINDOW)
+        } else {
+            None
+        };
+        [bounded, presence, search].into_iter().flatten().min()
     }
 }
 
@@ -1032,6 +1316,68 @@ async fn flush(
     Ok(())
 }
 
+/// The ranges Fluxer accepts: start <= end, at most 100 rows, end by 100,000; at most 10.
+fn valid_ranges(ranges: &[[u32; 2]]) -> Vec<[u32; 2]> {
+    ranges
+        .iter()
+        .copied()
+        .filter(|[s, e]| s <= e && e - s <= 99 && *e <= 100_000)
+        .take(MAX_MEMBER_LIST_RANGES)
+        .collect()
+}
+
+/// A small map that keeps its entries in order of last use and drops the
+/// least recently used entry past `cap`.
+struct Recent<V> {
+    entries: Vec<(String, V)>,
+    cap: usize,
+}
+
+impl<V> Recent<V> {
+    fn new(cap: usize) -> Self {
+        Recent {
+            entries: Vec::new(),
+            cap,
+        }
+    }
+
+    fn get(&self, key: &str) -> Option<&V> {
+        self.entries.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+    }
+
+    /// Inserts or refreshes `key` as the most recently used.
+    fn insert(&mut self, key: String, value: V) {
+        self.remove(&key);
+        if self.entries.len() >= self.cap {
+            self.entries.remove(0);
+        }
+        self.entries.push((key, value));
+    }
+
+    fn remove(&mut self, key: &str) {
+        self.entries.retain(|(k, _)| k != key);
+    }
+
+    fn keys(&self) -> impl Iterator<Item = &str> {
+        self.entries.iter().map(|(k, _)| k.as_str())
+    }
+}
+
+fn one_entry(key: String, value: Value) -> Value {
+    let mut m = serde_json::Map::new();
+    m.insert(key, value);
+    Value::Object(m)
+}
+
+fn lazy_request_subs(subs: Vec<(String, serde_json::Map<String, Value>)>) -> Value {
+    let map: serde_json::Map<String, Value> = subs
+        .into_iter()
+        .map(|(g, s)| (g, Value::Object(s)))
+        .collect();
+    json!({ "op": 14, "d": { "subscriptions": map } })
+}
+
+#[cfg(test)]
 fn lazy_request<'a>(guilds: impl Iterator<Item = (&'a str, bool)>) -> Value {
     let mut subs = serde_json::Map::new();
     for (g, active) in guilds {
@@ -1148,11 +1494,11 @@ mod tests {
 
     #[test]
     fn unknown_event_passes_through() {
-        let d = Dispatch::parse("PRESENCE_UPDATE", json!({"x": 1}));
+        let d = Dispatch::parse("CALL_CREATE", json!({"x": 1}));
         assert_eq!(
             d,
             Dispatch::Other {
-                name: "PRESENCE_UPDATE".into(),
+                name: "CALL_CREATE".into(),
                 data: json!({"x": 1})
             }
         );
@@ -1170,6 +1516,52 @@ mod tests {
             .collect();
         let payload = lazy_request(guilds.iter().map(|(g, a)| (g.as_str(), *a)));
         assert!(payload.to_string().len() < 16_384);
+    }
+
+    #[test]
+    fn recent_drops_the_least_recently_used() {
+        let mut r = Recent::new(2);
+        r.insert("a".into(), 1);
+        r.insert("b".into(), 2);
+        r.insert("a".into(), 3); // refresh a
+        r.insert("c".into(), 4); // drops b
+        assert_eq!(r.keys().collect::<Vec<_>>(), vec!["a", "c"]);
+        assert_eq!(r.get("a"), Some(&3));
+        r.remove("a");
+        assert!(r.get("a").is_none());
+        assert!(valid_ranges(&[[0, 150], [5, 1], [100_000, 100_001]]).is_empty());
+        assert_eq!(valid_ranges(&[[0, 99]; 12]).len(), MAX_MEMBER_LIST_RANGES);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn member_searches_stay_under_fluxers_limit() {
+        let mut pacer = Pacer::default();
+        let search = |q: &str| json!({"op": 8, "d": {"guild_id": "1", "query": q}});
+        for i in 0..6 {
+            pacer.push(search(&i.to_string()));
+        }
+        // Only the newest 4 wait; 4 bounded commands per second.
+        let first = pacer.take_ready(None);
+        assert_eq!(first.len(), 4);
+        assert_eq!(first[0]["d"]["query"], "2");
+        // One search per second for 30 s: never more than 10 in 10 s.
+        let mut sent = vec![Instant::now(); first.len()];
+        for _ in 0..30 {
+            pacer.push(search("x"));
+            pacer.push(search("y"));
+            for _ in pacer.take_ready(None) {
+                sent.push(Instant::now());
+            }
+            tokio::time::advance(Duration::from_secs(1)).await;
+        }
+        for (i, t) in sent.iter().enumerate() {
+            let in_window = sent[i..]
+                .iter()
+                .take_while(|u| **u - *t < SEARCH_WINDOW)
+                .count();
+            assert!(in_window <= SEARCH_PER_WINDOW, "{in_window} in 10 s");
+        }
+        assert!(sent.len() >= 20);
     }
 
     #[tokio::test(start_paused = true)]
