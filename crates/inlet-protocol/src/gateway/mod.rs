@@ -664,6 +664,14 @@ impl Task {
                 return self.classify_close(code, reason, None)
             }
             Ok(Err(ReadEnd::Error(e))) => return Outcome::retry(e),
+            Ok(Err(ReadEnd::BadData(e))) => {
+                return Outcome::Reconnect {
+                    reason: e,
+                    fresh: false,
+                    stable: false,
+                    min_delay: LONG_BACKOFF,
+                }
+            }
             Err(_) => return Outcome::retry("no Hello within 20 s"),
         };
         if hello.get("op").and_then(Value::as_u64) != Some(10) {
@@ -761,7 +769,8 @@ impl Task {
                         Ok(Some(p)) => p,
                         Ok(None) => return reconnect("connection closed".into(), false, Duration::ZERO),
                         Err(ReadEnd::Closed(code, reason)) => return self.classify_close(code, reason, connected_at),
-                        Err(ReadEnd::Error(e)) => {
+                        Err(ReadEnd::Error(e)) => return reconnect(e, false, Duration::ZERO),
+                        Err(ReadEnd::BadData(e)) => {
                             // A bad or oversized frame from the server: wait longer.
                             return reconnect(e, false, LONG_BACKOFF);
                         }
@@ -905,7 +914,10 @@ fn presence(status: &str) -> Value {
 
 enum ReadEnd {
     Closed(Option<u16>, String),
+    /// Network trouble.
     Error(String),
+    /// The server sent something unusable (bad JSON, bad zstd, too large).
+    BadData(String),
 }
 
 /// Reads the next JSON payload. `Ok(None)` means the stream ended.
@@ -916,7 +928,15 @@ async fn read_payload(
     loop {
         let msg = match ws.next().await {
             None => return Ok(None),
-            Some(Err(e)) => return Err(ReadEnd::Error(format!("read: {e}"))),
+            Some(Err(e)) => {
+                use tokio_tungstenite::tungstenite::Error as WsError;
+                return Err(match e {
+                    WsError::Capacity(_) => {
+                        ReadEnd::BadData(format!("read: {e}"))
+                    }
+                    _ => ReadEnd::Error(format!("read: {e}")),
+                });
+            }
             Some(Ok(m)) => m,
         };
         let parsed = match msg {
@@ -925,7 +945,7 @@ async fn read_payload(
                 Some(c) => {
                     let bytes = c
                         .decompress(&b)
-                        .map_err(|e| ReadEnd::Error(format!("zstd: {e}")))?;
+                        .map_err(|e| ReadEnd::BadData(format!("zstd: {e}")))?;
                     if bytes.is_empty() {
                         continue;
                     }
@@ -943,7 +963,7 @@ async fn read_payload(
         };
         return parsed
             .map(Some)
-            .map_err(|e| ReadEnd::Error(format!("bad JSON from gateway: {e}")));
+            .map_err(|e| ReadEnd::BadData(format!("bad JSON from gateway: {e}")));
     }
 }
 

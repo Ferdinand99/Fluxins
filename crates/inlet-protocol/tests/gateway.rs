@@ -425,3 +425,122 @@ async fn server_reconnect_request_resumes() {
     assert_eq!(resume["op"], 6);
     assert_eq!(resume["d"]["seq"], 1);
 }
+
+#[tokio::test]
+async fn guild_subscriptions_wait_for_ready_and_are_replayed_after_resume() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (handle, mut events) = Gateway::connect(
+        instance_for(port),
+        Token::new("gw-lazy"),
+        fast_options(true),
+    );
+    // Sent before READY: must be held back (a command before READY closes with 4003).
+    handle.set_guild_active("100", true);
+    handle.set_status("idle");
+    let mut c = Conn::accept(&listener).await;
+    c.hello(45_000).await;
+    assert_eq!(c.recv(false).await["op"], 2);
+    c.dispatch(1, "READY", ready("sess-lazy")).await;
+    let lazy = c.recv(false).await;
+    assert_eq!(lazy["op"], 14, "{lazy}");
+    assert_eq!(lazy["d"]["subscriptions"]["100"]["active"], true);
+    assert_eq!(c.recv(false).await["op"], 3);
+    let mut states = Vec::new();
+    next_dispatch(&mut events, &mut states).await;
+
+    // While the socket is down, the UI switches guilds.
+    drop(c);
+    handle.set_guild_active("100", false);
+    handle.set_guild_active("200", true);
+    let mut c2 = Conn::accept(&listener).await;
+    c2.hello(45_000).await;
+    assert_eq!(c2.recv(false).await["op"], 6);
+    c2.dispatch(1, "RESUMED", json!({})).await;
+    let lazy = c2.recv(false).await;
+    assert_eq!(lazy["op"], 14, "{lazy}");
+    let subs = lazy["d"]["subscriptions"].as_object().unwrap();
+    assert!(subs.contains_key("200"), "{lazy}");
+    assert!(!subs.contains_key("100"), "{lazy}");
+}
+
+#[tokio::test]
+async fn rate_limit_close_waits_long() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (handle, mut events) = Gateway::connect(
+        instance_for(port),
+        Token::new("gw-4008"),
+        fast_options(false),
+    );
+    let mut c = Conn::accept(&listener).await;
+    c.hello(45_000).await;
+    c.recv(false).await;
+    c.ws.close(Some(CloseFrame {
+        code: CloseCode::from(4008),
+        reason: "Rate limited".into(),
+    }))
+    .await
+    .unwrap();
+    loop {
+        if let ConnectionState::Reconnecting { delay, .. } = next_state(&mut events).await {
+            assert!(delay >= Duration::from_secs(30), "{delay:?}");
+            break;
+        }
+    }
+    handle.close();
+    loop {
+        if let ConnectionState::Closed(reason) = next_state(&mut events).await {
+            assert_eq!(reason, CloseReason::ClientClosed);
+            break;
+        }
+    }
+}
+
+#[tokio::test]
+async fn heartbeats_continue_while_the_event_channel_is_full() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let options = GatewayOptions {
+        event_buffer: 1,
+        ..fast_options(false)
+    };
+    // The receiver is never read.
+    let (_handle, _events) = Gateway::connect(instance_for(port), Token::new("gw-full"), options);
+    let mut c = Conn::accept(&listener).await;
+    c.hello(300).await;
+    c.recv(false).await;
+    c.dispatch(1, "READY", ready("sess-full")).await;
+    for i in 0..50 {
+        c.dispatch(
+            2 + i,
+            "TYPING_START",
+            json!({"channel_id": "200", "user_id": "11", "timestamp": 1}),
+        )
+        .await;
+    }
+    for _ in 0..3 {
+        let hb = c.recv(true).await;
+        assert_eq!(hb["op"], 1);
+        c.send(json!({"op": 11})).await;
+    }
+}
+
+#[tokio::test]
+async fn hostile_heartbeat_interval_does_not_panic() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (_handle, mut events) = Gateway::connect(
+        instance_for(port),
+        Token::new("gw-hb-hostile"),
+        fast_options(false),
+    );
+    let mut c = Conn::accept(&listener).await;
+    c.send(json!({"op": 10, "d": {"heartbeat_interval": 18_446_744_073_709_551_615u64}}))
+        .await;
+    assert_eq!(c.recv(false).await["op"], 2);
+    c.dispatch(1, "READY", ready("sess-h")).await;
+    let mut states = Vec::new();
+    let (_, ev) = next_dispatch(&mut events, &mut states).await;
+    assert!(matches!(ev, Dispatch::Ready(_)));
+}

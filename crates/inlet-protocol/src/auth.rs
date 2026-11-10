@@ -36,6 +36,12 @@ const CAPTCHA_TIMEOUT: Duration = Duration::from_secs(60);
 pub struct Ticket(String);
 
 impl Ticket {
+    /// A ticket from a raw value, for tests.
+    #[doc(hidden)]
+    pub fn for_tests(value: &str) -> Ticket {
+        Ticket(value.to_owned())
+    }
+
     /// The raw value.
     pub fn expose_secret(&self) -> &str {
         &self.0
