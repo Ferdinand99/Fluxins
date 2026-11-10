@@ -16,6 +16,7 @@
 //! save dialog. The file is never opened, run or revealed afterwards.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
@@ -80,12 +81,124 @@ pub struct Setup {
     /// The runtime the fetcher and the client run on.
     pub runtime: tokio::runtime::Handle,
     /// Images the cache let go of; the UI frees their textures once nothing shows them.
-    pub evicted: mpsc::Receiver<Arc<RenderImage>>,
+    pub evicted: Evictions,
+}
+
+/// Most bytes (counted like the cache: twice the pixels) that may wait in the eviction
+/// queue. A whole cache cleared at once fits.
+pub const EVICTION_QUEUE_BYTES: u64 = 2 * MEMORY_CACHE_BYTES;
+
+/// The decoded bytes of a gpui image, counted like the cache (CPU copy and atlas tile).
+fn counted_bytes(image: &RenderImage) -> u64 {
+    let pixels: u64 = (0..image.frame_count())
+        .map(|i| image.as_bytes(i).map_or(0, |b| b.len() as u64))
+        .sum();
+    pixels.saturating_mul(2)
+}
+
+/// The sending half of the eviction queue, inside the image sink. Bounded in bytes, it
+/// never blocks (the sink runs on the client's threads) and wakes the UI, which frees
+/// the textures right away instead of waiting for the next frame.
+pub struct EvictionQueue {
+    tx: Mutex<mpsc::Sender<(Arc<RenderImage>, u64)>>,
+    wake: Mutex<futures::channel::mpsc::Sender<()>>,
+    queued: Arc<AtomicU64>,
+    cap: u64,
+}
+
+/// The receiving half, on the UI thread.
+pub struct Evictions {
+    rx: mpsc::Receiver<(Arc<RenderImage>, u64)>,
+    queued: Arc<AtomicU64>,
+    /// Signals that images are waiting; the UI takes it to drain the queue when signalled.
+    pub wake: Option<futures::channel::mpsc::Receiver<()>>,
+}
+
+/// A new eviction queue holding at most `cap` counted bytes (one image always fits).
+pub fn eviction_queue(cap: u64) -> (EvictionQueue, Evictions) {
+    let (tx, rx) = mpsc::channel();
+    // One pending wake is enough: the UI drains everything when it wakes.
+    let (wake_tx, wake_rx) = futures::channel::mpsc::channel(1);
+    let queued = Arc::new(AtomicU64::new(0));
+    (
+        EvictionQueue {
+            tx: Mutex::new(tx),
+            wake: Mutex::new(wake_tx),
+            queued: queued.clone(),
+            cap,
+        },
+        Evictions {
+            rx,
+            queued,
+            wake: Some(wake_rx),
+        },
+    )
+}
+
+impl EvictionQueue {
+    /// Queues an image the cache let go of. Returns `false` when the queue is full: the
+    /// image is dropped here (its texture, if it was ever drawn, stays in the atlas
+    /// until the window closes, which the bound makes the rare case).
+    pub fn push(&self, image: Arc<RenderImage>) -> bool {
+        let bytes = counted_bytes(&image);
+        let mut now = self.queued.load(Ordering::Acquire);
+        let reserved = loop {
+            if now != 0 && now.saturating_add(bytes) > self.cap {
+                break false;
+            }
+            match self.queued.compare_exchange_weak(
+                now,
+                now.saturating_add(bytes),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break true,
+                Err(actual) => now = actual,
+            }
+        };
+        if !reserved {
+            log::warn!("image eviction queue full; dropping an evicted image");
+            return false;
+        }
+        let sent = self
+            .tx
+            .lock()
+            .is_ok_and(|tx| tx.send((image, bytes)).is_ok());
+        if !sent {
+            // The UI is gone; nothing will free it, nothing needs to.
+            self.queued.fetch_sub(bytes, Ordering::AcqRel);
+            return false;
+        }
+        if let Ok(mut wake) = self.wake.lock() {
+            // Full means a wake is already pending.
+            let _ = wake.try_send(());
+        }
+        true
+    }
+}
+
+impl Evictions {
+    /// Takes every waiting image off the queue.
+    pub fn drain(&self) -> Vec<Arc<RenderImage>> {
+        self.rx
+            .try_iter()
+            .map(|(image, bytes)| {
+                self.queued.fetch_sub(bytes, Ordering::AcqRel);
+                image
+            })
+            .collect()
+    }
+
+    /// Counted bytes waiting in the queue.
+    #[cfg(test)]
+    pub fn queued_bytes(&self) -> u64 {
+        self.queued.load(Ordering::Acquire)
+    }
 }
 
 /// Turns decoded images into gpui images and hands evicted ones to the UI thread.
 pub struct GpuiImages {
-    evicted: Mutex<mpsc::Sender<Arc<RenderImage>>>,
+    evicted: EvictionQueue,
 }
 
 impl ImageSink for GpuiImages {
@@ -98,10 +211,8 @@ impl ImageSink for GpuiImages {
     }
 
     fn evicted(&self, handle: Self::Handle) {
-        // Unbounded and never blocks; the UI drains it every frame.
-        if let Ok(tx) = self.evicted.lock() {
-            let _ = tx.send(handle);
-        }
+        // Bounded and never blocks.
+        self.evicted.push(handle);
     }
 }
 
@@ -124,14 +235,12 @@ pub fn config(proxy: &p::Media) -> MediaConfig {
 
 /// Builds the image client for a media endpoint. Runs on the backend runtime.
 pub fn setup(proxy: p::Media, fetcher: Arc<dyn Fetcher>) -> Setup {
-    let (tx, evicted) = mpsc::channel();
+    let (queue, evicted) = eviction_queue(EVICTION_QUEUE_BYTES);
     let runtime = tokio::runtime::Handle::current();
     let client = MediaClient::new(
         runtime.clone(),
         fetcher.clone(),
-        GpuiImages {
-            evicted: Mutex::new(tx),
-        },
+        GpuiImages { evicted: queue },
         config(&proxy),
     );
     Setup {
@@ -311,8 +420,7 @@ pub async fn save_to(
     if resp.content_length.is_some_and(|n| n > max_bytes) {
         return Err(SaveError::TooLarge);
     }
-    let part = part_path(&path);
-    let mut file = tokio::fs::File::create(&part)
+    let (part, mut file) = create_part(&path, part_seeds())
         .await
         .map_err(SaveError::Write)?;
     let mut body = resp.body;
@@ -343,13 +451,62 @@ pub async fn save_to(
     Ok(written)
 }
 
-/// `dir/.name.part`: the file a save writes before it is complete.
-fn part_path(path: &Path) -> PathBuf {
+/// Names tried for the temporary file of one save.
+const PART_ATTEMPTS: usize = 16;
+
+/// `dir/.name.<seed>.part`: a temporary file a save writes before it is complete.
+fn part_path(path: &Path, seed: u64) -> PathBuf {
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "download".into());
-    path.with_file_name(format!(".{name}.part"))
+    path.with_file_name(format!(".{name}.{seed:016x}.part"))
+}
+
+/// Seeds for temporary names nobody can guess ahead: the time, the process and a counter.
+fn part_seeds() -> impl Iterator<Item = u64> {
+    use std::hash::{BuildHasher, Hasher};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    // A fresh random key per call (std seeds it from the system's randomness).
+    let keys = std::collections::hash_map::RandomState::new();
+    (0..PART_ATTEMPTS as u64).map(move |attempt| {
+        let mut h = keys.build_hasher();
+        h.write_u64(COUNTER.fetch_add(1, Ordering::Relaxed));
+        h.write_u32(std::process::id());
+        h.write_u128(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos()),
+        );
+        h.write_u64(attempt);
+        h.finish()
+    })
+}
+
+/// Creates a new temporary file next to `path`, trying a name per seed. Each name is
+/// created exclusively (`create_new`): an existing file is never truncated, and a
+/// symbolic link in its place, even a dangling one, is never followed.
+async fn create_part(
+    path: &Path,
+    seeds: impl IntoIterator<Item = u64>,
+) -> std::io::Result<(PathBuf, tokio::fs::File)> {
+    for seed in seeds {
+        let part = part_path(path, seed);
+        match tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&part)
+            .await
+        {
+            Ok(file) => return Ok((part, file)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "no free name for the temporary file",
+    ))
 }
 
 /// A file name to suggest in the save dialog: no path separators, no characters
@@ -546,6 +703,109 @@ mod tests {
             let bytes = image.byte_size();
             (Arc::new(image), bytes)
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn temporary_file_is_new_and_never_follows_a_link() {
+        let dir = std::env::temp_dir().join(format!("inlet-part-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("photo.png");
+
+        // Someone placed a file where the first name would go, and (on Unix) a link to
+        // a file of theirs where the second would go.
+        let taken = part_path(&target, 1);
+        std::fs::write(&taken, b"keep me").unwrap();
+        let victim = dir.join("victim.txt");
+        std::fs::write(&victim, b"victim").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&victim, part_path(&target, 2)).unwrap();
+        #[cfg(not(unix))]
+        std::fs::write(part_path(&target, 2), b"keep me").unwrap();
+
+        let (part, file) = create_part(&target, [1, 2, 3]).await.unwrap();
+        drop(file);
+        assert_eq!(part, part_path(&target, 3));
+        assert_eq!(std::fs::read(&taken).unwrap(), b"keep me");
+        assert_eq!(std::fs::read(&victim).unwrap(), b"victim");
+        // Every name taken: refused, nothing overwritten.
+        assert!(create_part(&target, [1, 2]).await.is_err());
+        assert_eq!(std::fs::read(&taken).unwrap(), b"keep me");
+
+        // Two saves never share a temporary name.
+        let a: Vec<u64> = part_seeds().collect();
+        let b: Vec<u64> = part_seeds().collect();
+        assert_eq!(a.len(), PART_ATTEMPTS);
+        assert!(a.iter().all(|s| !b.contains(s)));
+
+        // A real save leaves a stale `.part` of an earlier save alone.
+        let stale = dir.join(".photo.png.part");
+        std::fs::write(&stale, b"stale").unwrap();
+        let fetcher = Arc::new(Recording {
+            seen: Mutex::default(),
+            body: Bytes::from_static(b"png bytes"),
+        });
+        let url = Url::parse("https://media.example.org/media/attachments/1/2/p.png").unwrap();
+        save_to(fetcher, url, target.clone(), save_limit(0))
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"png bytes");
+        assert_eq!(std::fs::read(&stale).unwrap(), b"stale");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn render_image(side: u32) -> Arc<RenderImage> {
+        let limits = inlet_media::KindLimits::for_kind(MediaKind::Attachment);
+        let decoded = inlet_media::decode(
+            &png::solid(side, side, [9, 9, 9, 255]),
+            Fit::square(side),
+            &limits,
+            &inlet_media::DecodeControl::with_budget(Duration::from_secs(5)),
+        )
+        .unwrap();
+        Arc::new(RenderImage::new(decoded.into_gpui_frames()))
+    }
+
+    #[test]
+    fn evicted_images_are_bounded_and_released() {
+        let a = render_image(16);
+        let bytes = counted_bytes(&a);
+        assert_eq!(bytes, 16 * 16 * 4 * 2);
+        // Room for two such images.
+        let (queue, mut evicted) = eviction_queue(bytes * 2);
+        let mut wake = evicted.wake.take().unwrap();
+
+        assert!(queue.push(a.clone()));
+        assert!(queue.push(render_image(16)));
+        // Full: the third is refused and let go at once, not kept.
+        let c = render_image(16);
+        assert!(!queue.push(c.clone()));
+        assert_eq!(Arc::strong_count(&c), 1);
+        assert_eq!(evicted.queued_bytes(), bytes * 2);
+        // The UI was woken (once is enough).
+        use futures::FutureExt;
+        assert_eq!(wake.next().now_or_never(), Some(Some(())));
+
+        // Draining hands the images over and empties the queue.
+        let drained = evicted.drain();
+        assert_eq!(drained.len(), 2);
+        assert_eq!(evicted.queued_bytes(), 0);
+        assert_eq!(Arc::strong_count(&a), 2);
+        drop(drained);
+        assert_eq!(Arc::strong_count(&a), 1);
+
+        // One image larger than the whole bound still fits an empty queue (the viewer's
+        // big image), and nothing else fits beside it.
+        let big = render_image(64);
+        assert!(queue.push(big));
+        assert!(!queue.push(render_image(16)));
+        assert_eq!(evicted.drain().len(), 1);
+
+        // The UI gone: nothing is kept for it.
+        drop(evicted);
+        let d = render_image(16);
+        assert!(!queue.push(d.clone()));
+        assert_eq!(Arc::strong_count(&d), 1);
     }
 
     fn proxy() -> p::Media {

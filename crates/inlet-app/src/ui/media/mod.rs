@@ -20,7 +20,8 @@ mod viewer;
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 
-use gpui::{Context, Pixels, RenderImage, Size, Window};
+use futures::StreamExt;
+use gpui::{Context, Pixels, RenderImage, Size, Task, Window};
 
 use crate::app::Inlet;
 use crate::backend::media::{Ev, Setup};
@@ -57,6 +58,8 @@ pub struct State {
     pub images: Images,
     /// Textures the cache let go of, freed once nothing draws them.
     pending_drop: Vec<Arc<RenderImage>>,
+    /// Frees evicted textures as soon as the cache lets go of them, between frames too.
+    evict_task: Option<Task<()>>,
     /// The display scale, for asking the proxy for device pixels.
     pub scale: f32,
     /// The window size, for the viewer.
@@ -87,6 +90,7 @@ impl Default for State {
             setup: None,
             images: Images::default(),
             pending_drop: Vec::new(),
+            evict_task: None,
             scale: 1.,
             viewport: Size::default(),
             column_width: 0.,
@@ -126,8 +130,9 @@ impl State {
         self.images.clear();
         if let Some(setup) = self.setup.take() {
             setup.client.clear_memory();
-            self.pending_drop.extend(setup.evicted.try_iter());
+            self.pending_drop.extend(setup.evicted.drain());
         }
+        self.evict_task = None;
         self.hovered_message = None;
         self.revealed.clear();
         self.revealed_order.clear();
@@ -144,21 +149,27 @@ impl Inlet {
         // Here, not while rows are drawn: the list holds its state borrowed then.
         self.media.column_width = self.chat.message_list.viewport_bounds().size.width.as_f32();
         self.media.images.next_frame();
+        self.release_evicted(Some(window), cx);
+        #[cfg(feature = "demo")]
+        self.demo_open_viewer(cx);
+    }
+
+    /// Takes the images the cache let go of and frees the texture of every one that
+    /// nothing draws any more; the others wait for a later frame.
+    fn release_evicted(&mut self, mut window: Option<&mut Window>, cx: &mut Context<Self>) {
         if let Some(setup) = &self.media.setup {
-            self.media.pending_drop.extend(setup.evicted.try_iter());
+            self.media.pending_drop.extend(setup.evicted.drain());
         }
         let mut keep = Vec::new();
         for image in self.media.pending_drop.drain(..) {
-            // Only the queue holds it: nothing draws it, free the texture.
+            // Only this list holds it: nothing draws it, free the texture.
             if Arc::strong_count(&image) > 1 {
                 keep.push(image);
             } else {
-                cx.drop_image(image, Some(window));
+                cx.drop_image(image, window.as_deref_mut());
             }
         }
         self.media.pending_drop = keep;
-        #[cfg(feature = "demo")]
-        self.demo_open_viewer(cx);
     }
 
     /// The shown size of media of `size`, shrunk to fit the message column (less
@@ -187,7 +198,20 @@ impl Inlet {
         match event {
             Ev::Ready(setup) => {
                 self.media.reset();
-                self.media.setup = Some(*setup);
+                let mut setup = *setup;
+                // Woken whenever the cache lets images go, so they are freed even while
+                // no frame is drawn (a hidden window).
+                self.media.evict_task = setup.evicted.wake.take().map(|mut wake| {
+                    cx.spawn(async move |this, cx| {
+                        while wake.next().await.is_some() {
+                            let freed = this.update(cx, |this, cx| this.release_evicted(None, cx));
+                            if freed.is_err() {
+                                break;
+                            }
+                        }
+                    })
+                });
+                self.media.setup = Some(setup);
             }
             Ev::Unavailable => self.media.reset(),
             Ev::Refreshed {
