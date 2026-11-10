@@ -1,0 +1,24 @@
+[package]
+name = "inlet-media-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bytes = "1"
+inlet-media = { path = ".." }
+
+# The fuzz crate is its own workspace, so the main workspace (and cargo-deny,
+# which only looks at that one) never sees the fuzzing dependencies.
+[workspace]
+
+[[bin]]
+name = "decode"
+path = "fuzz_targets/decode.rs"
+test = false
+doc = false
+bench = false
