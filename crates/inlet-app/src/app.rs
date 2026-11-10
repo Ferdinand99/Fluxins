@@ -102,15 +102,19 @@ impl Inlet {
         let mut subscriptions = Vec::new();
         let sign_in = ui::accounts::SignInState::new(window, cx, &mut subscriptions);
         let composer = ui::composer::ComposerState::new(window, cx, &mut subscriptions);
-        // The window getting focus again reads the open channel, if it is at the bottom.
+        // Whether the window has focus, for the once-a-second read check; getting focus
+        // again reads the open channel at once, if it is at the bottom.
         subscriptions.push(cx.observe_window_activation(window, |this, window, cx| {
-            if window.is_window_active() {
+            let active = window.is_window_active();
+            this.notifications.window_active = active;
+            if active {
                 let at_bottom = this.chat.message_list.is_following_tail();
                 this.read_if_watched(true, at_bottom, cx);
             }
         }));
 
         let (backend, _) = Self::spawn_backend(0, true, window, cx);
+        let notifications = ui::notifications::State::new(window.is_window_active());
         Self {
             backend,
             backend_epoch: 0,
@@ -138,7 +142,7 @@ impl Inlet {
             inbox: Default::default(),
             threads: Default::default(),
             voice: Default::default(),
-            notifications: Default::default(),
+            notifications,
             settings: Default::default(),
             #[cfg(feature = "demo")]
             demo_channel: None,

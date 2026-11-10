@@ -9,6 +9,10 @@
 //!   focus, the list coming back to the bottom) is acknowledged through the gate: at most
 //!   once per channel per 3 s, for the newest message only. The message view says when it
 //!   may read (`MessageView::may_mark_read`: focus, at the bottom, a complete window).
+//! - The once-a-second tick checks the same rules ([`should_read_now`]). That is what
+//!   makes reading at the bottom reliable: the list's own events miss some ways of
+//!   getting there (dragging the scroll bar, "Jump to present", the list taking up
+//!   following the newest messages only at its next layout, closing About).
 //! - "Mark as read" (a channel, a server, everything) is acknowledged at once, one
 //!   acknowledgement per channel that has something unread; the protocol sends them as
 //!   batches of up to 100 channels, one batch per second. Nothing is sent for a channel
@@ -16,12 +20,38 @@
 
 use std::time::Instant;
 
-use inlet_state::{AckKind, Changes, ChannelId, GuildId};
+use inlet_state::{AccountState, AckKind, Changes, ChannelId, GuildId};
 
 use super::unread::{all_unread_targets, category_unread_targets, has_unread, unread_targets};
 use crate::app::Inlet;
 use crate::backend::notifications as backend;
+use crate::ui::chat::messages::MessageView;
 use gpui::Context;
+
+/// What is known about the screen at a moment the open channel might be read.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Sight {
+    /// The chat is on screen ([`Inlet::chat_is_visible`]).
+    pub chat_visible: bool,
+    /// The window has focus.
+    pub window_active: bool,
+    /// The list is at the bottom, following the newest messages.
+    pub at_bottom: bool,
+}
+
+/// Whether the open channel `ch` is to be read now: the chat is on screen, the window
+/// has focus, the list is at the bottom of a window that holds the newest messages
+/// (`MessageView::may_mark_read`), and there is something to read.
+pub(crate) fn should_read_now(
+    view: &MessageView,
+    state: &AccountState,
+    ch: ChannelId,
+    sight: Sight,
+) -> bool {
+    sight.chat_visible
+        && view.may_mark_read(state, ch, sight.at_bottom, sight.window_active)
+        && has_unread(state, ch)
+}
 
 /// Which channels "mark as read" takes.
 enum Which {
@@ -73,9 +103,9 @@ impl Inlet {
         changes
     }
 
-    /// The open channel is read if it may be: the window has focus, the list is at the
-    /// bottom and shows the newest messages, and the chat is on screen. For the moments
-    /// that make that true: the window getting focus, the list coming back to the bottom.
+    /// The open channel is read if it may be ([`should_read_now`]). Called by the tick
+    /// once a second, and at once when the window gets focus or the list reports the
+    /// bottom. Never call it from inside the list's scroll handler: it can redraw rows.
     pub(crate) fn read_if_watched(
         &mut self,
         window_active: bool,
@@ -85,11 +115,12 @@ impl Inlet {
         let (Some(ch), Some(account)) = (self.open_channel_id(), self.account.clone()) else {
             return;
         };
-        if !self
-            .chat
-            .view
-            .may_mark_read(account.read(cx), ch, at_bottom, window_active)
-        {
+        let sight = Sight {
+            chat_visible: self.chat_is_visible(),
+            window_active,
+            at_bottom,
+        };
+        if !should_read_now(&self.chat.view, account.read(cx), ch, sight) {
             return;
         }
         let changes = self.read_channel(ch, AckKind::Automatic, false, cx);
@@ -171,8 +202,11 @@ impl Inlet {
         cx.notify();
     }
 
-    /// About once a second: the acknowledgements that are due, and the settings writes.
+    /// About once a second: reading the open channel if it is watched, the
+    /// acknowledgements that are due, and the settings writes.
     pub(crate) fn tick_notifications(&mut self, cx: &mut Context<Self>) {
+        let at_bottom = self.chat.message_list.is_following_tail();
+        self.read_if_watched(self.notifications.window_active, at_bottom, cx);
         let now = Instant::now();
         let due = self.notifications.gate.due(now);
         if !due.is_empty() {
@@ -184,5 +218,130 @@ impl Inlet {
             });
         }
         self.tick_settings_writes(now, cx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use inlet_protocol as p;
+    use inlet_protocol::models::FLUXER_EPOCH_MS;
+    use inlet_protocol::permissions::{READ_MESSAGE_HISTORY, SEND_MESSAGES, VIEW_CHANNEL};
+    use inlet_state::{AccountState, AckKind, ChannelId, MessagesPage};
+    use serde_json::json;
+
+    use super::{should_read_now, Sight};
+    use crate::ui::chat::messages::MessageView;
+
+    const CH: ChannelId = ChannelId(301);
+    /// 2026-01-01T00:00:00Z, when the account joined the guild.
+    const JOINED_MS: u64 = 1_767_225_600_000;
+
+    /// A message ID `secs` after the join time.
+    fn mid(secs: u64) -> u64 {
+        ((JOINED_MS + secs * 1000 - FLUXER_EPOCH_MS) << 22) + 1
+    }
+
+    fn message(id: u64) -> p::Message {
+        serde_json::from_value(json!({
+            "id": id.to_string(), "channel_id": "301", "type": 0,
+            "author": {"id": "7", "username": "u7"},
+            "content": "hi", "timestamp": "2026-01-01T01:00:00Z"
+        }))
+        .unwrap()
+    }
+
+    /// A guild with one text channel whose newest message is `mid(109)`, read up to
+    /// `mid(104)`.
+    fn state() -> AccountState {
+        let ready: p::Ready = serde_json::from_value(json!({
+            "session_id": "s",
+            "user": {"id": "10", "username": "me", "mfa_enabled": false},
+            "guilds": [{
+                "id": "20",
+                "properties": {"id": "20", "name": "G", "owner_id": "99", "mfa_level": 0,
+                               "default_message_notifications": 0},
+                "roles": [{"id": "20", "name": "@everyone", "position": 0,
+                           "permissions": (VIEW_CHANNEL | SEND_MESSAGES | READ_MESSAGE_HISTORY).to_string()}],
+                "channels": [{"id": "301", "type": 0, "position": 0, "name": "general",
+                              "last_message_id": mid(109).to_string()}],
+                "members": [{"user": {"id": "10", "username": "me"}, "roles": [],
+                             "joined_at": "2026-01-01T00:00:00Z"}],
+                "member_count": 2,
+            }],
+            "read_states": [{"id": "301", "mention_count": 0,
+                             "last_message_id": mid(104).to_string()}],
+            "user_guild_settings": [],
+            "presences": [],
+        }))
+        .unwrap();
+        AccountState::from_ready_at(&ready, JOINED_MS as i64 + 3_600_000)
+    }
+
+    /// The newest page lands: the window is complete.
+    fn newest_page(state: &mut AccountState) {
+        let msgs: Vec<p::Message> = (100..=109).map(|s| message(mid(s))).collect();
+        let _ = state.begin_load(CH);
+        let _ = state.apply_messages(CH, MessagesPage::latest(msgs, 50));
+    }
+
+    const SEEN: Sight = Sight {
+        chat_visible: true,
+        window_active: true,
+        at_bottom: true,
+    };
+
+    #[test]
+    fn the_tick_reads_only_a_watched_complete_unread_channel() {
+        let mut s = state();
+        let view = MessageView::loaded_for_tests();
+        // The newest page has not landed: the window is not complete.
+        let _ = s.begin_load(CH);
+        assert!(!should_read_now(&view, &s, CH, SEEN), "window not complete");
+        newest_page(&mut s);
+        assert!(s.unread(CH).unread);
+
+        // The true case: on screen, focused, at the bottom of a complete window, unread.
+        assert!(should_read_now(&view, &s, CH, SEEN));
+
+        let hidden = Sight {
+            chat_visible: false,
+            ..SEEN
+        };
+        assert!(!should_read_now(&view, &s, CH, hidden), "chat hidden");
+        let unfocused = Sight {
+            window_active: false,
+            ..SEEN
+        };
+        assert!(
+            !should_read_now(&view, &s, CH, unfocused),
+            "window unfocused"
+        );
+        let scrolled_up = Sight {
+            at_bottom: false,
+            ..SEEN
+        };
+        assert!(!should_read_now(&view, &s, CH, scrolled_up), "scrolled up");
+        // The view has not shown the channel's page yet.
+        assert!(!should_read_now(&MessageView::default(), &s, CH, SEEN));
+
+        // Already read: nothing to do, so nothing is acknowledged again.
+        let _ = s.mark_read(CH, None, AckKind::Explicit);
+        assert!(!should_read_now(&view, &s, CH, SEEN), "already read");
+    }
+
+    #[test]
+    fn a_detached_window_is_not_read_by_the_tick() {
+        let mut s = state();
+        newest_page(&mut s);
+        let view = MessageView::loaded_for_tests();
+        assert!(should_read_now(&view, &s, CH, SEEN));
+        // Older pages push the newest messages out of the window: it is detached.
+        for _ in 0..11 {
+            let oldest = s.messages(CH).and_then(|w| w.oldest_id()).unwrap();
+            let msgs: Vec<p::Message> = (0..50).map(|i| message(oldest.0 - 1 - i)).collect();
+            let _ = s.apply_messages(CH, MessagesPage::before(oldest, msgs, 50));
+        }
+        assert!(!s.messages(CH).unwrap().has_newest());
+        assert!(!should_read_now(&view, &s, CH, SEEN), "detached");
     }
 }

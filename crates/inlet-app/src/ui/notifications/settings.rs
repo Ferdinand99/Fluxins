@@ -14,6 +14,10 @@
 //! then. Changes to one guild within [`QUIET`] merge into one request, and at most
 //! [`MAX_PER_TICK`] start per tick, far below Fluxer's limit (30 per 10 s). The channel
 //! override map is sent whole, as the server replaces it.
+//!
+//! Every write has a [`WriteId`]: the sign-in session (counted up at every sign-out) and
+//! its number. Only the answer with the ID of the write in flight ends it, so a late
+//! answer of another write, or of an account that signed out, changes nothing.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -23,6 +27,8 @@ use inlet_state::guild_settings::{
 };
 use inlet_state::{AccountState, ChannelId, GuildId};
 use serde_json::{json, Map, Value};
+
+pub use crate::backend::notifications::WriteId;
 
 /// Changes to one guild's settings this close together become one request.
 pub const QUIET: Duration = Duration::from_millis(500);
@@ -239,8 +245,8 @@ fn body(base: &GuildNotificationSettings, intent: &Intent) -> Value {
 /// What `SettingsBatch::start_due` starts.
 #[derive(Debug, Default, PartialEq)]
 pub struct Started {
-    /// Requests to send: the guild and the body.
-    pub send: Vec<(Option<GuildId>, Value)>,
+    /// Requests to send: the write's ID, the guild and the body.
+    pub send: Vec<(WriteId, Option<GuildId>, Value)>,
     /// Guilds whose channel changes were dropped because the local override map is cut.
     pub refused: Vec<Option<GuildId>>,
 }
@@ -251,8 +257,8 @@ struct GuildWrite {
     confirmed: GuildNotificationSettings,
     /// The newest `version` seen; an update with a lower one is old news.
     version: Option<i64>,
-    /// Sent, not answered yet. At most one request per guild is in flight.
-    in_flight: Option<Intent>,
+    /// Sent, not answered yet, with its ID. At most one request per guild is in flight.
+    in_flight: Option<(WriteId, Intent)>,
     /// Asked for since, not sent yet, with when the first of it was asked for.
     pending: Option<(Intent, Instant)>,
 }
@@ -267,9 +273,22 @@ impl GuildWrite {
 #[derive(Default)]
 pub struct SettingsBatch {
     guilds: BTreeMap<Option<GuildId>, GuildWrite>,
+    /// The sign-in session these writes belong to.
+    session: u64,
+    /// The number of the last write started in this session.
+    seq: u64,
 }
 
 impl SettingsBatch {
+    /// Signed out: nothing of this session's writes is kept, and the next session's
+    /// writes get IDs that no answer of this one can carry.
+    pub fn next_session(&self) -> SettingsBatch {
+        SettingsBatch {
+            session: self.session + 1,
+            ..SettingsBatch::default()
+        }
+    }
+
     /// Queues an intent. `current` is the guild's settings as the state has them now; it
     /// is taken as the confirmed settings the first time (nothing was unconfirmed then).
     pub fn add(
@@ -301,6 +320,7 @@ impl SettingsBatch {
         let intents: Vec<&Intent> = w
             .in_flight
             .iter()
+            .map(|(_, i)| i)
             .chain(w.pending.as_ref().map(|(p, _)| p))
             .collect();
         Some(compose(&w.confirmed, guild, &intents))
@@ -392,26 +412,45 @@ impl SettingsBatch {
                 continue;
             }
             let b = body(&w.confirmed, &intent);
-            w.in_flight = Some(intent);
-            started.send.push((g, b));
+            self.seq += 1;
+            let id = WriteId {
+                session: self.session,
+                seq: self.seq,
+            };
+            w.in_flight = Some((id, intent));
+            started.send.push((id, g, b));
         }
         started
     }
 
-    /// The write in flight for a guild ended. When the server took it (`ok`), returns
-    /// the settings it holds then as far as the answer did not say (the confirmed
-    /// settings with the intent applied).
-    pub fn finish(&mut self, guild: Option<GuildId>, ok: bool) -> Option<Value> {
+    /// The write `id` for a guild ended. When the server took it (`ok`), returns the
+    /// settings it holds then as far as the answer did not say (the confirmed settings
+    /// with the intent applied). Any other write in flight is left alone.
+    pub fn finish(&mut self, guild: Option<GuildId>, id: WriteId, ok: bool) -> Option<Value> {
         let w = self.guilds.get_mut(&guild)?;
-        let intent = w.in_flight.take()?;
+        if w.in_flight.as_ref().map(|(i, _)| *i) != Some(id) {
+            return None;
+        }
+        let (_, intent) = w.in_flight.take()?;
         ok.then(|| compose(&w.confirmed, guild, &[&intent]))
     }
 
-    /// Whether a write is in flight for a guild (a late answer for none is ignored).
-    pub fn is_in_flight(&self, guild: Option<GuildId>) -> bool {
+    /// Whether the write `id` is the one in flight for a guild (an answer to any other
+    /// write, an earlier one or another session's, is ignored).
+    pub fn is_in_flight(&self, guild: Option<GuildId>, id: WriteId) -> bool {
         self.guilds
             .get(&guild)
-            .is_some_and(|w| w.in_flight.is_some())
+            .and_then(|w| w.in_flight.as_ref())
+            .is_some_and(|(i, _)| *i == id)
+    }
+
+    /// The ID of the write in flight for a guild.
+    #[cfg(test)]
+    pub fn in_flight(&self, guild: Option<GuildId>) -> Option<WriteId> {
+        self.guilds
+            .get(&guild)
+            .and_then(|w| w.in_flight.as_ref())
+            .map(|(i, _)| *i)
     }
 }
 
@@ -616,10 +655,11 @@ mod tests {
         let sent = b.start_due(at(600)).send;
         assert_eq!(sent.len(), 1, "one request for 51 changes");
         assert_eq!(
-            sent[0].1,
+            sent[0].2,
             json!({"message_notifications": 1, "suppress_roles": true})
         );
-        assert!(b.is_in_flight(g));
+        let first = sent[0].0;
+        assert!(b.is_in_flight(g, first));
 
         // More changes while it is out wait, however long.
         b.add(
@@ -629,13 +669,14 @@ mod tests {
             at(700),
         );
         assert!(b.start_due(at(60_000)).send.is_empty());
-        assert!(b.is_in_flight(g));
+        assert!(b.is_in_flight(g, first));
 
         // The answer comes: the waiting change goes out, built from what is confirmed.
-        b.finish(g, true);
+        b.finish(g, first, true);
         let sent = b.start_due(at(60_000)).send;
         assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0].1, json!({"suppress_everyone": true}));
+        assert_eq!(sent[0].2, json!({"suppress_everyone": true}));
+        assert_ne!(sent[0].0, first, "every write has its own ID");
     }
 
     #[test]
@@ -653,7 +694,12 @@ mod tests {
             );
         }
         let now = t + Duration::from_secs(5);
-        let first: Vec<_> = b.start_due(now).send.into_iter().map(|(g, _)| g).collect();
+        let first: Vec<_> = b
+            .start_due(now)
+            .send
+            .into_iter()
+            .map(|(_, g, _)| g)
+            .collect();
         assert_eq!(first, vec![Some(GuildId(0)), Some(GuildId(1))]);
         assert_eq!(b.start_due(now).send.len(), 2);
         assert_eq!(b.start_due(now).send.len(), 1);
@@ -667,7 +713,7 @@ mod tests {
         let t = Instant::now();
         let mut b = SettingsBatch::default();
         b.add(g, &base, intent(g, None, Change::Level(2)), t);
-        let _ = b.start_due(t + QUIET);
+        let id = b.start_due(t + QUIET).send[0].0;
         b.add(
             g,
             &base,
@@ -677,13 +723,13 @@ mod tests {
         assert_eq!(b.effective(g).unwrap()["message_notifications"], json!(2));
 
         // The write fails: its change is gone, the one made since stays.
-        assert!(b.finish(g, false).is_none());
+        assert!(b.finish(g, id, false).is_none());
         let v = b.effective(g).unwrap();
         assert_eq!(v["message_notifications"], json!(3));
         assert_eq!(v["suppress_roles"], json!(true));
         // Nothing waits any more once that one is sent and done.
-        let _ = b.start_due(t + QUIET * 3);
-        b.finish(g, true);
+        let id = b.start_due(t + QUIET * 3).send[0].0;
+        b.finish(g, id, true);
         assert!(b.effective(g).is_none());
     }
 
@@ -721,7 +767,8 @@ mod tests {
         let started = b.start_due(t + QUIET);
         assert_eq!(started.refused, vec![g]);
         // The guild field goes out; the channel part, which would delete "not-an-id", does not.
-        assert_eq!(started.send, vec![(g, json!({"suppress_roles": true}))]);
+        let sent: Vec<_> = started.send.into_iter().map(|(_, g, b)| (g, b)).collect();
+        assert_eq!(sent, vec![(g, json!({"suppress_roles": true}))]);
 
         // What the UI shows leaves the cut map alone, so it stays marked as cut.
         let shown = compose(&cut, g, &[&intent(g, None, Change::SuppressRoles(true))]);
@@ -744,5 +791,39 @@ mod tests {
         b.add(h, &base, intent(h, None, Change::Level(1)), Instant::now());
         b.reset(|_| base.clone(), &BTreeMap::new());
         assert!(!b.is_stale(h, Some(1)));
+    }
+
+    #[test]
+    fn a_late_answer_from_a_signed_out_account_does_not_touch_the_next_one() {
+        let base = settings(json!({"guild_id": "1"}));
+        let g = Some(GuildId(1));
+        let t = Instant::now();
+        // Account A writes to the guild, then signs out before the answer comes.
+        let mut a = SettingsBatch::default();
+        a.add(g, &base, intent(g, None, Change::Level(2)), t);
+        let a_write = a.start_due(t + QUIET).send[0].0;
+
+        // Account B, in the same guild, signs in and writes to it too.
+        let mut b = a.next_session();
+        assert!(b.effective(g).is_none(), "nothing of A is kept");
+        b.add(g, &base, intent(g, None, Change::SuppressRoles(true)), t);
+        let b_write = b.start_due(t + QUIET).send[0].0;
+        assert_ne!(a_write, b_write);
+        assert_ne!(a_write.session, b_write.session);
+
+        // A's answer arrives first: it is not B's write, so B's stays in flight and
+        // nothing of A's settings reaches B's state.
+        assert!(!b.is_in_flight(g, a_write));
+        assert!(b.finish(g, a_write, true).is_none());
+        assert_eq!(b.in_flight(g), Some(b_write));
+        let shown = b.effective(g).unwrap();
+        assert_eq!(shown["suppress_roles"], json!(true));
+        assert_ne!(shown["message_notifications"], json!(2));
+
+        // B's own answer ends B's write.
+        assert!(b.is_in_flight(g, b_write));
+        let held = b.finish(g, b_write, true).unwrap();
+        assert_eq!(held["suppress_roles"], json!(true));
+        assert!(b.in_flight(g).is_none());
     }
 }

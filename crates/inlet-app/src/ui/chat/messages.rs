@@ -770,6 +770,15 @@ impl MessageView {
         }
     }
 
+    /// A view whose channel's newest page has landed, for tests of the read rules.
+    #[cfg(test)]
+    pub fn loaded_for_tests() -> Self {
+        Self {
+            loaded: true,
+            ..Self::default()
+        }
+    }
+
     /// Whether channel `ch` may be marked read now: its newest page landed, its window
     /// has the newest messages, the list shows the bottom and the window has focus.
     pub fn may_mark_read(
@@ -1309,6 +1318,12 @@ impl Inlet {
     /// "NEW" line and the newest messages are out of view (for the banner and "Jump to
     /// present"). The list reports only scrolling by the person, so loading never
     /// repeats by itself.
+    ///
+    /// The handler runs while gpui holds the list's state borrowed for the scroll: anything
+    /// that touches `message_list` in it (`splice`, `reset`, `scroll_to_end`, even
+    /// `is_following_tail`) would panic. So the handler only notes plain view fields;
+    /// loading pages and reading the channel (which can rebuild rows and splice the list)
+    /// are deferred until the scroll is done and the borrow is released.
     pub(crate) fn hook_list_scroll(&mut self, cx: &mut Context<Self>) {
         if self.chat.view.scroll_hooked {
             return;
@@ -1321,6 +1336,9 @@ impl Inlet {
                 let range = event.visible_range.clone();
                 let following = event.is_following_tail;
                 let count = event.count;
+                let at_top = range.start <= 1;
+                let at_bottom = range.end >= count;
+                // Inside the list's borrow: plain fields of the view only.
                 let _ = weak.update(cx, |this, cx| {
                     let view = &mut this.chat.view;
                     view.divider_above = view
@@ -1329,17 +1347,28 @@ impl Inlet {
                         .position(|r| matches!(r, Row::Unread | Row::Day { new: true, .. }))
                         .is_some_and(|ix| ix < range.start);
                     view.scrolled_away = !following && range.end < count;
-                    let at_bottom = range.end >= count;
-                    if range.start <= 1 {
-                        this.load_older(cx);
-                    } else if at_bottom && this.chat.view.detached {
-                        this.reload_newest(cx);
-                    }
-                    // Back at the bottom with focus: the channel is read.
-                    if at_bottom {
-                        this.read_if_watched(window_active, following, cx);
-                    }
                     cx.notify();
+                });
+                if !at_top && !at_bottom {
+                    return;
+                }
+                // After the scroll: the list is free again.
+                let weak = weak.clone();
+                cx.defer(move |cx| {
+                    let _ = weak.update(cx, |this, cx| {
+                        if at_top {
+                            this.load_older(cx);
+                        } else if this.chat.view.detached {
+                            this.reload_newest(cx);
+                        }
+                        // Back at the bottom with focus: the channel is read. The tick
+                        // does the same once a second, for the ways to the bottom that
+                        // report nothing here.
+                        if at_bottom {
+                            this.read_if_watched(window_active, following, cx);
+                        }
+                        cx.notify();
+                    });
                 });
             },
         );

@@ -12,7 +12,9 @@
 //!   side decides when (at most one per channel per 3 s for reading, at once for "mark as
 //!   read"), and never sends one for a channel that is already read.
 //! - Settings: one `PATCH` per `Cmd::WriteSettings`; the UI keeps at most one in flight
-//!   per guild.
+//!   per guild. Each write carries a [`WriteId`] that its answer echoes, so the UI can
+//!   tell an answer to the write it waits for from a late one. Signing out aborts the
+//!   writes still running (`Accounts::teardown`), so no answer reaches the next account.
 
 use inlet_protocol as p;
 use inlet_state::GuildId;
@@ -21,12 +23,21 @@ use serde_json::Value;
 use super::session::Failure;
 use super::{Active, Backend};
 
+/// Which settings write an answer belongs to: the UI's sign-in session (counted up at
+/// every sign-out) and the write's number within it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WriteId {
+    pub session: u64,
+    pub seq: u64,
+}
+
 /// Commands of this domain.
 pub enum Cmd {
     /// Channels read up to a message: `(channel ID, message ID)`.
     Ack { items: Vec<(String, String)> },
     /// A settings write for a guild (`None`: the direct messages).
     WriteSettings {
+        id: WriteId,
         guild_id: Option<String>,
         body: Value,
     },
@@ -36,6 +47,7 @@ pub enum Cmd {
 pub enum Ev {
     /// A settings write ended: the settings the server answered with, or why it failed.
     SettingsWritten {
+        id: WriteId,
         guild_id: Option<String>,
         result: Result<Value, String>,
     },
@@ -78,7 +90,7 @@ pub(super) fn handle(backend: &mut Backend, cmd: Cmd) {
                 send_acks(r.session.client(), &items);
             }
         }
-        Cmd::WriteSettings { guild_id, body } => {
+        Cmd::WriteSettings { id, guild_id, body } => {
             // Only a guild ID that is one; anything else is answered with a failure, as
             // the UI waits for an answer to every write.
             let guild = match guild_id.as_deref() {
@@ -87,14 +99,23 @@ pub(super) fn handle(backend: &mut Backend, cmd: Cmd) {
             };
             let events = backend.events.clone();
             let answer = move |result: Result<Value, String>| {
-                let _ = events.unbounded_send(Ev::SettingsWritten { guild_id, result });
+                let _ = events.unbounded_send(Ev::SettingsWritten {
+                    id,
+                    guild_id,
+                    result,
+                });
             };
             match (&backend.active, guild) {
                 (Some(Active::Real(r)), Some(guild)) => {
                     let client = r.session.client().clone();
-                    backend.spawn_guarded("write settings", None, async move {
+                    let task = backend.spawn_guarded("write settings", None, async move {
                         answer(write_settings(&client, guild, &body).await);
                     });
+                    // Kept with the session, so signing out aborts it before it answers.
+                    if let Some(Active::Real(r)) = &mut backend.active {
+                        r.settings_writes.retain(|t| !t.is_finished());
+                        r.settings_writes.push(task);
+                    }
                 }
                 #[cfg(feature = "demo")]
                 (Some(Active::Demo(_)), Some(_)) => answer(Ok(Value::Null)),

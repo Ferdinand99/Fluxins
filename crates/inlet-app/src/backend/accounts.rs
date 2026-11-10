@@ -648,6 +648,7 @@ impl Backend {
             active_guild: None,
             policy,
             restart_timer: None,
+            settings_writes: Vec::new(),
         }));
     }
 
@@ -655,6 +656,9 @@ impl Backend {
         r.gateway.close();
         r.forward.abort();
         if let Some(t) = &r.restart_timer {
+            t.abort();
+        }
+        for t in &r.settings_writes {
             t.abort();
         }
         for task in [self.open_guild.take(), self.open_channel.take()]

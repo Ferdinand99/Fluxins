@@ -49,9 +49,11 @@ impl Inlet {
         cx: &mut Context<Self>,
     ) {
         match event {
-            backend::Ev::SettingsWritten { guild_id, result } => {
-                self.on_settings_written(guild_id, result, cx)
-            }
+            backend::Ev::SettingsWritten {
+                id,
+                guild_id,
+                result,
+            } => self.on_settings_written(id, guild_id, result, cx),
         }
     }
 
@@ -183,8 +185,9 @@ impl Inlet {
     /// Settings writes to start now, and the ones refused.
     pub(super) fn tick_settings_writes(&mut self, now: Instant, _cx: &mut Context<Self>) {
         let started = self.notifications.writes.start_due(now);
-        for (guild, body) in started.send {
+        for (id, guild, body) in started.send {
             self.backend.send(backend::Cmd::WriteSettings {
+                id,
                 guild_id: guild.map(|g| g.to_string()),
                 body,
             });
@@ -199,6 +202,7 @@ impl Inlet {
     /// again, and the error is shown.
     pub(crate) fn on_settings_written(
         &mut self,
+        id: backend::WriteId,
         guild_id: Option<String>,
         result: Result<Value, String>,
         cx: &mut Context<Self>,
@@ -210,13 +214,14 @@ impl Inlet {
                 None => return,
             },
         };
-        // A late answer of an earlier session finds nothing in flight.
-        if !self.notifications.writes.is_in_flight(guild) {
+        // Only the answer to the write in flight counts: a late answer of another write,
+        // or of an account that signed out since, is ignored.
+        if !self.notifications.writes.is_in_flight(guild, id) {
             return;
         }
         // What the server holds if it took the write: the confirmed settings with the
         // write on top. Its own answer, when it gives one, wins field by field.
-        let assumed = self.notifications.writes.finish(guild, result.is_ok());
+        let assumed = self.notifications.writes.finish(guild, id, result.is_ok());
         match result {
             Ok(answer) => {
                 let mut obj = match assumed {

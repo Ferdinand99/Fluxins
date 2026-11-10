@@ -14,8 +14,9 @@
 //! - `badge`: the pill and the count, and the rules for what a row shows.
 //!
 //! For the message view: its read marks call [`Inlet::read_channel`], which decides and
-//! sends the acknowledgement; [`Inlet::read_if_watched`] reads the open channel when the
-//! window gets focus or the list comes back to the bottom. The "NEW" divider keeps using
+//! sends the acknowledgement; [`Inlet::read_if_watched`] reads the open channel once a
+//! second when it is watched, and at once when the window gets focus or the list reports
+//! the bottom. The "NEW" divider keeps using
 //! the position the view captured when the channel was opened.
 
 pub mod badge;
@@ -62,9 +63,19 @@ pub struct State {
     /// Settings changes that are not confirmed yet.
     writes: SettingsBatch,
     pub settings: Option<SettingsWindow>,
+    /// Whether the window has focus, kept by the window's activation observer.
+    pub window_active: bool,
 }
 
 impl State {
+    /// Nothing yet, in a window that has focus (`window_active`) or not.
+    pub fn new(window_active: bool) -> Self {
+        State {
+            window_active,
+            ..State::default()
+        }
+    }
+
     /// Brings the badges up to date after the account state changed.
     pub fn refresh_badges(
         &mut self,
@@ -74,9 +85,15 @@ impl State {
         self.badges.refresh(state, changes);
     }
 
-    /// Forgets everything (signed out).
+    /// Forgets everything (signed out). The settings writes start a new session, so a
+    /// late answer to this one's writes is not taken for the next account's; whether
+    /// the window has focus is not about the account and stays.
     pub fn clear(&mut self) {
-        *self = State::default();
+        *self = State {
+            writes: self.writes.next_session(),
+            window_active: self.window_active,
+            ..State::default()
+        };
     }
 }
 
