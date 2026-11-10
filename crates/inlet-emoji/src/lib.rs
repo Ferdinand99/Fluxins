@@ -6,8 +6,9 @@
 //! * [`search`] ranks matches the way Fluxer's emoji picker does.
 //! * [`twemoji_svg`] returns the Twemoji drawing of a glyph (CC-BY-4.0, see
 //!   `LICENSE-TWEMOJI`). The drawings are kept compressed in the binary and unpacked one at
-//!   a time. Callers draw them with the image code in `inlet-media`; SVG files from the
-//!   network are never drawn.
+//!   a time. `inlet-media` does not draw SVG and refuses it. SVG drawing, when it is added,
+//!   is a separate API for these bundled drawings only, and no network bytes can reach it
+//!   (not `inlet-media`'s `load` or `decode`).
 //! * [`emoji_only`] tells whether a message is only emoji, which Fluxer shows larger.
 
 mod data;

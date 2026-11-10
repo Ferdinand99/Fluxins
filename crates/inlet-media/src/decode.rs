@@ -161,10 +161,27 @@ fn estimate_peak(
     animated: bool,
     encoded: usize,
 ) -> u64 {
-    let pixels = u64::from(width) * u64::from(height);
-    let mut peak = pixels * (bytes_per_pixel + 8) + encoded as u64 + 8 * MIB;
+    estimate_peak_pixels(
+        u64::from(width) * u64::from(height),
+        bytes_per_pixel,
+        animated,
+        encoded,
+    )
+}
+
+fn estimate_peak_pixels(pixels: u64, bytes_per_pixel: u64, animated: bool, encoded: usize) -> u64 {
+    // Still images: the decoder's buffer, an RGBA8 copy and a working copy. An
+    // animation holds three canvases (the canvas, the previous one and the frame) and
+    // the raw frame next to the RGBA copy, so at least 4 bytes per pixel and 12 more.
+    let per_pixel = if animated {
+        bytes_per_pixel.max(4) + 12
+    } else {
+        bytes_per_pixel + 8
+    };
+    let mut peak = pixels * per_pixel + encoded as u64 + 8 * MIB;
     if animated {
-        peak += 32 * MIB;
+        // The finished frames, up to the animation cap of 64 MiB.
+        peak += 64 * MIB;
     }
     peak
 }
@@ -173,14 +190,16 @@ fn image_limits(limits: &KindLimits) -> Limits {
     let mut image_limits = Limits::default();
     image_limits.max_image_width = Some(limits.max_width);
     image_limits.max_image_height = Some(limits.max_height);
-    // Room for the RGBA canvas, one working copy and the decoder's own buffers.
-    image_limits.max_alloc = Some(limits.max_pixels.saturating_mul(4 * 3) + 16 * MIB);
+    // Room for what an animation holds at the pixel limit: the canvas, the canvas of
+    // the previous frame, the frame, and the decoder's own buffers.
+    image_limits.max_alloc = Some(limits.max_pixels.saturating_mul(4 * 6) + 16 * MIB);
     image_limits
 }
 
 fn inspect_checked(bytes: Bytes, limits: &KindLimits) -> Result<Inspected, MediaError> {
     let format = image::guess_format(&bytes).map_err(|_| MediaError::Unsupported)?;
     let encoded = bytes.len();
+    let mut gif_peak = None;
     let (bytes, width, height, animated, bpp) = match format {
         ImageFormat::Png => {
             let bytes = scan_png(&bytes)?.map_or(bytes, Bytes::from);
@@ -199,6 +218,12 @@ fn inspect_checked(bytes: Bytes, limits: &KindLimits) -> Result<Inspected, Media
         }
         ImageFormat::Gif => {
             let scan = scan_gif(&bytes, limits)?;
+            // A frame can be larger than the canvas; the bigger of the two is the
+            // size of the working buffers.
+            let pixels =
+                (u64::from(scan.width) * u64::from(scan.height)).max(scan.largest_frame_pixels);
+            let peak = estimate_peak_pixels(pixels, 4, scan.frames > 1, encoded);
+            gif_peak = Some(peak);
             (bytes, scan.width, scan.height, scan.frames > 1, 4)
         }
         ImageFormat::WebP => {
@@ -220,7 +245,7 @@ fn inspect_checked(bytes: Bytes, limits: &KindLimits) -> Result<Inspected, Media
     };
     check_dimensions(width, height, limits)?;
     Ok(Inspected {
-        peak: estimate_peak(width, height, bpp, animated, encoded),
+        peak: gif_peak.unwrap_or_else(|| estimate_peak(width, height, bpp, animated, encoded)),
         bytes,
         format,
         width,
