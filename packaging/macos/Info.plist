@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Info.plist template for Inlet.app. packaging/macos/build-app.sh fills in
+  @SHORT_VERSION@ and @BUNDLE_VERSION@ from the workspace version in Cargo.toml.
+
+  LSMinimumSystemVersion follows gpui upstream (Zed bundles with 12.0); the
+  binary is Apple silicon only.
+-->
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>Inlet</string>
+	<key>CFBundleExecutable</key>
+	<string>inlet</string>
+	<key>CFBundleIconFile</key>
+	<string>inlet</string>
+	<key>CFBundleIdentifier</key>
+	<string>no.opland.inlet</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>Inlet</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>@SHORT_VERSION@</string>
+	<key>CFBundleVersion</key>
+	<string>@BUNDLE_VERSION@</string>
+	<key>CFBundleSupportedPlatforms</key>
+	<array>
+		<string>MacOSX</string>
+	</array>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.social-networking</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>12.0</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSSupportsAutomaticGraphicsSwitching</key>
+	<true/>
+	<key>NSHumanReadableCopyright</key>
+	<string>Inlet is free software under the GNU AGPL 3.0 or later.</string>
+	<!--
+	  Voice and screen sharing (milestones v0.2 and v0.3). Enable these together
+	  with the matching entries in entitlements.plist when the voice code lands;
+	  until then Inlet never asks for the microphone or the camera.
+
+	  Screen recording has no usage-string key: macOS asks for the
+	  "Screen & System Audio Recording" permission itself the first time
+	  ScreenCaptureKit is used, and a non-sandboxed app needs no entitlement for it.
+
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Inlet uses the microphone when you join a voice channel or a call.</string>
+	<key>NSCameraUsageDescription</key>
+	<string>Inlet uses the camera when you turn on video in a voice channel or a call.</string>
+	-->
+</dict>
+</plist>

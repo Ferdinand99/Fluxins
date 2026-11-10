@@ -1,0 +1,259 @@
+name: macOS signing
+
+# Reusable workflow: signs, notarises and staples an Inlet.app that an earlier
+# job built, then wraps it in a DMG that is signed, notarised and stapled too.
+#
+# Callers: release.yml (tags v*) and macos-sign-check.yml (manual, main only).
+# The job runs in the protected environment "release": every run waits for
+# approval, and only tags v* and the branch main may use it. Nothing here
+# compiles code; the app arrives as an artifact from a job without secrets.
+#
+# The scripts and entitlements come from the caller's own commit (the tag, or
+# main), never from a ref chosen at run time.
+#
+# Never add `set -x` to any step here.
+
+on:
+  workflow_call:
+    inputs:
+      app-artifact:
+        description: Artifact that holds inlet-macos-aarch64-app.tar.gz (an unsigned Inlet.app)
+        type: string
+        default: inlet-macos-aarch64-app
+      dmg-artifact:
+        description: Name of the artifact to upload the signed DMG as
+        type: string
+        default: inlet-macos-aarch64-dmg
+      retention-days:
+        description: How long the DMG artifact is kept
+        type: number
+        default: 7
+
+permissions:
+  contents: read
+
+jobs:
+  sign:
+    name: Sign and notarise (macOS)
+    runs-on: macos-latest
+    timeout-minutes: 120
+    environment: release
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: All signing secrets are present
+        env:
+          MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
+        run: |
+          missing=0
+          for name in MACOS_CERT_P12_BASE64 MACOS_CERT_PASSWORD APPLE_TEAM_ID \
+                      APPLE_API_KEY_ID APPLE_API_ISSUER_ID APPLE_API_KEY_P8_BASE64; do
+            if [ -z "${!name:-}" ]; then
+              echo "::error::The secret $name is empty or missing in the environment 'release'"
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Choose the keychain path
+        run: echo "KEYCHAIN=$RUNNER_TEMP/inlet-signing.keychain-db" >> "$GITHUB_ENV"
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ inputs.app-artifact }}
+          path: ${{ runner.temp }}/app-artifact
+
+      - name: Unpack the unsigned app
+        run: |
+          mkdir -p build
+          tar -xzf "$RUNNER_TEMP/app-artifact/inlet-macos-aarch64-app.tar.gz" -C build
+          test -x build/Inlet.app/Contents/MacOS/inlet
+          plutil -lint build/Inlet.app/Contents/Info.plist
+          id=$(plutil -extract CFBundleIdentifier raw -o - build/Inlet.app/Contents/Info.plist)
+          if [ "$id" != "no.opland.inlet" ]; then
+            echo "::error::Unexpected bundle identifier: $id"
+            exit 1
+          fi
+
+      # The Developer ID intermediate certificate, so codesign can build the
+      # chain to Apple's root. Pinned by its SHA-256 fingerprint.
+      - name: Fetch the Developer ID G2 intermediate certificate
+        env:
+          CA_URL: https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer
+          CA_SHA256: f16cd3c54c7f83cea4bf1a3e6a0819c8aaa8e4a1528fd144715f350643d2df3a
+        run: |
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/DeveloperIDG2CA.cer" "$CA_URL"
+          echo "$CA_SHA256  $RUNNER_TEMP/DeveloperIDG2CA.cer" | shasum -a 256 -c -
+
+      - name: Import the certificate into a temporary keychain
+        env:
+          MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          # A fresh random password; it only lives in this step.
+          keychain_password=$(openssl rand -base64 32)
+          security create-keychain -p "$keychain_password" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$keychain_password" "$KEYCHAIN"
+
+          p12="$RUNNER_TEMP/inlet-signing.p12"
+          (
+            umask 077
+            printf '%s' "$MACOS_CERT_P12_BASE64" | base64 --decode > "$p12"
+          )
+          security import "$p12" -k "$KEYCHAIN" -f pkcs12 -P "$MACOS_CERT_PASSWORD" \
+            -T /usr/bin/codesign > /dev/null
+          rm -f "$p12"
+          security import "$RUNNER_TEMP/DeveloperIDG2CA.cer" -k "$KEYCHAIN" > /dev/null
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
+            -k "$keychain_password" "$KEYCHAIN" > /dev/null
+
+          # Put the keychain first in the user search list, keep the others.
+          keychains=("$KEYCHAIN")
+          while IFS= read -r line; do
+            line=$(printf '%s' "$line" | sed -e 's/^[[:space:]]*"//' -e 's/"[[:space:]]*$//')
+            if [ -n "$line" ]; then keychains+=("$line"); fi
+          done < <(security list-keychains -d user)
+          security list-keychains -d user -s "${keychains[@]}"
+
+          # Pick the Developer ID Application identity of the team. Its SHA-1
+          # hash is used for signing; the name is never written to the log.
+          identities=$(security find-identity -v -p codesigning "$KEYCHAIN" \
+            | awk -v team="($APPLE_TEAM_ID)\"" \
+                'index($0, "\"Developer ID Application: ") && index($0, team) { print $2 }')
+          count=$(printf '%s\n' "$identities" | grep -c . || true)
+          if [ "$count" -ne 1 ]; then
+            echo "::error::Expected one valid Developer ID Application identity for the team, found $count"
+            exit 1
+          fi
+          echo "SIGN_IDENTITY=$identities" >> "$GITHUB_ENV"
+          echo "Found the Developer ID Application identity of the team"
+
+      - name: Sign the app
+        run: |
+          codesign --force --options runtime --timestamp \
+            --entitlements packaging/macos/entitlements.plist \
+            --keychain "$KEYCHAIN" --sign "$SIGN_IDENTITY" \
+            build/Inlet.app
+
+      - name: Verify the app signature
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          codesign --verify --deep --strict --verbose=2 build/Inlet.app
+          info=$(codesign --display --verbose=4 build/Inlet.app 2>&1)
+          printf '%s\n' "$info" | grep -E '^(Identifier|Format|CodeDirectory|Timestamp|Runtime Version)'
+          check() {
+            if ! printf '%s\n' "$info" | grep -Eq "$1"; then
+              echo "::error::$2"
+              exit 1
+            fi
+          }
+          check '^Identifier=no\.opland\.inlet$' "The signature has the wrong identifier"
+          check '^CodeDirectory .*flags=.*runtime' "The hardened runtime is not on"
+          check '^Authority=Developer ID Application: ' "Not signed with a Developer ID Application certificate"
+          check '^Timestamp=' "The signature has no secure timestamp"
+          check "^TeamIdentifier=${APPLE_TEAM_ID}\$" "The signature has the wrong team"
+          echo "Entitlements:"
+          codesign --display --entitlements - --xml build/Inlet.app | plutil -p - || true
+
+      - name: Notarise and staple the app
+        env:
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
+        run: |
+          ditto -c -k --keepParent build/Inlet.app "$RUNNER_TEMP/Inlet-notarize.zip"
+          packaging/macos/notarize.sh "$RUNNER_TEMP/Inlet-notarize.zip" build/Inlet.app
+          rm -f "$RUNNER_TEMP/Inlet-notarize.zip"
+
+      # Gatekeeper's own verdict. Before notarisation this rejects a Developer ID
+      # app, so it runs after stapling.
+      - name: Gatekeeper accepts the app
+        run: |
+          out=$(spctl --assess --type execute -vv build/Inlet.app 2>&1) || true
+          printf '%s\n' "$out" | grep -E '^(build/Inlet.app|source=)'
+          printf '%s\n' "$out" | grep -q '^source=Notarized Developer ID$'
+
+      - name: Build the DMG
+        run: |
+          stage="$RUNNER_TEMP/dmg-stage"
+          rm -rf "$stage"
+          mkdir -p "$stage" dist
+          ditto build/Inlet.app "$stage/Inlet.app"
+          ln -s /Applications "$stage/Applications"
+          # hdiutil now and then fails with "Resource busy" on hosted runners.
+          for attempt in 1 2 3; do
+            if hdiutil create -volname Inlet -srcfolder "$stage" -fs HFS+ \
+                 -format UDZO -ov dist/inlet-macos-aarch64.dmg; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then exit 1; fi
+            sleep 15
+          done
+
+      - name: Sign the DMG
+        run: |
+          codesign --force --timestamp --keychain "$KEYCHAIN" --sign "$SIGN_IDENTITY" \
+            dist/inlet-macos-aarch64.dmg
+          codesign --verify --strict --verbose=2 dist/inlet-macos-aarch64.dmg
+
+      - name: Notarise and staple the DMG
+        env:
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
+        run: packaging/macos/notarize.sh dist/inlet-macos-aarch64.dmg dist/inlet-macos-aarch64.dmg
+
+      - name: Gatekeeper accepts the DMG and the app inside it
+        run: |
+          out=$(spctl --assess --type open --context context:primary-signature -vv \
+            dist/inlet-macos-aarch64.dmg 2>&1) || true
+          printf '%s\n' "$out" | grep -E '^(dist/|source=)'
+          printf '%s\n' "$out" | grep -q '^source=Notarized Developer ID$'
+
+          mnt="$RUNNER_TEMP/dmg-mount"
+          mkdir -p "$mnt"
+          hdiutil attach -nobrowse -readonly -mountpoint "$mnt" dist/inlet-macos-aarch64.dmg > /dev/null
+          status=0
+          codesign --verify --deep --strict "$mnt/Inlet.app" || status=1
+          spctl --assess --type execute "$mnt/Inlet.app" || status=1
+          test -L "$mnt/Applications" || status=1
+          hdiutil detach "$mnt" > /dev/null || hdiutil detach -force "$mnt" > /dev/null
+          exit "$status"
+
+      - name: Checksum
+        working-directory: dist
+        run: shasum -a 256 inlet-macos-aarch64.dmg | tee inlet-macos-aarch64.dmg.sha256
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ inputs.dmg-artifact }}
+          path: |
+            dist/inlet-macos-aarch64.dmg
+            dist/inlet-macos-aarch64.dmg.sha256
+          if-no-files-found: error
+          retention-days: ${{ inputs.retention-days }}
+
+      - name: Delete the temporary keychain and key files
+        if: always()
+        run: |
+          KEYCHAIN=${KEYCHAIN:-$RUNNER_TEMP/inlet-signing.keychain-db}
+          if [ -f "$KEYCHAIN" ]; then
+            security delete-keychain "$KEYCHAIN" || rm -f "$KEYCHAIN"
+          fi
+          rm -f "$RUNNER_TEMP/inlet-signing.p12" "$RUNNER_TEMP/Inlet-notarize.zip"
+          rm -rf "$RUNNER_TEMP"/notary.*

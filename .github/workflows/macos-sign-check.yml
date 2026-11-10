@@ -1,0 +1,89 @@
+name: macOS signing check
+
+# Manual end-to-end check of macOS signing and notarisation, without a release.
+# Builds Inlet from the integration branch v0, signs and notarises it, and
+# keeps the DMG as an artifact for three days.
+#
+# Start it from the branch main (Actions > macOS signing check > Run workflow).
+# The signing job uses the protected environment "release", which only allows
+# main and tags v*, and waits for approval. The ref that is built is fixed to
+# v0 on purpose: a free ref input next to the signing secrets would let any
+# branch be signed.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-sign-check
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  RUSTUP_MAX_RETRIES: 10
+
+jobs:
+  build:
+    name: Build Inlet.app from v0 (unsigned)
+    if: github.ref == 'refs/heads/main'
+    runs-on: macos-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: v0
+          persist-credentials: false
+
+      - name: Record the commit that is built
+        run: |
+          rev=$(git rev-parse HEAD)
+          echo "INLET_SOURCE_REV=$rev" >> "$GITHUB_ENV"
+          echo "Building v0 at $rev"
+
+      - name: Install the pinned Rust toolchain
+        run: |
+          rustup toolchain install
+          rustc --version
+          cargo --version
+
+      # gpui compiles Metal shaders at build time. Recent Xcode versions ship the
+      # Metal toolchain as a separate download.
+      - name: Make sure the Metal toolchain is available
+        run: |
+          if ! xcrun --find metal >/dev/null 2>&1 || ! xcrun metal --version >/dev/null 2>&1; then
+            xcodebuild -downloadComponent MetalToolchain
+          fi
+          xcrun metal --version
+
+      - name: Build
+        run: cargo build --release --locked -p inlet
+
+      - name: Assemble Inlet.app
+        run: |
+          packaging/macos/build-app.sh target/release/inlet dist-app
+          tar -czf inlet-macos-aarch64-app.tar.gz -C dist-app Inlet.app
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: inlet-macos-aarch64-app
+          path: inlet-macos-aarch64-app.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  sign:
+    name: Sign
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/macos-sign.yml
+    with:
+      app-artifact: inlet-macos-aarch64-app
+      dmg-artifact: inlet-macos-aarch64-dmg-check
+      retention-days: 3
