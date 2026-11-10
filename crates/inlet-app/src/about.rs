@@ -51,13 +51,10 @@ fn wrap(line: &str, width: usize) -> Vec<String> {
     out
 }
 
-/// The source of exactly this build: the commit CI built from, or the version tag.
+/// The source of this build: the commit it was built from, or the `v0` branch.
 pub fn source_link() -> String {
-    match option_env!("INLET_SOURCE_REV") {
-        Some(rev) if !rev.is_empty() => format!("{SOURCE_URL}/tree/{rev}"),
-        // A local build has no commit to point at: link the repository (default branch).
-        _ => SOURCE_URL.to_string(),
-    }
+    // Set by build.rs: CI's commit, the local git commit, or the `v0` branch.
+    format!("{SOURCE_URL}/tree/{}", env!("INLET_SOURCE_REV"))
 }
 
 pub fn render(show_licences: bool, cx: &mut Context<Inlet>) -> impl IntoElement {
