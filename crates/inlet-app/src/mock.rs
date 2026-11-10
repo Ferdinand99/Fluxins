@@ -1,5 +1,7 @@
-//! Demo data, used only when the `INLET_DEMO` environment variable is set.
-//! Lets the UI be tried and screenshotted without an account.
+// SPDX-License-Identifier: AGPL-3.0-or-later
+//! Demo data, compiled only with the `demo` cargo feature and used only when the
+//! `INLET_DEMO` environment variable is set. Lets the UI be tried and screenshotted
+//! without an account. It touches neither the network nor the keychain.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -30,15 +32,33 @@ fn channel(id: &str, name: &str, kind: ChannelKind, parent: Option<&str>, positi
 }
 
 fn msg(id: u64, channel_id: &str, author: &str, time: &str, content: &str) -> Message {
-    Message {
+    let minutes = time
+        .split_once(':')
+        .and_then(|(h, m)| Some(h.parse::<i64>().ok()? * 60 + m.parse::<i64>().ok()?))
+        .unwrap_or(0);
+    let mut m = Message {
         id: id.to_string(),
         channel_id: channel_id.into(),
+        author_id: format!("user-{author}"),
         author: author.into(),
+        author_username: author.into(),
+        timestamp_ms: 1_794_000_000_000 + minutes * 60_000,
         timestamp: format!("2026-11-10 {time}"),
         content: content.into(),
+        blocks: vec![],
+        truncated: false,
         attachments: vec![],
         edited: false,
-    }
+    };
+    m.parse();
+    m
+}
+
+fn live(id: u64, channel_id: &str, author: &str, content: &str) -> Message {
+    let mut m = msg(id, channel_id, author, "", content);
+    m.timestamp_ms = chrono::Utc::now().timestamp_millis();
+    m.timestamp = now();
+    m
 }
 
 fn now() -> String {
@@ -95,6 +115,7 @@ impl MockSession {
             ),
             msg(5, "c-general", "linus", "09:18", "> Quotes render too\nand links: https://fluxer.app"),
             msg(6, "c-general", "grace", "09:20", "||spoiler text|| and a list:\n- one\n- two"),
+            msg(8, "c-general", "ada", "09:20", "Masked link: [Confirm your account](https://fluxer-login.example/verify)"),
         ];
         general.push(Message {
             attachments: vec![Attachment {
@@ -102,6 +123,12 @@ impl MockSession {
                 url: "https://example.invalid/attachments/screenshot.png".into(),
             }],
             ..msg(7, "c-general", "ada", "09:21", "Attachments show as links in v0.")
+        });
+        // Same display name, different account: gets its own header and shows @username.
+        general.push(Message {
+            author_id: "user-impostor".into(),
+            author_username: "not_ada".into(),
+            ..msg(9, "c-general", "ada", "09:21", "Same name, other account.")
         });
         messages.insert("c-general".into(), general);
         messages.insert(
@@ -130,17 +157,15 @@ impl MockSession {
             let interval = std::env::var("INLET_DEMO_LIVE_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(12);
+                .unwrap_or(12)
+                .max(1);
             tokio::spawn(async move {
                 let mut n = 0u64;
                 loop {
                     tokio::time::sleep(Duration::from_secs(interval)).await;
                     let Some(channel_id) = open.lock().unwrap().clone() else { continue };
                     n += 1;
-                    let m = Message {
-                        timestamp: now(),
-                        ..msg(1000 + n, &channel_id, "linus", "", &format!("Live message #{n} from the demo gateway"))
-                    };
+                    let m = live(1000 + n, &channel_id, "linus", &format!("Live message #{n} from the demo gateway"));
                     messages.lock().unwrap().entry(channel_id).or_default().push(m.clone());
                     let _ = events.unbounded_send(Event::MessageCreated(m));
                 }
@@ -167,15 +192,8 @@ impl MockSession {
 
     pub fn send(&mut self, channel_id: String, text: String) {
         self.next_id += 1;
-        let m = Message {
-            id: format!("local-{}", self.next_id),
-            channel_id: channel_id.clone(),
-            author: "demo".into(),
-            timestamp: now(),
-            content: text,
-            attachments: vec![],
-            edited: false,
-        };
+        let mut m = live(self.next_id, &channel_id, "demo", &text);
+        m.id = format!("local-{}", self.next_id);
         self.messages.lock().unwrap().entry(channel_id).or_default().push(m.clone());
         let _ = self.events.unbounded_send(Event::MessageCreated(m));
     }

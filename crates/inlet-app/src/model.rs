@@ -1,5 +1,17 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
 //! What the UI shows. The backend converts protocol types into these, so the views do
 //! not depend on the wire format.
+
+use crate::markdown::Block;
+
+/// Longest name shown anywhere (guild, channel, author, file).
+pub const MAX_NAME_CHARS: usize = 100;
+/// Message text drawn before "Show more".
+pub const DISPLAY_CHARS: usize = 4_000;
+/// Message text kept at all; the rest is dropped before parsing.
+pub const MAX_CONTENT_BYTES: usize = 16 * 1024;
+/// Consecutive messages from the same author within this window share one header.
+pub const GROUP_WINDOW_MS: i64 = 7 * 60 * 1000;
 
 #[derive(Clone, Debug)]
 pub struct Guild {
@@ -55,12 +67,82 @@ pub struct Attachment {
 pub struct Message {
     pub id: String,
     pub channel_id: String,
+    pub author_id: String,
+    /// Display name, cleaned.
     pub author: String,
+    /// Account name, cleaned; shown next to the display name when they differ.
+    pub author_username: String,
+    /// Milliseconds since the Unix epoch.
+    pub timestamp_ms: i64,
     /// Already formatted for display, in local time.
     pub timestamp: String,
     pub content: String,
+    /// The first [`DISPLAY_CHARS`] of `content`, parsed. Parsed on the backend thread.
+    pub blocks: Vec<Block>,
+    /// `content` is longer than what `blocks` shows.
+    pub truncated: bool,
     pub attachments: Vec<Attachment>,
     pub edited: bool,
+}
+
+impl Message {
+    /// Fills `blocks` and `truncated` from `content`. Caps the stored content first.
+    pub fn parse(&mut self) {
+        if self.content.len() > MAX_CONTENT_BYTES {
+            let cut = floor_char_boundary(&self.content, MAX_CONTENT_BYTES);
+            self.content.truncate(cut);
+        }
+        let shown = match self.content.char_indices().nth(DISPLAY_CHARS) {
+            Some((ix, _)) => {
+                self.truncated = true;
+                &self.content[..ix]
+            }
+            None => {
+                self.truncated = false;
+                &self.content[..]
+            }
+        };
+        self.blocks = crate::markdown::parse(shown);
+    }
+}
+
+fn floor_char_boundary(s: &str, mut ix: usize) -> usize {
+    while ix > 0 && !s.is_char_boundary(ix) {
+        ix -= 1;
+    }
+    ix
+}
+
+/// Whether `next` is drawn under `prev`'s header: same account, close in time.
+/// Grouping is by account ID, never by display name, so a look-alike name gets its own header.
+pub fn should_group(prev: &Message, next: &Message) -> bool {
+    prev.author_id == next.author_id
+        && next.timestamp_ms >= prev.timestamp_ms
+        && next.timestamp_ms - prev.timestamp_ms <= GROUP_WINDOW_MS
+}
+
+/// Removes characters that can fake or break a name: control characters, line breaks,
+/// bidi overrides and isolates, zero-width characters. Caps the length.
+pub fn clean_name(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .filter(|c| !is_hidden_or_control(*c))
+        .take(MAX_NAME_CHARS)
+        .collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() { "(no name)".into() } else { trimmed.to_string() }
+}
+
+fn is_hidden_or_control(c: char) -> bool {
+    c.is_control()
+        || matches!(c,
+            '\u{200B}'..='\u{200F}'   // zero-width space/joiners, LRM, RLM
+            | '\u{202A}'..='\u{202E}' // embeddings and overrides
+            | '\u{2066}'..='\u{2069}' // isolates
+            | '\u{2028}' | '\u{2029}' // line and paragraph separators
+            | '\u{FEFF}'              // zero-width no-break space
+            | '\u{061C}'              // Arabic letter mark
+        )
 }
 
 /// Orders channels the way the sidebar shows them: uncategorised first, then each
@@ -87,11 +169,14 @@ pub fn sidebar_order(channels: &[Channel]) -> Vec<Channel> {
     out
 }
 
-/// Formats an RFC 3339 timestamp in local time; falls back to the raw text.
-pub fn format_timestamp(rfc3339: &str) -> String {
+/// Parses an RFC 3339 timestamp into (milliseconds since epoch, local display text).
+pub fn timestamp(rfc3339: &str) -> (i64, String) {
     match chrono::DateTime::parse_from_rfc3339(rfc3339) {
-        Ok(t) => t.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string(),
-        Err(_) => rfc3339.to_string(),
+        Ok(t) => (
+            t.timestamp_millis(),
+            t.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string(),
+        ),
+        Err(_) => (0, clean_name(rfc3339)),
     }
 }
 
@@ -101,6 +186,23 @@ mod tests {
 
     fn ch(id: &str, kind: ChannelKind, parent: Option<&str>, pos: i64) -> Channel {
         Channel { id: id.into(), name: id.into(), kind, parent_id: parent.map(Into::into), position: pos }
+    }
+
+    pub(crate) fn msg(id: &str, author_id: &str, author: &str, t: i64) -> Message {
+        Message {
+            id: id.into(),
+            channel_id: "c".into(),
+            author_id: author_id.into(),
+            author: author.into(),
+            author_username: author.into(),
+            timestamp_ms: t,
+            timestamp: String::new(),
+            content: String::new(),
+            blocks: vec![],
+            truncated: false,
+            attachments: vec![],
+            edited: false,
+        }
     }
 
     #[test]
@@ -119,5 +221,44 @@ mod tests {
     fn initials() {
         assert_eq!(Guild { id: "1".into(), name: "Inlet Dev Hub".into() }.initials(), "IDH");
         assert_eq!(Guild { id: "1".into(), name: "".into() }.initials(), "?");
+    }
+
+    #[test]
+    fn groups_by_account_not_by_name() {
+        let a = msg("1", "100", "ada", 0);
+        let same = msg("2", "100", "ada", 60_000);
+        let impostor = msg("3", "200", "ada", 60_000);
+        assert!(should_group(&a, &same));
+        assert!(!should_group(&a, &impostor));
+    }
+
+    #[test]
+    fn groups_only_within_the_time_window() {
+        let a = msg("1", "100", "ada", 0);
+        assert!(should_group(&a, &msg("2", "100", "ada", GROUP_WINDOW_MS)));
+        assert!(!should_group(&a, &msg("2", "100", "ada", GROUP_WINDOW_MS + 1)));
+        assert!(!should_group(&msg("2", "100", "ada", 10_000), &msg("1", "100", "ada", 0)));
+    }
+
+    #[test]
+    fn clean_name_strips_bidi_control_and_zero_width() {
+        assert_eq!(clean_name("ad\u{202E}a"), "ada");
+        assert_eq!(clean_name("a\u{200B}d\u{2066}a\u{2069}"), "ada");
+        assert_eq!(clean_name("line\nbreak\t"), "linebreak");
+        assert_eq!(clean_name("\u{202E}\u{200F}"), "(no name)");
+        assert_eq!(clean_name("Åse 😀"), "Åse 😀");
+        assert_eq!(clean_name(&"x".repeat(500)).chars().count(), MAX_NAME_CHARS);
+    }
+
+    #[test]
+    fn long_content_is_truncated_for_display() {
+        let mut m = msg("1", "1", "a", 0);
+        m.content = "ø".repeat(DISPLAY_CHARS + 10);
+        m.parse();
+        assert!(m.truncated);
+        let mut big = msg("2", "1", "a", 0);
+        big.content = "x".repeat(MAX_CONTENT_BYTES * 2);
+        big.parse();
+        assert_eq!(big.content.len(), MAX_CONTENT_BYTES);
     }
 }
