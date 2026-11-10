@@ -2,35 +2,46 @@
 //!
 //! [`Gateway::connect`] spawns a task on the current tokio runtime and returns
 //! a [`GatewayHandle`] for commands and a receiver of [`GatewayEvent`]s. The
-//! task connects to `endpoints.gateway` with
-//! `?v=1&encoding=json&compress=zstd-stream&stream=1`, waits for Hello,
-//! heartbeats (first beat after a random part of the interval), sends Identify
-//! (or Resume when it has a session), and reconnects with exponential backoff
-//! and jitter. It resumes within Fluxer's 60-second window and identifies
-//! again after Invalid Session. It stops for good on close codes that a retry
-//! cannot fix (bad token 4004, version 4012, shard 4010/4011), on
-//! [`GatewayHandle::close`], or when the event receiver is dropped.
+//! task connects to `endpoints.gateway` (which must be `wss://`, or `ws://` on
+//! a loopback host) with `?v=1&encoding=json&compress=zstd-stream&stream=1`,
+//! waits for Hello, heartbeats (first beat after a random part of the
+//! interval), sends Identify (or Resume when it has a session), and reconnects
+//! with exponential backoff and jitter.
+//!
+//! - It resumes within Fluxer's 60-second window and identifies again after
+//!   Invalid Session, at most once every 5 seconds.
+//! - The backoff only resets after a connection has been stable for 60 s.
+//!   Close 4008 (rate limited) and protocol errors wait at least 30 s.
+//! - It stops for good on close codes a retry cannot fix (4004 bad token,
+//!   4010/4011 shard, 4012 version), on [`GatewayHandle::close`], when every
+//!   handle is dropped, or when the event receiver is dropped.
+//! - Heartbeats keep running when the event channel is full: the task stops
+//!   reading the socket until the receiver catches up.
 //!
 //! Large guilds (over 250 members) are passive until you call
 //! [`GatewayHandle::set_guild_active`]: a passive session gets no
-//! MESSAGE_CREATE there except mentions. Call it for the guild on screen.
+//! MESSAGE_CREATE there except mentions. The task remembers active guilds and
+//! the status, and sends them again after every Identify and Resume. Commands
+//! sent while disconnected are kept (up to 64) and sent once connected.
 
 pub mod codec;
 
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use rand::Rng;
+use serde::Deserialize;
 use serde_json::{json, Value};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::time::{sleep, timeout, Instant};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
-use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+use tokio_tungstenite::tungstenite::protocol::{CloseFrame, WebSocketConfig};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-use crate::instance::Instance;
+use crate::instance::{require_scheme, Instance};
 use crate::models::{Channel, GuildDelete, GuildReady, Message, MessageDelete, Ready, TypingStart};
 use crate::token::Token;
 use codec::ZstdStream;
@@ -41,6 +52,24 @@ pub const FLAG_DEBOUNCE_MESSAGE_REACTIONS: u32 = 1 << 1;
 pub const FLAG_CHANNEL_THREADS: u32 = 1 << 2;
 /// Identify session flag: receive guilds the account is visiting.
 pub const FLAG_GUILD_VISITS: u32 = 1 << 3;
+
+/// Shortest time between two Identify payloads.
+const IDENTIFY_SPACING: Duration = Duration::from_secs(5);
+/// A connection that lasted this long after READY resets the backoff.
+const STABLE_AFTER: Duration = Duration::from_secs(60);
+/// Shortest wait after close 4008 or a protocol error.
+const LONG_BACKOFF: Duration = Duration::from_secs(30);
+/// How long to wait for READY/RESUMED after Identify/Resume.
+const READY_TIMEOUT: Duration = Duration::from_secs(90);
+/// Commands kept while disconnected.
+const MAX_QUEUED: usize = 64;
+/// Capacity of the command channel.
+const COMMAND_BUFFER: usize = 256;
+/// Guilds per Lazy Request when replaying subscriptions (keeps payloads under 16 KiB).
+const LAZY_CHUNK: usize = 50;
+/// Allowed `heartbeat_interval` range.
+const HEARTBEAT_MIN: Duration = Duration::from_secs(1);
+const HEARTBEAT_MAX: Duration = Duration::from_secs(120);
 
 /// The `properties` of Identify.
 #[derive(Debug, Clone)]
@@ -80,8 +109,10 @@ pub struct GatewayOptions {
     pub backoff_base: Duration,
     /// Longest reconnect delay.
     pub backoff_max: Duration,
-    /// Capacity of the event channel. When full, the gateway task waits.
+    /// Capacity of the event channel. When full, the task stops reading (but keeps heartbeating).
     pub event_buffer: usize,
+    /// Largest gateway message accepted, compressed or not (default 32 MiB).
+    pub max_message_size: usize,
 }
 
 impl Default for GatewayOptions {
@@ -95,14 +126,16 @@ impl Default for GatewayOptions {
             backoff_base: Duration::from_secs(1),
             backoff_max: Duration::from_secs(60),
             event_buffer: 1024,
+            max_message_size: codec::DEFAULT_MAX_MESSAGE,
         }
     }
 }
 
 /// Why the gateway stopped for good.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CloseReason {
-    /// [`GatewayHandle::close`] was called or the handle was dropped.
+    /// [`GatewayHandle::close`] was called or every handle was dropped.
     ClientClosed,
     /// Close 4004: the token is invalid or revoked. Sign in again.
     AuthenticationFailed,
@@ -110,6 +143,8 @@ pub enum CloseReason {
     InvalidApiVersion,
     /// Close 4010 or 4011.
     InvalidShard,
+    /// The gateway URL is not usable (for example not `wss://`).
+    InvalidUrl(String),
 }
 
 /// Connection state changes, for a status indicator.
@@ -139,6 +174,7 @@ pub enum ConnectionState {
 
 /// A gateway Dispatch, typed where this crate knows the event.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum Dispatch {
     /// Initial state after Identify.
     Ready(Box<Ready>),
@@ -181,7 +217,7 @@ impl Dispatch {
             data: Value,
             wrap: impl FnOnce(T) -> Dispatch,
         ) -> Dispatch {
-            match serde_json::from_value::<T>(data.clone()) {
+            match T::deserialize(&data) {
                 Ok(v) => wrap(v),
                 Err(e) => {
                     tracing::warn!(event = name, error = %e, "gateway event did not parse; passing it on raw");
@@ -228,53 +264,56 @@ pub enum GatewayEvent {
 }
 
 enum Command {
-    Send(Value),
-    Close,
-}
-
-/// Sends commands to the gateway task. Cheap to clone. Dropping every clone closes the gateway.
-#[derive(Debug, Clone)]
-pub struct GatewayHandle {
-    tx: mpsc::UnboundedSender<Command>,
+    Raw(Value),
+    GuildActive(String, bool),
+    Status(String),
 }
 
 impl std::fmt::Debug for Command {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Command::Send(v) => write!(f, "Send(op {})", v.get("op").unwrap_or(&Value::Null)),
-            Command::Close => f.write_str("Close"),
+            Command::Raw(v) => write!(f, "Raw(op {})", v.get("op").unwrap_or(&Value::Null)),
+            Command::GuildActive(g, a) => write!(f, "GuildActive({g}, {a})"),
+            Command::Status(s) => write!(f, "Status({s})"),
         }
     }
 }
 
+/// Sends commands to the gateway task. Cheap to clone. Dropping every clone closes the gateway.
+#[derive(Debug, Clone)]
+pub struct GatewayHandle {
+    tx: mpsc::Sender<Command>,
+    close: Arc<watch::Sender<bool>>,
+}
+
 impl GatewayHandle {
-    /// Sends a raw command (`op` + `d`). Commands sent while disconnected are dropped.
+    fn push(&self, cmd: Command) {
+        if let Err(e) = self.tx.try_send(cmd) {
+            tracing::warn!("gateway command dropped: {e}");
+        }
+    }
+
+    /// Sends a raw command (`op` + `d`). Commands sent while disconnected are
+    /// queued (up to 64) and sent after the next READY or RESUMED.
     pub fn send_raw(&self, op: u8, d: Value) {
-        let _ = self.tx.send(Command::Send(json!({ "op": op, "d": d })));
+        self.push(Command::Raw(json!({ "op": op, "d": d })));
     }
 
     /// Lazy Request (op 14): makes a guild active (full message and typing
     /// events) or passive. Call it for the guild the person is looking at.
+    /// The gateway remembers it and sends it again after a reconnect.
     pub fn set_guild_active(&self, guild_id: &str, active: bool) {
-        let mut subs = serde_json::Map::new();
-        subs.insert(
-            guild_id.to_owned(),
-            json!({ "active": active, "typing": active }),
-        );
-        self.send_raw(14, json!({ "subscriptions": subs }));
+        self.push(Command::GuildActive(guild_id.to_owned(), active));
     }
 
-    /// Presence Update (op 3): `online`, `idle`, `dnd` or `invisible`.
+    /// Presence Update (op 3): `online`, `idle`, `dnd` or `invisible`. Remembered across reconnects.
     pub fn set_status(&self, status: &str) {
-        self.send_raw(
-            3,
-            json!({ "status": status, "afk": false, "mobile": false }),
-        );
+        self.push(Command::Status(status.to_owned()));
     }
 
     /// Closes the connection and ends the session (no resume).
     pub fn close(&self) {
-        let _ = self.tx.send(Command::Close);
+        let _ = self.close.send(true);
     }
 }
 
@@ -292,21 +331,32 @@ impl Gateway {
         options: GatewayOptions,
     ) -> (GatewayHandle, mpsc::Receiver<GatewayEvent>) {
         let (event_tx, event_rx) = mpsc::channel(options.event_buffer.max(1));
-        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-        let url = instance.discovery().endpoints.gateway.clone();
-        let user_agent = instance.client_info().user_agent.clone();
+        let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_BUFFER);
+        let (close_tx, close_rx) = watch::channel(false);
         let task = Task {
-            url,
-            user_agent,
+            url: instance.gateway_url().to_owned(),
+            user_agent: instance.client_info().user_agent.clone(),
             token,
             options,
             events: event_tx,
             commands: cmd_rx,
+            close: close_rx,
             session: None,
             seq: None,
+            last_identify: None,
+            active_guilds: BTreeMap::new(),
+            status: None,
+            queued: VecDeque::new(),
+            pending: VecDeque::new(),
         };
         tokio::spawn(task.run());
-        (GatewayHandle { tx: cmd_tx }, event_rx)
+        (
+            GatewayHandle {
+                tx: cmd_tx,
+                close: Arc::new(close_tx),
+            },
+            event_rx,
+        )
     }
 }
 
@@ -316,12 +366,27 @@ enum Outcome {
     Stop(CloseReason),
     /// The event receiver is gone; stop quietly.
     ReceiverGone,
-    /// Connect again. `fresh` drops the session so the next try identifies.
+    /// Connect again.
     Reconnect {
         reason: String,
+        /// Drop the session so the next try identifies.
         fresh: bool,
-        was_connected: bool,
+        /// The connection was stable long enough to reset the backoff.
+        stable: bool,
+        /// Wait at least this long.
+        min_delay: Duration,
     },
+}
+
+impl Outcome {
+    fn retry(reason: impl Into<String>) -> Self {
+        Outcome::Reconnect {
+            reason: reason.into(),
+            fresh: false,
+            stable: false,
+            min_delay: Duration::ZERO,
+        }
+    }
 }
 
 struct Task {
@@ -330,13 +395,24 @@ struct Task {
     token: Token,
     options: GatewayOptions,
     events: mpsc::Sender<GatewayEvent>,
-    commands: mpsc::UnboundedReceiver<Command>,
+    commands: mpsc::Receiver<Command>,
+    close: watch::Receiver<bool>,
     session: Option<String>,
     seq: Option<u64>,
+    last_identify: Option<Instant>,
+    /// Guilds the UI made active; replayed after Identify and Resume.
+    active_guilds: BTreeMap<String, bool>,
+    /// Last status the UI set; replayed after Identify and Resume.
+    status: Option<String>,
+    /// Raw commands sent while disconnected.
+    queued: VecDeque<Value>,
+    /// Events waiting for room in the event channel.
+    pending: VecDeque<GatewayEvent>,
 }
 
-type Ws =
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+type Ws = tokio_tungstenite::WebSocketStream<
+    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+>;
 
 /// TLS for the gateway: rustls with the ring provider and the Mozilla roots.
 pub fn tls_connector() -> Option<tokio_tungstenite::Connector> {
@@ -366,21 +442,59 @@ pub fn gateway_url(base: &str, compress: bool) -> Result<url::Url, url::ParseErr
     Ok(url)
 }
 
+/// Clamps Hello's `heartbeat_interval` (milliseconds) to 1-120 s.
+fn heartbeat_interval(hello: &Value) -> Duration {
+    let ms = hello["d"]["heartbeat_interval"]
+        .as_f64()
+        .filter(|v| v.is_finite())
+        .unwrap_or(41_250.0);
+    Duration::from_millis(ms.clamp(
+        HEARTBEAT_MIN.as_millis() as f64,
+        HEARTBEAT_MAX.as_millis() as f64,
+    ) as u64)
+}
+
 impl Task {
     async fn emit(&self, event: GatewayEvent) -> bool {
         self.events.send(event).await.is_ok()
     }
 
+    async fn flush_pending(&mut self) -> bool {
+        while let Some(ev) = self.pending.pop_front() {
+            if self.events.send(ev).await.is_err() {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// True after `close()` or once every handle is gone.
+    fn closed(&self) -> bool {
+        *self.close.borrow() || self.close.has_changed().is_err()
+    }
+
     async fn run(mut self) {
         let mut attempt: u32 = 0;
         loop {
+            if self.closed() {
+                let _ = self
+                    .emit(GatewayEvent::State(ConnectionState::Closed(
+                        CloseReason::ClientClosed,
+                    )))
+                    .await;
+                return;
+            }
             if !self
                 .emit(GatewayEvent::State(ConnectionState::Connecting { attempt }))
                 .await
             {
                 return;
             }
-            match self.connect_once().await {
+            let outcome = self.connect_once().await;
+            if !self.flush_pending().await {
+                return;
+            }
+            match outcome {
                 Outcome::Stop(reason) => {
                     let _ = self
                         .emit(GatewayEvent::State(ConnectionState::Closed(reason)))
@@ -391,18 +505,15 @@ impl Task {
                 Outcome::Reconnect {
                     reason,
                     fresh,
-                    was_connected,
+                    stable,
+                    min_delay,
                 } => {
                     if fresh {
                         self.session = None;
                         self.seq = None;
                     }
-                    attempt = if was_connected {
-                        0
-                    } else {
-                        attempt.saturating_add(1)
-                    };
-                    let delay = self.backoff(attempt);
+                    attempt = if stable { 0 } else { attempt.saturating_add(1) };
+                    let delay = self.backoff(attempt).max(min_delay);
                     tracing::info!(%reason, ?delay, "gateway reconnecting");
                     if !self
                         .emit(GatewayEvent::State(ConnectionState::Reconnecting {
@@ -413,15 +524,16 @@ impl Task {
                     {
                         return;
                     }
-                    // Wait, but stop early on Close.
+                    // Wait, keep track of commands, and stop early on close.
                     let deadline = sleep(delay);
                     tokio::pin!(deadline);
                     loop {
                         tokio::select! {
                             _ = &mut deadline => break,
+                            _ = self.close.changed() => break,
                             cmd = self.commands.recv() => match cmd {
-                                Some(Command::Send(_)) => {}
-                                Some(Command::Close) | None => {
+                                Some(c) => self.remember(c),
+                                None => {
                                     let _ = self.emit(GatewayEvent::State(ConnectionState::Closed(CloseReason::ClientClosed))).await;
                                     return;
                                 }
@@ -434,48 +546,111 @@ impl Task {
     }
 
     fn backoff(&self, attempt: u32) -> Duration {
+        if attempt == 0 {
+            return Duration::ZERO;
+        }
         let base = self.options.backoff_base.as_secs_f64();
         let max = self.options.backoff_max.as_secs_f64();
-        let exp = (base * 2f64.powi(attempt.min(16) as i32)).min(max);
+        let exp = (base * 2f64.powi(attempt.min(16) as i32 - 1)).min(max);
         // Equal jitter: between half and all of the exponential delay.
         let jittered = exp * rand::thread_rng().gen_range(0.5..=1.0);
         Duration::from_secs_f64(jittered)
     }
 
-    async fn connect_once(&mut self) -> Outcome {
-        let reconnect = |reason: String| Outcome::Reconnect {
-            reason,
-            fresh: false,
-            was_connected: false,
-        };
-        let url = match gateway_url(&self.url, self.options.compress) {
-            Ok(u) => u,
-            Err(e) => {
-                return Outcome::Stop(CloseReason::InvalidApiVersion)
-                    .also_log(&format!("bad gateway URL: {e}"))
+    /// Records a command while disconnected.
+    fn remember(&mut self, cmd: Command) {
+        match cmd {
+            Command::GuildActive(g, true) => {
+                if self.active_guilds.len() < 1_000 || self.active_guilds.contains_key(&g) {
+                    self.active_guilds.insert(g, true);
+                }
             }
+            Command::GuildActive(g, false) => {
+                self.active_guilds.remove(&g);
+            }
+            Command::Status(s) => self.status = Some(s),
+            Command::Raw(v) => {
+                if self.queued.len() >= MAX_QUEUED {
+                    tracing::warn!("gateway command queue full; dropping the oldest");
+                    self.queued.pop_front();
+                }
+                self.queued.push_back(v);
+            }
+        }
+    }
+
+    /// Payloads for a command while connected (and records the wanted state).
+    fn live(&mut self, cmd: Command) -> Option<Value> {
+        let payload = match &cmd {
+            Command::GuildActive(g, a) => Some(lazy_request(std::iter::once((g.as_str(), *a)))),
+            Command::Status(s) => Some(presence(s)),
+            Command::Raw(v) => Some(v.clone()),
+        };
+        if !matches!(cmd, Command::Raw(_)) {
+            self.remember(cmd);
+        }
+        payload
+    }
+
+    /// What to send after READY or RESUMED: subscriptions, status, queued commands.
+    fn replay(&mut self) -> Vec<Value> {
+        let mut out = Vec::new();
+        let active: Vec<(String, bool)> = self
+            .active_guilds
+            .iter()
+            .map(|(g, a)| (g.clone(), *a))
+            .collect();
+        for chunk in active.chunks(LAZY_CHUNK) {
+            out.push(lazy_request(chunk.iter().map(|(g, a)| (g.as_str(), *a))));
+        }
+        if let Some(s) = &self.status {
+            out.push(presence(s));
+        }
+        out.extend(self.queued.drain(..));
+        out
+    }
+
+    fn ws_config(&self) -> WebSocketConfig {
+        let mut config = WebSocketConfig::default();
+        config.max_message_size = Some(self.options.max_message_size);
+        config.max_frame_size = Some(self.options.max_message_size);
+        config
+    }
+
+    async fn connect_once(&mut self) -> Outcome {
+        let checked = require_scheme(&self.url, "wss", "ws", "gateway URL")
+            .map_err(|e| e.to_string())
+            .and_then(|_| gateway_url(&self.url, self.options.compress).map_err(|e| e.to_string()));
+        let url = match checked {
+            Ok(u) => u,
+            Err(e) => return Outcome::Stop(CloseReason::InvalidUrl(e)),
         };
         let mut request = match url.as_str().into_client_request() {
             Ok(r) => r,
-            Err(e) => return reconnect(format!("request: {e}")),
+            Err(e) => return Outcome::retry(format!("request: {e}")),
         };
         if let Ok(ua) = self.user_agent.parse() {
             request.headers_mut().insert("User-Agent", ua);
         }
         let connected = timeout(
             Duration::from_secs(20),
-            tokio_tungstenite::connect_async_tls_with_config(request, None, true, tls_connector()),
+            tokio_tungstenite::connect_async_tls_with_config(
+                request,
+                Some(self.ws_config()),
+                true,
+                tls_connector(),
+            ),
         )
         .await;
         let mut ws: Ws = match connected {
             Ok(Ok((ws, _))) => ws,
-            Ok(Err(e)) => return reconnect(format!("connect failed: {e}")),
-            Err(_) => return reconnect("connect timed out".into()),
+            Ok(Err(e)) => return Outcome::retry(format!("connect failed: {e}")),
+            Err(_) => return Outcome::retry("connect timed out"),
         };
         let mut codec = if self.options.compress {
-            match ZstdStream::new() {
+            match ZstdStream::with_limit(self.options.max_message_size) {
                 Ok(c) => Some(c),
-                Err(e) => return reconnect(format!("zstd: {e}")),
+                Err(e) => return Outcome::retry(format!("zstd: {e}")),
             }
         } else {
             None
@@ -485,28 +660,23 @@ impl Task {
         let hello = match timeout(Duration::from_secs(20), read_payload(&mut ws, &mut codec)).await
         {
             Ok(Ok(Some(p))) => p,
-            Ok(Ok(None)) => return reconnect("closed before Hello".into()),
+            Ok(Ok(None)) => return Outcome::retry("closed before Hello"),
             Ok(Err(ReadEnd::Closed(code, reason))) => {
-                return self.classify_close(code, reason, false)
+                return self.classify_close(code, reason, None)
             }
-            Ok(Err(ReadEnd::Error(e))) => return reconnect(e),
-            Err(_) => return reconnect("no Hello within 20 s".into()),
+            Ok(Err(ReadEnd::Error(e))) => return Outcome::retry(e),
+            Err(_) => return Outcome::retry("no Hello within 20 s"),
         };
         if hello.get("op").and_then(Value::as_u64) != Some(10) {
-            return reconnect("first payload was not Hello".into());
+            return Outcome::retry("first payload was not Hello");
         }
-        let interval_ms = hello["d"]["heartbeat_interval"]
-            .as_u64()
-            .unwrap_or(41_250)
-            .max(100);
-        let interval = Duration::from_millis(interval_ms);
+        let interval = heartbeat_interval(&hello);
 
         // Identify or Resume.
-        let first = match &self.session {
+        let first = match self.session.clone() {
             Some(session_id) => {
-                let _ = self
-                    .emit(GatewayEvent::State(ConnectionState::Resuming))
-                    .await;
+                self.pending
+                    .push_back(GatewayEvent::State(ConnectionState::Resuming));
                 json!({ "op": 6, "d": {
                     "token": self.token.expose_secret(),
                     "session_id": session_id,
@@ -514,58 +684,95 @@ impl Task {
                 }})
             }
             None => {
-                let _ = self
-                    .emit(GatewayEvent::State(ConnectionState::Identifying))
-                    .await;
+                self.identify_spacing().await;
+                self.pending
+                    .push_back(GatewayEvent::State(ConnectionState::Identifying));
                 self.identify_payload()
             }
         };
         if let Err(e) = send_payload(&mut ws, &mut codec, &first).await {
-            return reconnect(e);
+            return Outcome::retry(e);
         }
 
         let first_beat = interval.mul_f64(rand::thread_rng().gen_range(0.0..1.0));
         let heartbeat = sleep(first_beat);
         tokio::pin!(heartbeat);
+        let ready_deadline = sleep(READY_TIMEOUT);
+        tokio::pin!(ready_deadline);
         let mut acked = true;
-        let mut connected = false;
+        let mut connected_at: Option<Instant> = None;
 
         loop {
+            let stable = connected_at.is_some_and(|t| t.elapsed() >= STABLE_AFTER);
+            let reconnect = |reason: String, fresh: bool, min_delay: Duration| Outcome::Reconnect {
+                reason,
+                fresh,
+                stable,
+                min_delay,
+            };
+            let can_read = self.pending.is_empty();
             tokio::select! {
                 _ = &mut heartbeat => {
                     if !acked {
                         let _ = close(&mut ws, 4000).await;
-                        return Outcome::Reconnect { reason: "heartbeat not acknowledged".into(), fresh: false, was_connected: connected };
+                        return reconnect("heartbeat not acknowledged".into(), false, Duration::ZERO);
                     }
                     if let Err(e) = send_payload(&mut ws, &mut codec, &json!({ "op": 1, "d": self.seq })).await {
-                        return Outcome::Reconnect { reason: e, fresh: false, was_connected: connected };
+                        return reconnect(e, false, Duration::ZERO);
                     }
                     acked = false;
                     heartbeat.as_mut().reset(Instant::now() + interval);
                 }
-                cmd = self.commands.recv() => match cmd {
-                    Some(Command::Send(payload)) => {
-                        if let Err(e) = send_payload(&mut ws, &mut codec, &payload).await {
-                            return Outcome::Reconnect { reason: e, fresh: false, was_connected: connected };
+                _ = &mut ready_deadline, if connected_at.is_none() => {
+                    let _ = close(&mut ws, 4000).await;
+                    return reconnect("no READY in time".into(), true, Duration::ZERO);
+                }
+                _ = self.close.changed() => {
+                    let _ = close(&mut ws, 1000).await;
+                    return Outcome::Stop(CloseReason::ClientClosed);
+                }
+                permit = self.events.reserve(), if !self.pending.is_empty() => match permit {
+                    Ok(p) => {
+                        if let Some(ev) = self.pending.pop_front() {
+                            p.send(ev);
                         }
                     }
-                    Some(Command::Close) | None => {
+                    Err(_) => {
+                        let _ = close(&mut ws, 1000).await;
+                        return Outcome::ReceiverGone;
+                    }
+                },
+                cmd = self.commands.recv() => match cmd {
+                    Some(c) if connected_at.is_some() => {
+                        if let Some(payload) = self.live(c) {
+                            if let Err(e) = send_payload(&mut ws, &mut codec, &payload).await {
+                                return reconnect(e, false, Duration::ZERO);
+                            }
+                        }
+                    }
+                    // Commands before READY close the socket with 4003: keep them.
+                    Some(c) => self.remember(c),
+                    None => {
                         let _ = close(&mut ws, 1000).await;
                         return Outcome::Stop(CloseReason::ClientClosed);
                     }
                 },
-                read = read_payload(&mut ws, &mut codec) => {
+                read = read_payload(&mut ws, &mut codec), if can_read => {
                     let payload = match read {
                         Ok(Some(p)) => p,
-                        Ok(None) => return Outcome::Reconnect { reason: "connection closed".into(), fresh: false, was_connected: connected },
-                        Err(ReadEnd::Closed(code, reason)) => return self.classify_close(code, reason, connected),
-                        Err(ReadEnd::Error(e)) => return Outcome::Reconnect { reason: e, fresh: false, was_connected: connected },
+                        Ok(None) => return reconnect("connection closed".into(), false, Duration::ZERO),
+                        Err(ReadEnd::Closed(code, reason)) => return self.classify_close(code, reason, connected_at),
+                        Err(ReadEnd::Error(e)) => {
+                            // A bad or oversized frame from the server: wait longer.
+                            return reconnect(e, false, LONG_BACKOFF);
+                        }
                     };
                     match payload.get("op").and_then(Value::as_u64) {
                         Some(0) => {
                             let seq = payload.get("s").and_then(Value::as_u64);
+                            let mut payload = payload;
                             let name = payload.get("t").and_then(Value::as_str).unwrap_or_default().to_owned();
-                            let data = payload.get("d").cloned().unwrap_or(Value::Null);
+                            let data = payload.get_mut("d").map(Value::take).unwrap_or(Value::Null);
                             if name == "READY" {
                                 if let Some(id) = data.get("session_id").and_then(Value::as_str) {
                                     self.session = Some(id.to_owned());
@@ -574,37 +781,43 @@ impl Task {
                             if let Some(s) = seq {
                                 self.seq = Some(self.seq.map_or(s, |old| old.max(s)));
                             }
-                            if (name == "READY" || name == "RESUMED") && !connected {
-                                connected = true;
-                                if !self.emit(GatewayEvent::State(ConnectionState::Connected)).await {
-                                    return Outcome::ReceiverGone;
-                                }
+                            let ready_now = (name == "READY" || name == "RESUMED") && connected_at.is_none();
+                            if ready_now {
+                                connected_at = Some(Instant::now());
+                                self.pending.push_back(GatewayEvent::State(ConnectionState::Connected));
                             }
                             let event = Dispatch::parse(&name, data);
-                            if !self.emit(GatewayEvent::Dispatch { seq: seq.unwrap_or(0), event }).await {
-                                let _ = close(&mut ws, 1000).await;
-                                return Outcome::ReceiverGone;
+                            self.pending.push_back(GatewayEvent::Dispatch { seq: seq.unwrap_or(0), event });
+                            if ready_now {
+                                for p in self.replay() {
+                                    if let Err(e) = send_payload(&mut ws, &mut codec, &p).await {
+                                        return reconnect(e, false, Duration::ZERO);
+                                    }
+                                }
                             }
                         }
                         Some(1) => {
                             if let Err(e) = send_payload(&mut ws, &mut codec, &json!({ "op": 1, "d": self.seq })).await {
-                                return Outcome::Reconnect { reason: e, fresh: false, was_connected: connected };
+                                return reconnect(e, false, Duration::ZERO);
                             }
                         }
                         Some(7) => {
                             let _ = close(&mut ws, 4000).await;
-                            return Outcome::Reconnect { reason: "server asked to reconnect".into(), fresh: false, was_connected: connected };
+                            return reconnect("server asked to reconnect".into(), false, Duration::ZERO);
                         }
                         Some(9) => {
                             // The session cannot be resumed; identify again on this socket.
                             self.session = None;
                             self.seq = None;
+                            connected_at = None;
+                            ready_deadline.as_mut().reset(Instant::now() + READY_TIMEOUT);
                             let wait = Duration::from_millis(rand::thread_rng().gen_range(1_000..=5_000));
                             sleep(wait).await;
-                            let _ = self.emit(GatewayEvent::State(ConnectionState::Identifying)).await;
+                            self.identify_spacing().await;
+                            self.pending.push_back(GatewayEvent::State(ConnectionState::Identifying));
                             let identify = self.identify_payload();
                             if let Err(e) = send_payload(&mut ws, &mut codec, &identify).await {
-                                return Outcome::Reconnect { reason: e, fresh: true, was_connected: connected };
+                                return reconnect(e, true, Duration::ZERO);
                             }
                         }
                         Some(11) => acked = true,
@@ -613,6 +826,17 @@ impl Task {
                 }
             }
         }
+    }
+
+    /// Waits so two Identify payloads are at least [`IDENTIFY_SPACING`] apart.
+    async fn identify_spacing(&mut self) {
+        if let Some(last) = self.last_identify {
+            let since = last.elapsed();
+            if since < IDENTIFY_SPACING {
+                sleep(IDENTIFY_SPACING - since).await;
+            }
+        }
+        self.last_identify = Some(Instant::now());
     }
 
     fn identify_payload(&self) -> Value {
@@ -635,39 +859,49 @@ impl Task {
         json!({ "op": 2, "d": d })
     }
 
-    fn classify_close(&self, code: Option<u16>, reason: String, was_connected: bool) -> Outcome {
+    /// Maps a close code (see Fluxer's `gateway/opcodes-and-close-codes`) to what happens next.
+    fn classify_close(&self, code: Option<u16>, reason: String, connected_at: Option<Instant>) -> Outcome {
+        let stable = connected_at.is_some_and(|t| t.elapsed() >= STABLE_AFTER);
         let text = format!(
             "closed with {} {reason}",
             code.map_or("no code".into(), |c| c.to_string())
         );
+        let reconnect = |fresh: bool, min_delay: Duration| Outcome::Reconnect {
+            reason: text.clone(),
+            fresh,
+            stable,
+            min_delay,
+        };
         match code {
+            // Authentication failed: the token is invalid or revoked.
             Some(4004) => Outcome::Stop(CloseReason::AuthenticationFailed),
+            // Invalid API version.
             Some(4012) => Outcome::Stop(CloseReason::InvalidApiVersion),
+            // Invalid shard / sharding required.
             Some(4010) | Some(4011) => Outcome::Stop(CloseReason::InvalidShard),
-            // Bad sequence or a protocol fault: start a fresh session.
-            Some(4002) | Some(4003) | Some(4005) | Some(4007) => Outcome::Reconnect {
-                reason: text,
-                fresh: true,
-                was_connected,
-            },
-            _ => Outcome::Reconnect {
-                reason: text,
-                fresh: false,
-                was_connected,
-            },
+            // Rate limited (connections, payloads, sessions, identify).
+            Some(4008) => reconnect(false, LONG_BACKOFF),
+            // Unknown opcode, decode error, not authenticated, already
+            // authenticated: a protocol mismatch; start fresh and slowly.
+            Some(4001) | Some(4002) | Some(4003) | Some(4005) => reconnect(true, LONG_BACKOFF),
+            // Invalid sequence: start a fresh session.
+            Some(4007) => reconnect(true, Duration::ZERO),
+            // 4000 (unknown / node draining), 4009 (session timeout), network: resume.
+            _ => reconnect(false, Duration::ZERO),
         }
     }
 }
 
-trait AlsoLog {
-    fn also_log(self, msg: &str) -> Self;
+fn lazy_request<'a>(guilds: impl Iterator<Item = (&'a str, bool)>) -> Value {
+    let mut subs = serde_json::Map::new();
+    for (g, active) in guilds {
+        subs.insert(g.to_owned(), json!({ "active": active, "typing": active }));
+    }
+    json!({ "op": 14, "d": { "subscriptions": subs } })
 }
 
-impl AlsoLog for Outcome {
-    fn also_log(self, msg: &str) -> Self {
-        tracing::error!("{msg}");
-        self
-    }
+fn presence(status: &str) -> Value {
+    json!({ "op": 3, "d": { "status": status, "afk": false, "mobile": false } })
 }
 
 enum ReadEnd {
@@ -686,13 +920,19 @@ async fn read_payload(
             Some(Err(e)) => return Err(ReadEnd::Error(format!("read: {e}"))),
             Some(Ok(m)) => m,
         };
-        let bytes: Vec<u8> = match msg {
-            WsMessage::Text(t) => t.as_str().as_bytes().to_vec(),
+        let parsed = match msg {
+            WsMessage::Text(t) => serde_json::from_str::<Value>(t.as_str()),
             WsMessage::Binary(b) => match codec {
-                Some(c) => c
-                    .decompress(&b)
-                    .map_err(|e| ReadEnd::Error(format!("zstd: {e}")))?,
-                None => b.to_vec(),
+                Some(c) => {
+                    let bytes = c
+                        .decompress(&b)
+                        .map_err(|e| ReadEnd::Error(format!("zstd: {e}")))?;
+                    if bytes.is_empty() {
+                        continue;
+                    }
+                    serde_json::from_slice(&bytes)
+                }
+                None => serde_json::from_slice(&b),
             },
             WsMessage::Close(frame) => {
                 let (code, reason) = frame
@@ -702,10 +942,7 @@ async fn read_payload(
             }
             _ => continue,
         };
-        if bytes.is_empty() {
-            continue;
-        }
-        return serde_json::from_slice(&bytes)
+        return parsed
             .map(Some)
             .map_err(|e| ReadEnd::Error(format!("bad JSON from gateway: {e}")));
     }
@@ -750,6 +987,17 @@ mod tests {
     }
 
     #[test]
+    fn heartbeat_interval_is_clamped() {
+        let h = |v: Value| heartbeat_interval(&json!({"op": 10, "d": {"heartbeat_interval": v}}));
+        assert_eq!(h(json!(41_250)), Duration::from_millis(41_250));
+        assert_eq!(h(json!(u64::MAX)), HEARTBEAT_MAX);
+        assert_eq!(h(json!(1e300)), HEARTBEAT_MAX);
+        assert_eq!(h(json!(-5)), HEARTBEAT_MIN);
+        assert_eq!(h(json!(0)), HEARTBEAT_MIN);
+        assert_eq!(h(json!("x")), Duration::from_millis(41_250));
+    }
+
+    #[test]
     fn unknown_event_passes_through() {
         let d = Dispatch::parse("PRESENCE_UPDATE", json!({"x": 1}));
         assert_eq!(
@@ -764,5 +1012,16 @@ mod tests {
             Dispatch::parse("MESSAGE_CREATE", json!({})),
             Dispatch::Other { .. }
         ));
+    }
+
+    #[test]
+    fn lazy_requests_are_chunked() {
+        let guilds: Vec<(String, bool)> = (0..120).map(|i| (format!("{i}"), true)).collect();
+        let chunks: Vec<Value> = guilds
+            .chunks(LAZY_CHUNK)
+            .map(|c| lazy_request(c.iter().map(|(g, a)| (g.as_str(), *a))))
+            .collect();
+        assert_eq!(chunks.len(), 3);
+        assert!(chunks.iter().all(|c| c.to_string().len() < 16_384));
     }
 }

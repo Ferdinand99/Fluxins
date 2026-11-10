@@ -21,8 +21,9 @@ use serde_json::{json, Value};
 
 use crate::error::{Error, Result};
 
-/// Highest counter tried before giving up.
-const MAX_COUNTER: u64 = u32::MAX as u64;
+/// Total PBKDF2 iterations (counters tried x cost) one solve may spend.
+/// About a minute on 8 cores for PBKDF2/SHA-256.
+const WORK_BUDGET: u64 = 2_000_000_000;
 
 fn derive(algorithm: &str, password: &[u8], salt: &[u8], cost: u32, out: &mut [u8]) -> Result<()> {
     match algorithm {
@@ -92,11 +93,25 @@ fn try_counter(p: &Params, counter: u32, buf: &mut Vec<u8>, key: &mut [u8]) -> R
 /// Solves `challenge` (the `altcha_challenge` object) on all cores and returns
 /// the `X-Captcha-Token` value. Blocking: run it with `spawn_blocking`.
 pub fn solve_blocking(challenge: &Value, timeout: Duration) -> Result<String> {
+    solve_cancellable(challenge, timeout, &AtomicBool::new(false))
+}
+
+fn solve_cancellable(challenge: &Value, timeout: Duration, cancel: &AtomicBool) -> Result<String> {
     let parameters = challenge
         .get("parameters")
         .ok_or_else(|| Error::Captcha("challenge has no parameters".into()))?;
     let signature = challenge.get("signature").cloned().unwrap_or(Value::Null);
     let params = Arc::new(parse(parameters)?);
+    if let Some(expires) = parameters.get("expiresAt").and_then(Value::as_f64) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0.0, |d| d.as_secs_f64());
+        if expires < now {
+            return Err(Error::Captcha("the challenge has expired".into()));
+        }
+    }
+    // Bound the work: never try more counters than the budget allows for this cost.
+    let max_counter = (WORK_BUDGET / u64::from(params.cost)).min(u64::from(u32::MAX));
     // Fail fast on an unsupported algorithm.
     derive(&params.algorithm, b"", b"", 1, &mut [0u8; 1])?;
 
@@ -114,8 +129,11 @@ pub fn solve_blocking(challenge: &Value, timeout: Duration) -> Result<String> {
                 let mut buf = params.nonce.clone();
                 let mut key = vec![0u8; params.key_length];
                 let mut counter = w as u64;
-                while counter <= MAX_COUNTER {
-                    if stop.load(Ordering::Relaxed) || start.elapsed() > timeout {
+                while counter <= max_counter {
+                    if stop.load(Ordering::Relaxed)
+                        || cancel.load(Ordering::Relaxed)
+                        || start.elapsed() > timeout
+                    {
                         return None;
                     }
                     if try_counter(&params, counter as u32, &mut buf, &mut key).ok()? {
@@ -133,7 +151,7 @@ pub fn solve_blocking(challenge: &Value, timeout: Duration) -> Result<String> {
             .min_by_key(|(c, _)| *c)
     });
     let (counter, key) =
-        found.ok_or_else(|| Error::Captcha("no solution before the timeout".into()))?;
+        found.ok_or_else(|| Error::Captcha("no solution within the time and work limits".into()))?;
     let token = json!({
         "challenge": { "parameters": parameters, "signature": signature },
         "solution": {
@@ -145,9 +163,17 @@ pub fn solve_blocking(challenge: &Value, timeout: Duration) -> Result<String> {
     Ok(base64::engine::general_purpose::STANDARD.encode(token.to_string()))
 }
 
-/// Async wrapper around [`solve_blocking`].
+/// Async wrapper around [`solve_blocking`]. Dropping the future stops the work.
 pub async fn solve(challenge: Value, timeout: Duration) -> Result<String> {
-    tokio::task::spawn_blocking(move || solve_blocking(&challenge, timeout))
+    struct CancelOnDrop(Arc<AtomicBool>);
+    impl Drop for CancelOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+    let cancel = Arc::new(AtomicBool::new(false));
+    let _guard = CancelOnDrop(cancel.clone());
+    tokio::task::spawn_blocking(move || solve_cancellable(&challenge, timeout, &cancel))
         .await
         .map_err(|e| Error::Captcha(e.to_string()))?
 }
@@ -224,6 +250,27 @@ mod tests {
         // Parameters and signature are copied unchanged.
         assert_eq!(v["challenge"], challenge);
         assert!(v["solution"]["counter"].as_u64().unwrap() <= 1234);
+    }
+
+    #[test]
+    fn rejects_expired_and_respects_work_budget() {
+        let mut c = make_test_challenge(5, 10);
+        c["parameters"]["expiresAt"] = json!(1_000);
+        assert!(solve_blocking(&c, Duration::from_secs(5)).is_err());
+        // A huge cost leaves room for only a few counters; the answer at 5000 is out of reach.
+        let mut c = make_test_challenge(5_000, 1);
+        c["parameters"]["cost"] = json!(1_000_000_000u64);
+        assert!(parse(&c["parameters"]).is_err());
+    }
+
+    #[tokio::test]
+    async fn dropping_the_future_cancels_the_work() {
+        // An unsolvable challenge (prefix longer than any match) runs until cancelled.
+        let mut c = make_test_challenge(1, 1);
+        c["parameters"]["keyPrefix"] = json!("0123456789abcdef0123456789abcdef");
+        let fut = solve(c, Duration::from_secs(600));
+        let r = tokio::time::timeout(Duration::from_millis(200), fut).await;
+        assert!(r.is_err(), "still running when dropped");
     }
 
     #[test]

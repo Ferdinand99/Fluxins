@@ -38,14 +38,32 @@
 //!
 //! # Rate limits (read this)
 //!
-//! Fluxer revokes a **user token** when it goes over the global limit of
-//! 50 requests per second. Every request made with a token passes through one
-//! [`RateLimiter`] per token (shared by all clients of the same token) with a
-//! hard cap of 10 requests per second and a burst of 20, so no one-second
-//! window can hold more than 30. A 429 is retried after `retry_after` (up to
-//! 3 times, when the wait is 10 s or less); a 429 with `global: true` returns
-//! [`Error::GlobalRateLimited`], which means "sign in again".
+//! Fluxer counts its global limit of 50 requests per second **per user** and
+//! revokes the token that goes over it. Every request made with a token passes
+//! through one [`RateLimiter`] per (instance, user), kept for the life of the
+//! process: a hard cap of 20 requests in any one-second window (no config can
+//! raise it), with a token bucket of 10/s and burst 20 inside it. That leaves
+//! room for Fluxer's own client on the same account. A 429 is retried after
+//! `retry_after` (up to 3 times, when the wait is 10 s or less); a 429 with
+//! `global: true` returns [`Error::GlobalRateLimited`], which means "sign in
+//! again". Every server-given wait is clamped to 5 minutes.
 //!
+//! # Security
+//!
+//! - Tokens and secrets only travel over `https`/`wss`. `http`/`ws` is
+//!   accepted for loopback hosts only (tests).
+//! - Requests never follow redirects, so a body with a password, ticket or
+//!   poll secret cannot be resent to another host.
+//! - [`Session::pins`] gives the API and gateway hosts a token belongs to.
+//!   Store them with the token and use [`Session::from_token_pinned`]: if the
+//!   discovery document later names other hosts, the token is not sent there.
+//! - `webapp` (for the browser handoff) must be `https` on the instance's
+//!   domain or listed in [`ClientInfo::trusted_webapp_hosts`].
+//! - Response bodies are capped at 8 MiB and gateway messages at 32 MiB
+//!   (also after zstd decompression).
+//! - Zeroizing the token is best effort: copies in request bodies, JSON trees
+//!   and the zstd window are not wiped.
+
 //! # Sign-in on fluxer.opland.net
 //!
 //! Password sign-in needs an ALTCHA proof-of-work CAPTCHA there. This crate
@@ -87,7 +105,7 @@ pub use gateway::{
     CloseReason, ConnectionState, Dispatch, Gateway, GatewayEvent, GatewayHandle, GatewayOptions,
     IdentifyProperties,
 };
-pub use instance::{ClientInfo, Discovery, Endpoints, Instance};
+pub use instance::{ClientInfo, Discovery, EndpointPins, Endpoints, Instance};
 pub use models::{
     Attachment, Channel, CurrentUser, Guild, GuildReady, Message, Ready, Snowflake, User,
 };
