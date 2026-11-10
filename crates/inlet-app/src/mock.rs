@@ -7,13 +7,11 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use futures::channel::mpsc::UnboundedSender;
-
-use crate::backend::Event;
+use crate::backend::{Event, Ui};
 use crate::model::{Attachment, Channel, ChannelKind, Guild, Message};
 
 pub struct MockSession {
-    events: UnboundedSender<Event>,
+    events: Ui,
     channels: HashMap<Option<String>, Vec<Channel>>,
     messages: Arc<Mutex<HashMap<String, Vec<Message>>>>,
     open_channel: Arc<Mutex<Option<String>>>,
@@ -21,7 +19,13 @@ pub struct MockSession {
     ticker: tokio::task::JoinHandle<()>,
 }
 
-fn channel(id: &str, name: &str, kind: ChannelKind, parent: Option<&str>, position: i64) -> Channel {
+fn channel(
+    id: &str,
+    name: &str,
+    kind: ChannelKind,
+    parent: Option<&str>,
+    position: i64,
+) -> Channel {
     Channel {
         id: id.into(),
         name: name.into(),
@@ -66,11 +70,20 @@ fn now() -> String {
 }
 
 impl MockSession {
-    pub fn start(events: UnboundedSender<Event>) -> Self {
+    pub fn start(events: Ui) -> Self {
         let guilds = vec![
-            Guild { id: "g1".into(), name: "Inlet Dev".into() },
-            Guild { id: "g2".into(), name: "Rust Norway".into() },
-            Guild { id: "g3".into(), name: "Self Hosting".into() },
+            Guild {
+                id: "g1".into(),
+                name: "Inlet Dev".into(),
+            },
+            Guild {
+                id: "g2".into(),
+                name: "Rust Norway".into(),
+            },
+            Guild {
+                id: "g3".into(),
+                name: "Self Hosting".into(),
+            },
         ];
         let mut channels = HashMap::new();
         channels.insert(
@@ -97,15 +110,39 @@ impl MockSession {
             None,
             vec![
                 channel("dm-ada", "ada", ChannelKind::Dm, None, 0),
-                channel("dm-group", "ada, linus, grace", ChannelKind::GroupDm, None, 1),
+                channel(
+                    "dm-group",
+                    "ada, linus, grace",
+                    ChannelKind::GroupDm,
+                    None,
+                    1,
+                ),
             ],
         );
 
         let mut messages: HashMap<String, Vec<Message>> = HashMap::new();
         let mut general = vec![
-            msg(1, "c-general", "ada", "09:12", "Morning! Has anyone tried the **native client** yet?"),
-            msg(2, "c-general", "linus", "09:13", "Yes. It is *fast*. Scrolling is ~~janky~~ smooth."),
-            msg(3, "c-general", "grace", "09:15", "Inline code works: `cargo run -p inlet`"),
+            msg(
+                1,
+                "c-general",
+                "ada",
+                "09:12",
+                "Morning! Has anyone tried the **native client** yet?",
+            ),
+            msg(
+                2,
+                "c-general",
+                "linus",
+                "09:13",
+                "Yes. It is *fast*. Scrolling is ~~janky~~ smooth.",
+            ),
+            msg(
+                3,
+                "c-general",
+                "grace",
+                "09:15",
+                "Inline code works: `cargo run -p inlet`",
+            ),
             msg(
                 4,
                 "c-general",
@@ -113,16 +150,40 @@ impl MockSession {
                 "09:16",
                 "Code block:\n```rust\nfn main() {\n    println!(\"hello, Fluxer\");\n}\n```",
             ),
-            msg(5, "c-general", "linus", "09:18", "> Quotes render too\nand links: https://fluxer.app"),
-            msg(6, "c-general", "grace", "09:20", "||spoiler text|| and a list:\n- one\n- two"),
-            msg(8, "c-general", "ada", "09:20", "Masked link: [Confirm your account](https://fluxer-login.example/verify)"),
+            msg(
+                5,
+                "c-general",
+                "linus",
+                "09:18",
+                "> Quotes render too\nand links: https://fluxer.app",
+            ),
+            msg(
+                6,
+                "c-general",
+                "grace",
+                "09:20",
+                "||spoiler text|| and a list:\n- one\n- two",
+            ),
+            msg(
+                8,
+                "c-general",
+                "ada",
+                "09:20",
+                "Masked link: [Confirm your account](https://fluxer-login.example/verify)",
+            ),
         ];
         general.push(Message {
             attachments: vec![Attachment {
                 filename: "screenshot.png".into(),
                 url: "https://example.invalid/attachments/screenshot.png".into(),
             }],
-            ..msg(7, "c-general", "ada", "09:21", "Attachments show as links in v0.")
+            ..msg(
+                7,
+                "c-general",
+                "ada",
+                "09:21",
+                "Attachments show as links in v0.",
+            )
         });
         // Same display name, different account: gets its own header and shows @username.
         general.push(Message {
@@ -143,7 +204,13 @@ impl MockSession {
         );
         messages.insert(
             "dm-ada".into(),
-            vec![msg(20, "dm-ada", "ada", "10:01", "Hi! This is a direct message.")],
+            vec![msg(
+                20,
+                "dm-ada",
+                "ada",
+                "10:01",
+                "Hi! This is a direct message.",
+            )],
         );
 
         let messages = Arc::new(Mutex::new(messages));
@@ -163,38 +230,76 @@ impl MockSession {
                 let mut n = 0u64;
                 loop {
                     tokio::time::sleep(Duration::from_secs(interval)).await;
-                    let Some(channel_id) = open.lock().unwrap().clone() else { continue };
+                    let Some(channel_id) = open.lock().unwrap().clone() else {
+                        continue;
+                    };
                     n += 1;
-                    let m = live(1000 + n, &channel_id, "linus", &format!("Live message #{n} from the demo gateway"));
-                    messages.lock().unwrap().entry(channel_id).or_default().push(m.clone());
+                    let m = live(
+                        1000 + n,
+                        &channel_id,
+                        "linus",
+                        &format!("Live message #{n} from the demo gateway"),
+                    );
+                    messages
+                        .lock()
+                        .unwrap()
+                        .entry(channel_id)
+                        .or_default()
+                        .push(m.clone());
                     let _ = events.unbounded_send(Event::MessageCreated(m));
                 }
             })
         };
 
-        let _ = events.unbounded_send(Event::SignedIn { username: "demo".into(), instance: "demo".into() });
+        let _ = events.unbounded_send(Event::SignedIn {
+            username: "demo".into(),
+            instance: "demo".into(),
+        });
         let _ = events.unbounded_send(Event::Guilds(guilds));
         let _ = events.unbounded_send(Event::Status("Demo mode".into()));
 
-        Self { events, channels, messages, open_channel, next_id: 100, ticker }
+        Self {
+            events,
+            channels,
+            messages,
+            open_channel,
+            next_id: 100,
+            ticker,
+        }
     }
 
     pub fn open_guild(&mut self, guild_id: Option<String>) {
         let channels = self.channels.get(&guild_id).cloned().unwrap_or_default();
-        let _ = self.events.unbounded_send(Event::Channels { guild_id, channels });
+        let _ = self
+            .events
+            .unbounded_send(Event::Channels { guild_id, channels });
     }
 
     pub fn open_channel(&mut self, channel_id: String) {
         *self.open_channel.lock().unwrap() = Some(channel_id.clone());
-        let messages = self.messages.lock().unwrap().get(&channel_id).cloned().unwrap_or_default();
-        let _ = self.events.unbounded_send(Event::Messages { channel_id, messages });
+        let messages = self
+            .messages
+            .lock()
+            .unwrap()
+            .get(&channel_id)
+            .cloned()
+            .unwrap_or_default();
+        let _ = self.events.unbounded_send(Event::Messages {
+            channel_id,
+            messages,
+        });
     }
 
     pub fn send(&mut self, channel_id: String, text: String) {
         self.next_id += 1;
         let mut m = live(self.next_id, &channel_id, "demo", &text);
         m.id = format!("local-{}", self.next_id);
-        self.messages.lock().unwrap().entry(channel_id).or_default().push(m.clone());
+        self.messages
+            .lock()
+            .unwrap()
+            .entry(channel_id)
+            .or_default()
+            .push(m.clone());
         let _ = self.events.unbounded_send(Event::MessageCreated(m));
     }
 }

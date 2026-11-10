@@ -4,9 +4,9 @@
 
 use std::sync::OnceLock;
 
-use gpui::{Context, FontWeight, SharedString, div, prelude::*, px, uniform_list};
+use gpui::{div, prelude::*, px, uniform_list, Context, FontWeight, SharedString};
 
-use crate::{Inlet, button, theme};
+use crate::{button, theme, Inlet};
 
 /// Generated with `cargo about` (see `scripts/third-party-notices.sh`) and shipped next to
 /// every binary as `THIRD-PARTY-NOTICES`; also built into the app so it is always there.
@@ -19,7 +19,13 @@ const WRAP: usize = 110;
 
 fn notice_lines() -> &'static [SharedString] {
     static LINES: OnceLock<Vec<SharedString>> = OnceLock::new();
-    LINES.get_or_init(|| NOTICES.lines().flat_map(|l| wrap(l, WRAP)).map(SharedString::from).collect())
+    LINES.get_or_init(|| {
+        NOTICES
+            .lines()
+            .flat_map(|l| wrap(l, WRAP))
+            .map(SharedString::from)
+            .collect()
+    })
 }
 
 /// Splits a line at spaces so no piece is longer than `width` characters (a single word
@@ -45,12 +51,12 @@ fn wrap(line: &str, width: usize) -> Vec<String> {
     out
 }
 
-
 /// The source of exactly this build: the commit CI built from, or the version tag.
 pub fn source_link() -> String {
     match option_env!("INLET_SOURCE_REV") {
         Some(rev) if !rev.is_empty() => format!("{SOURCE_URL}/tree/{rev}"),
-        _ => format!("{SOURCE_URL}/tree/v{}", env!("CARGO_PKG_VERSION")),
+        // A local build has no commit to point at: link the repository (default branch).
+        _ => SOURCE_URL.to_string(),
     }
 }
 
@@ -83,7 +89,7 @@ pub fn render(show_licences: bool, cx: &mut Context<Inlet>) -> impl IntoElement 
                 .on_click(move |_, _, cx| cx.open_url(&source)),
         )
         .child(div().text_color(theme::text_muted()).child(
-            "Built with Fluxer's markdown parser (fluxer_markdown_parser, AGPL-3.0-or-later, Fluxer Platform AB, commit f1cba64), gpui from Zed (Apache-2.0, Zed Industries) and the crates listed under third-party licences.",
+            "Built with Fluxer's markdown parser (fluxer_markdown_parser, AGPL-3.0-or-later, Fluxer Platform AB, commit f1cba64), gpui from Zed (Apache-2.0, Zed Industries) and the crates listed under third-party licences. The full text of every licence, including the AGPL, is under \"Third-party licences\".",
         ))
         .child(
             div()
@@ -125,7 +131,12 @@ pub fn render(show_licences: bool, cx: &mut Context<Inlet>) -> impl IntoElement 
                     .child(
                         uniform_list("licences", lines.len(), move |range, _window, _cx| {
                             range
-                                .map(|ix| div().whitespace_nowrap().overflow_hidden().child(lines[ix].clone()))
+                                .map(|ix| {
+                                    div()
+                                        .whitespace_nowrap()
+                                        .overflow_hidden()
+                                        .child(lines[ix].clone())
+                                })
                                 .collect::<Vec<_>>()
                         })
                         .size_full(),
