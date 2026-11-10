@@ -47,12 +47,20 @@ const SEARCH_DELAY: Duration = Duration::from_millis(250);
 /// Wait after the last change before drafts are written to disk.
 const SAVE_DELAY: Duration = Duration::from_secs(1);
 
-/// The composer's keys on top of the editor's.
+/// The composer's keys on top of the editor's. Call it after the app-wide bindings.
+///
+/// The composer's own keys act in an editor inside the composer (the box or the edit
+/// box). gpui ranks a binding by how deep its context matches, and a binding with
+/// no context counts as matching at the focused element, so the app-wide Escape (mark
+/// as read) and Tab (next field) would outrank a binding on the composer itself. Bound
+/// at the editor and after the app-wide keys, these come first; their handlers pass the
+/// key on when there is nothing to do.
 pub fn bind_keys(cx: &mut App) {
     inlet_editor::bind_keys(cx);
+    let context = format!("{KEY_CONTEXT} > {}", inlet_editor::KEY_CONTEXT);
     cx.bind_keys([
-        KeyBinding::new("tab", AcceptCompletion, Some(KEY_CONTEXT)),
-        KeyBinding::new("escape", Cancel, Some(KEY_CONTEXT)),
+        KeyBinding::new("tab", AcceptCompletion, Some(context.as_str())),
+        KeyBinding::new("escape", Cancel, Some(context.as_str())),
     ]);
 }
 
@@ -906,17 +914,28 @@ mod tests {
     struct Host {
         view: Entity<ComposerView>,
         events: Vec<ComposerEvent>,
+        /// Escape reached the app's "mark as read".
+        marked_read: usize,
     }
 
     impl Render for Host {
-        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            div().w(px(600.)).child(self.view.clone())
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .w(px(600.))
+                .on_action(
+                    cx.listener(|h, _: &crate::ui::notifications::MarkChannelRead, _, _| {
+                        h.marked_read += 1
+                    }),
+                )
+                .child(self.view.clone())
         }
     }
 
+    /// A window with the composer, and the app's key bindings in the app's order.
     fn host(
         cx: &mut TestAppContext,
     ) -> (Entity<Host>, Entity<ComposerView>, &mut VisualTestContext) {
+        cx.update(crate::ui::notifications::bind_keys);
         cx.update(bind_keys);
         let (host, cx) = cx.add_window_view(|window, cx| {
             let view = cx.new(|cx| ComposerView::new(Rc::default(), 2000, window, cx));
@@ -927,6 +946,7 @@ mod tests {
             Host {
                 view,
                 events: Vec::new(),
+                marked_read: 0,
             }
         });
         let view = host.read_with(cx, |h, _| h.view.clone());
@@ -1372,5 +1392,23 @@ mod tests {
         let shown = view.update(cx, |v, cx| v.on_edit_failed(&id, "too fast", cx));
         assert!(!shown, "the app says it in the notice bar instead");
         assert!(view.read_with(cx, |v, _| v.error.is_none()));
+    }
+
+    #[gpui::test]
+    fn escape_cancels_a_reply_before_it_marks_the_channel_read(cx: &mut TestAppContext) {
+        let (host, view, cx) = host(cx);
+        open(&view, "301", cx);
+        view.update_in(cx, |v, window, cx| {
+            v.start_reply("55".into(), "ada".into(), window, cx)
+        });
+        cx.simulate_keystrokes("escape");
+        assert!(
+            view.read_with(cx, |v, _| v.reply.is_none()),
+            "the reply closes"
+        );
+        assert_eq!(host.read_with(cx, |h, _| h.marked_read), 0);
+        // Nothing left to cancel: Escape goes on to the app.
+        cx.simulate_keystrokes("escape");
+        assert_eq!(host.read_with(cx, |h, _| h.marked_read), 1);
     }
 }
