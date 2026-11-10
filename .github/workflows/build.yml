@@ -62,6 +62,7 @@ jobs:
         shell: pwsh
         run: |
           cargo build --locked -p inlet-platform --features gpui --example tray_demo
+          if ($LASTEXITCODE -ne 0) { exit 1 }
           New-Item -ItemType Directory -Force -Path platform-demo | Out-Null
           $p = Start-Process -FilePath target/debug/examples/tray_demo.exe -ArgumentList '--exit-after', '15' -PassThru -RedirectStandardOutput platform-demo/windows.log
           Start-Sleep -Seconds 8

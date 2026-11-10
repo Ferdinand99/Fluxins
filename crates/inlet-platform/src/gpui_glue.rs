@@ -71,13 +71,14 @@ pub fn flash_window(window: &Window) {
 
 #[cfg(windows)]
 fn flash_windows(window: &Window) -> bool {
-    use raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::{
         FlashWindowEx, FLASHWINFO, FLASHW_TIMERNOFG, FLASHW_TRAY,
     };
 
-    let Ok(handle) = window.window_handle() else {
+    // gpui's own `Window::window_handle` returns its handle type; this is the trait's.
+    let Ok(handle) = HasWindowHandle::window_handle(window) else {
         return false;
     };
     let RawWindowHandle::Win32(win32) = handle.as_raw() else {
