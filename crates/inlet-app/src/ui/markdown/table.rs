@@ -13,6 +13,10 @@ use super::inline::{self, inline_of, Look};
 use super::{Align, Inline, Table};
 use crate::theme;
 
+// Deviation: Fluxer draws every cell the parser gives (only its limit of 10 000 nodes
+// applies). Inlet cuts a table to 20 columns and 400 cells, with a note, so one message
+// cannot make the list lay out thousands of cells.
+
 /// Most columns drawn.
 pub(super) const MAX_COLUMNS: usize = 20;
 /// Most cells drawn (header included); rows past it are left out.
@@ -174,23 +178,48 @@ mod tests {
         assert!(table.rows.iter().all(|r| r.len() == MAX_COLUMNS));
         assert_eq!(table.align.len(), MAX_COLUMNS);
 
-        // The same through the parser: still cut, and parsing stays quick.
-        let line = |c: &str| format!("|{}\n", format!(" {c} |").repeat(100));
+        // The same through the parser, quickly. Whatever it gives for 10 000 cells,
+        // no table is drawn whole.
+        let started = std::time::Instant::now();
+        let blocks = super::super::parse(&table_text(100, 100));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert!(!blocks.is_empty());
+        for t in tables(&blocks) {
+            assert!(t.cut);
+            let cells = t.header.len() + t.rows.iter().map(Vec::len).sum::<usize>();
+            assert!(cells <= MAX_CELLS, "{cells} cells");
+        }
+        // A table the parser does give (30 x 30) is cut the same way.
+        let blocks = super::super::parse(&table_text(30, 30));
+        let found = tables(&blocks);
+        assert_eq!(found.len(), 1, "the parser gives a table: {blocks:?}");
+        let t = found[0];
+        assert!(t.cut);
+        assert_eq!(t.header.len(), MAX_COLUMNS);
+        let cells = t.header.len() + t.rows.iter().map(Vec::len).sum::<usize>();
+        assert!(cells <= MAX_CELLS, "{cells} cells");
+        assert_eq!(t.rows.len(), MAX_CELLS / MAX_COLUMNS - 1);
+    }
+
+    /// A markdown table of `columns` x `rows` (header included).
+    fn table_text(columns: usize, rows: usize) -> String {
+        let line = |c: &str| format!("|{}\n", format!(" {c} |").repeat(columns));
         let mut text = line("h");
-        text.push_str(&format!("|{}\n", " - |".repeat(100)));
-        for _ in 0..99 {
+        text.push_str(&format!("|{}\n", " - |".repeat(columns)));
+        for _ in 1..rows {
             text.push_str(&line("c"));
         }
-        let started = std::time::Instant::now();
-        let blocks = super::super::parse(&text);
-        assert!(started.elapsed() < std::time::Duration::from_secs(5));
-        for b in &blocks {
-            if let super::super::Block::Table(t) = b {
-                let cells = t.header.len() + t.rows.iter().map(Vec::len).sum::<usize>();
-                assert!(cells <= MAX_CELLS);
-                assert!(t.cut);
-            }
-        }
+        text
+    }
+
+    fn tables(blocks: &[super::super::Block]) -> Vec<&Table> {
+        blocks
+            .iter()
+            .filter_map(|b| match b {
+                super::super::Block::Table(t) => Some(&**t),
+                _ => None,
+            })
+            .collect()
     }
 
     #[test]

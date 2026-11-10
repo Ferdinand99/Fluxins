@@ -31,6 +31,7 @@ use fluxer_markdown_parser::ast::TimestampStyle;
 use gpui::SharedString;
 
 pub use blocks::{mark_edited, parse, parse_embed_with, parse_with, render, RenderCtx};
+pub use code::{with_message_budget, OffThread};
 pub use mention::MentionNames;
 pub use timestamp::refresh_due;
 
@@ -86,8 +87,9 @@ pub struct Code {
     pub language: Option<String>,
     /// A KaTeX block (`latex`, `tex`, `katex`), shown as code with a label.
     pub math: bool,
-    /// Coloured ranges of `content`, sorted; the rest is plain.
-    pub spans: Vec<(Range<usize>, CodeColor)>,
+    /// The colours, worked out off the UI thread when the block is first drawn; `None`
+    /// for a block that stays plain (no known language, or past the size limits).
+    pub highlight: Option<std::sync::Arc<code::Highlight>>,
 }
 
 /// Highlighting classes, coloured from `theme.rs`.
@@ -156,17 +158,12 @@ pub enum LiveKind {
         id: String,
         fallback: Option<String>,
     },
-    /// `<@&id>`.
-    Role {
-        id: String,
-        fallback: Option<String>,
-    },
-    /// `<#id>`.
-    Channel {
-        id: String,
-        fallback: Option<String>,
-    },
-    /// `<t:unix:style>`.
+    /// `<@&id>`. Only the roles of the message's own server are named.
+    Role { id: String },
+    /// `<#id>`. Only channels the account can see are named.
+    Channel { id: String },
+    /// `<t:unix:R>`: a relative time. The other styles do not change and are formatted
+    /// once, when parsing.
     Timestamp { unix: i64, style: TimestampStyle },
 }
 
@@ -313,7 +310,7 @@ mod tests {
     }
 
     #[test]
-    fn mentions_keep_the_backends_names_as_fallback() {
+    fn user_mentions_keep_the_backends_names_as_fallback() {
         let mut names = Names::default();
         names
             .channels
@@ -325,31 +322,35 @@ mod tests {
             &names,
         );
         let inline = first_inline(&blocks);
-        assert_eq!(
-            inline.text,
-            "see #general @ada @ada @Mods #unknown-channel @unknown-user"
-        );
         assert_eq!(inline.live.len(), 6);
-        // Drawn without the account state, the fallback names show and the known
-        // channel can be clicked.
+        // Drawn without the account state, only user names fall back to the backend's
+        // (one table for all servers): roles and channels need the account state,
+        // which knows their server.
         let c = compose(inline, &MentionNames::default(), 0);
         assert_eq!(
             c.text,
-            "see #general @ada @ada @Mods #unknown-channel @unknown-user"
+            "see #unknown-channel @ada @ada @Unknown\u{a0}role #unknown-channel @unknown-user"
         );
-        let channel_links: Vec<_> = c
-            .links
-            .iter()
-            .filter(|l| l.url.starts_with(CHANNEL_LINK))
-            .collect();
-        assert_eq!(channel_links.len(), 1);
-        assert_eq!(
-            channel_links[0].url,
-            format!("{CHANNEL_LINK}1559859109744869376")
-        );
+        assert!(c.links.is_empty());
         // Names do not leak into the next parse.
-        let plain = parse("<#1559859109744869376>");
-        assert_eq!(first_inline(&plain).text, "#unknown-channel");
+        let plain = parse("<@42>");
+        assert_eq!(first_inline(&plain).text, "@unknown-user");
+    }
+
+    #[test]
+    fn known_channels_open_on_click() {
+        let blocks = parse("see <#9>");
+        let mut now = MentionNames::default();
+        now.channels.insert(
+            "9".into(),
+            mention::ChannelName {
+                name: "general".into(),
+                pill: true,
+            },
+        );
+        let c = compose(first_inline(&blocks), &now, 0);
+        assert_eq!(c.links.len(), 1);
+        assert_eq!(c.links[0].url, format!("{CHANNEL_LINK}9"));
     }
 
     #[test]

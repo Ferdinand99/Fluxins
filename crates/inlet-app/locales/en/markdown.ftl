@@ -4,7 +4,7 @@ markdown-edited = (edited)
 markdown-invalid-link = invalid link
 markdown-unknown-channel = #unknown-channel
 markdown-unknown-user = unknown-user
-markdown-unknown-role = unknown-role
+markdown-unknown-role = Unknown role
 
 markdown-everyone = @everyone
 markdown-here = @here

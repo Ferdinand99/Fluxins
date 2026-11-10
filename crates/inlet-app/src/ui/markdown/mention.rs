@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Mention pills (`<@user>`, `<@&role>`, `<#channel>`, `@everyone`, `@here`, commands).
 //!
-//! Parsing stores the ID and the name the backend knew (`fallback`); drawing looks the
-//! name up again in the account state ([`MentionNames`], built per message when it is
-//! drawn), so a renamed member or channel shows its new name without parsing again.
+//! Parsing stores the ID (and for users the name the backend knew, `fallback`); drawing
+//! looks the name up in the account state ([`MentionNames`], built per message when it
+//! is drawn), so a renamed member or channel shows its new name without parsing again.
 //! As in Fluxer's `MentionRenderer`: a user shows their guild nickname or display name,
-//! a role its name in its own colour, a channel `#name` and opens it on click, a
-//! category plain `#name`, and anything unknown a pill with a generic label.
+//! a role of the message's own server its name in its own colour, a channel `#name` and
+//! opens it on click, a category plain `#name`, and anything unknown a pill with a
+//! generic label. A role from another server is unknown, as in Fluxer; so is a channel
+//! the account cannot see.
 
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -15,7 +17,7 @@ use fluxer_markdown_parser::ast::{GuildNavigationType, MentionKind};
 use gpui::{App, Hsla};
 use inlet_state::{AccountState, ChannelId, GuildId, RoleId, UserId};
 
-use super::blocks::lookup;
+use super::blocks::user_name;
 use super::inline::{push_live, push_marked, Paint};
 use super::{timestamp, Block, Inline, LiveKind, Style, CHANNEL_LINK};
 use crate::app::Inlet;
@@ -69,7 +71,7 @@ fn user_label(name: Option<&str>) -> String {
 fn role_label(name: Option<&str>) -> String {
     match name {
         Some(name) => format!("@{}", nowrap(name)),
-        None => format!("@{}", t!("markdown-unknown-role")),
+        None => format!("@{}", nowrap(&t!("markdown-unknown-role"))),
     }
 }
 
@@ -84,7 +86,7 @@ fn channel_label(name: Option<&str>) -> String {
 pub(super) fn push(kind: &MentionKind, inline: &mut Inline) {
     match kind {
         MentionKind::User { id } => {
-            let fallback = lookup(|n| n.users.get(id).cloned());
+            let fallback = user_name(id);
             let label = user_label(fallback.as_deref());
             push_live(
                 inline,
@@ -96,27 +98,13 @@ pub(super) fn push(kind: &MentionKind, inline: &mut Inline) {
             );
         }
         MentionKind::Role { id } => {
-            let fallback = lookup(|n| n.roles.get(id).cloned());
-            let label = role_label(fallback.as_deref());
-            push_live(
-                inline,
-                &label,
-                LiveKind::Role {
-                    id: id.clone(),
-                    fallback,
-                },
-            );
+            push_live(inline, &role_label(None), LiveKind::Role { id: id.clone() });
         }
         MentionKind::Channel { id } => {
-            let fallback = lookup(|n| n.channels.get(id).cloned());
-            let label = channel_label(fallback.as_deref());
             push_live(
                 inline,
-                &label,
-                LiveKind::Channel {
-                    id: id.clone(),
-                    fallback,
-                },
+                &channel_label(None),
+                LiveKind::Channel { id: id.clone() },
             );
         }
         MentionKind::Command {
@@ -125,6 +113,9 @@ pub(super) fn push(kind: &MentionKind, inline: &mut Inline) {
             subcommand,
             ..
         } => {
+            // Deviation: pills are highlighted runs of the message text, not boxes, so
+            // a long one can wrap at a line end (after the `/`); Fluxer keeps a pill on
+            // one line.
             let mut label = format!("/{name}");
             for part in [subcommand_group, subcommand].into_iter().flatten() {
                 label.push(' ');
@@ -194,7 +185,7 @@ pub(super) fn resolve(kind: &LiveKind, names: &MentionNames, now_s: i64) -> Show
                 None => neutral(user_label(None)),
             }
         }
-        LiveKind::Role { id, fallback } => match names.roles.get(id) {
+        LiveKind::Role { id } => match names.roles.get(id) {
             Some(role) => match role.color {
                 Some(color) => Shown {
                     text: role_label(Some(&role.name)),
@@ -206,12 +197,9 @@ pub(super) fn resolve(kind: &LiveKind, names: &MentionNames, now_s: i64) -> Show
                 },
                 None => pill(role_label(Some(&role.name))),
             },
-            None => match fallback {
-                Some(name) => pill(role_label(Some(name))),
-                None => neutral(role_label(None)),
-            },
+            None => neutral(role_label(None)),
         },
-        LiveKind::Channel { id, fallback } => {
+        LiveKind::Channel { id } => {
             let link = Some(format!("{CHANNEL_LINK}{id}"));
             match names.channels.get(id) {
                 Some(ChannelName { name, pill: true }) => Shown {
@@ -223,13 +211,7 @@ pub(super) fn resolve(kind: &LiveKind, names: &MentionNames, now_s: i64) -> Show
                     paint: None,
                     link: None,
                 },
-                None => match fallback {
-                    Some(name) => Shown {
-                        link,
-                        ..pill(channel_label(Some(name)))
-                    },
-                    None => neutral(channel_label(None)),
-                },
+                None => neutral(channel_label(None)),
             }
         }
         LiveKind::Timestamp { unix, style } => Shown {
@@ -295,7 +277,7 @@ impl MentionNames {
                     self.users.insert(id.clone(), model::clean_name(name));
                 }
             }
-            LiveKind::Role { id, .. } => {
+            LiveKind::Role { id } => {
                 if self.roles.contains_key(id) {
                     return;
                 }
@@ -314,13 +296,21 @@ impl MentionNames {
                     );
                 }
             }
-            LiveKind::Channel { id, .. } => {
+            LiveKind::Channel { id } => {
                 if self.channels.contains_key(id) {
                     return;
                 }
-                let Some(channel) = ChannelId::parse(id).and_then(|c| state.channel(c)) else {
+                let Some((channel_id, channel)) =
+                    ChannelId::parse(id).and_then(|c| Some((c, state.channel(c)?)))
+                else {
                     return;
                 };
+                // A channel the account cannot see stays unknown (its name is not
+                // shown, and opening it would fail). Channels of other servers the
+                // account can see keep their name, as in Fluxer.
+                if !state.channel_permissions(channel_id).can_view() {
+                    return;
+                }
                 let pill = match channel.kind {
                     channel_type::GUILD_CATEGORY => false,
                     // Direct messages are never mentioned by name: unknown, as in Fluxer.
@@ -394,7 +384,10 @@ mod tests {
         let mut names = MentionNames::default();
         names.users.insert("42".into(), "ada".into());
         let c = compose(inline(&blocks), &names, 0);
-        assert_eq!(c.text, "@unknown-user @unknown-role #unknown-channel @ada");
+        assert_eq!(
+            c.text,
+            "@unknown-user @Unknown\u{a0}role #unknown-channel @ada"
+        );
         let neutral = Paint::Pill {
             text: theme::mention_neutral_text(),
             fill: theme::mention_neutral_fill(),
@@ -408,13 +401,86 @@ mod tests {
         };
         // Unknown user, role and channel: the same neutral pill, never the ID, and
         // nothing to click.
-        for label in ["@unknown-user", "@unknown-role", "#unknown-channel"] {
+        for label in ["@unknown-user", "@Unknown\u{a0}role", "#unknown-channel"] {
             assert_eq!(paint_of(label), Some(neutral), "{label}");
         }
         assert!(!c.text.contains("123") && !c.text.contains("456"));
         assert!(c.links.is_empty());
         // A known user is a normal pill.
         assert_eq!(paint_of("@ada"), Some(Paint::Style(Style::Mention)));
+    }
+
+    /// An account in two servers, A (`100`) and B (`200`). A has role `11` and the
+    /// channels `101` (visible) and `102` (hidden from the account); B has role `22`
+    /// and channel `201`.
+    fn two_servers() -> AccountState {
+        use inlet_protocol::permissions::{SEND_MESSAGES, VIEW_CHANNEL};
+        use serde_json::json;
+        let everyone = (VIEW_CHANNEL | SEND_MESSAGES).to_string();
+        let guild = |id: &str, role: &str, role_name: &str, channels: serde_json::Value| {
+            json!({
+                "id": id,
+                "properties": {"id": id, "name": id, "owner_id": "1"},
+                "roles": [
+                    {"id": id, "name": "@everyone", "permissions": everyone, "position": 0},
+                    {"id": role, "name": role_name, "color": 0x11_22_33, "position": 1}
+                ],
+                "channels": channels,
+                "members": [{"user": {"id": "10", "username": "me"}, "roles": [],
+                             "joined_at": "2026-01-01T00:00:00Z"}],
+                "member_count": 2,
+            })
+        };
+        let hidden = json!([{"id": "100", "type": 0, "allow": "0",
+                             "deny": VIEW_CHANNEL.to_string()}]);
+        let ready = json!({
+            "session_id": "s",
+            "user": {"id": "10", "username": "me"},
+            "guilds": [
+                guild("100", "11", "Mods", json!([
+                    {"id": "101", "type": 0, "name": "general", "position": 0},
+                    {"id": "102", "type": 0, "name": "secret-plans", "position": 1,
+                     "permission_overwrites": hidden}
+                ])),
+                guild("200", "22", "Fluxer Staff", json!([
+                    {"id": "201", "type": 0, "name": "lobby", "position": 0}
+                ])),
+            ],
+            "private_channels": [],
+            "users": [],
+            "read_states": [],
+        });
+        AccountState::from_ready(&serde_json::from_value(ready).expect("a valid READY"))
+    }
+
+    #[test]
+    fn names_from_another_server_are_not_used() {
+        let state = two_servers();
+        let blocks = parse("<@&11> <@&22> <#101> <#201> <#102>");
+        let names_in = |channel: Option<&str>| {
+            MentionNames::for_blocks(
+                [blocks.as_slice()],
+                &state,
+                channel.and_then(ChannelId::parse),
+            )
+        };
+        // In server A: the role of server B is unknown although the account knows its
+        // name, and so is the hidden channel; a visible channel of B keeps its name.
+        let c = compose(inline(&blocks), &names_in(Some("101")), 0);
+        assert_eq!(
+            c.text,
+            "@Mods @Unknown\u{a0}role #general #lobby #unknown-channel"
+        );
+        assert!(!c.text.contains("Staff") && !c.text.contains("secret"));
+        // In server B it is the other way round.
+        let c = compose(inline(&blocks), &names_in(Some("201")), 0);
+        assert!(
+            c.text.starts_with("@Unknown\u{a0}role @Fluxer\u{a0}Staff"),
+            "{}",
+            c.text
+        );
+        // In a direct message no role is named.
+        assert!(names_in(None).roles.is_empty());
     }
 
     #[test]

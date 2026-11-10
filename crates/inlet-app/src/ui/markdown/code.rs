@@ -1,16 +1,26 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Code blocks: the box from Fluxer's `Markup.module.css` (`.codeContainer`), a copy
 //! button on hover, and highlighting for a selection of languages with `syntect`
-//! (MIT). Highlighting runs while parsing, on the backend thread, and stops at a size
-//! and time budget; past it the rest of the block is plain.
+//! (MIT).
+//!
+//! Parsing never highlights. It only decides which blocks may be highlighted: a known
+//! language, a block of at most [`MAX_HIGHLIGHT_BYTES`], and room left in the
+//! message's budget ([`MAX_MESSAGE_HIGHLIGHT_BYTES`] for its text and all its embeds).
+//! The first time such a block is drawn, it is highlighted once off the UI thread
+//! (`RenderCtx::off_thread`) and the result is kept in the block, which lives in the
+//! converted message. Until then it is plain monospace. Each run stops at a time
+//! budget and at a line longer than [`MAX_HIGHLIGHT_LINE`]; the rest of the block
+//! stays plain.
 //!
 //! Deviations: Fluxer highlights with tree-sitter grammars (Arborium) for more
 //! languages, in the GitHub Dark colours that `theme.rs` copies; KaTeX blocks (`tex`,
 //! `latex`, `katex`) show as code with a "math" label instead of typeset maths; ANSI
 //! blocks show their text without colours.
 
-use std::ops::Range;
-use std::sync::OnceLock;
+use std::cell::Cell;
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use gpui::{
@@ -21,17 +31,24 @@ use syntect::parsing::{ParseState, Scope, ScopeStack, SyntaxSet};
 
 use super::blocks::Draw;
 use super::{Code, CodeColor};
+use crate::app::Inlet;
 use crate::theme;
 
 /// Longest language name kept after the fence; longer ones are not a language.
 pub(super) const MAX_LANGUAGE_CHARS: usize = 32;
 /// Blocks larger than this are not highlighted.
-const MAX_HIGHLIGHT_BYTES: usize = 16 * 1024;
-/// Highlighting stops at a line longer than this.
-const MAX_HIGHLIGHT_LINE: usize = 1_024;
-/// Time one block may take to highlight; the rest stays plain. Generous enough for
-/// the first block of a language, which compiles that grammar's patterns.
-const HIGHLIGHT_BUDGET: Duration = Duration::from_millis(50);
+pub(super) const MAX_HIGHLIGHT_BYTES: usize = 16 * 1024;
+/// Code highlighted per message, its text and all its embeds together; blocks past it
+/// stay plain.
+pub(super) const MAX_MESSAGE_HIGHLIGHT_BYTES: usize = 64 * 1024;
+/// Highlighting stops at a line longer than this, the first line too: one line is one
+/// call into the grammar, and the clock is only read between lines.
+pub(super) const MAX_HIGHLIGHT_LINE: usize = 512;
+/// Time one block may take to highlight, counted from before its first line; the rest
+/// stays plain.
+const HIGHLIGHT_BUDGET: Duration = Duration::from_millis(25);
+/// Coloured ranges kept per block; the rest of the block is plain.
+const MAX_SPANS: usize = 4_096;
 
 /// Languages that are highlighted: the names people write after the fence, and the
 /// file extension `syntect` knows the language by.
@@ -128,17 +145,127 @@ pub(super) fn convert(language: Option<&str>, content: &str) -> Code {
     } else {
         content.to_string()
     };
-    let spans = match language.as_deref() {
-        Some(l) if !math => extension(l)
-            .map(|ext| highlight(&content, ext))
-            .unwrap_or_default(),
-        _ => Vec::new(),
+    let highlight = match language.as_deref() {
+        Some(l) if !math && content.len() <= MAX_HIGHLIGHT_BYTES => extension(l)
+            .filter(|_| take_budget(content.len()))
+            .map(|ext| Arc::new(Highlight::new(ext))),
+        _ => None,
     };
     Code {
         content: content.into(),
         language,
         math,
-        spans,
+        highlight,
+    }
+}
+
+thread_local! {
+    /// Bytes of code the message being parsed on this thread may still highlight.
+    static MESSAGE_BUDGET: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+/// Runs `f` with one highlighting budget for everything it parses: a message's text and
+/// all its embeds. Nested calls share the outer budget.
+pub fn with_message_budget<R>(f: impl FnOnce() -> R) -> R {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            MESSAGE_BUDGET.with(|b| b.set(None));
+        }
+    }
+    if MESSAGE_BUDGET.with(Cell::get).is_some() {
+        return f();
+    }
+    MESSAGE_BUDGET.with(|b| b.set(Some(MAX_MESSAGE_HIGHLIGHT_BYTES)));
+    let _reset = Reset;
+    f()
+}
+
+/// Takes `len` bytes from the message's budget; `false` when not enough is left.
+fn take_budget(len: usize) -> bool {
+    MESSAGE_BUDGET.with(|b| match b.get() {
+        Some(left) if left >= len => {
+            b.set(Some(left - len));
+            true
+        }
+        Some(_) => false,
+        None => len <= MAX_MESSAGE_HIGHLIGHT_BYTES,
+    })
+}
+
+/// One coloured range of a code block (byte offsets; a block is at most
+/// [`MAX_HIGHLIGHT_BYTES`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Span {
+    pub start: u32,
+    pub end: u32,
+    pub color: CodeColor,
+}
+
+impl Span {
+    pub fn range(&self) -> std::ops::Range<usize> {
+        self.start as usize..self.end as usize
+    }
+}
+
+/// The colours of one code block, worked out once, off the UI thread, the first time
+/// the block is drawn. Clones of the block share it.
+#[derive(Debug)]
+pub struct Highlight {
+    /// The file extension `syntect` knows the language by.
+    ext: &'static str,
+    /// A run was started (only one ever is).
+    started: AtomicBool,
+    spans: OnceLock<Box<[Span]>>,
+}
+
+impl Highlight {
+    fn new(ext: &'static str) -> Self {
+        Highlight {
+            ext,
+            started: AtomicBool::new(false),
+            spans: OnceLock::new(),
+        }
+    }
+
+    /// The colours, once they are worked out.
+    pub fn spans(&self) -> Option<&[Span]> {
+        self.spans.get().map(|s| &s[..])
+    }
+
+    /// Works out the colours of `content` (its block's text) and keeps them. Slow:
+    /// never on the UI thread.
+    pub fn run(&self, content: &str) {
+        // Loading the syntax set and compiling the grammar is not the input's doing:
+        // it happens first, on a fixed sample, and the clock starts after it.
+        warm(self.ext);
+        let spans = highlight(content, self.ext, Instant::now() + HIGHLIGHT_BUDGET);
+        let _ = self.spans.set(spans.into_boxed_slice());
+    }
+
+    /// Whether this call is the one that starts the run.
+    fn claim(&self) -> bool {
+        !self.started.swap(true, Ordering::AcqRel)
+    }
+}
+
+/// Runs a job off the UI thread, then draws the chat again.
+pub type OffThread = std::rc::Rc<dyn Fn(Box<dyn FnOnce() + Send>)>;
+
+impl Inlet {
+    /// [`OffThread`] for the chat: the job runs on gpui's background executor.
+    pub(crate) fn markdown_off_thread(&self, cx: &mut gpui::Context<Self>) -> OffThread {
+        let app = cx.to_async();
+        let weak = cx.entity().downgrade();
+        std::rc::Rc::new(move |job| {
+            let weak = weak.clone();
+            app.spawn(async move |cx| {
+                let task = cx.background_executor().spawn(async move { job() });
+                task.await;
+                let _ = weak.update(cx, |_, cx| cx.notify());
+            })
+            .detach();
+        })
     }
 }
 
@@ -177,6 +304,24 @@ fn strip_ansi(s: &str) -> String {
 fn syntaxes() -> &'static SyntaxSet {
     static SET: OnceLock<SyntaxSet> = OnceLock::new();
     SET.get_or_init(SyntaxSet::load_defaults_newlines)
+}
+
+/// A few common tokens (numbers, a string, comments, operators): highlighting it
+/// compiles the patterns most blocks use.
+const WARM_SAMPLE: &str = "1 = (\"2\", 3) // 4\n# 5\n";
+
+/// Loads the syntax set and compiles the main patterns of the grammar for `ext`, once,
+/// on [`WARM_SAMPLE`], so a block's own time budget is spent on the block.
+fn warm(ext: &'static str) {
+    static WARMED: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
+    let warmed = WARMED.get_or_init(Default::default);
+    if warmed.lock().map_or(true, |w| w.contains(ext)) {
+        return;
+    }
+    highlight(WARM_SAMPLE, ext, Instant::now() + Duration::from_secs(1));
+    if let Ok(mut w) = warmed.lock() {
+        w.insert(ext);
+    }
 }
 
 /// Scope prefixes and their colour, most specific first.
@@ -222,25 +367,24 @@ fn classify(stack: &ScopeStack) -> Option<CodeColor> {
     None
 }
 
-fn push_span(
-    out: &mut Vec<(Range<usize>, CodeColor)>,
-    range: Range<usize>,
-    color: Option<CodeColor>,
-) {
+fn push_span(out: &mut Vec<Span>, start: usize, end: usize, color: Option<CodeColor>) {
     let Some(color) = color else {
         return;
     };
-    if range.is_empty() {
+    if start >= end {
         return;
     }
+    let (start, end) = (start as u32, end as u32);
     match out.last_mut() {
-        Some((last, c)) if *c == color && last.end == range.start => last.end = range.end,
-        _ => out.push((range, color)),
+        Some(last) if last.color == color && last.end == start => last.end = end,
+        _ => out.push(Span { start, end, color }),
     }
 }
 
-/// Coloured ranges of `content` in the language with file extension `ext`.
-fn highlight(content: &str, ext: &str) -> Vec<(Range<usize>, CodeColor)> {
+/// Coloured ranges of `content` in the language with file extension `ext`. Stops at
+/// `deadline` (checked before every line, the first too), at a line longer than
+/// [`MAX_HIGHLIGHT_LINE`] and at [`MAX_SPANS`] ranges.
+fn highlight(content: &str, ext: &str, deadline: Instant) -> Vec<Span> {
     if content.len() > MAX_HIGHLIGHT_BYTES {
         return Vec::new();
     }
@@ -248,16 +392,12 @@ fn highlight(content: &str, ext: &str) -> Vec<(Range<usize>, CodeColor)> {
     let Some(syntax) = set.find_syntax_by_extension(ext) else {
         return Vec::new();
     };
-    // The clock starts after the first line: a grammar's patterns are compiled the
-    // first time they are used, which is not the input's doing.
-    let mut started: Option<Instant> = None;
     let mut state = ParseState::new(syntax);
     let mut stack = ScopeStack::new();
     let mut out = Vec::new();
     let mut offset = 0;
     for line in content.split_inclusive('\n') {
-        let over = started.is_some_and(|t| t.elapsed() > HIGHLIGHT_BUDGET);
-        if line.len() > MAX_HIGHLIGHT_LINE || over {
+        if line.len() > MAX_HIGHLIGHT_LINE || Instant::now() >= deadline || out.len() >= MAX_SPANS {
             break;
         }
         let Ok(ops) = state.parse_line(line, set) else {
@@ -267,25 +407,32 @@ fn highlight(content: &str, ext: &str) -> Vec<(Range<usize>, CodeColor)> {
         for (pos, op) in ops {
             let pos = pos.min(line.len());
             if pos > last {
-                push_span(&mut out, offset + last..offset + pos, classify(&stack));
+                push_span(&mut out, offset + last, offset + pos, classify(&stack));
                 last = pos;
             }
             if stack.apply(&op).is_err() {
-                return out;
+                return finish(content, out);
             }
         }
         if line.len() > last {
             push_span(
                 &mut out,
-                offset + last..offset + line.len(),
+                offset + last,
+                offset + line.len(),
                 classify(&stack),
             );
         }
         offset += line.len();
-        started.get_or_insert_with(Instant::now);
     }
-    // Ranges must fall on character boundaries for drawing.
-    out.retain(|(r, _)| content.is_char_boundary(r.start) && content.is_char_boundary(r.end));
+    finish(content, out)
+}
+
+/// Ranges must fall on character boundaries for drawing; at most [`MAX_SPANS`].
+fn finish(content: &str, mut out: Vec<Span>) -> Vec<Span> {
+    out.truncate(MAX_SPANS);
+    out.retain(|s| {
+        content.is_char_boundary(s.start as usize) && content.is_char_boundary(s.end as usize)
+    });
     out
 }
 
@@ -306,17 +453,32 @@ const CODE_GROUP: &str = "markdown-code";
 
 /// Draws a code block (`.codeContainer`: 14 px padding, 6 px corners, a 1 px border,
 /// monospace 12 px on 16 px lines).
-pub(super) fn render(id: &str, code: &Code, _d: &Draw) -> AnyElement {
-    let text =
-        StyledText::new(code.content.clone()).with_highlights(code.spans.iter().map(|(r, c)| {
-            (
-                r.clone(),
-                HighlightStyle {
-                    color: Some(color(*c)),
-                    ..Default::default()
-                },
-            )
-        }));
+pub(super) fn render(id: &str, code: &Code, d: &Draw) -> AnyElement {
+    let spans = match &code.highlight {
+        Some(h) => match h.spans() {
+            Some(spans) => spans,
+            None => {
+                // First drawn: highlight off the UI thread; plain until it lands.
+                if let Some(off_thread) = &d.ctx.off_thread {
+                    if h.claim() {
+                        let (h, content) = (h.clone(), code.content.clone());
+                        off_thread(Box::new(move || h.run(&content)));
+                    }
+                }
+                &[]
+            }
+        },
+        None => &[],
+    };
+    let text = StyledText::new(code.content.clone()).with_highlights(spans.iter().map(|s| {
+        (
+            s.range(),
+            HighlightStyle {
+                color: Some(color(s.color)),
+                ..Default::default()
+            },
+        )
+    }));
     let content = code.content.clone();
     let copy = div()
         .id(SharedString::from(format!("{id}-copy")))
@@ -369,7 +531,23 @@ pub(super) fn render(id: &str, code: &Code, _d: &Draw) -> AnyElement {
 
 #[cfg(test)]
 mod tests {
+    use super::super::{parse, Block};
     use super::*;
+
+    /// Highlights `code` here, as the background job would.
+    fn spans_of(code: &Code) -> Vec<Span> {
+        match &code.highlight {
+            Some(h) => {
+                h.run(&code.content);
+                h.spans().expect("worked out").to_vec()
+            }
+            None => Vec::new(),
+        }
+    }
+
+    fn later() -> Instant {
+        Instant::now() + Duration::from_secs(60)
+    }
 
     #[test]
     fn code_block_language_is_capped_and_unknown_falls_back() {
@@ -377,7 +555,7 @@ mod tests {
         let long = "a".repeat(MAX_LANGUAGE_CHARS + 1);
         let code = convert(Some(&long), "let x = 1;\n");
         assert_eq!(code.language, None);
-        assert!(code.spans.is_empty());
+        assert!(code.highlight.is_none());
         assert_eq!(code.content.as_ref(), "let x = 1;");
         // Odd characters: no language.
         assert_eq!(normalise_language(Some("rust\u{202e}")), None);
@@ -390,18 +568,19 @@ mod tests {
         // Unknown: plain text.
         let code = convert(Some("klingon"), "Qapla'");
         assert_eq!(code.language.as_deref(), Some("klingon"));
-        assert!(code.spans.is_empty());
-        // Known: coloured.
+        assert!(code.highlight.is_none());
+        // Known: coloured, but only once the block is drawn, never while parsing.
         let code = convert(Some("rust"), "fn main() { let s = \"hi\"; } // done");
-        assert!(code
-            .spans
+        assert!(code.highlight.as_ref().is_some_and(|h| h.spans().is_none()));
+        let spans = spans_of(&code);
+        assert!(spans
             .iter()
-            .any(|(r, c)| *c == CodeColor::Keyword && &code.content[r.clone()] == "fn"));
-        assert!(code.spans.iter().any(|(_, c)| *c == CodeColor::Comment));
-        assert!(code.spans.iter().any(|(_, c)| *c == CodeColor::String));
+            .any(|s| s.color == CodeColor::Keyword && &code.content[s.range()] == "fn"));
+        assert!(spans.iter().any(|s| s.color == CodeColor::Comment));
+        assert!(spans.iter().any(|s| s.color == CodeColor::String));
         // Maths is code with a label, not highlighted.
         let code = convert(Some("latex"), "\\frac{a}{b}");
-        assert!(code.math && code.spans.is_empty());
+        assert!(code.math && code.highlight.is_none());
     }
 
     #[test]
@@ -418,16 +597,48 @@ mod tests {
     }
 
     #[test]
-    fn highlighting_stops_at_the_budget() {
+    fn highlighting_stops_at_its_time_and_size_limits() {
+        // Time: a deadline that has passed stops before the first line.
+        assert!(highlight("fn a() {}\nfn b() {}\n", "rs", Instant::now()).is_empty());
+        assert!(!highlight("fn a() {}\n", "rs", later()).is_empty());
+        // A block too large is never highlighted.
         let huge = "let x = 1;\n".repeat(MAX_HIGHLIGHT_BYTES / 11 + 10);
-        assert!(convert(Some("rust"), &huge).spans.is_empty());
-        let long_line = format!(
-            "fn a() {{}}\n{}\nfn b() {{}}",
-            "x".repeat(MAX_HIGHLIGHT_LINE + 1)
-        );
-        let code = convert(Some("rust"), &long_line);
-        let first_line = long_line.find('\n').unwrap();
-        assert!(code.spans.iter().all(|(r, _)| r.end <= first_line + 1));
+        assert!(convert(Some("rust"), &huge).highlight.is_none());
+        assert!(highlight(&huge, "rs", later()).is_empty());
+        // A long first line: nothing at all.
+        let long = "x".repeat(MAX_HIGHLIGHT_LINE + 1);
+        assert!(highlight(&format!("{long}\nfn a() {{}}"), "rs", later()).is_empty());
+        // A long line later: only what comes before it.
+        let text = format!("fn a() {{}}\n{long}\nfn b() {{}}");
+        let first_line = text.find('\n').unwrap();
+        let spans = highlight(&text, "rs", later());
+        assert!(!spans.is_empty());
+        assert!(spans.iter().all(|s| s.range().end <= first_line + 1));
+        // Ranges per block are capped.
+        let line = format!("{}\n", "1 x ".repeat(MAX_HIGHLIGHT_LINE / 4 - 1));
+        let busy = line.repeat(MAX_HIGHLIGHT_BYTES / line.len());
+        assert!(highlight(&busy, "rs", later()).len() <= MAX_SPANS);
+    }
+
+    #[test]
+    fn a_message_highlights_at_most_its_budget() {
+        // An embed text is at most 4 096 characters; a message has up to 10 embeds
+        // with 25 fields each. Blocks of about 4 KiB: 16 fit in the message's 64 KiB.
+        let block = "let x = 1;\n".repeat(360);
+        let text = format!("```rust\n{block}```");
+        let eligible = |blocks: &[Block]| match &blocks[0] {
+            Block::Code(c) => c.highlight.is_some(),
+            other => panic!("{other:?}"),
+        };
+        let fits = MAX_MESSAGE_HIGHLIGHT_BYTES / (block.len() - 1);
+        assert_eq!(fits, 16);
+        let message: Vec<bool> =
+            with_message_budget(|| (0..20).map(|_| eligible(&parse(&text))).collect());
+        assert!(message[..fits].iter().all(|e| *e));
+        assert!(message[fits..].iter().all(|e| !e));
+        // The next message has its own budget.
+        assert!(with_message_budget(|| eligible(&parse(&text))));
+        assert!(eligible(&parse(&text)));
     }
 
     #[test]

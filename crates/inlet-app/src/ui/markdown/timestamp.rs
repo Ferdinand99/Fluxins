@@ -34,11 +34,14 @@ pub(super) fn push(timestamp: u64, style: TimestampStyle, inline: &mut Inline) {
         .ok()
         .filter(|t| DateTime::from_timestamp(*t, 0).is_some())
     {
-        Some(unix) => push_live(
+        // Only a relative time changes as time passes; the other styles are formatted
+        // once, here.
+        Some(unix) if style == TimestampStyle::RelativeTime => push_live(
             inline,
             &label(unix, style, now_s()),
             LiveKind::Timestamp { unix, style },
         ),
+        Some(unix) => push_marked(inline, &label(unix, style, now_s()), Style::Timestamp),
         None => push_marked(inline, &timestamp.to_string(), Style::Timestamp),
     }
 }
@@ -324,6 +327,17 @@ mod tests {
         assert!(inline.live.is_empty(), "{inline:?}");
         assert_eq!(inline.text, u64::MAX.to_string());
         assert_eq!(inline.highlights[0].1, Style::Timestamp);
+    }
+
+    #[test]
+    fn fixed_timestamps_are_formatted_once() {
+        let mut inline = Inline::default();
+        push(1_700_000_000, TimestampStyle::LongDate, &mut inline);
+        assert!(inline.live.is_empty(), "{inline:?}");
+        assert!(inline.text.contains("2023"));
+        assert_eq!(inline.highlights[0].1, Style::Timestamp);
+        push(1_700_000_000, TimestampStyle::RelativeTime, &mut inline);
+        assert_eq!(inline.live.len(), 1);
     }
 
     #[test]

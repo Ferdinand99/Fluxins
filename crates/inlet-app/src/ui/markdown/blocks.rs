@@ -3,6 +3,7 @@
 //! blocks with the spacing of Fluxer's `Markup.module.css`.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use fluxer_markdown_parser::{MarkdownParser, Node, ParseError, ParserFlags};
@@ -15,16 +16,17 @@ use crate::model::Names;
 use crate::theme;
 
 thread_local! {
-    /// Names for the parse running on this thread (set by [`parse_with`]).
-    static NAMES: RefCell<Names> = RefCell::new(Names::default());
+    /// Names of the users mentioned in the parse running on this thread (set by
+    /// [`parse_with`]), by ID.
+    static NAMES: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
 }
 
 pub fn parse(input: &str) -> Vec<Block> {
     parse_with(input, &Names::default())
 }
 
-/// Parses `input`. Mentions keep the names in `names` as a fallback for when the
-/// account state does not know them.
+/// Parses `input`. User mentions keep their name in `names` as a fallback for when the
+/// account state does not know the user.
 pub fn parse_with(input: &str, names: &Names) -> Vec<Block> {
     parse_flags(input, names, ParserFlags::ALL)
 }
@@ -36,9 +38,28 @@ pub fn parse_embed_with(input: &str, names: &Names) -> Vec<Block> {
 }
 
 fn parse_flags(input: &str, names: &Names, flags: u32) -> Vec<Block> {
-    NAMES.with(|n| *n.borrow_mut() = names.clone());
-    let out = parse_inner(input, flags);
-    NAMES.with(|n| *n.borrow_mut() = Names::default());
+    NAMES.with(|n| *n.borrow_mut() = mentioned_users(input, names));
+    let out = code::with_message_budget(|| parse_inner(input, flags));
+    NAMES.with(|n| n.borrow_mut().clear());
+    out
+}
+
+/// The names in `names` of the users `input` mentions (`<@id>`, `<@!id>`): all a
+/// parse looks up, so the whole table is never copied.
+fn mentioned_users(input: &str, names: &Names) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let mut rest = input;
+    while let Some(at) = rest.find("<@") {
+        rest = &rest[at + 2..];
+        let digits = rest.strip_prefix('!').unwrap_or(rest);
+        let len = digits.bytes().take_while(u8::is_ascii_digit).count();
+        if len > 0 && digits[len..].starts_with('>') {
+            let id = &digits[..len];
+            if let Some(name) = names.users.get(id) {
+                out.insert(id.to_string(), name.clone());
+            }
+        }
+    }
     out
 }
 
@@ -58,8 +79,9 @@ pub fn mark_edited(blocks: &mut Vec<Block>) {
     }
 }
 
-pub(super) fn lookup(f: impl Fn(&Names) -> Option<String>) -> Option<String> {
-    NAMES.with(|n| f(&n.borrow()))
+/// The name the backend knew for user `id`, for the parse running on this thread.
+pub(super) fn user_name(id: &str) -> Option<String> {
+    NAMES.with(|n| n.borrow().get(id).cloned())
 }
 
 /// Fluxer's parser with the flags of a standard message (`STANDARD_FLAGS`, which is
@@ -180,6 +202,8 @@ pub struct RenderCtx {
     pub names: Rc<MentionNames>,
     /// Emoji-only text may be drawn large (not in compact mode, as in Fluxer).
     pub jumbo: bool,
+    /// Runs slow work (code highlighting) off the UI thread; `None` leaves code plain.
+    pub off_thread: Option<super::OffThread>,
 }
 
 /// One drawing pass: the context and the time relative timestamps are measured from.
@@ -573,7 +597,9 @@ mod tests {
         )));
         assert!(has(&|b| matches!(b, Block::List(l) if l.items.len() == 2)));
         assert!(has(&|b| matches!(b, Block::Table(t) if t.rows.len() == 1)));
-        assert!(has(&|b| matches!(b, Block::Code(c) if !c.spans.is_empty())));
+        assert!(has(
+            &|b| matches!(b, Block::Code(c) if c.highlight.is_some())
+        ));
         let text = blocks
             .iter()
             .filter_map(|b| match b {
