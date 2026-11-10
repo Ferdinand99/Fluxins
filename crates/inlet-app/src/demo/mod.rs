@@ -14,6 +14,7 @@ mod guilds;
 mod messages;
 pub mod scenes;
 mod social;
+mod unread;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

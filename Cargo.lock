@@ -3000,6 +3000,7 @@ dependencies = [
  "unicode-segmentation",
  "url",
  "winresource",
+ "wiremock",
  "zeroize",
 ]
 
