@@ -26,41 +26,31 @@ shot 01-sign-in
 # switch to the token tab
 kill $pid; wait $pid 2>/dev/null
 
-# 2. Demo data
-INLET_DEMO=1 INLET_DEMO_LIVE_SECS=4 "$bin" >"$out/demo.log" 2>&1 &
+# 2. Demo data. Navigation uses INLET_DEMO_GUILD/INLET_DEMO_CHANNEL (demo builds only)
+#    instead of clicks, so layout changes do not break the script.
+INLET_DEMO=1 INLET_DEMO_LIVE_SECS=4 INLET_DEMO_GUILD=g1 INLET_DEMO_CHANNEL=c-general "$bin" >"$out/demo.log" 2>&1 &
 pid=$!
 sleep 6
-shot 02-direct-messages
-click 36 102         # first guild in the rail
-shot 03-guild-welcome
-click 192 172        # "# general"
-shot 04-general
+shot 02-general
 xdotool type --delay 30 'Hello from **Inlet** on Xvfb'
 xdotool key Return
 sleep 5              # a live demo message arrives too
-shot 05-sent-and-live
+shot 03-sent-and-live
 grep -E 'VmRSS|VmHWM' /proc/$pid/status > "$out/memory.txt"
 kill $pid; wait $pid 2>/dev/null
 
-# 3. Static demo (no live messages): spoiler, masked link, About
+# 3. Embed-only bot messages and a message without anything.
+INLET_DEMO=1 INLET_DEMO_LIVE_SECS=3600 INLET_DEMO_GUILD=g1 INLET_DEMO_CHANNEL=c-joins "$bin" >>"$out/demo.log" 2>&1 &
+pid=$!
+sleep 6
+shot 04-embeds
+kill $pid; wait $pid 2>/dev/null
+
+# 4. Direct messages (the start view).
 INLET_DEMO=1 INLET_DEMO_LIVE_SECS=3600 "$bin" >>"$out/demo.log" 2>&1 &
 pid=$!
 sleep 6
-click 36 102
-click 192 172
-shot 06-general-static
-click 370 478        # the hidden spoiler
-shot 07-spoiler-revealed
-click 507 592        # the masked link
-shot 08-link-confirm
-kill $pid; wait $pid 2>/dev/null
-INLET_DEMO=1 "$bin" >>"$out/demo.log" 2>&1 &
-pid=$!
-sleep 6
-click 100 763        # "About" in the user panel
-shot 09-about
-click 122 306        # "Third-party licences"
-shot 10-licences
+shot 05-direct-messages
 kill $pid; wait $pid 2>/dev/null
 
 tail -n 20 "$out/signin.log" "$out/demo.log" >&2

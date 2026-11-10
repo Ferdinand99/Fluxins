@@ -2,6 +2,8 @@
 //! What the UI shows. The backend converts protocol types into these, so the views do
 //! not depend on the wire format.
 
+use std::collections::HashMap;
+
 use crate::markdown::Block;
 
 /// Longest name shown anywhere (guild, channel, author, file).
@@ -53,6 +55,46 @@ pub struct Channel {
     pub kind: ChannelKind,
     pub parent_id: Option<String>,
     pub position: i64,
+    /// Channel topic, cleaned; shown after the name in the header.
+    pub topic: Option<String>,
+}
+
+/// Names for resolving mentions (`<#id>`, `<@id>`, `<@&id>`) while parsing.
+#[derive(Clone, Debug, Default)]
+pub struct Names {
+    pub channels: HashMap<String, String>,
+    pub users: HashMap<String, String>,
+    pub roles: HashMap<String, String>,
+}
+
+/// A rich embed (bots post these), drawn as a card.
+#[derive(Clone, Debug, Default)]
+pub struct Embed {
+    /// Colour of the left bar, `0xRRGGBB`.
+    pub color: Option<u32>,
+    pub author: Option<String>,
+    pub title: Option<String>,
+    /// Link of the title (http/https only when opened).
+    pub url: Option<String>,
+    pub description: Vec<Block>,
+    pub fields: Vec<EmbedField>,
+    pub footer: Option<String>,
+    /// Images, thumbnails and videos, shown as links in v0.
+    pub media: Vec<Attachment>,
+}
+
+#[derive(Clone, Debug)]
+pub struct EmbedField {
+    pub name: String,
+    pub value: Vec<Block>,
+}
+
+/// The message a reply points to, for the line above the reply.
+#[derive(Clone, Debug)]
+pub struct Reply {
+    pub author: String,
+    /// The first words, cleaned and shortened.
+    pub snippet: String,
 }
 
 impl Channel {
@@ -79,6 +121,8 @@ pub struct Message {
     pub author: String,
     /// Account name, cleaned; shown next to the display name when they differ.
     pub author_username: String,
+    /// The author is a bot: show a BOT tag.
+    pub author_bot: bool,
     /// Milliseconds since the Unix epoch.
     pub timestamp_ms: i64,
     /// Already formatted for display, in local time.
@@ -89,12 +133,33 @@ pub struct Message {
     /// `content` is longer than what `blocks` shows.
     pub truncated: bool,
     pub attachments: Vec<Attachment>,
+    pub embeds: Vec<Embed>,
+    pub reply: Option<Reply>,
     pub edited: bool,
 }
 
 impl Message {
-    /// Fills `blocks` and `truncated` from `content`. Caps the stored content first.
+    /// Whether there is anything to show under the header.
+    pub fn is_empty(&self) -> bool {
+        self.blocks.is_empty() && self.embeds.is_empty() && self.attachments.is_empty()
+    }
+
+    /// Local calendar day of the message, for date separators.
+    pub fn day(&self) -> Option<chrono::NaiveDate> {
+        chrono::DateTime::from_timestamp_millis(self.timestamp_ms)
+            .filter(|_| self.timestamp_ms > 0)
+            .map(|t| t.with_timezone(&chrono::Local).date_naive())
+    }
+
+    /// Fills `blocks` and `truncated` from `content`, without mention names.
+    #[cfg(test)]
     pub fn parse(&mut self) {
+        self.parse_with(&Names::default());
+    }
+
+    /// Fills `blocks` and `truncated` from `content`, resolving mentions with `names`.
+    /// Caps the stored content first.
+    pub fn parse_with(&mut self, names: &Names) {
         if self.content.len() > MAX_CONTENT_BYTES {
             let cut = floor_char_boundary(&self.content, MAX_CONTENT_BYTES);
             self.content.truncate(cut);
@@ -109,7 +174,10 @@ impl Message {
                 &self.content[..]
             }
         };
-        self.blocks = crate::markdown::parse(shown);
+        self.blocks = crate::markdown::parse_with(shown, names);
+        if self.edited {
+            crate::markdown::mark_edited(&mut self.blocks);
+        }
     }
 }
 
@@ -186,6 +254,21 @@ pub fn sidebar_order(channels: &[Channel]) -> Vec<Channel> {
     out
 }
 
+/// "Thursday, 1 October 2026" for a date separator.
+pub fn day_label(day: chrono::NaiveDate) -> String {
+    day.format("%A, %-d %B %Y").to_string()
+}
+
+/// The first `max` characters of `text` on one line, with "…" when cut.
+pub fn snippet(text: &str, max: usize) -> String {
+    let one_line: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let cleaned = clean_name(&one_line);
+    match cleaned.char_indices().nth(max) {
+        Some((ix, _)) => format!("{}\u{2026}", &cleaned[..ix]),
+        None => cleaned,
+    }
+}
+
 /// Parses an RFC 3339 timestamp into (milliseconds since epoch, local display text).
 pub fn timestamp(rfc3339: &str) -> (i64, String) {
     match chrono::DateTime::parse_from_rfc3339(rfc3339) {
@@ -210,6 +293,7 @@ mod tests {
             kind,
             parent_id: parent.map(Into::into),
             position: pos,
+            topic: None,
         }
     }
 
@@ -220,14 +304,25 @@ mod tests {
             author_id: author_id.into(),
             author: author.into(),
             author_username: author.into(),
+            author_bot: false,
             timestamp_ms: t,
             timestamp: String::new(),
             content: String::new(),
             blocks: vec![],
             truncated: false,
             attachments: vec![],
+            embeds: vec![],
+            reply: None,
             edited: false,
         }
+    }
+
+    #[test]
+    fn day_labels_and_snippets() {
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 10, 1).unwrap();
+        assert_eq!(day_label(day), "Thursday, 1 October 2026");
+        assert_eq!(snippet("Hi!  I can't\nsee", 100), "Hi! I can't see");
+        assert_eq!(snippet("abcdef", 3), "abc\u{2026}");
     }
 
     #[test]
