@@ -17,16 +17,13 @@ const MAX_COUNTED: usize = 50;
 impl Inlet {
     pub(super) fn render_new_messages_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let view = &self.chat.view;
-        if view.unread_count == 0 {
+        if view.unread_count == 0 || !view.divider_above {
             return None;
         }
         let divider = view
             .rows
             .iter()
             .position(|r| matches!(r, Row::Unread | Row::Day { new: true, .. }))?;
-        if self.chat.message_list.item_is_above_viewport(divider) != Some(true) {
-            return None;
-        }
         let text = if view.unread_count == 1 {
             t!("chat-new-message", since = time::full(view.unread_since_ms))
         } else if view.unread_count > MAX_COUNTED {
@@ -69,6 +66,7 @@ impl Inlet {
                         .cursor_pointer()
                         .child(text)
                         .on_click(cx.listener(move |this, _, _, cx| {
+                            this.chat.view.divider_above = false;
                             this.chat.message_list.pause_following_tail();
                             this.chat.message_list.scroll_to_reveal_item(divider);
                             cx.notify();
@@ -88,11 +86,7 @@ impl Inlet {
     }
 
     pub(super) fn render_jump_to_present(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let count = self.chat.view.rows.len();
-        if count == 0 || self.chat.message_list.is_following_tail() {
-            return None;
-        }
-        if self.chat.message_list.item_is_below_viewport(count - 1) != Some(true) {
+        if self.chat.view.rows.is_empty() || !self.chat.view.scrolled_away {
             return None;
         }
         Some(

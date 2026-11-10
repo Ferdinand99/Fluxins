@@ -204,6 +204,11 @@ pub(crate) fn message_at(
         .map(|n| user(n))
         .collect();
     v["mentions"] = Value::Array(mentions);
+    let roles: Vec<&str> = [ROLE_MODERATORS, ROLE_CONTRIBUTORS]
+        .into_iter()
+        .filter(|r| content.contains(&format!("<@&{r}>")))
+        .collect();
+    v["mention_roles"] = json!(roles);
     if let (Some(obj), Some(more)) = (v.as_object_mut(), extra.as_object()) {
         for (k, val) in more {
             obj.insert(k.clone(), val.clone());

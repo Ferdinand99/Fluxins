@@ -110,7 +110,10 @@ fn general() -> Vec<p::Message> {
             "ada",
             "09:21",
             "Same name, other account.",
-            json!({"author": {"id": "2099", "username": "not_ada", "global_name": "ada"}}),
+            json!({
+                "author": {"id": "2099", "username": "not_ada", "global_name": "ada"},
+                "member": {"roles": []}
+            }),
         ),
         msg_with(
             11,

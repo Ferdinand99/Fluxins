@@ -97,6 +97,8 @@ pub fn render(row: &SystemRow, compact: bool) -> AnyElement {
                         .gap_2()
                         .child(
                             div()
+                                .min_w_0()
+                                .max_w_full()
                                 .text_color(theme::text_tertiary())
                                 .when(row.kind == SystemKind::Unknown, |d| d.italic())
                                 .child(row.text.clone()),

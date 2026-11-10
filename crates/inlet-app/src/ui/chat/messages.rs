@@ -250,6 +250,10 @@ pub struct MessageView {
     newest_retries: u8,
     ticker: Option<Task<()>>,
     scroll_hooked: bool,
+    /// The person scrolled the "NEW" line out of view above (the banner shows).
+    pub divider_above: bool,
+    /// The person scrolled away from the newest messages ("Jump to present" shows).
+    pub scrolled_away: bool,
 }
 
 fn now_ms() -> i64 {
@@ -876,6 +880,8 @@ impl Inlet {
         view.pager = OlderPager::default();
         view.loaded = false;
         view.newest_retries = 0;
+        view.divider_above = false;
+        view.scrolled_away = false;
         self.chat.message_list.reset(0);
         self.chat.message_list.set_follow_mode(FollowMode::Tail);
     }
@@ -950,8 +956,10 @@ impl Inlet {
         }
     }
 
-    /// Calls `load_older` when the person scrolls near the top of the list. The list
-    /// reports only scrolling by the person, so loading never repeats by itself.
+    /// Follows the person's scrolling: asks for older messages near the top, and notes
+    /// whether the "NEW" line and the newest messages are out of view (for the banner
+    /// and "Jump to present"). The list reports only scrolling by the person, so loading
+    /// never repeats by itself.
     pub(crate) fn hook_list_scroll(&mut self, cx: &mut Context<Self>) {
         if self.chat.view.scroll_hooked {
             return;
@@ -960,9 +968,22 @@ impl Inlet {
         let weak = cx.entity().downgrade();
         self.chat.message_list.set_scroll_handler(
             move |event: &ListScrollEvent, _window: &mut Window, cx: &mut App| {
-                if event.visible_range.start <= 1 {
-                    let _ = weak.update(cx, |this, cx| this.load_older(cx));
-                }
+                let range = event.visible_range.clone();
+                let following = event.is_following_tail;
+                let count = event.count;
+                let _ = weak.update(cx, |this, cx| {
+                    let view = &mut this.chat.view;
+                    view.divider_above = view
+                        .rows
+                        .iter()
+                        .position(|r| matches!(r, Row::Unread | Row::Day { new: true, .. }))
+                        .is_some_and(|ix| ix < range.start);
+                    view.scrolled_away = !following && range.end < count;
+                    if range.start <= 1 {
+                        this.load_older(cx);
+                    }
+                    cx.notify();
+                });
             },
         );
     }
@@ -1019,6 +1040,7 @@ impl Inlet {
 
     /// Back to the newest messages, following new ones again.
     pub(crate) fn jump_to_present(&mut self, cx: &mut Context<Self>) {
+        self.chat.view.scrolled_away = false;
         self.chat.message_list.scroll_to_end();
         self.chat.message_list.set_follow_mode(FollowMode::Tail);
         cx.notify();
@@ -1027,6 +1049,7 @@ impl Inlet {
     /// "Mark as read" in the new-messages banner: the "NEW" line goes too.
     pub(crate) fn mark_open_channel_read(&mut self, cx: &mut Context<Self>) {
         self.chat.view.unread_after = None;
+        self.chat.view.divider_above = false;
         if let (Some(ch), Some(account)) = (self.open_channel_id(), self.account.clone()) {
             let changes = account.update(cx, |s, _| s.mark_read(ch, None, AckKind::Explicit));
             self.after_changes(changes, cx);
