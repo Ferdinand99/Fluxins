@@ -650,6 +650,8 @@ type Ws =
 pub fn tls_connector() -> Option<tokio_tungstenite::Connector> {
     let mut roots = rustls::RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    #[cfg(feature = "test-extra-ca")]
+    crate::test_ca::add_to_store(&mut roots);
     let config = rustls::ClientConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
     ))

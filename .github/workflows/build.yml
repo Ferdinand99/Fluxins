@@ -165,6 +165,15 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      # The extra test CA of inlet-protocol is for tests only. The crate also
+      # refuses to compile it in release mode; this checks the feature graph.
+      - name: The app does not enable test-only features
+        run: |
+          if cargo tree --locked -p inlet -e features,no-dev | grep -F 'test-extra-ca'; then
+            echo "inlet enables the test-extra-ca feature"
+            exit 1
+          fi
+
       - name: Package
         run: |
           mkdir dist

@@ -114,9 +114,16 @@ pub mod models;
 pub mod permissions;
 pub mod ratelimit;
 pub mod rest;
+#[cfg(feature = "test-extra-ca")]
+pub mod test_ca;
 pub mod token;
 pub mod upload;
 
+// The extra test CA must never ship.
+#[cfg(all(feature = "test-extra-ca", not(debug_assertions)))]
+compile_error!(
+    "the `test-extra-ca` feature is for tests against a private instance and must not be in a release build"
+);
 
 pub use auth::{
     poll_ip_authorization, sign_in_password, sign_in_totp, Handoff, HandoffStatus, IpAuthorization,

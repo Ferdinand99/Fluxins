@@ -30,6 +30,11 @@ webpki-roots = "0.26"
 zeroize = "1"
 zstd = "0.13"
 
+[features]
+# Trust the PEM file in INLET_TEST_EXTRA_CA_FILE as an extra root CA, for a
+# private test instance. Tests only: refused in release builds.
+test-extra-ca = []
+
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util", "time", "net", "sync"] }
 wiremock = "0.6"

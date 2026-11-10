@@ -311,11 +311,22 @@ pub fn normalize_origin(origin: &str) -> Result<String> {
 }
 
 fn http_builder(info: &ClientInfo) -> reqwest::ClientBuilder {
-    reqwest::Client::builder()
+    let builder = reqwest::Client::builder()
         .user_agent(info.user_agent.clone())
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(30))
-        .use_rustls_tls()
+        .use_rustls_tls();
+    extra_roots(builder)
+}
+
+#[cfg(feature = "test-extra-ca")]
+fn extra_roots(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    crate::test_ca::add_to_http(builder)
+}
+
+#[cfg(not(feature = "test-extra-ca"))]
+fn extra_roots(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    builder
 }
 
 pub(crate) fn build_http(info: &ClientInfo) -> Result<(reqwest::Client, reqwest::Client)> {
