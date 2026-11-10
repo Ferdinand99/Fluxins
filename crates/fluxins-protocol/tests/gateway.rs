@@ -1,6 +1,9 @@
 //! Gateway against a mock WebSocket server that speaks Fluxer's protocol
 //! (JSON, optional zstd-stream, Hello/Identify/Resume/Heartbeat).
 
+// The tungstenite handshake callback has a large error type we do not control.
+#![allow(clippy::result_large_err)]
+
 mod common;
 
 use std::sync::{Arc, Mutex};
