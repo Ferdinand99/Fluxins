@@ -9,11 +9,11 @@
 //! messages from that thread's message loop (gpui's main loop pumps them); on
 //! macOS AppKit only allows it on the main thread.
 //!
-//! With gpui on Windows, shell calls (tray, taskbar) and toasts may dispatch
-//! window messages while they run, and gpui's window procedure cannot borrow the
-//! app at that moment: it logs "RefCell already borrowed" and skips a frame. The
-//! demo therefore keeps them out of the `Application::run` callback and makes the
-//! tray and badge calls in a `cx.spawn` task between awaits.
+//! Tray calls must not run while gpui's app is borrowed: on Windows the shell can
+//! dispatch window messages during them, and gpui's window procedure then cannot
+//! borrow the app ("RefCell already borrowed", a skipped frame). So the methods
+//! here are not public; apps use `gpui_glue::create_tray`, `set_tray_state` and
+//! `set_tray_tooltip`, which run them in a task outside any borrow.
 
 use crate::{Icon, Result};
 
@@ -71,7 +71,8 @@ pub(crate) fn icon_for(base: &Icon, state: TrayState) -> Icon {
     }
 }
 
-/// A tray icon with a menu. Removed from the tray when dropped.
+/// A tray icon with a menu. Removed from the tray when dropped. Created and changed
+/// through `gpui_glue`.
 pub struct Tray {
     base: Icon,
     inner: imp::Tray,
@@ -83,20 +84,23 @@ impl Tray {
     /// fails with [`crate::Error::Unsupported`] when the desktop has no tray host
     /// (GNOME without the AppIndicator extension); the app should then not hide its
     /// window to the tray.
-    pub fn new(icon: Icon, menu: Vec<TrayItem>) -> Result<Self> {
+    #[cfg_attr(not(feature = "gpui"), allow(dead_code))]
+    pub(crate) fn new(icon: Icon, menu: Vec<TrayItem>) -> Result<Self> {
         let inner = imp::Tray::new(&icon, &menu)?;
         Ok(Self { base: icon, inner })
     }
 
     /// Switches the icon between normal, unread and mention.
-    pub fn set_state(&self, state: TrayState) {
+    #[cfg_attr(not(feature = "gpui"), allow(dead_code))]
+    pub(crate) fn set_state(&self, state: TrayState) {
         if let Err(err) = self.inner.set_icon(&icon_for(&self.base, state)) {
             log::warn!("could not update the tray icon: {err}");
         }
     }
 
     /// Sets the hover text, for example "Inlet – 3 mentions".
-    pub fn set_tooltip(&self, text: &str) {
+    #[cfg_attr(not(feature = "gpui"), allow(dead_code))]
+    pub(crate) fn set_tooltip(&self, text: &str) {
         let text = crate::clean_text(text, 64);
         if let Err(err) = self.inner.set_tooltip(&text) {
             log::warn!("could not update the tray tooltip: {err}");

@@ -11,6 +11,9 @@ pub enum Error {
     InvalidInput(&'static str),
     /// A file, socket or pipe that should be private to this user is not.
     Insecure(&'static str),
+    /// Another instance exists (its pipe or lock is there) but did not take the
+    /// command line within the deadline. Exit; do not start a second instance.
+    NotResponding,
     /// An I/O error.
     Io(io::Error),
     /// An error reported by an OS API.
@@ -26,6 +29,7 @@ impl fmt::Display for Error {
             Error::Unsupported(what) => write!(f, "not supported here: {what}"),
             Error::InvalidInput(what) => write!(f, "invalid input: {what}"),
             Error::Insecure(what) => write!(f, "refused, not private to this user: {what}"),
+            Error::NotResponding => f.write_str("another instance is running but does not respond"),
             Error::Io(err) => write!(f, "I/O error: {err}"),
             Error::Os(err) => write!(f, "OS error: {err}"),
         }

@@ -132,24 +132,26 @@ fn valid_invite_code(code: &str) -> bool {
         && !code.ends_with('-')
 }
 
-/// Finds the deep link in a command line, the way Fluxer does: after `--url` (and
-/// after `--` if present) when that flag is there, otherwise anywhere. Only the
-/// first `inlet:` argument is considered; if it does not parse, there is no link.
+/// Finds the deep link in a command line, split with [`crate::split_args`]: when
+/// there is a `--`, only the values after it are looked at (that is how the
+/// registered handlers pass the link); otherwise the arguments after `--url`, or
+/// all of them. Only the first `inlet:` argument is considered; if it does not
+/// parse, there is no link.
 pub fn extract<S: AsRef<str>>(args: &[S]) -> Option<DeepLink> {
     let looks_like_link = |a: &&S| {
         a.as_ref()
             .get(..=SCHEME.len())
             .is_some_and(|head| head.eq_ignore_ascii_case("inlet:"))
     };
-    let candidates: &[S] = match args.iter().position(|a| a.as_ref() == "--url") {
-        Some(flag) => {
-            let after = &args[flag + 1..];
-            match after.iter().position(|a| a.as_ref() == "--") {
-                Some(sep) => &after[sep + 1..],
-                None => after,
-            }
+    let has_separator = args.iter().any(|a| a.as_ref() == "--");
+    let (options, positional) = crate::split_args(args);
+    let candidates: &[S] = if has_separator {
+        positional
+    } else {
+        match options.iter().position(|a| a.as_ref() == "--url") {
+            Some(flag) => &options[flag + 1..],
+            None => options,
         }
-        None => args,
     };
     candidates
         .iter()
@@ -522,6 +524,36 @@ mod tests {
         assert_eq!(extract(&args), None);
         assert_eq!(extract::<&str>(&[]), None);
         assert_eq!(extract(&["fluxer://channels/@me/5"]), None);
+        // A link before the separator is an option, not the link.
+        let args = ["inlet://channels/1/1", "--", "inlet://channels/2/2"];
+        assert_eq!(extract(&args), Some(channel(Some(2), 2, None)));
+    }
+
+    /// A link that broke out of its quotes in `"exe" --url -- "%1"` cannot set
+    /// flags: everything after `--` is data.
+    #[test]
+    fn a_link_that_breaks_out_of_its_quotes_sets_no_flags() {
+        let args = [
+            "--url",
+            "--",
+            "inlet://channels/1/2\"",
+            "--autostart",
+            "--start-minimized",
+            "",
+        ];
+        assert_eq!(extract(&args), None, "the broken link does not parse");
+        assert!(!crate::autostart::launched_at_login(&args));
+        assert!(!crate::autostart::start_minimized(&args));
+        let args = [
+            "--url",
+            "--",
+            "inlet://channels/1/2",
+            "--autostart",
+            "--start-minimized",
+        ];
+        assert_eq!(extract(&args), Some(channel(Some(1), 2, None)));
+        assert!(!crate::autostart::launched_at_login(&args));
+        assert!(!crate::autostart::start_minimized(&args));
     }
 
     #[test]

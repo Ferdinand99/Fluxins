@@ -68,7 +68,8 @@ fn glyph(c: char) -> Option<[u8; 7]> {
 
 /// Draws the Windows overlay: a red disc with the label in white, `side` pixels
 /// square. Fluxer ships these as pre-drawn icon files; Inlet draws them.
-pub fn render_overlay(badge: Badge, side: u32) -> Option<Icon> {
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn render_overlay(badge: Badge, side: u32) -> Option<Icon> {
     let label = badge.overlay_label()?;
     let s = side.clamp(8, 256) as usize;
     let mut rgba = vec![0u8; s * s * 4];
@@ -111,12 +112,17 @@ pub fn render_overlay(badge: Badge, side: u32) -> Option<Icon> {
     Icon::from_rgba(rgba, s as u32, s as u32).ok()
 }
 
-/// Sets the badge. `set_badge(Some(3))`, `set_badge(None)` and
-/// `set_badge(Badge::Dot)` all work. Call it on the UI thread: macOS only allows
-/// the dock tile there, and on Windows the taskbar list is a COM object of that
-/// thread. Failures are logged, not returned: a badge is never worth an error
-/// dialog.
-pub fn set_badge(badge: impl Into<Badge>) {
+/// Sets the badge. Runs on the UI thread (macOS only allows the dock tile there;
+/// on Windows the taskbar list is a COM object of that thread) and must not run
+/// while gpui's app is borrowed: the taskbar call can dispatch window messages.
+/// Apps reach it through `gpui_glue::set_badge`, which runs it in a task.
+/// Failures are logged, not returned: a badge is never worth an error dialog.
+///
+/// Known gaps: on Linux `Badge::Dot` shows nothing (the launcher API has counts
+/// only); on Windows the overlay is lost when the taskbar button is recreated
+/// (Explorer restart), until the next call.
+#[cfg_attr(not(feature = "gpui"), allow(dead_code))]
+pub(crate) fn set_badge(badge: impl Into<Badge>) {
     imp::set(badge.into());
 }
 
@@ -172,9 +178,10 @@ mod imp {
         // SAFETY: plain COM creation; gpui has initialised COM on the UI thread.
         let taskbar: ITaskbarList3 =
             unsafe { CoCreateInstance(&TaskbarList, None, CLSCTX_INPROC_SERVER)? };
+        // SAFETY: HrInit must be called once before the other methods; it is.
         unsafe { taskbar.HrInit()? };
         let icon = match render_overlay(badge, 32) {
-            Some(icon) => Some(make_hicon(&icon)?),
+            Some(icon) => Some(OwnedIcon(make_hicon(&icon)?)),
             None => None,
         };
         let description = HSTRING::from(badge.overlay_label().unwrap_or_default());
@@ -183,16 +190,24 @@ mod imp {
             unsafe {
                 taskbar.SetOverlayIcon(
                     hwnd,
-                    icon.unwrap_or_default(),
+                    icon.as_ref().map(|i| i.0).unwrap_or_default(),
                     PCWSTR(description.as_ptr()),
                 )?;
             }
         }
-        if let Some(icon) = icon {
-            // SAFETY: created above and no longer used.
-            unsafe { DestroyIcon(icon)? };
-        }
         Ok(())
+    }
+
+    /// An icon handle destroyed on drop, also when setting the overlay fails.
+    struct OwnedIcon(HICON);
+
+    impl Drop for OwnedIcon {
+        fn drop(&mut self) {
+            // SAFETY: created by make_hicon, owned here and destroyed once.
+            unsafe {
+                let _ = DestroyIcon(self.0);
+            }
+        }
     }
 
     /// Visible, unowned top-level windows of this process: the app's main windows,
@@ -202,12 +217,15 @@ mod imp {
             // SAFETY: `list` is the Vec passed to EnumWindows below, alive for the call.
             let list = unsafe { &mut *(list.0 as *mut Vec<HWND>) };
             let mut pid = 0u32;
+            // SAFETY: `hwnd` comes from EnumWindows; `pid` is a valid out-pointer.
             unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid as *mut u32)) };
+            // SAFETY: plain queries on a window handle from EnumWindows.
             let owned = unsafe { GetWindow(hwnd, GW_OWNER) }.is_ok_and(|o| !o.is_invalid());
-            if pid == unsafe { GetCurrentProcessId() }
-                && unsafe { IsWindowVisible(hwnd) }.as_bool()
-                && !owned
-            {
+            // SAFETY: no preconditions.
+            let own_process = pid == unsafe { GetCurrentProcessId() };
+            // SAFETY: a window handle from EnumWindows.
+            let visible = unsafe { IsWindowVisible(hwnd) }.as_bool();
+            if own_process && visible && !owned {
                 list.push(hwnd);
             }
             true.into()
@@ -251,6 +269,7 @@ mod imp {
         };
         // SAFETY: both bitmaps are valid; the icon copies them, so they are freed after.
         let hicon = unsafe { CreateIconIndirect(&icon_info) };
+        // SAFETY: both bitmaps were created above and are not used after this.
         unsafe {
             let _ = DeleteObject(HGDIOBJ(color.0));
             let _ = DeleteObject(HGDIOBJ(mask.0));

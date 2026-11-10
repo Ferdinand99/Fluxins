@@ -57,7 +57,8 @@ jobs:
         run: cargo test --locked -p inlet-platform -- --include-ignored
 
       # Runs the platform demo (window, tray icon, badge, notification) and keeps a
-      # screenshot. It fails if the tray icon could not be created.
+      # screenshot. It fails if the tray icon could not be created or gpui logged a
+      # borrow error (a dropped frame).
       - name: Platform demo
         shell: pwsh
         run: |
@@ -76,6 +77,8 @@ jobs:
           if (-not $p.WaitForExit(30000)) { Stop-Process -Id $p.Id -Force }
           Get-Content platform-demo/windows.log
           if (-not (Select-String -Path platform-demo/windows.log -Pattern 'tray icon created' -Quiet)) { exit 1 }
+          # The platform calls must never make gpui drop a frame.
+          if (Select-String -Path platform-demo/windows.log -Pattern 'RefCell already borrowed' -Quiet) { exit 1 }
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()

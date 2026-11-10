@@ -7,12 +7,24 @@
 //! - Windows: a named pipe whose owner and only allowed user is the current user,
 //!   created with `FILE_FLAG_FIRST_PIPE_INSTANCE`, refusing remote clients. The
 //!   second instance checks that the pipe's owner is its own user before it sends
-//!   anything, and connects with identification-level impersonation only.
+//!   anything, and connects with identification-level impersonation only. All pipe
+//!   I/O is overlapped and cancelled with `CancelIoEx` when its deadline passes.
+//!
+//! Deadlines: the first instance gives each connection 2 s in all (a client that
+//! connects and sends nothing is dropped after that); a second instance gives up
+//! after 5 s in all.
 //!
 //! Messages are bounded: at most 32 arguments, 2 KiB each, 16 KiB in all, UTF-8.
+//! Longer or extra arguments are dropped with a warning before anything is sent.
+//!
+//! **What the app must do with an error:** any `Err` from [`single_instance`] means
+//! another instance may be running (for example [`Error::NotResponding`]: the pipe
+//! or socket exists but nobody answered). Show the error and exit; never carry on as
+//! a second primary, which would run every account twice.
 
 use std::io::{self, Read, Write};
 use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use crate::{Error, Result};
 
@@ -21,6 +33,10 @@ const MAX_ARGS: usize = 32;
 const MAX_ARG_BYTES: usize = 2048;
 const MAX_MESSAGE_BYTES: usize = 16 * 1024;
 const ACK: u8 = 0x06;
+/// Time the first instance gives one connection, from accept to the end of the ACK.
+const SERVE_DEADLINE: Duration = Duration::from_secs(2);
+/// Time a second instance gives the whole hand-over, connecting included.
+const SEND_DEADLINE: Duration = Duration::from_secs(5);
 
 /// Which instance this process is.
 pub enum Instance {
@@ -40,9 +56,19 @@ impl std::fmt::Debug for Instance {
 }
 
 /// Becomes the primary instance, or hands this process's arguments (without the
-/// program name) to the running one.
+/// program name) to the running one. Arguments that are not valid Unicode are
+/// dropped. On `Err`, exit (see the module documentation).
 pub fn single_instance(app_id: &str) -> Result<Instance> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let args: Vec<String> = std::env::args_os()
+        .skip(1)
+        .filter_map(|arg| match arg.into_string() {
+            Ok(arg) => Some(arg),
+            Err(_) => {
+                log::warn!("dropped a command-line argument that is not valid Unicode");
+                None
+            }
+        })
+        .collect();
     SingleInstance::new(app_id).start(&args)
 }
 
@@ -70,6 +96,7 @@ impl SingleInstance {
         self
     }
 
+    /// See [`single_instance`]. On `Err`, exit.
     pub fn start(&self, args: &[String]) -> Result<Instance> {
         let ok = !self.app_id.is_empty()
             && self.app_id.len() <= 64
@@ -80,9 +107,34 @@ impl SingleInstance {
         if !ok {
             return Err(Error::InvalidInput("app id"));
         }
-        let message = encode(args)?;
+        // What does not fit is dropped first, so a long argument cannot keep the
+        // first instance from starting.
+        let message = encode(&forwardable(args))?;
         imp::start(self, &message)
     }
+}
+
+/// The arguments that fit in one message: too long ones are dropped, then the
+/// list is cut at the argument and size limits.
+fn forwardable(args: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut size = MAGIC.len() + 4;
+    for arg in args {
+        if arg.len() > MAX_ARG_BYTES {
+            log::warn!(
+                "dropped a {}-byte argument that is too long to forward",
+                arg.len()
+            );
+            continue;
+        }
+        if out.len() == MAX_ARGS || size + 4 + arg.len() > MAX_MESSAGE_BYTES {
+            log::warn!("dropped command-line arguments beyond the forwarding limit");
+            break;
+        }
+        size += 4 + arg.len();
+        out.push(arg.clone());
+    }
+    out
 }
 
 fn encode(args: &[String]) -> Result<Vec<u8>> {
@@ -133,44 +185,63 @@ fn read_message(stream: &mut impl Read) -> io::Result<Vec<String>> {
     Ok(args)
 }
 
-/// Serves one connection: reads the message, passes it on, acknowledges.
+/// Serves one connection: reads the message, passes it on, acknowledges, and waits
+/// (within the stream's deadline) for the client to hang up, so the ACK is read
+/// before the connection is torn down.
 fn serve(stream: &mut (impl Read + Write), tx: &mpsc::Sender<Vec<String>>) {
     match read_message(stream) {
         Ok(args) => {
             let _ = tx.send(args);
-            let _ = stream.write_all(&[ACK]);
-            let _ = stream.flush();
+            if stream
+                .write_all(&[ACK])
+                .and_then(|()| stream.flush())
+                .is_ok()
+            {
+                let _ = stream.read(&mut [0u8; 1]);
+            }
         }
         Err(err) => log::warn!("refused a message from another instance: {err}"),
     }
 }
 
 fn send(stream: &mut (impl Read + Write), message: &[u8]) -> Result<Instance> {
-    stream.write_all(message)?;
-    stream.flush()?;
+    let not_responding = |_| Error::NotResponding;
+    stream.write_all(message).map_err(not_responding)?;
+    stream.flush().map_err(not_responding)?;
     let mut ack = [0u8; 1];
-    stream.read_exact(&mut ack)?;
+    stream.read_exact(&mut ack).map_err(not_responding)?;
     if ack[0] != ACK {
-        return Err(Error::Os("the running instance did not acknowledge".into()));
+        return Err(Error::NotResponding);
     }
     Ok(Instance::Secondary)
+}
+
+/// Time left until `until`, or a `TimedOut` error once it has passed.
+fn remaining(until: Instant) -> io::Result<Duration> {
+    let left = until.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        Err(io::Error::new(io::ErrorKind::TimedOut, "deadline passed"))
+    } else {
+        Ok(left)
+    }
 }
 
 #[cfg(unix)]
 mod imp {
     use std::fs::{DirBuilder, File, OpenOptions};
+    use std::io::{self, Read, Write};
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
     use std::sync::mpsc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
-    use super::{send, serve, Instance, SingleInstance};
+    use super::{remaining, send, serve, Instance, SingleInstance, SEND_DEADLINE, SERVE_DEADLINE};
     use crate::{Error, Result};
 
     fn uid() -> u32 {
-        // SAFETY: getuid cannot fail.
+        // SAFETY: getuid has no preconditions and cannot fail.
         unsafe { libc::getuid() }
     }
 
@@ -189,7 +260,7 @@ mod imp {
     pub(super) fn private_dir(base: &Path, app_id: &str) -> Result<PathBuf> {
         let dir = base.join(format!("{app_id}-{}", uid()));
         match DirBuilder::new().mode(0o700).create(&dir) {
-            Err(err) if err.kind() != std::io::ErrorKind::AlreadyExists => return Err(err.into()),
+            Err(err) if err.kind() != io::ErrorKind::AlreadyExists => return Err(err.into()),
             _ => {}
         }
         let meta = std::fs::symlink_metadata(&dir)?;
@@ -205,13 +276,14 @@ mod imp {
         Ok(dir)
     }
 
-    fn peer_uid(stream: &UnixStream) -> std::io::Result<u32> {
+    fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
         let fd = stream.as_raw_fd();
         #[cfg(any(target_os = "linux", target_os = "android"))]
         {
+            // SAFETY: ucred is plain old data; all-zero is a valid value.
             let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
             let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-            // SAFETY: `cred` and `len` are valid for the call.
+            // SAFETY: `cred` and `len` are valid for the call and sized for SO_PEERCRED.
             let rc = unsafe {
                 libc::getsockopt(
                     fd,
@@ -222,31 +294,56 @@ mod imp {
                 )
             };
             if rc != 0 {
-                return Err(std::io::Error::last_os_error());
+                return Err(io::Error::last_os_error());
             }
             Ok(cred.uid)
         }
         #[cfg(not(any(target_os = "linux", target_os = "android")))]
         {
             let (mut uid, mut gid) = (0, 0);
-            // SAFETY: both out-pointers are valid.
+            // SAFETY: both out-pointers are valid for the call.
             if unsafe { libc::getpeereid(fd, &mut uid, &mut gid) } != 0 {
-                return Err(std::io::Error::last_os_error());
+                return Err(io::Error::last_os_error());
             }
             Ok(uid)
         }
     }
 
-    fn try_lock(file: &File) -> std::io::Result<bool> {
+    fn try_lock(file: &File) -> io::Result<bool> {
         // SAFETY: a valid descriptor; the lock lives as long as the file is open.
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
             return Ok(true);
         }
-        let err = std::io::Error::last_os_error();
+        let err = io::Error::last_os_error();
         if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
             Ok(false)
         } else {
             Err(err)
+        }
+    }
+
+    /// A socket whose reads and writes share one deadline.
+    struct Deadline<'a> {
+        stream: &'a mut UnixStream,
+        until: Instant,
+    }
+
+    impl Read for Deadline<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.stream.set_read_timeout(Some(remaining(self.until)?))?;
+            self.stream.read(buf)
+        }
+    }
+
+    impl Write for Deadline<'_> {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.stream
+                .set_write_timeout(Some(remaining(self.until)?))?;
+            self.stream.write(buf)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.stream.flush()
         }
     }
 
@@ -272,7 +369,7 @@ mod imp {
     fn primary(lock: File, socket: &Path) -> Result<Instance> {
         // Only the lock holder gets here, so a socket file left behind is stale.
         match std::fs::remove_file(socket) {
-            Err(err) if err.kind() != std::io::ErrorKind::NotFound => return Err(err.into()),
+            Err(err) if err.kind() != io::ErrorKind::NotFound => return Err(err.into()),
             _ => {}
         }
         let listener = UnixListener::bind(socket)?;
@@ -284,7 +381,15 @@ mod imp {
                 // The lock is held for as long as this thread runs: the life of the app.
                 let _lock = lock;
                 for stream in listener.incoming() {
-                    let Ok(mut stream) = stream else { continue };
+                    let mut stream = match stream {
+                        Ok(stream) => stream,
+                        Err(err) => {
+                            // Out of descriptors, say: back off instead of spinning.
+                            log::warn!("single-instance accept failed: {err}");
+                            std::thread::sleep(Duration::from_millis(200));
+                            continue;
+                        }
+                    };
                     match peer_uid(&stream) {
                         Ok(peer) if peer == uid() => {}
                         _ => {
@@ -292,18 +397,24 @@ mod imp {
                             continue;
                         }
                     }
-                    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-                    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
-                    serve(&mut stream, &tx);
+                    let until = Instant::now() + SERVE_DEADLINE;
+                    serve(
+                        &mut Deadline {
+                            stream: &mut stream,
+                            until,
+                        },
+                        &tx,
+                    );
                 }
             })?;
         Ok(Instance::Primary(rx))
     }
 
     fn secondary(socket: &Path, message: &[u8]) -> Result<Instance> {
-        // The first instance may hold the lock but not have bound its socket yet.
-        let mut last = None;
-        for _ in 0..50 {
+        // The first instance holds the lock, so it exists: anything but a hand-over
+        // within the deadline is "not responding", never "go ahead".
+        let until = Instant::now() + SEND_DEADLINE;
+        loop {
             match UnixStream::connect(socket) {
                 Ok(mut stream) => {
                     if peer_uid(&stream)? != uid() {
@@ -311,15 +422,21 @@ mod imp {
                             "the running instance belongs to another user",
                         ));
                     }
-                    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-                    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-                    return send(&mut stream, message);
+                    return send(
+                        &mut Deadline {
+                            stream: &mut stream,
+                            until,
+                        },
+                        message,
+                    );
                 }
-                Err(err) => last = Some(err),
+                // It may hold the lock but not have bound its socket yet.
+                Err(_) if remaining(until).is_ok() => {
+                    std::thread::sleep(Duration::from_millis(100))
+                }
+                Err(_) => return Err(Error::NotResponding),
             }
-            std::thread::sleep(Duration::from_millis(100));
         }
-        Err(last.map_or(Error::Os("no running instance answered".into()), Error::Io))
     }
 }
 
@@ -327,12 +444,13 @@ mod imp {
 mod imp {
     use std::io::{self, Read, Write};
     use std::sync::mpsc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use windows::core::{HSTRING, PCWSTR, PWSTR};
     use windows::Win32::Foundation::{
-        CloseHandle, LocalFree, ERROR_ACCESS_DENIED, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED,
-        GENERIC_READ, GENERIC_WRITE, HANDLE, HLOCAL,
+        CloseHandle, LocalFree, ERROR_ACCESS_DENIED, ERROR_BROKEN_PIPE, ERROR_IO_PENDING,
+        ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, GENERIC_READ, GENERIC_WRITE, HANDLE, HLOCAL,
+        WAIT_OBJECT_0,
     };
     use windows::Win32::Security::Authorization::{
         ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
@@ -343,22 +461,26 @@ mod imp {
         PSID, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
     };
     use windows::Win32::Storage::FileSystem::{
-        CreateFileW, FlushFileBuffers, ReadFile, WriteFile, FILE_FLAGS_AND_ATTRIBUTES,
-        FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_SHARE_NONE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
-        READ_CONTROL, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
+        CreateFileW, ReadFile, WriteFile, FILE_FLAGS_AND_ATTRIBUTES, FILE_FLAG_FIRST_PIPE_INSTANCE,
+        FILE_FLAG_OVERLAPPED, FILE_SHARE_NONE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX, READ_CONTROL,
+        SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
     };
     use windows::Win32::System::Pipes::{
         ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, WaitNamedPipeW,
         PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
     };
-    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    use windows::Win32::System::Threading::{
+        CreateEventW, GetCurrentProcess, OpenProcessToken, WaitForSingleObject, INFINITE,
+    };
+    use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 
-    use super::{send, serve, Instance, SingleInstance};
+    use super::{remaining, send, serve, Instance, SingleInstance, SEND_DEADLINE, SERVE_DEADLINE};
     use crate::{Error, Result};
 
-    /// An owned handle that is closed on drop. Pipe handles may be used from any thread.
+    /// An owned handle that is closed on drop.
     struct Handle(HANDLE);
-    // SAFETY: a kernel handle is just a number; the pipe is only used by one thread at a time.
+    // SAFETY: a kernel handle may be used from any thread; each one here is only used
+    // by one thread at a time.
     unsafe impl Send for Handle {}
 
     impl Drop for Handle {
@@ -370,28 +492,102 @@ mod imp {
         }
     }
 
-    impl Read for Handle {
-        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            let mut read = 0u32;
-            // SAFETY: synchronous read into a valid buffer.
-            unsafe { ReadFile(self.0, Some(buf), Some(&mut read), None) }
-                .map_err(io::Error::other)?;
-            Ok(read as usize)
+    fn os_error(err: windows::core::Error) -> io::Error {
+        if err.code() == ERROR_BROKEN_PIPE.to_hresult() {
+            io::Error::new(io::ErrorKind::BrokenPipe, err)
+        } else if err.code() == ERROR_PIPE_CONNECTED.to_hresult() {
+            io::Error::new(io::ErrorKind::AlreadyExists, err)
+        } else {
+            io::Error::other(err)
         }
     }
 
-    impl Write for Handle {
+    /// Overlapped I/O on a pipe, every operation bounded by one shared deadline. When
+    /// the deadline passes, the operation is cancelled with `CancelIoEx`.
+    struct Overlapped<'a> {
+        pipe: &'a Handle,
+        event: Handle,
+        until: Option<Instant>,
+    }
+
+    impl<'a> Overlapped<'a> {
+        fn new(pipe: &'a Handle, until: Option<Instant>) -> io::Result<Self> {
+            // SAFETY: an unnamed manual-reset event with default security.
+            let event =
+                unsafe { CreateEventW(None, true, false, PCWSTR::null()) }.map_err(os_error)?;
+            Ok(Self {
+                pipe,
+                event: Handle(event),
+                until,
+            })
+        }
+
+        /// Starts an operation with `start` and waits for it within the deadline.
+        fn run(
+            &self,
+            start: impl FnOnce(&mut OVERLAPPED) -> windows::core::Result<()>,
+        ) -> io::Result<u32> {
+            let mut ov = OVERLAPPED {
+                hEvent: self.event.0,
+                ..Default::default()
+            };
+            match start(&mut ov) {
+                Ok(()) => {}
+                Err(err) if err.code() == ERROR_IO_PENDING.to_hresult() => {
+                    let wait_ms = match self.until {
+                        Some(until) => remaining(until)?.as_millis().clamp(1, 60_000) as u32,
+                        None => INFINITE,
+                    };
+                    // SAFETY: the event belongs to this operation and stays alive.
+                    let woke = unsafe { WaitForSingleObject(self.event.0, wait_ms) };
+                    if woke != WAIT_OBJECT_0 {
+                        // SAFETY: cancels only this operation, then waits for the
+                        // cancellation to finish so `ov` is no longer in use.
+                        unsafe {
+                            let _ = CancelIoEx(self.pipe.0, Some(&ov));
+                            let mut ignored = 0u32;
+                            let _ = GetOverlappedResult(self.pipe.0, &ov, &mut ignored, true);
+                        }
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "pipe deadline passed",
+                        ));
+                    }
+                }
+                Err(err) => return Err(os_error(err)),
+            }
+            let mut done = 0u32;
+            // SAFETY: the operation on `ov` has completed.
+            unsafe { GetOverlappedResult(self.pipe.0, &ov, &mut done, false) }.map_err(os_error)?;
+            Ok(done)
+        }
+    }
+
+    impl Read for Overlapped<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let pipe = self.pipe.0;
+            // SAFETY: `buf` and the OVERLAPPED outlive the operation (run waits for it).
+            match self.run(|ov| unsafe { ReadFile(pipe, Some(buf), None, Some(ov)) }) {
+                Ok(n) => Ok(n as usize),
+                // The other side hung up: end of stream.
+                Err(err) if err.kind() == io::ErrorKind::BrokenPipe => Ok(0),
+                Err(err) => Err(err),
+            }
+        }
+    }
+
+    impl Write for Overlapped<'_> {
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            let mut written = 0u32;
-            // SAFETY: synchronous write from a valid buffer.
-            unsafe { WriteFile(self.0, Some(buf), Some(&mut written), None) }
-                .map_err(io::Error::other)?;
-            Ok(written as usize)
+            let pipe = self.pipe.0;
+            // SAFETY: `buf` and the OVERLAPPED outlive the operation (run waits for it).
+            self.run(|ov| unsafe { WriteFile(pipe, Some(buf), None, Some(ov)) })
+                .map(|n| n as usize)
         }
 
         fn flush(&mut self) -> io::Result<()> {
-            // SAFETY: valid pipe handle.
-            unsafe { FlushFileBuffers(self.0) }.map_err(io::Error::other)
+            // Writes complete when the data is in the pipe; FlushFileBuffers would
+            // wait for the reader without a deadline.
+            Ok(())
         }
     }
 
@@ -430,7 +626,7 @@ mod imp {
 
         fn string(&self) -> Result<String> {
             let mut out = PWSTR::null();
-            // SAFETY: valid SID; the string is freed with LocalFree.
+            // SAFETY: valid SID; the string is freed with LocalFree once read.
             unsafe {
                 ConvertSidToStringSidW(self.psid(), &mut out)?;
                 let text = out.to_string().map_err(|e| Error::Os(e.to_string()));
@@ -442,6 +638,39 @@ mod imp {
 
     fn pipe_name(app_id: &str, sid: &str) -> HSTRING {
         HSTRING::from(format!(r"\\.\pipe\{app_id}-{sid}"))
+    }
+
+    /// Opens the pipe as a client: identification level only, so the server cannot
+    /// act as this user.
+    fn open_client(name: &HSTRING, overlapped: bool) -> windows::core::Result<HANDLE> {
+        let mut flags = SECURITY_SQOS_PRESENT.0 | SECURITY_IDENTIFICATION.0;
+        if overlapped {
+            flags |= FILE_FLAG_OVERLAPPED.0;
+        }
+        // SAFETY: opening a named pipe by a valid, NUL-terminated name.
+        unsafe {
+            CreateFileW(
+                PCWSTR(name.as_ptr()),
+                (GENERIC_READ | GENERIC_WRITE).0 | READ_CONTROL.0,
+                FILE_SHARE_NONE,
+                None,
+                OPEN_EXISTING,
+                FILE_FLAGS_AND_ATTRIBUTES(flags),
+                None,
+            )
+        }
+    }
+
+    /// A client that connects and then sends nothing (tests only).
+    #[cfg(test)]
+    pub(super) struct SilentClient(#[allow(dead_code)] Handle);
+
+    #[cfg(test)]
+    pub(super) fn silent_client(app_id: &str) -> SilentClient {
+        let sid = UserSid::current().unwrap().string().unwrap();
+        SilentClient(Handle(
+            open_client(&pipe_name(app_id, &sid), false).unwrap(),
+        ))
     }
 
     pub(super) fn start(opts: &SingleInstance, message: &[u8]) -> Result<Instance> {
@@ -469,7 +698,7 @@ mod imp {
         let pipe = unsafe {
             CreateNamedPipeW(
                 PCWSTR(name.as_ptr()),
-                PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
+                PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE | FILE_FLAG_OVERLAPPED,
                 PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
                 1,
                 4096,
@@ -498,21 +727,39 @@ mod imp {
         primary(Handle(pipe))
     }
 
-    fn primary(mut pipe: Handle) -> Result<Instance> {
+    /// Waits (without a deadline) for the next client to connect.
+    fn accept(pipe: &Handle) -> io::Result<()> {
+        let io = Overlapped::new(pipe, None)?;
+        let handle = pipe.0;
+        // SAFETY: valid pipe handle; `run` waits for the operation to finish.
+        match io.run(|ov| unsafe { ConnectNamedPipe(handle, Some(ov)) }) {
+            Ok(_) => Ok(()),
+            // The client connected between CreateNamedPipe/Disconnect and this call.
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+            Err(err) => Err(err),
+        }
+    }
+
+    fn primary(pipe: Handle) -> Result<Instance> {
         let (tx, rx) = mpsc::channel();
         std::thread::Builder::new()
             .name("inlet-single-instance".into())
             .spawn(move || loop {
-                // SAFETY: valid pipe handle owned by this thread.
-                let connected = unsafe { ConnectNamedPipe(pipe.0, None) };
-                let ok = match connected {
-                    Ok(()) => true,
-                    Err(err) => err.code() == ERROR_PIPE_CONNECTED.to_hresult(),
-                };
-                if ok {
-                    serve(&mut pipe, &tx);
+                match accept(&pipe) {
+                    Ok(()) => {
+                        let until = Instant::now() + SERVE_DEADLINE;
+                        match Overlapped::new(&pipe, Some(until)) {
+                            Ok(mut io) => serve(&mut io, &tx),
+                            Err(err) => log::warn!("single-instance pipe: {err}"),
+                        }
+                    }
+                    Err(err) => {
+                        log::warn!("single-instance pipe connect failed: {err}");
+                        std::thread::sleep(Duration::from_millis(200));
+                    }
                 }
-                // SAFETY: ends this client's session; the handle stays valid.
+                // SAFETY: ends this client's session (a silent one is cut off here);
+                // the handle stays valid for the next client.
                 unsafe {
                     let _ = DisconnectNamedPipe(pipe.0);
                 }
@@ -521,34 +768,29 @@ mod imp {
     }
 
     fn secondary(name: &HSTRING, user: &UserSid, message: &[u8]) -> Result<Instance> {
-        for _ in 0..50 {
-            // SAFETY: opening a named pipe; identification level only, so the
-            // server cannot act as this user.
-            let opened = unsafe {
-                CreateFileW(
-                    PCWSTR(name.as_ptr()),
-                    (GENERIC_READ | GENERIC_WRITE).0 | READ_CONTROL.0,
-                    FILE_SHARE_NONE,
-                    None,
-                    OPEN_EXISTING,
-                    FILE_FLAGS_AND_ATTRIBUTES(SECURITY_SQOS_PRESENT.0 | SECURITY_IDENTIFICATION.0),
-                    None,
-                )
+        // The pipe exists, so an instance is running: anything but a hand-over within
+        // the deadline is "not responding", never "go ahead".
+        let until = Instant::now() + SEND_DEADLINE;
+        loop {
+            let Ok(left) = remaining(until) else {
+                return Err(Error::NotResponding);
             };
-            match opened {
+            match open_client(name, true) {
                 Ok(handle) => {
-                    let mut pipe = Handle(handle);
+                    let pipe = Handle(handle);
                     check_owner(&pipe, user)?;
-                    return send(&mut pipe, message);
+                    let mut io =
+                        Overlapped::new(&pipe, Some(until)).map_err(|_| Error::NotResponding)?;
+                    return send(&mut io, message);
                 }
                 Err(err) if err.code() == ERROR_PIPE_BUSY.to_hresult() => {
-                    // SAFETY: waits for the pipe instance to become free.
-                    let _ = unsafe { WaitNamedPipeW(PCWSTR(name.as_ptr()), 2000) };
+                    let wait_ms = left.as_millis().clamp(1, 5_000) as u32;
+                    // SAFETY: waits, bounded, for the pipe instance to become free.
+                    let _ = unsafe { WaitNamedPipeW(PCWSTR(name.as_ptr()), wait_ms) };
                 }
                 Err(_) => std::thread::sleep(Duration::from_millis(100)),
             }
         }
-        Err(Error::Os("no running instance answered".into()))
     }
 
     /// Refuses a pipe that someone else created under our name.
@@ -573,6 +815,7 @@ mod imp {
         }
         // SAFETY: both SIDs are valid while `sd` lives.
         let same = unsafe { EqualSid(owner, user.psid()) }.is_ok();
+        // SAFETY: allocated by GetSecurityInfo and no longer used.
         unsafe {
             let _ = LocalFree(Some(HLOCAL(sd.0)));
         }
@@ -634,6 +877,52 @@ mod tests {
             rx.recv_timeout(Duration::from_secs(5)).unwrap(),
             args(&["x"])
         );
+    }
+
+    /// A client that connects and sends nothing is cut off after the serve deadline;
+    /// the next start still hands over within its own deadline.
+    #[test]
+    fn a_silent_client_does_not_block_the_next_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let app_id = format!("inlet-test-{}-silent", std::process::id());
+        let Instance::Primary(rx) = opts(dir.path(), &app_id).start(&[]).unwrap() else {
+            panic!("first start should be primary");
+        };
+        #[cfg(unix)]
+        let _silent = std::os::unix::net::UnixStream::connect(
+            imp::private_dir(dir.path(), &app_id)
+                .unwrap()
+                .join("socket"),
+        )
+        .unwrap();
+        #[cfg(windows)]
+        let _silent = imp::silent_client(&app_id);
+        let started = std::time::Instant::now();
+        let second = opts(dir.path(), &app_id).start(&args(&["x"])).unwrap();
+        assert!(matches!(second, Instance::Secondary));
+        assert!(started.elapsed() < SEND_DEADLINE, "{:?}", started.elapsed());
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            args(&["x"])
+        );
+    }
+
+    #[test]
+    fn long_or_extra_arguments_are_dropped_not_fatal() {
+        let long = "a".repeat(MAX_ARG_BYTES + 1);
+        let kept = forwardable(&[long, "inlet://invite/abc".into()]);
+        assert_eq!(kept, args(&["inlet://invite/abc"]));
+        let many: Vec<String> = (0..100).map(|i| i.to_string()).collect();
+        assert_eq!(forwardable(&many).len(), MAX_ARGS);
+        let big = vec!["b".repeat(MAX_ARG_BYTES); 20];
+        let kept = forwardable(&big);
+        assert!(encode(&kept).is_ok());
+        assert!(kept.len() < 20);
+        // A first instance with an oversized argument still starts.
+        let dir = tempfile::tempdir().unwrap();
+        let app_id = format!("inlet-test-{}-long", std::process::id());
+        let start = opts(dir.path(), &app_id).start(&["c".repeat(10_000)]);
+        assert!(matches!(start, Ok(Instance::Primary(_))));
     }
 
     #[test]

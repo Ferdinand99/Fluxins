@@ -33,15 +33,16 @@ pub fn get() -> Result<bool> {
     Autostart::for_current_exe()?.get()
 }
 
-/// Whether this process was started by the login item.
+/// Whether this process was started by the login item. Only options before any
+/// `--` count (see [`crate::split_args`]).
 pub fn launched_at_login<S: AsRef<str>>(args: &[S]) -> bool {
-    args.iter().any(|a| a.as_ref() == AUTOSTART_ARG)
+    crate::args::has_flag(args, AUTOSTART_ARG)
 }
 
 /// Whether this process should start hidden in the tray: only for a login start
-/// that asked for it.
+/// that asked for it, and only from options before any `--`.
 pub fn start_minimized<S: AsRef<str>>(args: &[S]) -> bool {
-    launched_at_login(args) && args.iter().any(|a| a.as_ref() == MINIMIZED_ARG)
+    launched_at_login(args) && crate::args::has_flag(args, MINIMIZED_ARG)
 }
 
 /// The login item of one executable. [`set`] and [`get`] use the running

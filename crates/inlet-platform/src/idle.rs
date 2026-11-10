@@ -32,6 +32,7 @@ mod imp {
         }
         // Both are milliseconds since boot in 32 bits; wrapping_sub handles the
         // 49.7-day wrap.
+        // SAFETY: no preconditions.
         let now = unsafe { GetTickCount() };
         Some(Duration::from_millis(u64::from(
             now.wrapping_sub(info.dwTime),

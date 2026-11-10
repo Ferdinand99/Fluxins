@@ -1,11 +1,12 @@
 //! System notifications.
 //!
-//! Showing a notification and receiving its click go through gpui
-//! (`App::show_system_notification`, `App::on_system_notification_response`), which
-//! has a backend for all three systems: toasts with an AppUserModelID on Windows,
-//! `UNUserNotificationCenter` on macOS (only inside an app bundle), and the
-//! freedesktop notification service through `notify-rust` on Linux. See
-//! [`crate::gpui_glue`].
+//! - Windows: this crate shows the toast itself, from its own thread
+//!   ([`notify`]). gpui's toast call pumps window messages while the app is
+//!   borrowed, which makes gpui drop frames ("RefCell already borrowed"); a toast
+//!   from another thread never touches the UI thread.
+//! - macOS and Linux: through gpui (`App::show_system_notification`), see
+//!   `gpui_glue::notify`. macOS needs an app bundle. On Linux the body is escaped
+//!   first when the notification server reads markup.
 //!
 //! This module builds what is shown: text from the server is cleaned and capped
 //! here, and when the user has turned previews off the message content never
@@ -44,8 +45,9 @@ pub struct Notification {
 }
 
 impl Notification {
-    /// A notification with free text. `tag` identifies it (a newer notification with
-    /// the same tag replaces the older one) and comes back in
+    /// A notification with free text. `tag` identifies it (on Windows and macOS a
+    /// newer notification with the same tag replaces the older one; Linux shows
+    /// both) and comes back in
     /// [`crate::PlatformEvent::NotificationClicked`]. It must be 1 to 64 characters of
     /// `A-Z a-z 0-9 . _ : -`.
     pub fn new(tag: &str, title: &str, body: &str) -> Result<Self> {
@@ -117,7 +119,64 @@ fn is_invisible_format(c: char) -> bool {
             | '\u{2066}'..='\u{2069}'
             | '\u{FEFF}'
             | '\u{FFF9}'..='\u{FFFB}'
+            // Fillers and joiners that render as nothing, popular for blank names.
+            | '\u{034F}'
+            | '\u{115F}'
+            | '\u{1160}'
+            | '\u{180E}'
+            | '\u{3164}'
+            | '\u{FFA0}'
     )
+}
+
+/// Escapes text for a notification server that reads markup in the body
+/// (`body-markup`): `&`, `<`, `>`, `"` and `'` become entities, so a message can
+/// never turn into a link or formatting.
+pub fn escape_markup(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Shows a notification. Windows only: the toast is shown from this crate's own
+/// notification thread, so it is safe to call from anywhere, also while gpui's app
+/// is borrowed. A click arrives as [`crate::PlatformEvent::NotificationClicked`].
+/// Elsewhere this returns [`Error::Unsupported`]; use `gpui_glue::notify`, which
+/// picks the right path on every system.
+pub fn notify(notification: &Notification) -> Result<()> {
+    #[cfg(windows)]
+    {
+        crate::toast::show(notification)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = notification;
+        Err(Error::Unsupported(
+            "notifications go through gpui here: use gpui_glue::notify",
+        ))
+    }
+}
+
+/// Removes a notification shown by [`notify`] (Windows only; elsewhere a no-op).
+pub fn dismiss(tag: &str) -> Result<()> {
+    #[cfg(windows)]
+    {
+        crate::toast::dismiss(tag)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = tag;
+        Ok(())
+    }
 }
 
 /// Makes server text safe to hand to the OS: cuts the input to 4 KiB, turns line
@@ -229,6 +288,31 @@ mod tests {
         let n =
             Notification::message("m:1", "Alice", secret, Preview::Show, "New message").unwrap();
         assert_eq!(n.body(), secret);
+    }
+
+    #[test]
+    fn blank_name_fillers_are_removed() {
+        let n = Notification::new(
+            "a:1",
+            "\u{3164}\u{115F}\u{1160}\u{FFA0}\u{034F}\u{180E}",
+            "a\u{3164}b",
+        )
+        .unwrap();
+        assert_eq!(n.title(), "");
+        assert_eq!(n.body(), "ab");
+        // Tag characters stay: flag emoji such as England need them.
+        let england = "\u{1F3F4}\u{E0067}\u{E0062}\u{E0065}\u{E006E}\u{E0067}\u{E007F}";
+        assert_eq!(clean_text(england, 10), england);
+    }
+
+    #[test]
+    fn markup_is_escaped_for_markup_servers() {
+        let body = r#"<a href="https://evil.example">Log in</a> & a < b 'q'"#;
+        assert_eq!(
+            escape_markup(body),
+            "&lt;a href=&quot;https://evil.example&quot;&gt;Log in&lt;/a&gt; &amp; a &lt; b &apos;q&apos;"
+        );
+        assert_eq!(escape_markup("plain"), "plain");
     }
 
     #[test]

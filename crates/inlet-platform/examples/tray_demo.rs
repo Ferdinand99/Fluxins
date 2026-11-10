@@ -15,8 +15,8 @@ use gpui::{
     WindowOptions,
 };
 use inlet_platform::{
-    deep_link, gpui_glue, idle_time, set_badge, single_instance, Badge, Icon, Instance,
-    Notification, PlatformEvent, Tray, TrayItem, TrayState,
+    deep_link, flag_value, gpui_glue, idle_time, single_instance, Badge, Icon, Instance,
+    Notification, PlatformEvent, TrayItem, TrayState,
 };
 
 /// A filled disc with a lighter ring: the demo's tray icon. On macOS only its
@@ -62,21 +62,19 @@ impl Render for Demo {
 fn main() {
     env_logger_lite();
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let exit_after = args
-        .iter()
-        .position(|a| a == "--exit-after")
-        .and_then(|i| args.get(i + 1))
-        .and_then(|n| n.parse::<u64>().ok());
+    // Options only before `--`: a link that broke out of its quotes cannot set them.
+    let exit_after = flag_value(&args, "--exit-after").and_then(|n| n.parse::<u64>().ok());
 
     let forwarded = match single_instance(inlet_platform::APP_ID) {
         Ok(Instance::Secondary) => {
-            println!("another instance is running; handed it {args:?}");
+            println!("another instance is running; handed it the command line");
             return;
         }
-        Ok(Instance::Primary(rx)) => Some(rx),
+        Ok(Instance::Primary(rx)) => rx,
+        // Never carry on as a second primary: another instance may be running.
         Err(err) => {
-            println!("single instance unavailable: {err}");
-            None
+            eprintln!("Inlet is already running but does not respond ({err}).");
+            std::process::exit(1);
         }
     };
     if let Some(link) = deep_link::extract(&args) {
@@ -109,23 +107,28 @@ fn main() {
             .expect("open the demo window");
         cx.activate(true);
 
-        // Shell calls (tray, taskbar) may dispatch window messages while they run,
-        // and gpui's window procedure needs the app, so on Windows they stay out of
-        // this `run` callback and out of `cx.update`: in a task, between awaits.
+        // The gpui_glue calls are safe from anywhere, also from this callback and
+        // inside `cx.update`: tray and badge calls run in their own task, and
+        // Windows toasts come from the crate's notification thread.
+        let menu = vec![
+            TrayItem::action("open", "Open Inlet"),
+            TrayItem::action("unread", "Show unread"),
+            TrayItem::action("normal", "Clear"),
+            TrayItem::separator(),
+            TrayItem::action("quit", "Quit Inlet"),
+        ];
+        let tray_task = gpui_glue::create_tray(cx, demo_icon(32), menu);
+        gpui_glue::set_badge(cx, Badge::Count(3));
+
         let events = inlet_platform::events();
         cx.spawn(async move |cx| {
-            let menu = vec![
-                TrayItem::action("open", "Open Inlet"),
-                TrayItem::action("unread", "Show unread"),
-                TrayItem::action("normal", "Clear"),
-                TrayItem::separator(),
-                TrayItem::action("quit", "Quit Inlet"),
-            ];
-            let tray = match Tray::new(demo_icon(32), menu) {
+            let tray = match tray_task.await {
                 Ok(tray) => {
-                    tray.set_state(TrayState::Mention);
-                    tray.set_tooltip("Inlet \u{2013} 3 mentions");
                     println!("tray icon created");
+                    cx.update(|cx| {
+                        gpui_glue::set_tray_state(cx, &tray, TrayState::Mention);
+                        gpui_glue::set_tray_tooltip(cx, &tray, "Inlet \u{2013} 3 mentions");
+                    });
                     Some(tray)
                 }
                 Err(err) => {
@@ -133,70 +136,67 @@ fn main() {
                     None
                 }
             };
-            set_badge(Badge::Count(3));
             println!("idle time: {:?}", idle_time());
 
             // Platform events, including the tray menu.
             while let Ok(event) = events.recv().await {
                 println!("event: {event:?}");
-                match event {
-                    PlatformEvent::TrayMenu(id) if id == "quit" => cx.update(|cx| cx.quit()),
+                cx.update(|cx| match event {
+                    PlatformEvent::TrayMenu(id) if id == "quit" => cx.quit(),
                     PlatformEvent::TrayMenu(id) if id == "unread" => {
                         if let Some(tray) = &tray {
-                            tray.set_state(TrayState::Unread);
+                            gpui_glue::set_tray_state(cx, tray, TrayState::Unread);
                         }
-                        set_badge(Badge::Dot);
+                        gpui_glue::set_badge(cx, Badge::Dot);
                     }
                     PlatformEvent::TrayMenu(id) if id == "normal" => {
                         if let Some(tray) = &tray {
-                            tray.set_state(TrayState::Normal);
+                            gpui_glue::set_tray_state(cx, tray, TrayState::Normal);
                         }
-                        set_badge(None);
+                        gpui_glue::set_badge(cx, None);
                     }
                     _ => {}
-                }
+                });
             }
         })
         .detach();
 
         // Command lines from later starts.
-        if let Some(rx) = forwarded {
-            let (tx, links) = async_channel::unbounded::<Vec<String>>();
-            std::thread::spawn(move || {
-                while let Ok(args) = rx.recv() {
-                    if tx.send_blocking(args).is_err() {
-                        break;
-                    }
+        let (tx, handed_over) = async_channel::unbounded::<Vec<String>>();
+        std::thread::spawn(move || {
+            while let Ok(args) = forwarded.recv() {
+                if tx.send_blocking(args).is_err() {
+                    break;
                 }
-            });
-            cx.spawn(async move |_cx| {
-                while let Ok(args) = links.recv().await {
-                    match deep_link::extract(&args) {
-                        Some(link) => println!("second start handed over {}", link.to_url()),
-                        None => println!("second start without a link: {args:?}"),
-                    }
+            }
+        });
+        cx.spawn(async move |_cx| {
+            while let Ok(args) = handed_over.recv().await {
+                match deep_link::extract(&args) {
+                    Some(link) => println!("second start handed over {}", link.to_url()),
+                    None => println!("second start without a link"),
                 }
-            })
-            .detach();
-        }
+            }
+        })
+        .detach();
 
-        // Flash the window after a moment (visible when it is in the background),
-        // set the badge once the taskbar button exists, then post a notification.
+        // After a moment: flash the window (visible when it is in the background),
+        // set the badge again now that the taskbar button exists, and post a
+        // notification, all from inside `cx.update`.
         cx.spawn(async move |cx| {
             cx.background_executor().timer(Duration::from_secs(2)).await;
-            set_badge(Badge::Count(3));
-            cx.update(|cx| {
-                let _ = window.update(cx, |_, window, _| gpui_glue::flash_window(window));
-            });
             println!("posting the notification");
             cx.update(|cx| {
-                match Notification::new(
+                gpui_glue::set_badge(cx, Badge::Count(3));
+                let _ = window.update(cx, |_, window, _| gpui_glue::flash_window(window));
+                let posted = Notification::new(
                     "demo:1",
                     "Inlet demo",
                     "This notification came from inlet-platform.",
-                ) {
-                    Ok(n) => gpui_glue::notify(cx, &n),
-                    Err(err) => println!("notification refused: {err}"),
+                )
+                .and_then(|n| gpui_glue::notify(cx, &n));
+                if let Err(err) = posted {
+                    println!("notification not shown: {err}");
                 }
             });
             println!("notification posted");
