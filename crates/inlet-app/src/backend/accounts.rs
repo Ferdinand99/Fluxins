@@ -365,6 +365,8 @@ impl Backend {
             self.start_background(r, delay, 0);
         }
         match (first, legacy) {
+            // Already running (start-up asked for again): nothing to start.
+            (Some(r), _) if self.engine_of(&r.key).is_some() => {}
             (Some(r), _) => {
                 let instance = r.key.origin.to_string();
                 let credential = Credential::Stored {
@@ -393,6 +395,19 @@ impl Backend {
     fn set_known(&mut self, list: Vec<AccountInfo>) {
         self.known = list.clone();
         self.tell(Ev::Accounts(list));
+    }
+
+    /// Runs a task on the stored accounts after every store task started before it, so
+    /// keychain and list writes happen in the order the backend asked for them (a
+    /// sign-out after a restore removes what the restore stored, never the other way).
+    fn store_job(&mut self, job: impl std::future::Future<Output = ()> + Send + 'static) {
+        let previous = self.store_tail.take();
+        self.store_tail = Some(tokio::spawn(async move {
+            if let Some(previous) = previous {
+                let _ = previous.await;
+            }
+            job.await;
+        }));
     }
 
     /// Stops waiting for a connect. A restore is aborted. A new sign-in is left to finish
@@ -665,17 +680,28 @@ impl Backend {
         };
         let session = connected.session.clone();
         let (name, handle) = (connected.username.clone(), connected.account.clone());
+        // A stored token must belong to the account its entry is named after. Otherwise
+        // it is not used (fail closed); the entry stays, nothing is stored under another
+        // name.
+        if let Some(Restore::Account(expected)) = &restore {
+            let origin = session.instance().origin().to_string();
+            if AccountKey::new(&origin, &connected.user_id).as_ref() != Some(expected) {
+                log::warn!("a stored token belongs to another account than its entry");
+                if !self.promote_next() {
+                    self.tell(Ev::NeedsSignIn {
+                        instance: Some(origin),
+                    });
+                    self.tell(Ev::SignInFailed(t!("error-account-mismatch")));
+                }
+                return;
+            }
+        }
         let Some(key) = self.install(connected, false, pasted) else {
             return;
         };
-        if let Some(Restore::Account(expected)) = &restore {
-            if expected != &key {
-                log::warn!("a stored token belongs to another account than its entry");
-            }
-        }
         let store = self.store.clone();
         let internal = self.internal.clone();
-        self.spawn_guarded("store session", None, async move {
+        self.store_job(async move {
             let mut accounts = store.lock().await;
             if let Some(Restore::Legacy(origin)) = restore {
                 let info = AccountInfo {
@@ -719,7 +745,7 @@ impl Backend {
                     }
                     Some(Restore::Legacy(origin)) => {
                         let store = self.store.clone();
-                        self.spawn_guarded("forget token", None, async move {
+                        self.store_job(async move {
                             store.lock().await.forget_legacy(&origin, false).await;
                         });
                     }
@@ -772,6 +798,10 @@ impl Backend {
         let session = connected.session;
         let instance = session.instance().origin().to_string();
         let Some(key) = AccountKey::new(&instance, &connected.user_id) else {
+            // Leaves the start-up or "Finishing" screen for the sign-in form.
+            self.tell(Ev::NeedsSignIn {
+                instance: Some(instance),
+            });
             self.tell(Ev::SignInFailed(t!("error-account-id")));
             return None;
         };
@@ -819,7 +849,7 @@ impl Backend {
             let global = self.global.clone();
             // Through the store's lock: a sign-out right after waits for this write, so
             // it cannot store a token that sign-out is about to end.
-            self.spawn_guarded("store account", None, async move {
+            self.store_job(async move {
                 let mut accounts = store.lock().await;
                 match accounts.add(signed_in, pasted).await {
                     Ok(_) => {
@@ -926,7 +956,7 @@ impl Backend {
             .unwrap_or_default();
         let store = self.store.clone();
         let (k, s) = (key.clone(), session.clone());
-        self.spawn_guarded("store session", None, async move {
+        self.store_job(async move {
             store.lock().await.remember_session(k, s);
         });
         self.background.push(RealActive {
@@ -1011,7 +1041,7 @@ impl Backend {
         let _ = self.events.unbounded_send(messages::Ev::Guilds(guilds));
         let store = self.store.clone();
         let key = key.clone();
-        self.spawn_guarded("store active", None, async move {
+        self.store_job(async move {
             let mut accounts = store.lock().await;
             accounts.set_active(&key);
             accounts.save().await;
@@ -1055,7 +1085,7 @@ impl Backend {
             self.demote_active();
             let store = self.store.clone();
             let internal = self.internal.clone();
-            self.spawn_guarded("load account", None, async move {
+            self.store_job(async move {
                 let restored = store.lock().await.load(&key).await;
                 let _ = internal.send(Internal::ForegroundLoaded(restored));
             });
@@ -1153,7 +1183,7 @@ impl Backend {
         self.drop_engine(&key);
         let store = self.store.clone();
         let internal = self.internal.clone();
-        self.spawn_guarded("sign out", None, async move {
+        self.store_job(async move {
             let mut accounts = store.lock().await;
             accounts.remove(&key, revoke).await;
             let _ = internal.send(Internal::ListChanged(accounts.list()));
@@ -1204,7 +1234,7 @@ impl Backend {
     pub(super) fn forget_stored(&mut self) {
         let store = self.store.clone();
         let internal = self.internal.clone();
-        self.spawn_guarded("forget stored", None, async move {
+        self.store_job(async move {
             let mut accounts = store.lock().await;
             accounts.restore_all().await;
             let active = accounts.active().cloned();
@@ -1248,7 +1278,7 @@ impl Backend {
             Some(Restore::Account(key)) => self.forget_account(key, true),
             Some(Restore::Legacy(origin)) => {
                 let store = self.store.clone();
-                self.spawn_guarded("sign out", None, async move {
+                self.store_job(async move {
                     store.lock().await.forget_legacy(&origin, true).await;
                 });
             }

@@ -604,3 +604,21 @@ fn account_keys_name_their_keychain_entry() {
     // The same user on two instances is two accounts.
     assert_ne!(k, AccountKey::new("https://other.example", "42").unwrap());
 }
+
+#[tokio::test]
+async fn store_tasks_run_in_the_order_they_were_asked_for() {
+    let (mut b, _rx, _irx) = backend();
+    let order = Arc::new(StdMutex::new(Vec::new()));
+    let (first, second) = (order.clone(), order.clone());
+    // A slow restore-time write, then a sign-out: the sign-out must come second.
+    b.store_job(async move {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        first.lock().unwrap().push("store session");
+    });
+    b.store_job(async move {
+        second.lock().unwrap().push("sign out");
+    });
+    let last = b.store_tail.take().unwrap();
+    last.await.unwrap();
+    assert_eq!(*order.lock().unwrap(), vec!["store session", "sign out"]);
+}

@@ -404,6 +404,8 @@ struct Backend {
     known: Vec<AccountInfo>,
     /// The keychain entries and the account list; tasks lock it in turn.
     store: Arc<tokio::sync::Mutex<Accounts>>,
+    /// The last task on the store; the next one waits for it (see `store_job`).
+    store_tail: Option<tokio::task::JoinHandle<()>>,
     attempt: u64,
     connecting: Option<(u64, AbortHandle, Mode)>,
     offline: Option<Offline>,
@@ -435,6 +437,7 @@ impl Backend {
             starts: HashMap::new(),
             known: Vec::new(),
             store: Arc::new(tokio::sync::Mutex::new(store)),
+            store_tail: None,
             attempt: 0,
             connecting: None,
             offline: None,
