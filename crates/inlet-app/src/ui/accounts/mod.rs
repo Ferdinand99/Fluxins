@@ -196,10 +196,15 @@ impl Inlet {
                 }
             }
             Ev::SessionEnded(message) => {
+                // The account is gone: its drafts go too.
+                self.composer.sign_out();
                 self.reset_main();
                 self.sign_in.error = Some(message);
             }
-            Ev::SignedOut => self.reset_main(),
+            Ev::SignedOut => {
+                self.composer.sign_out();
+                self.reset_main();
+            }
             // The messages domain loads the open channel again on every READY.
             Ev::Reconnected => {}
             Ev::Status(status) => {
@@ -215,6 +220,7 @@ impl Inlet {
     /// From the fatal screen: start a fresh backend that ends the stored session on the
     /// server (best effort, with timeouts) and removes it, all off the UI thread.
     pub(crate) fn fatal_sign_out(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.composer.sign_out();
         self.restart_backend(false, window, cx);
         self.backend.send(Cmd::ForgetStored);
     }

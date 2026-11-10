@@ -55,11 +55,13 @@ impl Mentions {
 /// What to send as `allowed_mentions`: the mentions the user picked, so the server drops any
 /// other mention whatever the text says.
 ///
-/// Send `users` and `roles` as lists and leave `parse` out. Add `parse: ["everyone"]` only
-/// when `everyone` is true. The server does not accept `parse` together with the lists
-/// (`PARSE_AND_USERS_OR_ROLES_CANNOT_BE_USED_TOGETHER`), so with an everyone mention and
-/// picked users or roles at once, send `parse: ["everyone", "users", "roles"]` and rely on
-/// the escaping in [`to_wire`] for the rest.
+/// Send `users` and `roles` as lists with an empty `parse` (`parse: []`: Fluxer reads a
+/// missing `parse` without lists as "parse everything"). Use `parse: ["everyone"]`, without
+/// lists, only when `everyone` is true. The server does not accept a non-empty `parse`
+/// together with the lists (`PARSE_AND_USERS_OR_ROLES_CANNOT_BE_USED_TOGETHER`), so with an
+/// everyone mention and picked users or roles at once, send `parse: ["everyone", "users",
+/// "roles"]` and rely on the escaping in [`to_wire`] for the rest. The protocol crate's
+/// `AllowedMentions::only` and `AllowedMentions::all` build exactly these.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AllowedMentions {
     pub users: Vec<Id>,
