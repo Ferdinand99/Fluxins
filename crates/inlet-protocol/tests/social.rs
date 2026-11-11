@@ -80,15 +80,21 @@ async fn group_dm_create_solves_captcha_or_returns_captcha_result() {
         .mount(&server)
         .await;
     let c = client(&instance, "tok-gdm-ok");
-    // The executor keeps running while the challenge is solved (this test
-    // runs on a single-threaded runtime: a solve on it would stop the ticks).
-    let ticks = Arc::new(AtomicU64::new(0));
-    let ticker = {
-        let ticks = ticks.clone();
+    // The executor keeps running while the challenge is solved. This test
+    // runs on a single-threaded runtime, and a task that only yields measures
+    // the longest time it was not polled: a solve on the runtime thread would
+    // stall it for about the whole solve. (Timer-free, so it holds on every OS.)
+    let longest_stall_us = Arc::new(AtomicU64::new(0));
+    let watcher = {
+        let longest = longest_stall_us.clone();
         tokio::spawn(async move {
+            let mut last = Instant::now();
             loop {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-                ticks.fetch_add(1, Ordering::Relaxed);
+                tokio::task::yield_now().await;
+                let now = Instant::now();
+                let gap = now.duration_since(last).as_micros() as u64;
+                longest.fetch_max(gap, Ordering::Relaxed);
+                last = now;
             }
         })
     };
@@ -97,18 +103,20 @@ async fn group_dm_create_solves_captcha_or_returns_captcha_result() {
         .create_group_dm(&["11".into(), "12".into(), "11".into()])
         .await
         .unwrap();
-    let elapsed_ms = started.elapsed().as_millis();
-    ticker.abort();
+    let elapsed = started.elapsed();
+    watcher.abort();
     match out {
         GroupDmOutcome::Done(ch) => assert_eq!((ch.id.as_str(), ch.kind), ("500", 3)),
         other => panic!("{other:?}"),
     }
-    // A tick needs 1-2 ms; a solve on the executor would leave almost none.
-    let ticks = u128::from(ticks.load(Ordering::Relaxed));
-    assert!(
-        ticks * 3 >= elapsed_ms.saturating_sub(20),
-        "solving blocked the executor: {ticks} ticks in {elapsed_ms} ms"
-    );
+    let longest = Duration::from_micros(longest_stall_us.load(Ordering::Relaxed));
+    // Only meaningful when the call took a while (the solve dominates it).
+    if elapsed >= Duration::from_millis(100) {
+        assert!(
+            longest * 2 < elapsed,
+            "solving blocked the executor: stalled {longest:?} of {elapsed:?}"
+        );
+    }
 
     // 2. A challenge that cannot be solved: the CAPTCHA result, one request.
     let (server, instance) = common::instance().await;
