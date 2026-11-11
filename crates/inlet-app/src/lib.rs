@@ -96,6 +96,7 @@ fn bind_keys(cx: &mut App) {
     text_input::bind_keys(cx);
     ui::notifications::bind_keys(cx);
     ui::composer::bind_keys(cx);
+    ui::composer::pickers::bind_keys(cx);
     ui::chat::bind_keys(cx);
     ui::search::bind_keys(cx);
 }
@@ -116,6 +117,10 @@ mod tests {
         ("text_input", crate::text_input::bind_keys),
         ("ui::notifications", crate::ui::notifications::bind_keys),
         ("ui::composer", crate::ui::composer::bind_keys),
+        (
+            "ui::composer::pickers",
+            crate::ui::composer::pickers::bind_keys,
+        ),
         ("ui::chat", crate::ui::chat::bind_keys),
         ("ui::search", crate::ui::search::bind_keys),
     ];

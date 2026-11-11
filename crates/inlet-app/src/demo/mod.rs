@@ -22,6 +22,7 @@ pub mod inbox;
 mod markdown;
 pub mod media;
 mod messages;
+pub mod pickers;
 pub mod scene_file;
 pub mod scenes;
 pub mod search;

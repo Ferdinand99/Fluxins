@@ -18,10 +18,13 @@
 //!   per 10 s;
 //! - a message with files: see [`upload`] (one plan request, one `PUT` per part, one
 //!   complete request for files in parts, then the message).
+//!
+//! The pickers' requests (GIFs, preferences, memes, stickers) are in `gif`, with their
+//! own budget.
 
 mod directory;
 pub mod exif;
-mod gif;
+pub mod gif;
 mod send;
 pub mod upload;
 
@@ -64,6 +67,8 @@ pub enum Cmd {
     Upload(Upload),
     /// Stop an upload and let go of its files.
     CancelUpload { nonce: String },
+    /// The emoji, GIF, sticker and meme pickers.
+    Pickers(gif::Cmd),
 }
 
 pub enum Ev {
@@ -110,6 +115,8 @@ pub enum Ev {
     /// Nothing was sent: the metadata of photo `name` could not be removed. The message
     /// goes back to the composer with that file marked; its pending row goes.
     UploadStuck { nonce: String, name: String },
+    /// Answers for the pickers.
+    Pickers(gif::Ev),
 }
 
 pub(super) fn handle(backend: &mut Backend, cmd: Cmd) {
@@ -132,5 +139,6 @@ pub(super) fn handle(backend: &mut Backend, cmd: Cmd) {
         Cmd::DirectMessage { user_id, message } => backend.direct_message(user_id, message),
         Cmd::Upload(upload) => backend.upload(upload),
         Cmd::CancelUpload { nonce } => backend.cancel_upload(nonce),
+        Cmd::Pickers(cmd) => backend.pickers(cmd),
     }
 }
