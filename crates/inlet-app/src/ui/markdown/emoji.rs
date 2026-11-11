@@ -8,27 +8,26 @@
 //! carries Fluxer's own list.
 //!
 //! An emoji takes a placeholder in the text as wide as Fluxer's inline emoji (1.5 em)
-//! and its Twemoji drawing is painted over it once the text is laid out ([`overlay`]).
-//! The drawings live in a bounded cache ([`EmojiImages`]); an emoji that does not get
-//! an image is painted as text.
+//! and its picture is painted over it once the text is laid out ([`overlay`]): the
+//! Twemoji drawing of a Unicode emoji (an emoji that does not get an image is painted as
+//! text), or the picture of a custom (guild) emoji. The pictures and their bounds live
+//! in `ui::media::emoji`.
 //! A message of only emoji (up to 30) is drawn large, as in Fluxer's `JumboDetector`.
-//! Custom (guild) emoji show their `:name:` until custom emoji images arrive.
 
-use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::ops::Range;
+use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant};
 
 use fluxer_markdown_parser::ast::EmojiKind;
 use fluxer_markdown_parser::{EmojiContext, Node};
 use gpui::{
-    canvas, point, prelude::*, size, AnyElement, Bounds, Corners, Image, ImageFormat, Pixels,
-    RenderImage, ShapedLine, SharedString, TextAlign, TextLayout, TextRun,
+    canvas, point, prelude::*, size, AnyElement, Bounds, Corners, Image, Pixels, RenderImage,
+    ShapedLine, SharedString, TextAlign, TextLayout, TextRun,
 };
 
-use super::inline::push_marked;
-use super::{Emoji, Inline, Style};
+use super::{Emoji, Inline};
+use crate::ui::media::emoji::{self as media_emoji, EmojiPictures, Picture};
 
 /// The text an emoji takes: an em space and an en space (1.5 em, Fluxer's inline
 /// emoji width), joined by a word joiner so a line never breaks inside it.
@@ -66,7 +65,7 @@ pub(super) fn push(kind: &EmojiKind, inline: &mut Inline) {
         }
         EmojiKind::Custom { name, id, animated } => {
             let start = inline.text.len();
-            push_marked(inline, &format!(":{name}:"), Style::Muted);
+            inline.text.push_str(PLACEHOLDER);
             inline.emoji.push((
                 start..inline.text.len(),
                 Emoji::Custom {
@@ -255,202 +254,61 @@ fn shortcodes(input: &str) -> Vec<&str> {
 
 // ---- Drawing --------------------------------------------------------------------
 
-// Deviation: the plan (K9) has Twemoji drawn by `inlet-media`, through its bounded
-// image cache. That shared cache does not exist yet, so this module keeps its own
-// bounded cache ([`EmojiImages`]) and gives the bundled SVG bytes to gpui's
-// `Image::from_bytes`. Only drawings from `inlet-emoji` reach gpui; no SVG from the
-// network is ever drawn. The seam is `EmojiImages`: moving onto the shared cache
-// replaces that type and the release step in [`overlay`].
-
-/// Twemoji drawings are rendered this large, so they stay sharp at 48 px on a 1.5x
-/// screen and at the inline size on a 2x one.
-const RASTER: u32 = 64;
-/// Drawings kept as images. Each is RASTER x RASTER x 4 bytes = 16 KiB decoded, and as
-/// much in the GPU atlas: 500 images are 8 MB of each.
-pub(super) const MAX_IMAGES: usize = 500;
-/// Different emoji drawn as images in one text; the others are painted as text.
-pub(super) const MAX_IMAGES_PER_TEXT: usize = 200;
-/// An image used this recently may still be on screen, so it is never evicted to make
-/// room; the new emoji is painted as text instead.
-const IN_USE: Duration = Duration::from_millis(500);
-
-/// One cached drawing.
-struct Entry {
-    image: Arc<Image>,
-    /// What gpui decoded it to, once drawn: dropped from the atlas on eviction.
-    render: Option<Arc<RenderImage>>,
-    used: Instant,
-}
-
-/// A bounded, least-recently-used cache of Twemoji images. Evicted images are queued
-/// and released from gpui (its asset cache and the GPU atlas) at the next paint, where
-/// the app is at hand.
-#[derive(Default)]
-pub(super) struct EmojiImages {
-    entries: HashMap<String, Entry>,
-    /// Glyphs with no drawing (looked up once).
-    missing: HashSet<String>,
-    released: Vec<(Arc<Image>, Option<Arc<RenderImage>>)>,
-}
-
-impl EmojiImages {
-    /// The image for `glyph`, or `None` when it has no drawing or every cached image
-    /// is in use (it is painted as text then).
-    fn reserve(&mut self, glyph: &str, now: Instant) -> Option<Arc<Image>> {
-        if let Some(entry) = self.entries.get_mut(glyph) {
-            entry.used = now;
-            return Some(entry.image.clone());
-        }
-        if self.missing.contains(glyph) {
-            return None;
-        }
-        if self.entries.len() >= MAX_IMAGES {
-            let (oldest, used) = self
-                .entries
-                .iter()
-                .min_by_key(|(_, e)| e.used)
-                .map(|(k, e)| (k.clone(), e.used))?;
-            if now.saturating_duration_since(used) < IN_USE {
-                return None;
-            }
-            if let Some(entry) = self.entries.remove(&oldest) {
-                self.released.push((entry.image, entry.render));
-            }
-        }
-        let Some(svg) = inlet_emoji::twemoji_svg(glyph) else {
-            self.missing.insert(glyph.to_string());
-            return None;
-        };
-        let image = Arc::new(Image::from_bytes(ImageFormat::Svg, sized_svg(&svg)));
-        self.entries.insert(
-            glyph.to_string(),
-            Entry {
-                image: image.clone(),
-                render: None,
-                used: now,
-            },
-        );
-        Some(image)
-    }
-
-    /// Notes what gpui decoded `glyph` to, so eviction can drop it from the atlas.
-    fn rendered(&mut self, glyph: &str, render: &Arc<RenderImage>) {
-        if let Some(entry) = self.entries.get_mut(glyph) {
-            entry.render.get_or_insert_with(|| render.clone());
-        }
-    }
-
-    /// For each emoji of one text: its image, or `None` to paint it as text. At most
-    /// [`MAX_IMAGES_PER_TEXT`] different emoji get an image.
-    fn plan(&mut self, glyphs: &[&str], now: Instant) -> Vec<Option<Arc<Image>>> {
-        let mut seen: HashMap<&str, Option<Arc<Image>>> = HashMap::new();
-        glyphs
-            .iter()
-            .map(|glyph| {
-                if let Some(found) = seen.get(glyph) {
-                    return found.clone();
-                }
-                let image = if seen.len() < MAX_IMAGES_PER_TEXT {
-                    self.reserve(glyph, now)
-                } else {
-                    None
-                };
-                seen.insert(glyph, image.clone());
-                image
-            })
-            .collect()
-    }
-
-    fn take_released(&mut self) -> Vec<(Arc<Image>, Option<Arc<RenderImage>>)> {
-        std::mem::take(&mut self.released)
-    }
-}
-
-thread_local! {
-    static IMAGES: RefCell<EmojiImages> = RefCell::new(EmojiImages::default());
-}
-
-/// The bundled Twemoji SVG for `glyph`, sized to [`RASTER`] pixels. Only drawings from
-/// `inlet-emoji` reach this; no SVG from the network is ever drawn.
-fn sized_svg(svg: &[u8]) -> Vec<u8> {
-    // Twemoji drawings have a 36 x 36 view box and no size: give the root a size so
-    // gpui renders them at RASTER pixels instead of 36.
-    let tag = svg
-        .windows(4)
-        .position(|w| w[0] == b'<' && &w[1..] == b"svg")
-        .map(|p| p + 4);
-    let Some(at) = tag else {
-        return svg.to_vec();
-    };
-    let head = &svg[..svg.iter().position(|b| *b == b'>').unwrap_or(svg.len())];
-    if head.windows(5).any(|w| w == b"width") {
-        return svg.to_vec();
-    }
-    let attrs = [("width", RASTER), ("height", RASTER)]
-        .iter()
-        .map(|(name, value)| format!("{name}=\"{value}\""))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let mut out = Vec::with_capacity(svg.len() + attrs.len() + 2);
-    out.extend_from_slice(&svg[..at]);
-    out.push(b' ');
-    out.extend_from_slice(attrs.as_bytes());
-    out.extend_from_slice(&svg[at..]);
-    out
-}
-
 /// How one emoji is painted over its placeholder.
 enum Slot {
+    /// A Twemoji drawing.
     Image(String, Arc<Image>),
-    /// No image (none left in the cache, or no drawing): the glyph as text.
+    /// No Twemoji image (none left in the cache, or no drawing): the glyph as text.
     Text(String),
+    /// A custom emoji's picture (see `ui::media::emoji`).
+    Custom(Picture),
 }
 
 enum Painted {
     Image(Arc<RenderImage>),
     Text(Box<ShapedLine>),
+    Custom(Picture),
 }
 
-/// Paints the Twemoji of `emoji` over their placeholders in a laid-out text. `None`
-/// when there is nothing to paint. Custom emoji have no image yet: their name shows.
+/// Paints the emoji of a laid-out text over their placeholders: Twemoji, and custom
+/// emoji from `pictures` (the message's, see `RenderCtx`). `None` when there is nothing
+/// to paint.
 pub(super) fn overlay(
     layout: TextLayout,
     emoji: &[&(Range<usize>, Emoji)],
     side: Pixels,
+    pictures: Option<Rc<EmojiPictures>>,
 ) -> Option<AnyElement> {
-    let standard: Vec<(Range<usize>, &str)> = emoji
+    if emoji.is_empty() {
+        return None;
+    }
+    let glyphs: Vec<&str> = emoji
         .iter()
-        .filter_map(|(range, e)| match e {
-            Emoji::Standard(glyph) => Some((range.clone(), glyph.as_str())),
+        .filter_map(|(_, e)| match e {
+            Emoji::Standard(glyph) => Some(glyph.as_str()),
             Emoji::Custom { .. } => None,
         })
         .collect();
-    if standard.is_empty() {
-        return None;
-    }
-    let glyphs: Vec<&str> = standard.iter().map(|(_, g)| *g).collect();
-    let images = IMAGES.with(|c| c.borrow_mut().plan(&glyphs, Instant::now()));
-    let slots: Vec<(Range<usize>, Slot)> = standard
-        .into_iter()
-        .zip(images)
-        .map(|((range, glyph), image)| {
-            let slot = match image {
-                Some(image) => Slot::Image(glyph.to_string(), image),
-                None => Slot::Text(glyph.to_string()),
+    let mut images = media_emoji::twemoji_plan(&glyphs).into_iter();
+    let slots: Vec<(Range<usize>, Slot)> = emoji
+        .iter()
+        .map(|(range, e)| {
+            let slot = match e {
+                Emoji::Standard(glyph) => match images.next().flatten() {
+                    Some(image) => Slot::Image(glyph.clone(), image),
+                    None => Slot::Text(glyph.clone()),
+                },
+                Emoji::Custom { id, .. } => {
+                    Slot::Custom(pictures.as_ref().map_or(Picture::Missing, |p| p.get(id)))
+                }
             };
-            (range, slot)
+            (range.clone(), slot)
         })
         .collect();
+    let budget = pictures.map(|p| p.budget.clone());
     Some(
         canvas(
             move |_, window, cx| {
-                // Release what the cache evicted: gpui's copy and the atlas entry.
-                for (image, render) in IMAGES.with(|c| c.borrow_mut().take_released()) {
-                    image.remove_asset(cx);
-                    if let Some(render) = render {
-                        cx.drop_image(render, Some(window));
-                    }
-                }
                 let style = window.text_style();
                 let font_size = style.font_size.to_pixels(window.rem_size());
                 slots
@@ -458,9 +316,10 @@ pub(super) fn overlay(
                     .filter_map(|(range, slot)| match slot {
                         Slot::Image(glyph, image) => {
                             let render = image.use_render_image(window, cx)?;
-                            IMAGES.with(|c| c.borrow_mut().rendered(&glyph, &render));
+                            media_emoji::twemoji_rendered(&glyph, &render);
                             Some((range, Painted::Image(render)))
                         }
+                        Slot::Custom(picture) => Some((range, Painted::Custom(picture))),
                         Slot::Text(glyph) => {
                             let run = TextRun {
                                 len: glyph.len(),
@@ -492,11 +351,10 @@ pub(super) fn overlay(
                         Some(end) if end.y == start.y && end.x > start.x => end.x - start.x,
                         _ => side,
                     };
+                    let origin = point(start.x + (width - side) / 2., start.y + (line - side) / 2.);
+                    let bounds = Bounds::new(origin, size(side, side));
                     match item {
                         Painted::Image(img) => {
-                            let origin =
-                                point(start.x + (width - side) / 2., start.y + (line - side) / 2.);
-                            let bounds = Bounds::new(origin, size(side, side));
                             let _ = window.paint_image(
                                 bounds,
                                 bounds,
@@ -505,6 +363,11 @@ pub(super) fn overlay(
                                 0,
                                 false,
                             );
+                        }
+                        Painted::Custom(picture) => {
+                            if let Some(budget) = &budget {
+                                media_emoji::paint_emoji(&picture, bounds, budget, window, cx);
+                            }
                         }
                         Painted::Text(text) => {
                             let x = start.x + (width - text.width()).max(Pixels::ZERO) / 2.;
@@ -539,78 +402,6 @@ mod tests {
         assert_eq!(shortcodes("a:b:c:d"), vec!["b"]);
         assert_eq!(shortcodes("::: :x-y_1:"), vec!["x-y_1"]);
         assert!(shortcodes("no colons").is_empty());
-    }
-
-    #[test]
-    fn svg_gets_a_size_once() {
-        let svg = b"<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 36 36\"><path/></svg>";
-        let sized = String::from_utf8(sized_svg(svg)).unwrap();
-        assert!(
-            sized.starts_with("<svg width=\"64\" height=\"64\" xmlns"),
-            "{sized}"
-        );
-        assert_eq!(sized_svg(sized.as_bytes()), sized.as_bytes());
-    }
-
-    #[test]
-    fn every_drawable_glyph_has_an_image() {
-        let mut cache = EmojiImages::default();
-        let now = Instant::now();
-        assert!(cache.reserve("\u{1F600}", now).is_some());
-        assert!(cache.reserve("\u{1F44B}\u{1F3FD}", now).is_some());
-        assert!(cache.reserve("not an emoji", now).is_none());
-        assert!(cache.missing.contains("not an emoji"));
-    }
-
-    /// Decoded bytes of the images in `cache` (what gpui keeps for each, and as much
-    /// again in the GPU atlas).
-    fn decoded_bytes(cache: &EmojiImages) -> usize {
-        cache.entries.len() * (RASTER * RASTER * 4) as usize
-    }
-
-    #[test]
-    fn emoji_images_are_bounded_and_released() {
-        let distinct: Vec<&str> = inlet_emoji::glyphs()
-            .filter(|g| inlet_emoji::twemoji_svg(g).is_some())
-            .take(2_000)
-            .collect();
-        assert_eq!(distinct.len(), 2_000);
-        let mut cache = EmojiImages::default();
-        let start = Instant::now();
-
-        // One message with 2 000 different emoji: 200 images, the rest as text.
-        let plan = cache.plan(&distinct, start);
-        let images = plan.iter().filter(|i| i.is_some()).count();
-        assert_eq!(images, MAX_IMAGES_PER_TEXT);
-        assert_eq!(cache.entries.len(), MAX_IMAGES_PER_TEXT);
-        assert_eq!(decoded_bytes(&cache), 200 * 16 * 1024);
-        let svg_bytes: usize = cache.entries.values().map(|e| e.image.bytes().len()).sum();
-        eprintln!(
-            "2000 distinct emoji: {images} images, {} KiB decoded (and in the atlas), {} KiB SVG",
-            decoded_bytes(&cache) / 1024,
-            svg_bytes / 1024
-        );
-        // The same emoji again reuses the images.
-        let again = cache.plan(&distinct, start);
-        assert_eq!(again.iter().filter(|i| i.is_some()).count(), images);
-        assert_eq!(cache.entries.len(), MAX_IMAGES_PER_TEXT);
-
-        // More texts on the same screen: the cache stops at its cap, nothing in use is
-        // evicted, and the rest is painted as text.
-        for chunk in distinct[200..1_000].chunks(200) {
-            cache.plan(chunk, start);
-        }
-        assert_eq!(cache.entries.len(), MAX_IMAGES);
-        assert!(cache.released.is_empty());
-        assert!(decoded_bytes(&cache) <= 8 * 1024 * 1024);
-
-        // Later, other emoji: the oldest images are evicted and queued for release.
-        let later = start + Duration::from_secs(5);
-        let plan = cache.plan(&distinct[1_000..1_100], later);
-        assert!(plan.iter().all(Option::is_some));
-        assert_eq!(cache.entries.len(), MAX_IMAGES);
-        assert_eq!(cache.take_released().len(), 100);
-        assert!(cache.take_released().is_empty());
     }
 
     #[test]

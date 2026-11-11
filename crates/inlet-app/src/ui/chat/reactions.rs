@@ -82,7 +82,8 @@ impl ReactionChip {
 }
 
 /// How an emoji is drawn: a known Unicode emoji as its Twemoji image, anything else as
-/// short text (a custom emoji as `:name:` until custom emoji images arrive).
+/// short text (a custom emoji as `:name:` where it has no picture, see
+/// [`Inlet::reaction_emoji`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EmojiLabel {
     Glyph(String),
@@ -131,6 +132,27 @@ fn glyph_blocks(glyph: &str) -> Rc<Vec<Block>> {
     })
 }
 
+impl Inlet {
+    /// An emoji of a reaction as an element, `size` the text size it is drawn at: a
+    /// custom emoji as its picture (through the image client and the animation rules,
+    /// like custom emoji in text), anything else as [`emoji_el`] draws it.
+    pub(crate) fn reaction_emoji(
+        &self,
+        id: &str,
+        emoji: &p::Emoji,
+        size: f32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        match emoji.id.as_deref() {
+            Some(custom) if emoji.is_custom() => {
+                // The size Twemoji get at this text size (1.375 em).
+                self.custom_emoji(custom, emoji.animated, (size * 1.375).round(), cx)
+            }
+            _ => emoji_el(id, emoji, size),
+        }
+    }
+}
+
 /// An emoji as an element, `size` the text size it is drawn at.
 pub fn emoji_el(id: &str, emoji: &p::Emoji, size: f32) -> AnyElement {
     match label(emoji) {
@@ -139,6 +161,7 @@ pub fn emoji_el(id: &str, emoji: &p::Emoji, size: f32) -> AnyElement {
                 revealed: true,
                 names: Rc::default(),
                 jumbo: false,
+                emoji: None,
                 off_thread: None,
                 on_link: Rc::new(|_, _, _, _| {}),
                 on_reveal: Rc::new(|_, _| {}),
@@ -436,7 +459,7 @@ impl Inlet {
                             .border_color(gpui::transparent_black())
                             .hover(|s| s.border_color(theme::accent_border()))
                     })
-                    .child(emoji_el(&format!("react-e-{id}-{i}"), &chip.emoji, 11.))
+                    .child(self.reaction_emoji(&format!("react-e-{id}-{i}"), &chip.emoji, 11., cx))
                     .child(
                         div()
                             .text_size(px(14.))

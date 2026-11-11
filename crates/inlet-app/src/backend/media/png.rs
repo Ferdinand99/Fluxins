@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! A tiny PNG and APNG writer (stored deflate, no compression) for the demo pictures and
-//! the tests. Nothing in a release build uses it.
+//! Tiny PNG, APNG and GIF writers (no compression) and a WebP writer (lossless, still
+//! and animated) for the demo pictures and the tests. Nothing in a release build uses
+//! them.
 
 fn crc32(data: &[u8]) -> u32 {
     let mut crc = 0xFFFF_FFFFu32;
@@ -88,7 +89,7 @@ pub fn encode(w: u32, h: u32, rgba: &[u8]) -> Vec<u8> {
 }
 
 /// Frames of the same size as an animated PNG that loops, `delay_ms` per frame.
-#[cfg(feature = "demo")]
+#[cfg(any(test, feature = "demo"))]
 pub fn encode_apng(w: u32, h: u32, frames: &[Vec<u8>], delay_ms: u16) -> Vec<u8> {
     let mut out = SIGNATURE.to_vec();
     ihdr(&mut out, w, h);
@@ -145,62 +146,158 @@ pub fn claiming(w: u32, h: u32) -> Vec<u8> {
     out
 }
 
-/// A GIF of `frames` frames on a `w` x `h` canvas: the first frame fills it, the others
-/// change one pixel. Small to send, large once every frame is decoded at full size.
-/// LZW without compression: 7-bit codes in bytes, a clear code every 64 pixels so the
-/// code width never grows.
-#[cfg(test)]
-pub fn long_gif(w: u16, h: u16, frames: usize) -> Vec<u8> {
-    fn image_data(out: &mut Vec<u8>, pixels: impl Iterator<Item = u8>) {
-        const CLEAR: u8 = 128;
-        const END: u8 = 129;
-        let mut codes = Vec::new();
-        let mut run = 0;
-        codes.push(CLEAR);
-        for p in pixels {
-            if run == 64 {
-                codes.push(CLEAR);
-                run = 0;
-            }
-            codes.push(p & 0x7f);
-            run += 1;
+/// GIF image data for 7-bit colour indexes. LZW without compression: 7-bit codes in
+/// bytes, a clear code every 64 pixels so the code width never grows.
+#[cfg(any(test, feature = "demo"))]
+fn gif_image_data(out: &mut Vec<u8>, pixels: impl Iterator<Item = u8>) {
+    const CLEAR: u8 = 128;
+    const END: u8 = 129;
+    let mut codes = Vec::new();
+    let mut run = 0;
+    codes.push(CLEAR);
+    for p in pixels {
+        if run == 64 {
+            codes.push(CLEAR);
+            run = 0;
         }
-        codes.push(END);
-        out.push(7); // LZW minimum code size: 128 colours.
-        for block in codes.chunks(255) {
-            out.push(block.len() as u8);
-            out.extend(block);
-        }
-        out.push(0);
+        codes.push(p & 0x7f);
+        run += 1;
     }
-    fn descriptor(out: &mut Vec<u8>, w: u16, h: u16) {
-        // Graphic control: 100 ms, no transparency.
-        out.extend([0x21, 0xF9, 4, 0, 10, 0, 0, 0]);
-        out.push(0x2C);
-        out.extend(0u16.to_le_bytes());
-        out.extend(0u16.to_le_bytes());
-        out.extend(w.to_le_bytes());
-        out.extend(h.to_le_bytes());
-        out.push(0);
+    codes.push(END);
+    out.push(7); // LZW minimum code size: 128 colours.
+    for block in codes.chunks(255) {
+        out.push(block.len() as u8);
+        out.extend(block);
     }
+    out.push(0);
+}
+
+/// A frame's graphic control (`delay_cs` hundredths of a second; with `transparent`,
+/// colour 0 is transparent and the frame is cleared before the next) and image
+/// descriptor, at the top left.
+#[cfg(any(test, feature = "demo"))]
+fn gif_descriptor(out: &mut Vec<u8>, w: u16, h: u16, delay_cs: u16, transparent: bool) {
+    out.extend([0x21, 0xF9, 4, if transparent { 0x09 } else { 0 }]);
+    out.extend(delay_cs.to_le_bytes());
+    out.extend([0, 0]);
+    out.push(0x2C);
+    out.extend(0u16.to_le_bytes());
+    out.extend(0u16.to_le_bytes());
+    out.extend(w.to_le_bytes());
+    out.extend(h.to_le_bytes());
+    out.push(0);
+}
+
+/// The GIF header with a global colour table of 128 entries (8-bit colour resolution).
+#[cfg(any(test, feature = "demo"))]
+fn gif_header(w: u16, h: u16, palette: impl Fn(u8) -> [u8; 3]) -> Vec<u8> {
     let mut out = b"GIF89a".to_vec();
     out.extend(w.to_le_bytes());
     out.extend(h.to_le_bytes());
-    // Global colour table of 128 entries, 8-bit colour resolution.
     out.extend([0xF6, 0, 0]);
     for i in 0..128u8 {
-        out.extend([i * 2, 255 - i * 2, 90]);
+        out.extend(palette(i));
     }
-    descriptor(&mut out, w, h);
-    image_data(
+    out
+}
+
+/// RGBA frames of `w` x `h` as a GIF, `delay_cs` hundredths of a second each, in 128
+/// colours (2 bits red, 3 green, 2 blue; colour 0 is transparent, for pixels that are
+/// mostly transparent).
+#[cfg(any(test, feature = "demo"))]
+pub fn encode_gif(w: u16, h: u16, frames: &[Vec<u8>], delay_cs: u16) -> Vec<u8> {
+    let palette = |i: u8| [(i >> 5) * 85, ((i >> 2) & 7) * 36, (i & 3) * 85];
+    let index = |p: &[u8; 4]| match p[3] {
+        0..128 => 0,
+        _ => (((p[0] >> 6) << 5) | ((p[1] >> 5) << 2) | (p[2] >> 6)).max(1),
+    };
+    let mut out = gif_header(w, h, palette);
+    for rgba in frames {
+        gif_descriptor(&mut out, w, h, delay_cs, true);
+        gif_image_data(&mut out, rgba.as_chunks::<4>().0.iter().map(index));
+    }
+    out.push(0x3B);
+    out
+}
+
+/// A GIF of `frames` frames on a `w` x `h` canvas: the first frame fills it, the others
+/// change one pixel. Small to send, large once every frame is decoded at full size.
+#[cfg(test)]
+pub fn long_gif(w: u16, h: u16, frames: usize) -> Vec<u8> {
+    let mut out = gif_header(w, h, |i| [i * 2, 255 - i * 2, 90]);
+    gif_descriptor(&mut out, w, h, 10, false);
+    gif_image_data(
         &mut out,
         (0..usize::from(w) * usize::from(h)).map(|i| (i / 97) as u8),
     );
     for i in 1..frames {
-        descriptor(&mut out, 1, 1);
-        image_data(&mut out, std::iter::once((i % 128) as u8));
+        gif_descriptor(&mut out, 1, 1, 10, false);
+        gif_image_data(&mut out, std::iter::once((i % 128) as u8));
     }
     out.push(0x3B);
+    out
+}
+
+/// An RGBA image as a lossless WebP.
+#[cfg(any(test, feature = "demo"))]
+pub fn encode_webp(w: u32, h: u32, rgba: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    image_webp::WebPEncoder::new(&mut out)
+        .encode(rgba, w, h, image_webp::ColorType::Rgba8)
+        .expect("an RGBA buffer of the given size encodes");
+    out
+}
+
+/// A RIFF chunk of a WebP file.
+#[cfg(any(test, feature = "demo"))]
+fn riff_chunk(out: &mut Vec<u8>, fourcc: &[u8; 4], data: &[u8]) {
+    out.extend(fourcc);
+    out.extend((data.len() as u32).to_le_bytes());
+    out.extend(data);
+    if data.len() % 2 == 1 {
+        out.push(0);
+    }
+}
+
+/// Frames of the same size as an animated WebP (`VP8X`, `ANIM`, one lossless `ANMF`
+/// per frame) that loops, `delay_ms` per frame.
+#[cfg(any(test, feature = "demo"))]
+pub fn encode_animated_webp(w: u32, h: u32, frames: &[Vec<u8>], delay_ms: u32) -> Vec<u8> {
+    /// The `VP8L` payload of a still lossless WebP.
+    fn vp8l(still: &[u8]) -> &[u8] {
+        let mut pos = 12;
+        while pos + 8 <= still.len() {
+            let size = u32::from_le_bytes([
+                still[pos + 4],
+                still[pos + 5],
+                still[pos + 6],
+                still[pos + 7],
+            ]) as usize;
+            if &still[pos..pos + 4] == b"VP8L" {
+                return &still[pos + 8..pos + 8 + size];
+            }
+            pos += 8 + size + (size % 2);
+        }
+        &[]
+    }
+    let mut body = b"WEBP".to_vec();
+    let mut vp8x = vec![0x12u8, 0, 0, 0]; // animation and alpha
+    vp8x.extend(&(w - 1).to_le_bytes()[..3]);
+    vp8x.extend(&(h - 1).to_le_bytes()[..3]);
+    riff_chunk(&mut body, b"VP8X", &vp8x);
+    riff_chunk(&mut body, b"ANIM", &[0, 0, 0, 0, 0, 0]);
+    for rgba in frames {
+        let mut anmf = vec![0, 0, 0, 0, 0, 0]; // at 0, 0
+        anmf.extend(&(w - 1).to_le_bytes()[..3]);
+        anmf.extend(&(h - 1).to_le_bytes()[..3]);
+        anmf.extend(&delay_ms.to_le_bytes()[..3]);
+        anmf.push(0b10); // no blending, no disposal
+        riff_chunk(&mut anmf, b"VP8L", vp8l(&encode_webp(w, h, rgba)));
+        riff_chunk(&mut body, b"ANMF", &anmf);
+    }
+    let mut out = b"RIFF".to_vec();
+    out.extend((body.len() as u32).to_le_bytes());
+    out.extend(body);
     out
 }
 

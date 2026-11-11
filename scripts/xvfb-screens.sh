@@ -105,7 +105,27 @@ scene 25-inbox-unreads inbox-unreads c-general
 scene 26-inbox-saved inbox-saved c-general
 scene 27-inbox-mentions inbox-mentions c-general
 
+# 8. Custom emoji and stickers; 100 animated custom emoji. Each with the CPU the app
+#    takes over 10 s (a share of one core) and how often it redrew.
+cpu_scene() {
+  RUST_LOG=info INLET_DEMO=1 INLET_DEMO_LIVE_SECS=3600 INLET_DEMO_SCENE="$2" INLET_DEMO_GUILD=g1 INLET_DEMO_CHANNEL=c-dev "$bin" >"$out/$1.log" 2>&1 &
+  pid=$!
+  sleep 6
+  # Without a window manager nothing has the focus (and animations stop): give it.
+  xdotool windowfocus "$(win)" 2>/dev/null; sleep 1
+  c0=$(awk '{print $14 + $15}' "/proc/$pid/stat" 2>/dev/null || echo 0)
+  sleep 10
+  c1=$(awk '{print $14 + $15}' "/proc/$pid/stat" 2>/dev/null || echo 0)
+  echo "$1: cpu $(( (c1 - c0) * 100 / $(getconf CLK_TCK) / 10 )) % of one core over 10 s" >> "$out/memory.txt"
+  shot "$1"
+  echo "$1: $(grep -E 'VmRSS|VmHWM' /proc/$pid/status | paste -sd ' ')" >> "$out/memory.txt"
+  kill $pid; wait $pid 2>/dev/null
+}
+cpu_scene 28-custom-emoji custom-emoji
+cpu_scene 29-emoji-100 emoji-100
+
 tail -n 20 "$out/signin.log" "$out/demo.log" >&2
+grep -H "demo animations" "$out/28-custom-emoji.log" "$out/29-emoji-100.log" >&2
 cat "$out/memory.txt" >&2
 rm -rf "$out/config"
 tar -C "$out" -cf - .
