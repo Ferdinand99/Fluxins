@@ -10,7 +10,13 @@ use crate::assets::Icon;
 use crate::theme;
 
 pub fn render(w: &WelcomeRow) -> AnyElement {
-    let icon = if w.private { Icon::At } else { Icon::Hash };
+    let icon = if w.private {
+        Icon::At
+    } else if w.thread {
+        Icon::Chats
+    } else {
+        Icon::Hash
+    };
     div()
         .w_full()
         .px_4()

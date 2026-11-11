@@ -18,6 +18,8 @@ pub enum Icon {
     Megaphone,
     /// Forum and other channels (`chats-circle`).
     Chats,
+    /// Media channel (`images-square`).
+    ImagesSquare,
     /// Direct message (`at`, bold).
     At,
     /// Direct messages home (`chat-circle`).
@@ -43,6 +45,7 @@ impl Icon {
             Icon::Speaker => include_bytes!("../assets/icons/speaker-high.svg"),
             Icon::Megaphone => include_bytes!("../assets/icons/megaphone.svg"),
             Icon::Chats => include_bytes!("../assets/icons/chats-circle.svg"),
+            Icon::ImagesSquare => include_bytes!("../assets/icons/images-square.svg"),
             Icon::At => include_bytes!("../assets/icons/at.svg"),
             Icon::ChatCircle => include_bytes!("../assets/icons/chat-circle.svg"),
             Icon::CaretDown => include_bytes!("../assets/icons/caret-down.svg"),

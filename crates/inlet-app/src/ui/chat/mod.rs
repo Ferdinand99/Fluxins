@@ -95,6 +95,9 @@ impl Inlet {
         };
         div()
             .flex_1()
+            // Narrower than its content beside the thread panel: the header and the
+            // rows shrink with it instead of being cut off.
+            .min_w_0()
             .h_full()
             .flex()
             .flex_col()

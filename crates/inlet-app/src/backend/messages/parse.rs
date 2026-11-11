@@ -65,6 +65,8 @@ fn channel_kind(kind: i64) -> ChannelKind {
         channel_type::GUILD_CATEGORY => ChannelKind::Category,
         channel_type::DM => ChannelKind::Dm,
         channel_type::GROUP_DM => ChannelKind::GroupDm,
+        channel_type::GUILD_FORUM => ChannelKind::Forum,
+        channel_type::GUILD_MEDIA => ChannelKind::Media,
         _ => ChannelKind::Other,
     }
 }
