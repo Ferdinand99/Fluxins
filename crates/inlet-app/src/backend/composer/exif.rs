@@ -13,6 +13,8 @@ use bytes::Bytes;
 
 const EXIF_HEADER: &[u8] = b"Exif\0\0";
 const XMP_HEADER: &[u8] = b"http://ns.adobe.com/xap/1.0/\0";
+/// Extended XMP: the part of a large XMP block that did not fit in one segment.
+const XMP_EXTENSION_HEADER: &[u8] = b"http://ns.adobe.com/xmp/extension/\0";
 /// EXIF's orientation tag.
 const ORIENTATION: u16 = 0x0112;
 
@@ -88,6 +90,19 @@ fn orientation_only(value: u16) -> Vec<u8> {
     t
 }
 
+/// The end of the entropy-coded data that starts at `from`: the next marker that is
+/// not a stuffed `FF 00` or a restart marker.
+fn scan_end(d: &[u8], from: usize) -> usize {
+    let mut i = from;
+    while i + 1 < d.len() {
+        if d[i] == 0xFF && d[i + 1] != 0x00 && !(0xD0..=0xD7).contains(&d[i + 1]) {
+            return i;
+        }
+        i += 1;
+    }
+    d.len()
+}
+
 fn strip_jpeg(d: &[u8]) -> Option<Bytes> {
     let mut out = Vec::with_capacity(d.len());
     out.extend_from_slice(&d[..2]);
@@ -104,9 +119,11 @@ fn strip_jpeg(d: &[u8]) -> Option<Bytes> {
             return None;
         }
         let marker = *d.get(m + 1)?;
-        // Start of scan (the image data follows to the end), or end of image.
-        if marker == 0xDA || marker == 0xD9 {
-            out.extend_from_slice(&d[at..]);
+        if marker == 0xD9 {
+            // End of image. What follows (the other pictures of a multi-picture file,
+            // which carry their own metadata) is not sent.
+            out.extend_from_slice(&d[at..m + 2]);
+            removed |= m + 2 < d.len();
             break;
         }
         // Markers without a length.
@@ -121,9 +138,22 @@ fn strip_jpeg(d: &[u8]) -> Option<Bytes> {
         }
         let end = m + 2 + len;
         let body = d.get(m + 4..end)?;
+        if marker == 0xDA {
+            // A scan: its header, then the image data up to the next marker.
+            let data_end = scan_end(d, end);
+            out.extend_from_slice(&d[at..data_end]);
+            at = data_end;
+            if at >= d.len() {
+                break;
+            }
+            continue;
+        }
         let exif = marker == 0xE1 && body.starts_with(EXIF_HEADER);
-        let xmp = marker == 0xE1 && body.starts_with(XMP_HEADER);
-        if exif || xmp {
+        let xmp = marker == 0xE1
+            && (body.starts_with(XMP_HEADER) || body.starts_with(XMP_EXTENSION_HEADER));
+        // The index of the other pictures, which are not sent.
+        let mpf = marker == 0xE2 && body.starts_with(b"MPF\0");
+        if exif || xmp || mpf {
             removed = true;
             if exif && !kept_orientation {
                 if let Some(value) = orientation(&body[EXIF_HEADER.len()..]) {
@@ -321,6 +351,26 @@ pub(crate) mod tests {
         let out = strip(&jpeg_with_exif(1)).unwrap();
         assert!(!contains(&out, EXIF_HEADER));
         assert_eq!(&out[..], &[&[0xFF, 0xD8][..], tail].concat()[..]);
+        // Extended XMP goes too, and so do the other pictures of a multi-picture file
+        // (with their own metadata) after the end of the first.
+        let mut multi = jpeg_with_exif(1);
+        let mut ext = XMP_EXTENSION_HEADER.to_vec();
+        ext.extend_from_slice(b"GPS extended");
+        let ext_seg = [
+            &[0xFF, 0xE1][..],
+            &((ext.len() + 2) as u16).to_be_bytes(),
+            &ext,
+        ]
+        .concat();
+        multi.splice(2..2, ext_seg);
+        multi.extend_from_slice(&jpeg_with_exif(6));
+        let out = strip(&multi).unwrap();
+        assert!(!contains(&out, b"GPS"));
+        assert_eq!(
+            &out[..],
+            &[&[0xFF, 0xD8][..], tail].concat()[..],
+            "the first picture only"
+        );
         // Nothing to remove: `None` (the file is sent as it is).
         assert!(strip(&out).is_none());
         assert!(strip(b"not an image").is_none());
