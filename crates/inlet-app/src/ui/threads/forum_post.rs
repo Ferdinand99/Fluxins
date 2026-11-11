@@ -6,7 +6,7 @@
 use gpui::{div, prelude::*, px, AnyElement, Context, FontWeight, SharedString};
 use inlet_protocol as p;
 use inlet_protocol::api::threads::ForumTag;
-use inlet_state::threads::is_archived;
+use inlet_state::threads::{is_archived, is_pinned_post};
 
 use super::{tags, ThreadIcon};
 use crate::app::Inlet;
@@ -39,6 +39,7 @@ impl Inlet {
             .is_some_and(|p| p.thread.to_string() == post.id);
         let count = post.message_count().unwrap_or(0);
         let archived = is_archived(post);
+        let pinned = is_pinned_post(post) && !archived;
         let target = post.clone();
         div()
             .id(SharedString::from(format!("post-{}", post.id)))
@@ -138,6 +139,7 @@ impl Inlet {
                                 .child(super::count_text(u64::from(unread), true)),
                         )
                     })
+                    .when(pinned, |d| d.child(t!("forum-pinned")))
                     .when(archived, |d| d.child(t!("threads-archived-tag"))),
             )
             .on_click(

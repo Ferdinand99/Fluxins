@@ -79,7 +79,7 @@ impl ForumView {
 
 impl Inlet {
     /// Whether the forum view is up (its channel is the selected one).
-    pub(super) fn forum_is_open(&self) -> bool {
+    pub(crate) fn forum_is_open(&self) -> bool {
         self.threads
             .forum
             .as_ref()
@@ -94,7 +94,6 @@ impl Inlet {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let _ = window;
         self.threads_leave_channel(Some(channel_id), cx);
         let is_forum = self
             .channels
@@ -103,8 +102,10 @@ impl Inlet {
         if !is_forum {
             return false;
         }
-        // The chat's list empties; a forum has no messages of its own.
+        // The chat's list empties; a forum has no messages of its own. The keyboard
+        // leaves the chat's composer, which is not on screen.
         self.clear_messages();
+        window.focus(&self.focus, cx);
         let (Some(account), Some(forum)) = (self.account.clone(), ChannelId::parse(channel_id))
         else {
             return true;

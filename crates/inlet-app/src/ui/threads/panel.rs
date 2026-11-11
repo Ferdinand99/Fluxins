@@ -17,7 +17,7 @@
 //!   would be marked read.
 
 use gpui::{
-    div, list, prelude::*, px, AnyElement, App, Context, Entity, Focusable, FollowMode, FontWeight,
+    div, list, prelude::*, px, AnyElement, App, Context, Entity, FollowMode, FontWeight,
     ListAlignment, ListScrollEvent, ListState, Window,
 };
 use inlet_protocol as p;
@@ -183,8 +183,7 @@ impl Inlet {
             return;
         }
         self.drop_thread_panel(cx);
-        let focus = self.composer.view.focus_handle(cx);
-        window.focus(&focus, cx);
+        self.focus_center(window, cx);
     }
 
     /// Closes the panel without moving the keyboard.

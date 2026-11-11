@@ -182,6 +182,8 @@ pub struct WelcomeRow {
     pub subtitle: String,
     /// A direct message (the icon is an @).
     pub private: bool,
+    /// A thread or forum post (the icon is a speech bubble).
+    pub thread: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -663,12 +665,23 @@ fn welcome_row(state: &AccountState, ch: ChannelId) -> WelcomeRow {
                 title: who.clone(),
                 subtitle: t!("welcome-dm", name = who),
                 private: true,
+                thread: false,
             }
         }
         channel_type::GROUP_DM => WelcomeRow {
             title: name.unwrap_or_else(recipients),
             subtitle: t!("welcome-group"),
             private: true,
+            thread: false,
+        },
+        // Fluxer's thread welcome: the thread's name, and where it starts.
+        channel_type::PUBLIC_THREAD
+        | channel_type::PRIVATE_THREAD
+        | channel_type::ANNOUNCEMENT_THREAD => WelcomeRow {
+            title: name.unwrap_or_default(),
+            subtitle: t!("welcome-thread"),
+            private: false,
+            thread: true,
         },
         _ => {
             let channel = name.unwrap_or_default();
@@ -676,6 +689,7 @@ fn welcome_row(state: &AccountState, ch: ChannelId) -> WelcomeRow {
                 title: t!("welcome-channel-title", channel = channel),
                 subtitle: t!("welcome-channel", channel = channel),
                 private: false,
+                thread: false,
             }
         }
     }
@@ -1370,6 +1384,10 @@ impl Inlet {
     /// Opens the open channel's window in the account state and asks for its newest
     /// page. Before READY there is no state yet; READY loads the channel then.
     fn load_open_channel(&mut self, cx: &mut Context<Self>) {
+        // A forum has no messages of its own: the forum view lists its posts.
+        if self.forum_is_open() {
+            return;
+        }
         let (Some(channel_id), Some(account)) =
             (self.selected_channel.clone(), self.account.clone())
         else {

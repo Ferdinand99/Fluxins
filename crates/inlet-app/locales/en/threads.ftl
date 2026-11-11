@@ -18,6 +18,7 @@ threads-unavailable = This thread is not available.
 threads-error-list = Could not load threads: { $error }
 threads-error-indexing = The server is still indexing threads. Try again in a moment.
 threads-error-offline = Not connected to the server.
+welcome-thread = This is the start of the thread.
 
 forum-sort-label = Sort by
 forum-sort-latest = Latest Activity
@@ -25,3 +26,4 @@ forum-sort-created = Date Created
 forum-no-posts = There are no posts yet.
 forum-archived-posts = Older Posts
 forum-new = NEW
+forum-pinned = Pinned

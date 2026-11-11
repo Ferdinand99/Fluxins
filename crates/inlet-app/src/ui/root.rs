@@ -11,8 +11,7 @@ impl Render for Inlet {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.media_frame(window, cx);
         self.take_channel_jump(window, cx);
-        #[cfg(feature = "demo")]
-        self.demo_threads(window, cx);
+        self.threads_frame(window, cx);
         self.focus_layer(window, cx);
         self.focus_message_overlay(window, cx);
         let root = div()

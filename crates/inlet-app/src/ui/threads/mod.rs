@@ -157,7 +157,15 @@ impl Inlet {
             .h_full()
             .flex()
             .flex_row()
-            .child(div().flex_1().min_w_0().h_full().flex().child(main))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .flex()
+                    .overflow_hidden()
+                    .child(main),
+            )
             .children(self.render_thread_panel(cx))
             .children(self.render_thread_list(cx))
     }
@@ -266,6 +274,37 @@ impl Inlet {
                 guild_id,
                 member_lists,
             }));
+    }
+
+    /// Once per frame, with the window: the keyboard never stays in a composer that is
+    /// not on screen (the panel's after the panel closed, the chat's under a forum), so
+    /// nothing typed can go to a channel nobody sees.
+    pub(crate) fn threads_frame(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use gpui::Focusable;
+        let panel_hidden = self.threads.panel.is_none()
+            && self
+                .threads
+                .composer
+                .as_ref()
+                .is_some_and(|v| v.focus_handle(cx).is_focused(window));
+        let chat_hidden =
+            self.forum_is_open() && self.composer.view.focus_handle(cx).is_focused(window);
+        if panel_hidden || chat_hidden {
+            self.focus_center(window, cx);
+        }
+        #[cfg(feature = "demo")]
+        self.demo_threads(window, cx);
+    }
+
+    /// The keyboard goes to the chat's composer, or to the window under a forum.
+    pub(crate) fn focus_center(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use gpui::Focusable;
+        if self.forum_is_open() {
+            window.focus(&self.focus, cx);
+        } else {
+            let focus = self.composer.view.focus_handle(cx);
+            window.focus(&focus, cx);
+        }
     }
 
     /// Demo scenes open the thread panel or the thread list once `#general` shows its
