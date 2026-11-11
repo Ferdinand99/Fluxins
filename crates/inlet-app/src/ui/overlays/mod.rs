@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Everything drawn on top of the window content: modals, context menus, tooltips.
 
+pub mod account_switcher;
 mod context_menu;
 mod link_confirm;
 mod link_prompt;
@@ -39,6 +40,10 @@ impl Inlet {
         out.extend(self.render_image_viewer(cx));
         if self.settings.view.is_some() {
             out.push(self.render_settings_overlay(cx));
+        }
+        // The account switcher: a layer over the settings view, under the link prompts.
+        if self.switcher_layer_open() {
+            out.push(self.render_account_switcher(cx));
         }
         if self.notifications.settings.is_some() {
             out.push(self.render_notification_settings(cx));

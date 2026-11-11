@@ -62,6 +62,19 @@ impl<K: Ord + Copy, V> LruMap<K, V> {
         None
     }
 
+    /// A new cap; the least recently used entries go until the map fits.
+    pub(crate) fn set_cap(&mut self, cap: usize) {
+        self.cap = cap.max(1);
+        while self.entries.len() > self.cap {
+            match self.order.pop_first() {
+                Some((_, oldest)) => {
+                    self.entries.remove(&oldest);
+                }
+                None => break,
+            }
+        }
+    }
+
     /// Marks `key` as most recently used.
     pub(crate) fn touch(&mut self, key: &K) {
         let stamp = self.next_stamp();

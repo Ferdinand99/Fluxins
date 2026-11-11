@@ -111,6 +111,16 @@ pub mod limits {
     pub const MAX_MEMBERS_TOTAL: usize = 50_000;
     /// Cached presences (one per user, across guilds).
     pub const MAX_PRESENCES: usize = 10_000;
+    /// Cached members other than the account's own, for an account in the
+    /// background ([`crate::AccountState::set_passive`]): none, its unread
+    /// counts need only its own member.
+    pub const PASSIVE_MAX_MEMBERS_TOTAL: usize = 0;
+    /// Cached presences for an account in the background (the cache keeps at
+    /// least one entry).
+    pub const PASSIVE_MAX_PRESENCES: usize = 1;
+    /// Cached users for an account in the background: the account itself and
+    /// the people seen last (DM partners, message authors).
+    pub const PASSIVE_MAX_USERS: usize = 200;
     /// Cached users.
     pub const MAX_USERS: usize = 20_000;
     /// Read-state entries of known channels.

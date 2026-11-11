@@ -15,6 +15,12 @@
 //!
 //! The token never travels to the UI. It goes from the browser handoff (or the paste
 //! field) to the keychain and the protocol session, nowhere else.
+//!
+//! Several accounts can be signed in at once. The active one is `Backend::active`, as
+//! before; the others run in `Backend::background` with their own session, limiter and
+//! gateway, passive (see `accounts`). Every event an account's tasks send carries the
+//! account ([`Event::Tagged`]), so the UI can tell the active account's events from the
+//! others' and from late answers of an account it switched away from.
 
 pub mod accounts;
 pub mod composer;
@@ -29,7 +35,9 @@ pub mod settings;
 pub mod social;
 pub mod voice;
 
+use std::collections::HashMap;
 use std::future::Future;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -40,6 +48,7 @@ use tokio::task::AbortHandle;
 
 use crate::model::Guild;
 use crate::reconnect::ReconnectPolicy;
+use accounts::{AccountInfo, AccountKey, Accounts};
 use gateway::GatewayEnd;
 use messages::parse::{ChannelCache, SharedNames};
 use session::{Credential, Failure, FailureKind};
@@ -75,6 +84,13 @@ pub enum Event {
     Notifications(notifications::Ev),
     Voice(voice::Ev),
     Platform(platform::Ev),
+    /// An event sent by one account's tasks (its gateway, its REST calls). The UI hands
+    /// it on as usual when `account` is the active account, and to that account's
+    /// passive state otherwise.
+    Tagged {
+        account: AccountKey,
+        event: Box<Event>,
+    },
 }
 
 /// `From` for each domain's `Cmd` and `Ev`, so callers write `send(accounts::Cmd::SignOut)`.
@@ -111,10 +127,13 @@ domains! {
 /// The sender for UI events. Errors and status lines are coalesced: the same text again
 /// within a few seconds is dropped, and at most a handful of errors pass per window, so
 /// no loop can flood the UI.
+///
+/// A sender made with [`Ui::for_account`] tags every event with its account.
 #[derive(Clone)]
 pub struct Ui {
     tx: UnboundedSender<Event>,
     throttle: Arc<Mutex<Throttle>>,
+    account: Option<AccountKey>,
 }
 
 #[derive(Default)]
@@ -134,6 +153,17 @@ impl Ui {
         Self {
             tx,
             throttle: Arc::default(),
+            account: None,
+        }
+    }
+
+    /// A sender for one account's tasks: same channel, own error throttle, and every
+    /// event wrapped in [`Event::Tagged`].
+    pub fn for_account(&self, account: AccountKey) -> Self {
+        Self {
+            tx: self.tx.clone(),
+            throttle: Arc::default(),
+            account: Some(account),
         }
     }
 
@@ -147,6 +177,13 @@ impl Ui {
                 return Ok(());
             }
         }
+        let event = match &self.account {
+            Some(account) => Event::Tagged {
+                account: account.clone(),
+                event: Box::new(event),
+            },
+            None => event,
+        };
         self.tx.unbounded_send(event).map_err(|_| ())
     }
 }
@@ -154,6 +191,7 @@ impl Ui {
 impl Throttle {
     fn admit(&mut self, event: &Event, now: Instant) -> bool {
         match event {
+            Event::Tagged { event, .. } => self.admit(event, now),
             Event::Accounts(accounts::Ev::Error(message)) => {
                 if let Some((last, at)) = &self.last_error {
                     if last == message && now.saturating_duration_since(*at) < ERROR_REPEAT {
@@ -187,16 +225,35 @@ impl Throttle {
     }
 }
 
+/// The UI's way to the backend. Every command except the accounts domain's goes out
+/// with the account the UI shows ([`BackendHandle::set_account`]); the backend runs it
+/// only while that account is the active one, so no command meant for one account can
+/// ever run with another account's session and token.
 #[derive(Clone)]
 pub struct BackendHandle {
-    tx: TokioSender<Command>,
+    tx: TokioSender<(Option<AccountKey>, Command)>,
+    account: Arc<Mutex<Option<AccountKey>>>,
 }
 
 impl BackendHandle {
     /// Sends a command. If the backend thread has died, the UI notices because the
     /// event channel closes; nothing to do here.
     pub fn send(&self, command: impl Into<Command>) {
-        let _ = self.tx.send(command.into());
+        let command = command.into();
+        let account = match command {
+            Command::Accounts(_) => None,
+            _ => self
+                .account
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+        };
+        let _ = self.tx.send((account, command));
+    }
+
+    /// The account the UI shows from now on; the commands sent after this are for it.
+    pub fn set_account(&self, account: Option<AccountKey>) {
+        *self.account.lock().unwrap_or_else(|e| e.into_inner()) = account;
     }
 
     /// A handle with no backend behind it: commands go nowhere. For the layout tests,
@@ -204,13 +261,25 @@ impl BackendHandle {
     #[cfg(feature = "demo")]
     pub fn detached() -> Self {
         let (tx, _rx) = unbounded_channel();
-        Self { tx }
+        Self {
+            tx,
+            account: Arc::default(),
+        }
     }
 }
 
 /// Starts the backend thread. Events arrive on `events`. When the thread ends (a panic in
 /// the loop itself), `events` is dropped and the UI's receiver ends.
 pub fn start(events: UnboundedSender<Event>) -> BackendHandle {
+    start_with(events, Accounts::system)
+}
+
+/// Starts the backend thread with the stored accounts `store` makes (the system
+/// keychain in the app, an in-memory one in tests).
+pub fn start_with(
+    events: UnboundedSender<Event>,
+    store: impl FnOnce(Ui) -> Accounts + Send + 'static,
+) -> BackendHandle {
     let events = Ui::new(events);
     let (tx, rx) = unbounded_channel();
     std::thread::Builder::new()
@@ -221,20 +290,55 @@ pub fn start(events: UnboundedSender<Event>) -> BackendHandle {
                 .enable_all()
                 .build()
                 .expect("tokio runtime");
-            runtime.block_on(Backend::new(events).run(rx));
+            let store = store(events.clone());
+            runtime.block_on(Backend::with_store(events, store).run(rx));
         })
         .expect("backend thread");
-    BackendHandle { tx }
+    BackendHandle {
+        tx,
+        account: Arc::default(),
+    }
 }
 
 /// Messages from tasks back to the loop.
 enum Internal {
+    /// The stored accounts were read (start-up).
+    Restored {
+        attempt: u64,
+        restored: Vec<accounts::Restored>,
+        legacy: Option<accounts::Legacy>,
+        list: Vec<AccountInfo>,
+        last_instance: Option<String>,
+    },
+    /// The list of stored accounts changed.
+    ListChanged(Vec<AccountInfo>),
     Connected {
         attempt: u64,
         mode: Mode,
         instance: String,
         credential: Credential,
+        /// Which stored account this restore is for (`None` for a new sign-in).
+        restore: Option<accounts::Restore>,
         result: Result<session::Connected, Failure>,
+    },
+    /// A background account's session is built (or failed); its gateway starts next.
+    BackgroundReady {
+        key: AccountKey,
+        result: Result<p::Session, Failure>,
+    },
+    /// An account was signed out from the recovery screen; start again with the rest.
+    Forgotten,
+    /// A stored account read again to start it in the background.
+    BackgroundLoaded(Option<accounts::Restored>),
+    /// A stored account read again to make it the active one (`None`: not stored).
+    ForegroundLoaded(Option<accounts::Restored>),
+    /// The move of an older entry found a newer token in the account's own entry: the
+    /// account goes on with that one, and the older session (`old`) is ended on the
+    /// server unless it was pasted.
+    NewerEntry {
+        key: AccountKey,
+        old: p::Session,
+        old_pasted: bool,
     },
     HandoffDone {
         id: u64,
@@ -287,8 +391,26 @@ pub fn backoff_secs(failures: u32) -> u64 {
 
 struct RealActive {
     gen: u64,
-    /// The token was pasted: sign-out only forgets it.
-    pasted: bool,
+    /// Which account this is.
+    key: AccountKey,
+    /// Display name, for the UI when the account becomes the active one.
+    name: String,
+    /// Sends events tagged with this account.
+    events: Ui,
+    /// Whether this is the active account. The gateway task reads it: a background
+    /// account's events are not rendered and its lists are not sent to the UI.
+    foreground: Arc<AtomicBool>,
+    /// The gateway was started for the background (it ignores typing events); it is
+    /// started again when the account becomes the active one.
+    ignores_typing: bool,
+    /// The gateway stopped and waits for the person (no automatic restart).
+    down: bool,
+    /// The account was restored from an older Inlet's entry (this origin) that may not
+    /// be moved yet; signing it out removes that entry too.
+    legacy: Option<String>,
+    /// The composer's state of this account: its ID and limit, sends that may be
+    /// retried, open member searches. Kept per account, so switching back finds it.
+    composer: composer::State,
     session: p::Session,
     gateway: p::GatewayHandle,
     forward: AbortHandle,
@@ -320,15 +442,32 @@ enum Active {
 struct Offline {
     instance: String,
     credential: Credential,
+    restore: Option<accounts::Restore>,
     failures: u32,
     timer: Option<AbortHandle>,
 }
 
 struct Backend {
+    /// The active account's sender (tagged with it), or `global` with none active.
     events: Ui,
+    /// The untagged sender: sign-in, the account list, which account is active.
+    global: Ui,
     internal: TokioSender<Internal>,
     next_gen: u64,
     active: Option<Active>,
+    /// The other signed-in accounts, passive.
+    background: Vec<RealActive>,
+    /// Stored accounts whose background start is waiting (start-up spacing, retries).
+    starts: HashMap<AccountKey, accounts::PendingStart>,
+    /// The stored accounts as last read or written.
+    known: Vec<AccountInfo>,
+    /// The keychain entries and the account list; tasks lock it in turn.
+    store: Arc<tokio::sync::Mutex<Accounts>>,
+    /// The last task on the store; the next one waits for it (see `store_job`).
+    store_tail: Option<tokio::task::JoinHandle<()>>,
+    /// The account the UI last switched to (a stored account read again is started only
+    /// when it still is).
+    switch_target: Option<AccountKey>,
     attempt: u64,
     connecting: Option<(u64, AbortHandle, Mode)>,
     offline: Option<Offline>,
@@ -336,34 +475,35 @@ struct Backend {
     handoff: Option<(u64, tokio::sync::oneshot::Sender<()>)>,
     /// A new sign-in waiting for the person to confirm the account.
     pending_confirm: Option<PendingConfirm>,
-    /// The task writing a new token to the keychain; sign-out waits for it.
-    saving: Option<tokio::task::JoinHandle<()>>,
     open_guild: Option<AbortHandle>,
     open_channel: Option<AbortHandle>,
-    /// The composer's cache: account ID, message length limit, autocomplete data.
-    composer: composer::State,
     /// The request for older messages of the open channel.
     older: messages::OlderPages,
 }
 
 impl Backend {
-    fn new(events: Ui) -> Self {
+    fn with_store(events: Ui, store: Accounts) -> Self {
         let (internal, _) = unbounded_channel();
         Self {
+            global: events.clone(),
             events,
             internal,
             next_gen: 1,
             active: None,
+            background: Vec::new(),
+            starts: HashMap::new(),
+            known: Vec::new(),
+            store: Arc::new(tokio::sync::Mutex::new(store)),
+            store_tail: None,
+            switch_target: None,
             attempt: 0,
             connecting: None,
             offline: None,
             handoff_seq: 0,
             handoff: None,
             pending_confirm: None,
-            saving: None,
             open_guild: None,
             open_channel: None,
-            composer: Default::default(),
             older: Default::default(),
         }
     }
@@ -376,6 +516,21 @@ impl Backend {
         match &self.active {
             Some(Active::Real(r)) => Some(r.gen),
             _ => None,
+        }
+    }
+
+    /// The account (active or background) whose session generation is `gen`.
+    fn engine(&self, gen: u64) -> Option<&RealActive> {
+        match &self.active {
+            Some(Active::Real(r)) if r.gen == gen => Some(r),
+            _ => self.background.iter().find(|r| r.gen == gen),
+        }
+    }
+
+    fn engine_mut(&mut self, gen: u64) -> Option<&mut RealActive> {
+        match &mut self.active {
+            Some(Active::Real(r)) if r.gen == gen => Some(r),
+            _ => self.background.iter_mut().find(|r| r.gen == gen),
         }
     }
 
@@ -400,7 +555,7 @@ impl Backend {
         abort
     }
 
-    async fn run(mut self, mut rx: UnboundedReceiver<Command>) {
+    async fn run(mut self, mut rx: UnboundedReceiver<(Option<AccountKey>, Command)>) {
         let (internal, mut internal_rx) = unbounded_channel();
         self.internal = internal;
         loop {
@@ -409,10 +564,52 @@ impl Backend {
                 biased;
                 Some(msg) = internal_rx.recv() => self.internal(msg),
                 command = rx.recv() => match command {
-                    Some(command) => self.handle(command),
+                    Some((account, command)) => self.command(account, command),
                     None => break,
                 },
             }
+        }
+    }
+
+    /// A command from the UI, for `account` (`None` for the accounts domain). A command
+    /// for an account that is not the active one is dropped: it was sent before a
+    /// switch reached the backend, and running it would use the wrong session.
+    fn command(&mut self, account: Option<AccountKey>, command: Command) {
+        if !matches!(command, Command::Accounts(_)) && !self.acts_for(account.as_ref()) {
+            log::debug!("a command for an account that is not the active one was not run");
+            return self.answer_without_session(account, command);
+        }
+        self.handle(command);
+    }
+
+    /// Runs a command for an account that is not the active one as if no account were
+    /// signed in: every domain then answers "not connected" without using any token,
+    /// tagged with the command's account, so a caller that waits for an answer (a page,
+    /// a settings write, a send) never hangs. Nothing of the active account is touched.
+    fn answer_without_session(&mut self, account: Option<AccountKey>, command: Command) {
+        let answer_to = match account {
+            Some(k) => self.global.for_account(k),
+            None => self.global.clone(),
+        };
+        let active = self.active.take();
+        let events = std::mem::replace(&mut self.events, answer_to);
+        let open = (self.open_guild.take(), self.open_channel.take());
+        let older = std::mem::take(&mut self.older);
+        self.handle(command);
+        (self.open_guild, self.open_channel) = open;
+        self.older = older;
+        self.events = events;
+        self.active = active;
+    }
+
+    /// Whether a command sent for `account` may run now.
+    fn acts_for(&self, account: Option<&AccountKey>) -> bool {
+        match &self.active {
+            Some(Active::Real(r)) => account == Some(&r.key),
+            #[cfg(feature = "demo")]
+            Some(Active::Demo(_)) => true,
+            // No session: the domains answer "not connected" without a token.
+            None => true,
         }
     }
 

@@ -8,9 +8,11 @@
 //! instance. Demo IDs such as `c-general` are mapped to stable snowflakes
 //! ([`snowflake`]), and message IDs are made from the message's time.
 //!
-//! One file per domain (`guilds`, `media`, `messages`, `markdown`, `social`); `scenes`
-//! picks what to show, also from the scene files of the visual checks (`scene_file`).
+//! One file per domain (`guilds`, `media`, `messages`, `markdown`, `social`, `accounts`);
+//! `scenes` picks what to show, also from the scene files of the visual checks
+//! (`scene_file`).
 
+pub mod accounts;
 pub mod actions;
 pub mod composer;
 mod guilds;
@@ -30,10 +32,11 @@ use inlet_protocol as p;
 use inlet_state::{MessageId, MessagesPage};
 use serde_json::{json, Value};
 
+use crate::backend::accounts::AccountKey;
 use crate::backend::messages::parse::{self, SharedNames};
 use crate::backend::messages::PAGE_SIZE;
-use crate::backend::{accounts, messages as msgs, Ui};
-use crate::model::{Channel, ChannelKind, Message, Names};
+use crate::backend::{accounts as acc, messages as msgs, Ui};
+use crate::model::{Channel, ChannelKind, Guild, Message, Names};
 
 /// The demo's own account.
 pub const ME: &str = "demo";
@@ -46,6 +49,9 @@ pub struct MockSession {
     open_channel: Arc<Mutex<Option<String>>>,
     next_seq: u64,
     ticker: tokio::task::JoinHandle<()>,
+    /// The demo account's READY and guilds, to show them again after a switch.
+    ready: Box<p::Ready>,
+    guilds: Vec<Guild>,
 }
 
 /// A stable snowflake for a demo ID (`g1`, `c-general`); a snowflake stays as it is.
@@ -350,19 +356,28 @@ impl MockSession {
             })
         };
 
+        // The account switcher scenes have two more accounts in the background.
+        if matches!(scene, scenes::Scene::Accounts | scenes::Scene::AccountsAdd) {
+            accounts::start_background(&events);
+        } else {
+            let main = accounts::list().into_iter().take(1).collect();
+            let _ = events.unbounded_send(acc::Ev::Accounts(main));
+        }
+        // As with a real account: which account it is first, then its READY.
+        let _ = events.unbounded_send(acc::Ev::SignedIn {
+            key: accounts::main_key(),
+            username: ME.into(),
+            instance: accounts::INSTANCE.into(),
+        });
         let _ = events.unbounded_send(msgs::Ev::Dispatch {
-            dispatch: Box::new(p::Dispatch::Ready(Box::new(ready))),
+            dispatch: Box::new(p::Dispatch::Ready(Box::new(ready.clone()))),
             rendered: Vec::new(),
         });
-        let _ = events.unbounded_send(accounts::Ev::SignedIn {
-            username: ME.into(),
-            instance: "demo".into(),
-        });
-        let _ = events.unbounded_send(msgs::Ev::Guilds(guilds));
+        let _ = events.unbounded_send(msgs::Ev::Guilds(guilds.clone()));
         for out in outgoing {
             let _ = events.unbounded_send(msgs::Ev::Pending(out));
         }
-        let _ = events.unbounded_send(accounts::Ev::Status("Demo mode".into()));
+        let _ = events.unbounded_send(acc::Ev::Status("Demo mode".into()));
 
         Self {
             events,
@@ -372,7 +387,37 @@ impl MockSession {
             open_channel,
             next_seq: 100,
             ticker,
+            ready: Box::new(ready),
+            guilds,
         }
+    }
+
+    /// Shows another demo account (its guild list), or the demo account again.
+    pub fn switch(&mut self, key: &AccountKey) {
+        // Live demo messages belong to the demo account's open channel only.
+        *self.open_channel.lock().unwrap() = None;
+        let (name, instance, ready, guilds) = if key == &accounts::main_key() {
+            (
+                ME.to_string(),
+                accounts::INSTANCE.to_string(),
+                (*self.ready).clone(),
+                self.guilds.clone(),
+            )
+        } else if let Some((name, ready, guilds)) = accounts::switch_to(key) {
+            (name, key.origin.to_string(), ready, guilds)
+        } else {
+            return;
+        };
+        let _ = self.events.unbounded_send(acc::Ev::SignedIn {
+            key: key.clone(),
+            username: name,
+            instance,
+        });
+        let _ = self.events.unbounded_send(msgs::Ev::Dispatch {
+            dispatch: Box::new(p::Dispatch::Ready(Box::new(ready))),
+            rendered: Vec::new(),
+        });
+        let _ = self.events.unbounded_send(msgs::Ev::Guilds(guilds));
     }
 
     pub fn open_guild(&mut self, guild_id: Option<String>) {

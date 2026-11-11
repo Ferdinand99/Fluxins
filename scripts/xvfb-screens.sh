@@ -102,7 +102,12 @@ sleep 6
 shot 15-link-prompt
 kill $pid; wait $pid 2>/dev/null
 
-# 7. The scene files of the visual checks. Xvfb's pointer cannot be moved and sits in
+# 7. Several accounts: the account switcher (two more accounts in the background, one
+#    on another instance) and the sign-in screen when adding one.
+scene 22-accounts accounts c-general
+scene 23-accounts-add accounts-add c-general
+
+# 8. The scene files of the visual checks. Xvfb's pointer cannot be moved and sits in
 #    the middle of the screen; the demo puts a scene's window in the top left corner,
 #    and the screen is more than twice its size, so the pointer is never over it (no
 #    hover states). The app reads each file itself.

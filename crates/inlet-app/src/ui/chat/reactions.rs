@@ -356,6 +356,20 @@ impl Inlet {
     }
 
     /// Sends the net change of every reaction window that is over.
+    /// Sends every reaction click still waiting in its window, at once: before the
+    /// account changes, while the clicks still go out for the account they were made in.
+    pub(crate) fn flush_all_reactions(&mut self) {
+        let later = Instant::now() + WINDOW;
+        for s in self.chat.actions.clicks.due(later) {
+            self.backend.send(Cmd::Action(actions::Cmd::React {
+                channel_id: s.channel_id,
+                message_id: s.message_id,
+                emoji: s.emoji,
+                add: s.add,
+            }));
+        }
+    }
+
     fn flush_reactions(&mut self) {
         for s in self.chat.actions.clicks.due(Instant::now()) {
             self.backend.send(Cmd::Action(actions::Cmd::React {
@@ -459,6 +473,21 @@ mod tests {
 
     fn thumbs() -> p::Emoji {
         p::Emoji::unicode("\u{1F44D}")
+    }
+
+    /// Before an account switch every click still in its window goes out at once (the
+    /// flush asks for what is due half a second later), so none is lost with the switch.
+    #[test]
+    fn clicks_in_their_window_are_all_due_before_a_switch() {
+        let t0 = Instant::now();
+        let mut clicks = ReactionClicks::default();
+        clicks.click("1", "5", &thumbs(), false, t0);
+        clicks.click("1", "6", &thumbs(), true, t0 + Duration::from_millis(400));
+        assert!(clicks.due(t0 + Duration::from_millis(450)).is_empty());
+        let sent = clicks.due(t0 + Duration::from_millis(450) + WINDOW);
+        assert_eq!(sent.len(), 2);
+        assert!(sent.iter().any(|s| s.message_id == "5" && s.add));
+        assert!(sent.iter().any(|s| s.message_id == "6" && !s.add));
     }
 
     #[test]

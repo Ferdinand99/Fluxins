@@ -31,7 +31,7 @@
 //! Limits (Fluxer's): at most 512 KiB decoded and 699,052 base64 characters.
 
 use std::collections::VecDeque;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use base64::Engine;
@@ -245,7 +245,8 @@ struct Writer {
 #[derive(Default)]
 pub(crate) struct PreferencesState {
     queue: Mutex<Vec<Pending>>,
-    writer: tokio::sync::Mutex<Writer>,
+    /// Shared, so a batch can hold the lock in a task of its own.
+    writer: Arc<tokio::sync::Mutex<Writer>>,
 }
 
 impl std::fmt::Debug for PreferencesState {
@@ -270,7 +271,8 @@ fn conflict_error() -> Error {
 }
 
 /// A copy of an error for every caller of a batch. A network error becomes
-/// [`Error::Decode`] with its text (it cannot be copied).
+/// [`Error::Network`] with its text ([`Error::Http`] cannot be copied); every
+/// other error keeps its kind.
 fn share_error(e: &Error) -> Error {
     match e {
         Error::Api(a) => Error::Api(a.clone()),
@@ -285,7 +287,12 @@ fn share_error(e: &Error) -> Error {
             new: new.clone(),
         },
         Error::TooLarge { limit } => Error::TooLarge { limit: *limit },
-        other => Error::Decode(other.to_string()),
+        Error::Http(e) => Error::Network(e.to_string()),
+        Error::Network(s) => Error::Network(s.clone()),
+        Error::Decode(s) => Error::Decode(s.clone()),
+        Error::Url(s) => Error::Url(s.clone()),
+        Error::UnsupportedApiVersion(v) => Error::UnsupportedApiVersion(*v),
+        Error::Captcha(s) => Error::Captcha(s.clone()),
     }
 }
 
@@ -398,8 +405,12 @@ impl Client {
     ///   `SYNCED_PREFERENCES_CONFLICT`. A batch makes at most 3 PATCH and 2 GET
     ///   requests.
     /// - When the batch changes nothing, no request is made.
-    /// - A network error reaches the other callers of the batch as
-    ///   [`Error::Decode`] with its text. More than 256 waiting edits are
+    /// - The write runs in a task of its own, so dropping the returned future
+    ///   does not cancel it: the edit is still sent, and the other callers of
+    ///   its batch get the real result. Needs a Tokio runtime.
+    /// - Every caller of a batch gets the batch's error with its kind kept.
+    ///   Only [`Error::Http`], which cannot be copied, comes as
+    ///   [`Error::Network`] with its text. More than 256 waiting edits are
     ///   refused with [`Error::RateLimited`].
     ///
     /// Returns the snapshot as stored.
@@ -413,7 +424,7 @@ impl Client {
     {
         let limiter = self.rate_limiter();
         let state = &limiter.coalesce.preferences;
-        let (done, mut rx) = oneshot::channel();
+        let (done, rx) = oneshot::channel();
         {
             let mut queue = state.queue.lock().unwrap_or_else(|e| e.into_inner());
             if queue.len() >= MAX_PENDING_EDITS {
@@ -427,10 +438,29 @@ impl Client {
                 done,
             });
         }
-        let mut writer = state.writer.lock().await;
-        // A writer before this one may have sent this edit already.
-        if let Ok(result) = rx.try_recv() {
-            return result;
+        // The write runs in a task of its own: a caller that is dropped (the
+        // account is switched, the window closes) must not cancel a batch
+        // that other callers wait for, or that has reached the server.
+        let client = self.clone();
+        tokio::spawn(async move { client.flush_preferences().await });
+        rx.await
+            .unwrap_or_else(|_| Err(Error::Decode("the preference write was cancelled".into())))
+    }
+
+    /// Waits for the account's writer, then sends the queued edits as one batch
+    /// and hands the result to every caller in it.
+    async fn flush_preferences(&self) {
+        let limiter = self.rate_limiter();
+        let state = &limiter.coalesce.preferences;
+        let mut writer = Arc::clone(&state.writer).lock_owned().await;
+        // A writer before this one may have sent every queued edit already.
+        if state
+            .queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+        {
+            return;
         }
         // Gather more edits, and keep the interval since the last PATCH.
         let mut start = Instant::now() + PREFERENCES_FLUSH_DELAY;
@@ -446,9 +476,6 @@ impl Client {
                 Err(e) => Err(share_error(e)),
             });
         }
-        drop(writer);
-        rx.await
-            .unwrap_or_else(|_| Err(Error::Decode("the preference write was cancelled".into())))
     }
 
     /// Applies a batch of edits and stores it (with conflict retries).
@@ -487,6 +514,30 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_shared_error_keeps_its_kind() {
+        assert!(matches!(
+            share_error(&Error::Network("offline".into())),
+            Error::Network(t) if t == "offline"
+        ));
+        assert!(matches!(
+            share_error(&Error::Url("bad".into())),
+            Error::Url(t) if t == "bad"
+        ));
+        assert!(matches!(
+            share_error(&Error::Captcha("slow".into())),
+            Error::Captcha(t) if t == "slow"
+        ));
+        assert!(matches!(
+            share_error(&Error::UnsupportedApiVersion(9)),
+            Error::UnsupportedApiVersion(9)
+        ));
+        assert!(matches!(
+            share_error(&Error::Decode("odd".into())),
+            Error::Decode(t) if t == "odd"
+        ));
+    }
 
     #[test]
     fn debug_shows_only_the_size() {

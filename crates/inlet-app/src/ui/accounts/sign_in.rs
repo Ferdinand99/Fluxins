@@ -179,6 +179,12 @@ impl Inlet {
         if let Some(notice) = &self.sign_in.notice {
             form = form.child(div().text_color(theme::text_muted()).child(notice.clone()));
         }
+        if self.sign_in_has_way_back() && self.sign_in.handoff.is_none() && !self.sign_in.busy {
+            form =
+                form.child(button("sign-in-back", t!("sign-in-back"), false).on_click(
+                    cx.listener(|this, _, window, cx| this.back_from_sign_in(window, cx)),
+                ));
+        }
         form = form.child(Self::about_link(t!("about-link"), cx));
         self.render_card(form)
     }

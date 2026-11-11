@@ -3,9 +3,9 @@
 //! Demo builds only; not an API.
 //!
 //! [`Probe`] opens the real view without a backend thread and feeds it the events the
-//! demo backend would send: READY, sign-in, the guilds, the channels of `g1` and the
-//! newest page of `#general`. The views mark what the tests measure with gpui's
-//! `debug_selector`; the names are in [`selector`].
+//! demo backend would send: the account, sign-in, READY, the guilds, the channels of
+//! `g1` and the newest page of `#general`. The views mark what the tests measure with
+//! gpui's `debug_selector`; the names are in [`selector`].
 
 use std::sync::{Arc, Mutex};
 
@@ -75,19 +75,23 @@ impl Render for Probe {
 fn open_demo(inlet: &mut Inlet, window: &mut Window, cx: &mut Context<Inlet>) {
     let data = scenes::data(scenes::Scene::Default);
     let names = Arc::new(Mutex::new(demo::demo_names(&data.channels)));
+    // As the demo backend: the account list, which account it is, then its READY.
+    let main = demo::accounts::list().into_iter().take(1).collect();
+    inlet.handle_event(accounts::Ev::Accounts(main).into(), window, cx);
     inlet.handle_event(
-        msgs::Ev::Dispatch {
-            dispatch: Box::new(p::Dispatch::Ready(Box::new(data.ready))),
-            rendered: Vec::new(),
+        accounts::Ev::SignedIn {
+            key: demo::accounts::main_key(),
+            username: demo::ME.into(),
+            instance: demo::accounts::INSTANCE.into(),
         }
         .into(),
         window,
         cx,
     );
     inlet.handle_event(
-        accounts::Ev::SignedIn {
-            username: demo::ME.into(),
-            instance: "demo".into(),
+        msgs::Ev::Dispatch {
+            dispatch: Box::new(p::Dispatch::Ready(Box::new(data.ready))),
+            rendered: Vec::new(),
         }
         .into(),
         window,
