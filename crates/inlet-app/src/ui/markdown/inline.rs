@@ -441,6 +441,27 @@ fn overlaps(a: &Range<usize>, b: &Range<usize>) -> bool {
     a.start < b.end && b.start < a.end
 }
 
+/// Whether a link lies in one of the hidden spoiler ranges. Such a link is inert until
+/// the spoiler is revealed, and its embed under the message is covered: this is the one
+/// rule for both.
+pub(super) fn link_in_spoiler(spoilers: &[Range<usize>], link: &Range<usize>) -> bool {
+    spoilers.iter().any(|s| overlaps(s, link))
+}
+
+/// The links of `inline` inside its spoiler ranges (as parsed, before drawing).
+pub(super) fn spoilered_links(inline: &Inline) -> impl Iterator<Item = &Link> {
+    let spoilers: Vec<Range<usize>> = inline
+        .highlights
+        .iter()
+        .filter(|(_, style)| *style == Style::Spoiler)
+        .map(|(r, _)| r.clone())
+        .collect();
+    inline
+        .links
+        .iter()
+        .filter(move |link| link_in_spoiler(&spoilers, &link.range))
+}
+
 /// What a click on a range of an inline does.
 pub(super) enum Click {
     Link(String, bool),
@@ -452,7 +473,7 @@ pub(super) fn clickables(c: &Composed, revealed: bool) -> Vec<(Range<usize>, Cli
     let mut out = Vec::new();
     for link in &c.links {
         // Links inside a hidden spoiler stay inert until it is revealed.
-        if spoilers.iter().any(|s| overlaps(s, &link.range)) {
+        if link_in_spoiler(&spoilers, &link.range) {
             continue;
         }
         out.push((

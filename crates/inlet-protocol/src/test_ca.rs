@@ -53,8 +53,8 @@ fn warn_once(count: usize) {
     });
 }
 
-/// Adds the extra roots to a reqwest client.
-pub(crate) fn add_to_http(mut builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+/// Adds the extra roots to a reqwest client (also used by the app's media client).
+pub fn add_to_http(mut builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
     for cert in certificates() {
         match reqwest::Certificate::from_der(cert.as_ref()) {
             Ok(c) => builder = builder.add_root_certificate(c),

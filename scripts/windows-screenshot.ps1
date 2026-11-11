@@ -30,13 +30,25 @@ function Run-Demo([string]$Name, [hashtable]$Env, [int]$Seconds) {
     if ($p.HasExited) {
         Write-Host "inlet.exe exited early with code $($p.ExitCode)"
         Get-Content $log | Select-Object -Last 40
+        $script:Failed += $Name
     }
     Save-Screen $Name
-    if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force }
+    # A panic on another thread can leave the window up: the log tells.
+    if (-not ($script:Failed -contains $Name) -and (Select-String -Path $log -Pattern 'panicked' -Quiet)) {
+        Write-Host "$($Name): a panic in the log"
+        Get-Content $log | Select-String -Pattern 'panicked' -Context 0,3
+        $script:Failed += $Name
+    }
+    if (-not $p.HasExited) {
+        $p.Refresh()
+        Write-Host ("memory {0}: working set {1} MB, private {2} MB" -f $Name, [math]::Round($p.WorkingSet64 / 1MB), [math]::Round($p.PrivateMemorySize64 / 1MB))
+        Stop-Process -Id $p.Id -Force
+    }
     foreach ($k in $Env.Keys) { Remove-Item -Path "Env:$k" -ErrorAction SilentlyContinue }
     Start-Sleep -Seconds 1
 }
 
+$script:Failed = @()
 $env:RUST_LOG = "info"
 # Sign-in screen (no saved session, no demo).
 Run-Demo "01-sign-in" @{} 8
@@ -58,3 +70,14 @@ Run-Demo "11-markdown-code" @{ INLET_DEMO = "1"; INLET_DEMO_LIVE_SECS = "3600"; 
 # The Desktop settings tab, and the prompt a link from outside opens.
 Run-Demo "12-settings-desktop" @{ INLET_DEMO = "1"; INLET_DEMO_LIVE_SECS = "3600"; INLET_DEMO_GUILD = "g1"; INLET_DEMO_CHANNEL = "c-general"; INLET_DEMO_SETTINGS = "desktop" } 10
 Run-Demo "13-link-prompt" @{ INLET_DEMO = "1"; INLET_DEMO_LIVE_SECS = "3600"; INLET_DEMO_GUILD = "g1"; INLET_DEMO_CHANNEL = "c-general"; INLET_DEMO_DEEP_LINK = "inlet://invite/abc123" } 10
+# Images, files, a video still, a spoiler and explicit media; every embed type; the viewer.
+Run-Demo "14-attachments" @{ INLET_DEMO = "1"; INLET_DEMO_LIVE_SECS = "3600"; INLET_DEMO_SCENE = "attachments"; INLET_DEMO_GUILD = "g1"; INLET_DEMO_CHANNEL = "c-attachments" } 10
+Run-Demo "15-embed-all-types" @{ INLET_DEMO = "1"; INLET_DEMO_LIVE_SECS = "3600"; INLET_DEMO_SCENE = "embed-all-types"; INLET_DEMO_GUILD = "g1"; INLET_DEMO_CHANNEL = "c-embeds" } 10
+Run-Demo "16-image-viewer" @{ INLET_DEMO = "1"; INLET_DEMO_LIVE_SECS = "3600"; INLET_DEMO_SCENE = "image-viewer"; INLET_DEMO_GUILD = "g1"; INLET_DEMO_CHANNEL = "c-attachments" } 10
+
+# A demo that quit before its screenshot crashed: fail the job, the pictures are not
+# worth checking.
+if ($script:Failed.Count -gt 0) {
+    Write-Host "exited early: $($script:Failed -join ', ')"
+    exit 1
+}

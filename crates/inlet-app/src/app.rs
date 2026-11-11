@@ -65,7 +65,6 @@ pub struct Inlet {
     pub chat: ui::chat::ChatState,
     pub composer: ui::composer::ComposerState,
     pub overlays: ui::overlays::OverlayState,
-    #[allow(dead_code)] // filled by the task that builds the domain
     pub media: ui::media::State,
     #[allow(dead_code)] // filled by the task that builds the domain
     pub members: ui::members::State,
@@ -239,6 +238,7 @@ impl Inlet {
         self.selected_guild = None;
         self.selected_channel = None;
         self.reset_messages();
+        self.media.reset();
         self.notifications.clear();
         self.chat.status.clear();
         self.chat.error = None;

@@ -106,7 +106,7 @@ impl Inlet {
             .flex()
             .flex_col()
             .bg(theme::bg_app())
-            .child(self.render_guild_header())
+            .child(self.render_guild_header(cx))
             .child(
                 div()
                     .id("channels")
