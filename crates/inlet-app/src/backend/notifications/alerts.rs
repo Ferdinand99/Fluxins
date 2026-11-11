@@ -464,7 +464,7 @@ pub fn plain_content(state: &AccountState, m: &Message) -> String {
     while !m.content.is_char_boundary(end) {
         end -= 1;
     }
-    let content = hide_spoilers(&m.content[..end]);
+    let content = hide_spoilers(&m.content[..end], end < m.content.len());
     let guild = ChannelId::parse(&m.channel_id).and_then(|c| state.channels().guild_of(c));
     let mut out = String::with_capacity(content.len());
     let mut rest = content.as_str();
@@ -488,13 +488,19 @@ pub fn plain_content(state: &AccountState, m: &Message) -> String {
     out
 }
 
-/// `||secret||` becomes the spoiler text; an unclosed `||` stays.
-fn hide_spoilers(text: &str) -> String {
+/// `||secret||` becomes the spoiler text. An unclosed `||` stays as it is, unless the
+/// text was cut (`cut`): its closing `||` may be past the cut, so the rest is hidden.
+fn hide_spoilers(text: &str, cut: bool) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(open) = rest.find("||") {
         let after = &rest[open + 2..];
         let Some(close) = after.find("||") else {
+            if cut {
+                out.push_str(&rest[..open]);
+                out.push_str(&t!("alerts-spoiler"));
+                return out;
+            }
             break;
         };
         out.push_str(&rest[..open]);

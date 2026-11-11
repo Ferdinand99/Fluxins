@@ -188,6 +188,18 @@ fn notification_body_respects_the_preview_setting() {
     let n = shown(&d).expect("a DM notifies");
     assert_eq!((n.title(), n.body()), ("Ada", "New message"));
 
+    // A spoiler whose end lies past the cut stays hidden; a plain unclosed `||` shows.
+    let mut long_secret = "x ".repeat(990);
+    long_secret.push_str("||");
+    long_secret.push_str(&"secret ".repeat(100));
+    long_secret.push_str("||");
+    let m = message(id(10), "100", "2", &long_secret, false);
+    let text = plain_content(&state, &m);
+    assert!(!text.contains("secret"), "{text}");
+    assert!(text.ends_with("(spoiler)"), "{text}");
+    let m = message(id(11), "100", "2", "a || b", false);
+    assert_eq!(plain_content(&state, &m), "a || b");
+
     // Long content is cut; an attachment without text says so.
     let mut engine = Engine::new(AlertPrefs::default());
     let long = message(id(3), "300", "2", &"word ".repeat(2000), false);
