@@ -7,8 +7,11 @@
 //! `?`, is [`crate::Error::InvalidInput`] without a request.
 //!
 //! [`parse_invite`] takes a bare code or an invite link of this instance
-//! (`{endpoints.invite}/{code}` or `{webapp}/invite/{code}`); links to other
-//! hosts are not invites of this instance and give `None`.
+//! (`{endpoints.invite}/{code}` or `{webapp}/invite/{code}`). A link to another
+//! host is not an invite of this instance: it comes back as
+//! [`InviteLink::OtherInstance`] with the host, so the UI can hand it to the
+//! account of that instance or open it in the browser, and its code is never
+//! sent to this one.
 
 use reqwest::Method;
 use serde::{Deserialize, Serialize};
@@ -45,19 +48,45 @@ pub fn invite_code(code: &str) -> Result<&str> {
     Ok(code)
 }
 
-/// The invite code in `input`: a bare code, or an `https` invite link of this
-/// instance (`{endpoints.invite}/{code}` or `{webapp}/invite/{code}`).
-pub fn parse_invite(input: &str, instance: &Instance) -> Option<String> {
+/// What a piece of text is, as an invite ([`parse_invite`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum InviteLink {
+    /// An invite of this instance: the checked code.
+    Code(String),
+    /// An `https` link to another host. It is not this instance's invite and
+    /// its code must not be sent here: let the account of that instance
+    /// handle it, or open it in the browser.
+    OtherInstance {
+        /// The host of the link (lowercase, without port).
+        host: String,
+        /// The code, when the path looks like `/invite/{code}` or `/{code}`.
+        code: Option<String>,
+    },
+    /// Neither a code nor an invite link.
+    NotAnInvite,
+}
+
+/// What `input` is: a bare code or an invite link of this instance
+/// (`{endpoints.invite}/{code}`, `{endpoints.invite}/invite/{code}` or
+/// `{webapp}/invite/{code}`) gives [`InviteLink::Code`]; an `https` link
+/// elsewhere gives [`InviteLink::OtherInstance`] with its host.
+pub fn parse_invite(input: &str, instance: &Instance) -> InviteLink {
     let input = input.trim();
     if invite_code(input).is_ok() {
-        return Some(input.to_owned());
+        return InviteLink::Code(input.to_owned());
     }
     // https only (http on a loopback host, for tests), and no credentials.
-    let url = require_scheme(input, "https", "http", "invite link").ok()?;
+    let Ok(url) = require_scheme(input, "https", "http", "invite link") else {
+        return InviteLink::NotAnInvite;
+    };
     if !url.username().is_empty() || url.password().is_some() {
-        return None;
+        return InviteLink::NotAnInvite;
     }
-    let segments: Vec<&str> = url.path_segments()?.filter(|s| !s.is_empty()).collect();
+    let segments: Vec<&str> = url
+        .path_segments()
+        .map(|s| s.filter(|s| !s.is_empty()).collect())
+        .unwrap_or_default();
     let same_origin = |base: &str| {
         require_scheme(base, "https", "http", "invite base")
             .ok()
@@ -73,24 +102,28 @@ pub fn parse_invite(input: &str, instance: &Instance) -> Option<String> {
         .extra
         .get("invite")
         .and_then(Value::as_str);
+    let invite_host = invite_base.is_some_and(same_origin);
+    let invite_root = invite_host
+        && invite_base
+            .is_some_and(|b| Url::parse(b).is_ok_and(|b| b.path().trim_matches('/').is_empty()));
+    let ours = invite_host || same_origin(instance.webapp());
     let code = match segments.as_slice() {
         // {endpoints.invite}/{code}, when the invite base has no path of its own.
-        [code]
-            if invite_base.is_some_and(|b| {
-                same_origin(b) && Url::parse(b).is_ok_and(|b| b.path().trim_matches('/').is_empty())
-            }) =>
-        {
-            *code
-        }
+        [code] if invite_root || !ours => Some(*code),
         // {endpoints.invite}/invite/{code} or {webapp}/invite/{code}.
-        ["invite", code]
-            if invite_base.is_some_and(same_origin) || same_origin(instance.webapp()) =>
-        {
-            *code
+        ["invite", code] => Some(*code),
+        _ => None,
+    }
+    .and_then(|c| invite_code(c).ok())
+    .map(str::to_owned);
+    if ours {
+        code.map_or(InviteLink::NotAnInvite, InviteLink::Code)
+    } else {
+        InviteLink::OtherInstance {
+            host: url.host_str().unwrap_or_default().to_ascii_lowercase(),
+            code,
         }
-        _ => return None,
-    };
-    invite_code(code).ok().map(str::to_owned)
+    }
 }
 
 /// The guild of a guild invite.

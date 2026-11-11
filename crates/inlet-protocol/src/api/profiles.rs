@@ -123,18 +123,7 @@ fn put_text(
     multiline: bool,
 ) -> Result<()> {
     if let Some(v) = value {
-        let v = v.as_deref().filter(|s| !s.is_empty());
-        if let Some(s) = v {
-            if s.trim().is_empty() {
-                return Err(Error::InvalidInput(format!("{key} is blank")));
-            }
-            let bad = |c: char| c.is_control() && !(multiline && c == '\n');
-            if s.chars().count() > max || s.chars().any(bad) {
-                return Err(Error::InvalidInput(format!(
-                    "{key}: 1-{max} characters without control characters"
-                )));
-            }
-        }
+        let v = crate::api::optional_text(v.as_deref(), max, key, multiline)?;
         body.insert(key.into(), json!(v));
     }
     Ok(())

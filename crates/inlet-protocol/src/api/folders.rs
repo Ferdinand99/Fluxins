@@ -85,10 +85,8 @@ impl GuildFolder {
         if id < UNCATEGORIZED_FOLDER_ID || id > i64::from(i32::MAX) {
             return Err(Error::InvalidInput("folder ID out of range".into()));
         }
-        let name = self.name.as_deref().filter(|n| !n.trim().is_empty());
-        if let Some(n) = name {
-            crate::api::text(n, 100, "folder name")?;
-        }
+        // "" means no name; a name of only whitespace is refused.
+        let name = crate::api::optional_text(self.name.as_deref(), 100, "folder name", false)?;
         if self.color.is_some_and(|c| c > 0xFF_FFFF) {
             return Err(Error::InvalidInput("folder colour: 24-bit RGB".into()));
         }

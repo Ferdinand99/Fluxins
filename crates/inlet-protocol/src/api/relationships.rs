@@ -89,23 +89,36 @@ impl Relationship {
     /// Applies a RELATIONSHIP_UPDATE (or a repeated RELATIONSHIP_ADD) to the
     /// stored record: every field comes from `update`, except a missing
     /// `user`, which keeps the stored one.
+    ///
+    /// `friend_shares_voice_activity` (in `extra`) is only accurate in
+    /// [`crate::Client::relationships`] and in the update sent by the
+    /// voice-activity-sharing route; other events say `true`. Take it from the
+    /// REST list, not from events.
     pub fn apply_update(&mut self, update: Relationship) {
         let user = update.user.or_else(|| self.user.take());
         *self = Relationship { user, ..update };
     }
 }
 
-fn check_text(value: &str, max: usize, what: &str) -> Result<()> {
-    crate::api::text(value, max, what)
-}
+/// Most relationships kept from one list (Fluxer's default limit is 1,000).
+pub const MAX_RELATIONSHIPS: usize = 5_000;
+/// Most notes kept from one list.
+pub const MAX_NOTES: usize = 5_000;
 
 impl Ready {
     /// The account's relationships, with `user` filled in from `users`.
+    /// At most [`MAX_RELATIONSHIPS`].
     pub fn relationships(&self) -> Vec<Relationship> {
-        let mut list: Vec<Relationship> = crate::models::extra_list(&self.extra, "relationships");
+        let items = match self.extra.get("relationships") {
+            Some(Value::Array(items)) => &items[..items.len().min(MAX_RELATIONSHIPS)],
+            _ => return Vec::new(),
+        };
+        let mut list: Vec<Relationship> = crate::models::parse_values(items, "relationship");
+        let users: std::collections::HashMap<&str, &User> =
+            self.users.iter().map(|u| (u.id.as_str(), u)).collect();
         for r in &mut list {
             if r.user.is_none() {
-                r.user = self.users.iter().find(|u| u.id == r.id).cloned();
+                r.user = users.get(r.id.as_str()).map(|u| (*u).clone());
             }
         }
         list
@@ -120,7 +133,7 @@ impl Ready {
 fn notes_from(v: Option<&Value>) -> BTreeMap<Snowflake, String> {
     let mut out = BTreeMap::new();
     if let Some(Value::Object(map)) = v {
-        for (k, v) in map {
+        for (k, v) in map.iter().take(MAX_NOTES) {
             if let (true, Some(note)) = (crate::media::is_snowflake(k), v.as_str()) {
                 if !note.is_empty() {
                     out.insert(k.clone(), note.to_owned());
@@ -138,10 +151,15 @@ struct NoteBody {
 }
 
 impl Client {
-    /// `GET /users/@me/relationships`: every relationship, in no order.
+    /// `GET /users/@me/relationships`: every relationship, in no order (at
+    /// most [`MAX_RELATIONSHIPS`]).
     pub async fn relationships(&self) -> Result<Vec<Relationship>> {
-        self.get_list("/users/@me/relationships", "relationship")
-            .await
+        self.get_list_capped(
+            "/users/@me/relationships",
+            "relationship",
+            MAX_RELATIONSHIPS,
+        )
+        .await
     }
 
     /// `POST /users/@me/relationships/{user}`: sends a friend request, or
@@ -164,7 +182,7 @@ impl Client {
         username: &str,
         discriminator: Option<&str>,
     ) -> Result<Relationship> {
-        check_text(username, 32, "username")?;
+        crate::api::nonblank(username, 32, "username")?;
         let mut body = json!({ "username": username });
         if let Some(d) = discriminator {
             if d.is_empty() || d.len() > 4 || !d.bytes().all(|b| b.is_ascii_digit()) {
@@ -214,17 +232,15 @@ impl Client {
         Ok(())
     }
 
-    /// `PATCH /users/@me/relationships/{user}`: sets (or with `None` clears)
-    /// the private nickname for a friend.
+    /// `PATCH /users/@me/relationships/{user}`: sets (or with `None` or an
+    /// empty string clears) the private nickname for a friend. Text of only
+    /// whitespace is refused.
     pub async fn set_friend_nickname(
         &self,
         user_id: &str,
         nickname: Option<&str>,
     ) -> Result<Relationship> {
-        let nickname = nickname.filter(|n| !n.is_empty());
-        if let Some(n) = nickname {
-            check_text(n, MAX_NOTE_CHARS, "nickname")?;
-        }
+        let nickname = crate::api::optional_text(nickname, MAX_NOTE_CHARS, "nickname", false)?;
         self.raw(
             Method::PATCH,
             &format!("/users/@me/relationships/{}", snowflake(user_id)?),
@@ -256,17 +272,11 @@ impl Client {
         }
     }
 
-    /// `PUT /users/@me/notes/{user}`: sets the note (1-256 characters), or
-    /// deletes it with `None` or an empty string.
+    /// `PUT /users/@me/notes/{user}`: sets the note (1-256 characters, line
+    /// breaks allowed), or deletes it with `None` or an empty string. Text of
+    /// only whitespace is refused.
     pub async fn set_note(&self, user_id: &str, note: Option<&str>) -> Result<()> {
-        let note = note.filter(|n| !n.is_empty());
-        if let Some(n) = note {
-            if n.chars().count() > MAX_NOTE_CHARS {
-                return Err(Error::InvalidInput(format!(
-                    "note: at most {MAX_NOTE_CHARS} characters"
-                )));
-            }
-        }
+        let note = crate::api::optional_text(note, MAX_NOTE_CHARS, "note", true)?;
         self.raw(
             Method::PUT,
             &format!("/users/@me/notes/{}", snowflake(user_id)?),

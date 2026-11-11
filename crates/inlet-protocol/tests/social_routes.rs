@@ -6,11 +6,15 @@ mod common;
 use inlet_protocol::api::expressions::{MemeEdit, NewMeme};
 use inlet_protocol::models::GuildFolder;
 use inlet_protocol::{
-    Client, Error, GroupDmEdit, ImageData, Instance, MemberProfileEdit, ProfileEdit, Token,
+    Channel, Client, Error, GroupDmEdit, ImageData, Instance, MemberProfileEdit, ProfileEdit, Token,
 };
 use serde_json::json;
 use wiremock::matchers::{body_json, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+fn channel(id: &str, kind: i64) -> Channel {
+    serde_json::from_value(json!({"id": id, "type": kind})).unwrap()
+}
 
 fn client(instance: &Instance, token: &str) -> Client {
     Client::new(instance.clone(), Token::new(token))
@@ -325,7 +329,8 @@ async fn dms_profiles_folders_and_memes() {
     assert_eq!(c.open_dm("11").await.unwrap().id, "600");
     c.pin_dm("600").await.unwrap();
     c.unpin_dm("600").await.unwrap();
-    c.close_dm("500", true).await.unwrap();
+    let group = channel("500", 3);
+    c.close_dm(&group, true).await.unwrap();
     c.remove_group_dm_recipient("500", "12", false)
         .await
         .unwrap();
@@ -335,7 +340,11 @@ async fn dms_profiles_folders_and_memes() {
         owner_id: Some("11".into()),
     };
     assert_eq!(
-        c.edit_group_dm("500", &edit).await.unwrap().name.as_deref(),
+        c.edit_group_dm(&group, &edit)
+            .await
+            .unwrap()
+            .name
+            .as_deref(),
         Some("Trip")
     );
 
@@ -403,11 +412,51 @@ async fn dms_profiles_folders_and_memes() {
         Err(Error::InvalidInput(_))
     ));
     assert!(matches!(
-        c.close_dm("@me", false).await,
+        c.close_dm(&channel("@me", 1), false).await,
         Err(Error::InvalidInput(_))
     ));
     assert!(matches!(
-        c.edit_group_dm("500", &GroupDmEdit::default()).await,
+        c.edit_group_dm(&group, &GroupDmEdit::default()).await,
+        Err(Error::InvalidInput(_))
+    ));
+    // A guild channel passed by mistake is never deleted or edited.
+    let text_channel = channel("700", 0);
+    let edit = GroupDmEdit {
+        name: Some(Some("Oops".into())),
+        ..Default::default()
+    };
+    assert!(matches!(
+        c.close_dm(&text_channel, false).await,
+        Err(Error::InvalidInput(_))
+    ));
+    assert!(matches!(
+        c.edit_group_dm(&text_channel, &edit).await,
+        Err(Error::InvalidInput(_))
+    ));
+    assert!(matches!(
+        c.edit_group_dm(&channel("600", 1), &edit).await,
+        Err(Error::InvalidInput(_))
+    ));
+    // Whitespace-only text is refused everywhere; "" clears.
+    assert!(matches!(
+        c.set_note("11", Some("   ")).await,
+        Err(Error::InvalidInput(_))
+    ));
+    assert!(matches!(
+        c.set_friend_nickname("11", Some(" ")).await,
+        Err(Error::InvalidInput(_))
+    ));
+    let blank = GuildFolder::new(5, Some("  "), vec!["300".into()]);
+    assert!(matches!(
+        c.set_guild_folders(&[blank]).await,
+        Err(Error::InvalidInput(_))
+    ));
+    let blank_meme = NewMeme {
+        name: " ".into(),
+        ..Default::default()
+    };
+    assert!(matches!(
+        c.save_meme_from_message("200", "9", &blank_meme).await,
         Err(Error::InvalidInput(_))
     ));
     assert!(matches!(
@@ -419,4 +468,26 @@ async fn dms_profiles_folders_and_memes() {
         c.emoji_metadata("x").await,
         Err(Error::InvalidInput(_))
     ));
+}
+
+#[tokio::test]
+async fn group_dm_rate_limit_reports_the_real_wait() {
+    // Fluxer allows 10 group DM creations per hour; the UI must be able to say
+    // "try again in 50 minutes", not the limiter's 5-minute ceiling.
+    let (server, instance) = common::instance().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/users/@me/channels"))
+        .respond_with(ResponseTemplate::new(429).set_body_json(json!({
+            "code": "RATE_LIMITED", "message": "slow", "global": false, "retry_after": 3000
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let c = client(&instance, "tok-gdm-hour");
+    match c.create_group_dm(&["11".into()]).await {
+        Err(Error::RateLimited { retry_after }) => {
+            assert_eq!(retry_after, std::time::Duration::from_secs(3000))
+        }
+        other => panic!("{other:?}"),
+    }
 }

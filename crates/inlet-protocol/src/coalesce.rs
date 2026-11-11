@@ -145,6 +145,8 @@ pub(crate) struct Shared {
     search: Mutex<Option<Instant>>,
     /// Start time of the last GIF search slot handed out.
     gif_search: Mutex<Option<Instant>>,
+    /// Synced preference writes: one writer and one batch at a time.
+    pub(crate) preferences: crate::api::preferences::PreferencesState,
 }
 
 /// Claims the next slot at least `interval` after the previous one:

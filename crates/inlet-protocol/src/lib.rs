@@ -170,7 +170,7 @@ pub use api::dms::{GroupDmEdit, GroupDmOutcome};
 pub use api::expressions::Meme;
 pub use api::gifs::Gif;
 pub use api::inbox::MentionsQuery;
-pub use api::invites::Invite;
+pub use api::invites::{Invite, InviteLink};
 pub use api::messages::ForwardSource;
 pub use api::preferences::{PreferencesSave, SyncedPreferences};
 pub use api::profiles::{ImageData, MemberProfileEdit, ProfileEdit};

@@ -103,6 +103,55 @@ pub(crate) fn id_list(ids: &[String], max: usize, what: &str) -> crate::Result<(
     Ok(())
 }
 
+/// Text rules for the social, profile and settings calls (one rule
+/// everywhere): an empty string means "clear" where clearing exists, text of
+/// only whitespace is refused, and text has 1 to `max` characters without
+/// control characters (line breaks allowed where `multiline`).
+pub(crate) fn optional_text<'a>(
+    value: Option<&'a str>,
+    max: usize,
+    what: &str,
+    multiline: bool,
+) -> crate::Result<Option<&'a str>> {
+    let Some(v) = value.filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    if v.trim().is_empty() {
+        return Err(crate::Error::InvalidInput(format!("{what} is blank")));
+    }
+    let bad = |c: char| c.is_control() && !(multiline && c == '\n');
+    if v.chars().count() > max || v.chars().any(bad) {
+        return Err(crate::Error::InvalidInput(format!(
+            "{what}: 1-{max} characters without control characters"
+        )));
+    }
+    Ok(Some(v))
+}
+
+/// Required text: like [`optional_text`], but empty is refused too.
+pub(crate) fn nonblank<'a>(value: &'a str, max: usize, what: &str) -> crate::Result<&'a str> {
+    optional_text(Some(value), max, what, false)?
+        .ok_or_else(|| crate::Error::InvalidInput(format!("{what} is empty")))
+}
+
+impl crate::Client {
+    /// A GET list, at most `cap` elements parsed (the rest are dropped).
+    pub(crate) async fn get_list_capped<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        what: &str,
+        cap: usize,
+    ) -> crate::Result<Vec<T>> {
+        let mut items: Vec<serde_json::Value> =
+            self.raw(reqwest::Method::GET, path, None).await?.json()?;
+        if items.len() > cap {
+            tracing::warn!(what, len = items.len(), cap, "list cut to its cap");
+            items.truncate(cap);
+        }
+        Ok(crate::models::lenient_list(items, what))
+    }
+}
+
 /// Checks text for a query or body: 1 to `max` characters, no control characters.
 pub(crate) fn text(value: &str, max: usize, what: &str) -> crate::Result<()> {
     let n = value.chars().count();

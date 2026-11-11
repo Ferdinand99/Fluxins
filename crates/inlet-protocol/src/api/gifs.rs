@@ -178,17 +178,56 @@ impl Discovery {
     }
 }
 
-/// A locale for the GIF routes: `xx`, `xxx` or `xx-YY`-style, at most 16 characters.
-fn locale(value: &str) -> Result<&str> {
-    let ok = !value.is_empty()
-        && value.len() <= 16
-        && value
-            .split('-')
-            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_alphanumeric()));
-    if ok {
-        Ok(value)
-    } else {
-        Err(Error::InvalidInput("not a locale".into()))
+/// The locales Fluxer accepts (`LocaleSchema`, a closed list).
+pub const FLUXER_LOCALES: &[&str] = &[
+    "ar", "be", "bg", "bn", "ca", "cs", "da", "de", "el", "en-GB", "en-US", "es-ES", "es-419",
+    "fi", "fil", "fr", "he", "hi", "hr", "hu", "id", "it", "ja", "ko", "lt", "lv", "nl", "no",
+    "pl", "pt-BR", "pt-PT", "ro", "ru", "sk", "sl", "sq", "sv-SE", "th", "tok", "tr", "uk", "vi",
+    "zh-CN", "zh-TW",
+];
+
+/// Most GIFs (or suggestions, or categories) kept from one answer; Fluxer sends at most 50.
+pub const MAX_GIFS: usize = 100;
+
+/// A locale Fluxer accepts for `tag` (a BCP 47 tag such as `nb-NO`, `de-DE`
+/// or `en`): the exact entry of [`FLUXER_LOCALES`] (any case), else Norwegian
+/// `nb`/`nn` as `no`, else the entry for the language alone (`de-DE` is `de`,
+/// `en` is `en-US`, `pt` is `pt-BR`, traditional Chinese is `zh-TW`), else
+/// `en-US`. Only list values reach a request.
+pub fn fluxer_locale(tag: &str) -> &'static str {
+    let tag = tag.trim().replace('_', "-");
+    if let Some(l) = FLUXER_LOCALES.iter().find(|l| l.eq_ignore_ascii_case(&tag)) {
+        return l;
+    }
+    let lang = tag
+        .split('-')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match lang.as_str() {
+        "nb" | "nn" | "no" => "no",
+        "en" => "en-US",
+        "es" => "es-ES",
+        "pt" => "pt-BR",
+        "sv" => "sv-SE",
+        "zh" => {
+            let t = tag.to_ascii_lowercase();
+            let traditional =
+                t.contains("hant") || ["-tw", "-hk", "-mo"].iter().any(|r| t.ends_with(r));
+            if traditional {
+                "zh-TW"
+            } else {
+                "zh-CN"
+            }
+        }
+        "tl" => "fil",
+        "iw" => "he",
+        "in" => "id",
+        _ => FLUXER_LOCALES
+            .iter()
+            .find(|l| **l == lang)
+            .copied()
+            .unwrap_or("en-US"),
     }
 }
 
@@ -211,39 +250,43 @@ impl Client {
 
     /// `GET /gifs/search?q=..&locale=..`: up to 50 GIFs. Paced (module docs).
     pub async fn gif_search(&self, query: &str, locale_tag: &str) -> Result<Vec<Gif>> {
-        crate::api::text(query, 256, "GIF search")?;
+        crate::api::nonblank(query, 256, "GIF search")?;
         let path = format!(
             "/gifs/search?q={}&locale={}",
             enc_query(query),
-            locale(locale_tag)?
+            fluxer_locale(locale_tag)
         );
         self.gif_slot().await?;
-        self.get_list(&path, "GIF").await
+        self.get_list_capped(&path, "GIF", MAX_GIFS).await
     }
 
     /// `GET /gifs/suggest?q=..&locale=..`: search terms for a partial query.
     /// Paced together with [`Client::gif_search`].
     pub async fn gif_suggestions(&self, query: &str, locale_tag: &str) -> Result<Vec<String>> {
-        crate::api::text(query, 256, "GIF search")?;
+        crate::api::nonblank(query, 256, "GIF search")?;
         let path = format!(
             "/gifs/suggest?q={}&locale={}",
             enc_query(query),
-            locale(locale_tag)?
+            fluxer_locale(locale_tag)
         );
         self.gif_slot().await?;
-        self.get_list(&path, "GIF suggestion").await
+        self.get_list_capped(&path, "GIF suggestion", MAX_GIFS)
+            .await
     }
 
     /// `GET /gifs/trending?locale=..`: up to 50 trending GIFs.
     pub async fn gif_trending(&self, locale_tag: &str) -> Result<Vec<Gif>> {
-        let path = format!("/gifs/trending?locale={}", locale(locale_tag)?);
-        self.get_list(&path, "GIF").await
+        let path = format!("/gifs/trending?locale={}", fluxer_locale(locale_tag));
+        self.get_list_capped(&path, "GIF", MAX_GIFS).await
     }
 
     /// `GET /gifs/featured?locale=..`: a featured GIF and the categories.
     pub async fn gif_featured(&self, locale_tag: &str) -> Result<GifFeatured> {
-        let path = format!("/gifs/featured?locale={}", locale(locale_tag)?);
-        self.raw(Method::GET, &path, None).await?.json()
+        let path = format!("/gifs/featured?locale={}", fluxer_locale(locale_tag));
+        let mut featured: GifFeatured = self.raw(Method::GET, &path, None).await?.json()?;
+        featured.gifs.truncate(MAX_GIFS);
+        featured.categories.truncate(MAX_GIFS);
+        Ok(featured)
     }
 
     /// `POST /gifs/register-share`: tells the instance (which tells its
@@ -260,11 +303,8 @@ impl Client {
             &gif.slug
         };
         crate::api::text(id, 300, "GIF id")?;
-        let query = query.filter(|q| !q.is_empty());
-        if let Some(q) = query {
-            crate::api::text(q, 256, "GIF search")?;
-        }
-        let body = json!({ "id": id, "q": query, "locale": locale(locale_tag)? });
+        let query = crate::api::optional_text(query, 256, "GIF search", false)?;
+        let body = json!({ "id": id, "q": query, "locale": fluxer_locale(locale_tag) });
         self.raw(Method::POST, "/gifs/register-share", Some(&body))
             .await?;
         Ok(())
@@ -276,12 +316,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn locales_are_checked() {
-        for good in ["en-US", "nb", "zh-Hant-TW"] {
-            assert!(locale(good).is_ok());
+    fn locales_map_to_fluxers_list() {
+        for (tag, want) in [
+            ("en-US", "en-US"),
+            ("EN-us", "en-US"),
+            ("en", "en-US"),
+            ("en_GB", "en-GB"),
+            ("nb", "no"),
+            ("nb-NO", "no"),
+            ("nn-NO", "no"),
+            ("no", "no"),
+            ("de-DE", "de"),
+            ("pt", "pt-BR"),
+            ("pt-PT", "pt-PT"),
+            ("zh-Hant-TW", "zh-TW"),
+            ("zh-HK", "zh-TW"),
+            ("zh", "zh-CN"),
+            ("zh-TW", "zh-TW"),
+            ("sv", "sv-SE"),
+            ("", "en-US"),
+            ("en-US&x=1", "en-US"),
+            ("xx", "en-US"),
+        ] {
+            assert_eq!(fluxer_locale(tag), want, "{tag}");
         }
-        for bad in ["", "en_US&x=1", "en US", "-", "a/b", "abcdefghijklmnopq"] {
-            assert!(locale(bad).is_err(), "{bad}");
-        }
+        assert!(FLUXER_LOCALES.iter().all(|l| fluxer_locale(l) == *l));
     }
 }

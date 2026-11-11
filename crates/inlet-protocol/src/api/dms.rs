@@ -3,27 +3,32 @@
 //!
 //! Creating a group DM and adding someone to one are CAPTCHA-gated on
 //! instances that turn the check on. The crate solves the ALTCHA
-//! proof-of-work itself ([`crate::altcha`]): on a blocking thread, one solve
-//! at a time per process, at most [`GROUP_DM_CAPTCHA_TIMEOUT`] each and at
-//! most two solves per call (so at most three requests). When it cannot pass
-//! the check, the call returns [`GroupDmOutcome::Captcha`] and the UI tells
-//! the person to do it in the browser. Fluxer allows 10 group DM creations per
-//! hour, and every attempt counts.
+//! proof-of-work itself ([`crate::altcha::solve`]): on a blocking thread, one
+//! solve at a time per process (shared with sign-in), at most
+//! [`GROUP_DM_CAPTCHA_TIMEOUT`] each and at most two solves per call (so at
+//! most three requests). When it cannot pass the check, the call returns
+//! [`GroupDmOutcome::Captcha`] and the UI tells the person to do it in the
+//! browser.
+//!
+//! Fluxer allows 10 group DM creations and 10 participant additions per hour
+//! per account, and every attempt counts (a normal call uses two: without a
+//! token, then with the answer, as Fluxer's own client). Over the limit the
+//! call fails with [`crate::Error::RateLimited`], whose `retry_after` is the
+//! server's real wait (up to an hour here). After `Captcha` or `RateLimited`
+//! the UI should show a lasting message and must not retry on its own.
 //!
 //! The pinned DM list is in READY ([`crate::Ready::pinned_dms`]) and
 //! USER_PINNED_DMS_UPDATE ([`crate::Dispatch::UserPinnedDmsUpdate`]).
 
-use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use reqwest::Method;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use tokio::sync::Semaphore;
 
 use crate::api::profiles::ImageData;
 use crate::error::{Error, Result};
-use crate::models::{null_as_default, sf, Channel, Snowflake};
+use crate::models::{channel_type, null_as_default, sf, Channel, Snowflake};
 use crate::rest::{send, snowflake, RawResponse, Request};
 use crate::Client;
 
@@ -34,13 +39,6 @@ pub const MAX_GROUP_DM_RECIPIENTS: usize = 49;
 pub const GROUP_DM_CAPTCHA_TIMEOUT: Duration = Duration::from_secs(30);
 /// Solves per call: the first challenge, and one more after `INVALID_CAPTCHA`.
 const MAX_SOLVES: usize = 2;
-
-/// One solve at a time in the whole process, so many clicks or accounts
-/// cannot take every core.
-fn solver_slot() -> Arc<Semaphore> {
-    static SLOT: OnceLock<Arc<Semaphore>> = OnceLock::new();
-    SLOT.get_or_init(|| Arc::new(Semaphore::new(1))).clone()
-}
 
 /// A recipient that could not be added to a new group DM.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -91,13 +89,7 @@ impl GroupDmEdit {
         if let Some(name) = &self.name {
             // "" clears like `None`; a name of only spaces is refused, not
             // taken as a clear.
-            let name = name.as_deref().filter(|n| !n.is_empty());
-            if let Some(n) = name {
-                if n.trim().is_empty() {
-                    return Err(Error::InvalidInput("group DM name is blank".into()));
-                }
-                crate::api::text(n, 100, "group DM name")?;
-            }
+            let name = crate::api::optional_text(name.as_deref(), 100, "group DM name", false)?;
             body.insert("name".into(), json!(name));
         }
         if let Some(icon) = &self.icon {
@@ -118,21 +110,10 @@ impl GroupDmEdit {
     }
 }
 
-/// Solves a challenge on a blocking thread, one solve at a time, within the
-/// timeout. The slot is held by the blocking work itself, so it is only
-/// freed once that work has stopped, even when this future gives up first.
+/// Solves a challenge with the process-wide solver ([`crate::altcha::solve`]:
+/// one solve at a time, off the async threads, hard deadline).
 async fn solve_bounded(challenge: Value) -> Result<String> {
-    let started = tokio::time::Instant::now();
-    let permit = tokio::time::timeout(GROUP_DM_CAPTCHA_TIMEOUT, solver_slot().acquire_owned())
-        .await
-        .map_err(|_| Error::Captcha("another CAPTCHA is being solved".into()))?
-        .map_err(|_| Error::Captcha("solver closed".into()))?;
-    let left = GROUP_DM_CAPTCHA_TIMEOUT.saturating_sub(started.elapsed());
-    // The workers stop on their own after `left`; the outer timeout also covers
-    // the hand-off, and dropping the inner future cancels the workers.
-    tokio::time::timeout(left, crate::altcha::solve_holding(challenge, left, permit))
-        .await
-        .unwrap_or_else(|_| Err(Error::Captcha("CAPTCHA timed out".into())))
+    crate::altcha::solve(challenge, GROUP_DM_CAPTCHA_TIMEOUT).await
 }
 
 impl Client {
@@ -288,19 +269,30 @@ impl Client {
     /// `DELETE /channels/{channel}`: closes a DM or leaves a group DM.
     /// `silent` skips the "left the group" message. (Deleting the account's
     /// own messages on the way out needs sudo mode and is not offered.)
-    pub async fn close_dm(&self, channel_id: &str, silent: bool) -> Result<()> {
-        let path = format!("/channels/{}?silent={silent}", snowflake(channel_id)?);
+    ///
+    /// The route deletes any channel the account may delete, so this takes
+    /// the channel and refuses anything but a DM or group DM with
+    /// [`Error::InvalidInput`], without a request.
+    pub async fn close_dm(&self, channel: &Channel, silent: bool) -> Result<()> {
+        if !matches!(channel.kind, channel_type::DM | channel_type::GROUP_DM) {
+            return Err(Error::InvalidInput("not a DM or group DM".into()));
+        }
+        let path = format!("/channels/{}?silent={silent}", snowflake(&channel.id)?);
         self.raw(Method::DELETE, &path, None).await?;
         Ok(())
     }
 
     /// `PATCH /channels/{channel}`: renames a group DM, changes its icon or
-    /// hands it to another participant.
-    pub async fn edit_group_dm(&self, channel_id: &str, edit: &GroupDmEdit) -> Result<Channel> {
+    /// hands it to another participant. Refuses anything but a group DM with
+    /// [`Error::InvalidInput`], without a request (the route edits any channel).
+    pub async fn edit_group_dm(&self, channel: &Channel, edit: &GroupDmEdit) -> Result<Channel> {
+        if channel.kind != channel_type::GROUP_DM {
+            return Err(Error::InvalidInput("not a group DM".into()));
+        }
         let body = edit.to_json()?;
         self.raw(
             Method::PATCH,
-            &format!("/channels/{}", snowflake(channel_id)?),
+            &format!("/channels/{}", snowflake(&channel.id)?),
             Some(&body),
         )
         .await?
@@ -334,6 +326,8 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use tokio::sync::Semaphore;
 
     #[tokio::test]
     async fn the_solver_slot_is_held_until_the_blocking_work_stops() {

@@ -17,12 +17,26 @@
 //! - fields the schema does not know are copied unchanged;
 //! - known fields that did not change are copied from the original bytes
 //!   (with any unknown fields inside them);
-//! - a changed top-level message keeps the unknown fields inside it;
-//! - a changed list or map keeps the original encoding of every element that
-//!   is still there, and new or changed elements come from the new value.
+//! - a changed top-level message is merged field by field, so the unknown
+//!   fields inside it stay;
+//! - a changed **map** is matched by key: an entry whose key and value did
+//!   not change keeps its original bytes, a changed entry with a message value
+//!   is merged field by field, and new, changed or removed entries follow the
+//!   new value. The order on the wire does not matter (prost writes maps
+//!   sorted, Fluxer's clients in insertion order);
+//! - a changed **list** keeps the original bytes of every element of the new
+//!   list that is equal, as a whole, to an element of the old list (each old
+//!   element used once). New or changed elements come from the new value, so
+//!   unknown fields inside an element Inlet changes are lost. The identity of
+//!   a list element is its whole value: there is no per-field key, and a
+//!   changed element counts as removed and added.
 //!
-//! When the original bytes cannot be split into records (malformed, or the
-//! deprecated group encoding), nothing is merged and the write is refused.
+//! The result is checked: decoded again, it must encode exactly like the
+//! changed value. If it does not, or the original bytes cannot be split into
+//! records (malformed, or the deprecated group encoding), nothing is sent and
+//! the write fails with [`crate::Error::InvalidInput`]. A lossy merge is never
+//! sent. Matching uses hash maps, so the merge is linear in the size of the
+//! snapshot.
 //!
 //! # Regenerating
 //!
@@ -34,7 +48,10 @@
 //! `prost_build::Config::new().btree_map(["."])` with `compile_fds` on
 //! `protox::compile(["fluxer/user/preferences/v1/preferences.proto"], [<proto dir>])`,
 //! keep the provenance header of `preferences_v1.rs`, run `cargo fmt`, and update
-//! `SYNCED_PREFERENCES_MESSAGE_FIELDS` (a test checks it against the code).
+//! `Schema::SYNCED_PREFERENCES`. A test reads the generated code and fails when
+//! the table and the code disagree (singular message fields, maps and their
+//! value types), and when a message below the top level gets a singular
+//! message field of its own, which the merge does not descend into.
 //! Maps must stay `BTreeMap`: the merge compares encodings, and a `HashMap`
 //! encodes in random order.
 
@@ -43,43 +60,120 @@
 #[path = "preferences_v1.rs"]
 pub mod preferences;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-/// The tags of `SyncedPreferences` fields that are singular messages. Only
-/// these are merged field by field when they change; their own fields are
-/// all scalars, lists or maps.
-pub(crate) const SYNCED_PREFERENCES_MESSAGE_FIELDS: &[u32] = &[
-    1, 2, 3, 20, 21, 22, 23, 24, 25, 40, 41, 42, 43, 44, 45, 60, 61, 62, 63, 80, 81, 100, 101, 102,
-    103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 114, 115, 116,
-];
-
-/// Which fields of a message are singular sub-messages (merged recursively).
+/// How a message is merged: its singular message fields (merged
+/// recursively with their own schema) and its map fields.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Schema {
-    /// Tags of singular message fields; their own fields are merged flat.
-    pub(crate) message_fields: &'static [u32],
+    /// Tags of singular message fields, with the schema of that message.
+    pub(crate) message_fields: &'static [(u32, &'static Schema)],
+    /// Tags of map fields, and whether the map value is a message.
+    pub(crate) map_fields: &'static [(u32, bool)],
 }
 
 impl Schema {
-    /// A message whose fields are all scalars, lists or maps.
+    /// A message whose fields are all scalars or lists.
     pub(crate) const FLAT: Schema = Schema {
         message_fields: &[],
+        map_fields: &[],
+    };
+    /// A map entry whose value (field 2) is a flat message.
+    const MESSAGE_ENTRY: Schema = Schema {
+        message_fields: &[(2, &Schema::FLAT)],
+        map_fields: &[],
+    };
+    /// A message with one `map<string, message>` at tag 1 (`EmojiPickerState`,
+    /// `StickerPickerState`, `MemesPickerState`, `ChannelFrecencyState`).
+    const USAGE: Schema = Schema {
+        message_fields: &[],
+        map_fields: &[(1, true)],
+    };
+    /// `NagbarDismissals`: five `map<string, bool>`.
+    const NAGBARS: Schema = Schema {
+        message_fields: &[],
+        map_fields: &[
+            (15, false),
+            (16, false),
+            (17, false),
+            (18, false),
+            (19, false),
+        ],
+    };
+    /// `SoundSettings`: `map<string, bool>` and `map<string, double>`.
+    const SOUND: Schema = Schema {
+        message_fields: &[],
+        map_fields: &[(3, false), (4, false)],
     };
     /// `SyncedPreferences`.
     pub(crate) const SYNCED_PREFERENCES: Schema = Schema {
-        message_fields: SYNCED_PREFERENCES_MESSAGE_FIELDS,
+        message_fields: &[
+            (1, &Schema::FLAT),
+            (2, &Schema::FLAT),
+            (3, &Schema::FLAT),
+            (20, &Schema::USAGE),
+            (21, &Schema::USAGE),
+            (22, &Schema::USAGE),
+            (23, &Schema::FLAT),
+            (24, &Schema::FLAT),
+            (25, &Schema::FLAT),
+            (40, &Schema::FLAT),
+            (41, &Schema::FLAT),
+            (42, &Schema::FLAT),
+            (43, &Schema::FLAT),
+            (44, &Schema::FLAT),
+            (45, &Schema::FLAT),
+            (60, &Schema::NAGBARS),
+            (61, &Schema::FLAT),
+            (62, &Schema::FLAT),
+            (63, &Schema::FLAT),
+            (80, &Schema::FLAT),
+            (81, &Schema::FLAT),
+            (100, &Schema::SOUND),
+            (101, &Schema::FLAT),
+            (102, &Schema::FLAT),
+            (103, &Schema::FLAT),
+            (104, &Schema::FLAT),
+            (105, &Schema::FLAT),
+            (106, &Schema::FLAT),
+            (107, &Schema::FLAT),
+            (108, &Schema::FLAT),
+            (109, &Schema::FLAT),
+            (110, &Schema::FLAT),
+            (111, &Schema::FLAT),
+            (112, &Schema::FLAT),
+            (114, &Schema::FLAT),
+            (115, &Schema::USAGE),
+            (116, &Schema::FLAT),
+        ],
+        map_fields: &[],
     };
+
+    fn message(&self, tag: u32) -> Option<&'static Schema> {
+        self.message_fields
+            .iter()
+            .find(|(t, _)| *t == tag)
+            .map(|(_, s)| *s)
+    }
+
+    fn map(&self, tag: u32) -> Option<bool> {
+        self.map_fields
+            .iter()
+            .find(|(t, _)| *t == tag)
+            .map(|(_, m)| *m)
+    }
 }
 
 /// Why a merge was not possible.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MergeError;
 
-/// One field record: its whole encoding (tag included), and the payload of a
-/// length-delimited record.
+/// One field record: its whole encoding (tag included), the bytes after the
+/// tag, and the payload of a length-delimited record.
 #[derive(Debug, Clone, Copy)]
 struct Record<'a> {
     whole: &'a [u8],
+    value: &'a [u8],
     len_payload: Option<&'a [u8]>,
 }
 
@@ -104,6 +198,12 @@ fn write_varint(out: &mut Vec<u8>, mut value: u64) {
     out.push(value as u8);
 }
 
+fn write_len_field(out: &mut Vec<u8>, field: u32, payload: &[u8]) {
+    write_varint(out, (u64::from(field) << 3) | 2);
+    write_varint(out, payload.len() as u64);
+    out.extend_from_slice(payload);
+}
+
 /// Splits a message into its records, grouped by field number in wire order.
 /// `None` for malformed input or group records (wire types 3 and 4).
 fn records(buf: &[u8]) -> Option<BTreeMap<u32, Vec<Record<'_>>>> {
@@ -113,6 +213,7 @@ fn records(buf: &[u8]) -> Option<BTreeMap<u32, Vec<Record<'_>>>> {
         let start = pos;
         let key = read_varint(buf, &mut pos)?;
         let field = u32::try_from(key >> 3).ok().filter(|f| *f != 0)?;
+        let value_start = pos;
         let mut len_payload = None;
         match key & 7 {
             0 => {
@@ -130,6 +231,7 @@ fn records(buf: &[u8]) -> Option<BTreeMap<u32, Vec<Record<'_>>>> {
         }
         out.entry(field).or_default().push(Record {
             whole: &buf[start..pos],
+            value: &buf[value_start..pos],
             len_payload,
         });
     }
@@ -146,13 +248,92 @@ fn emit(out: &mut Vec<u8>, recs: &[Record<'_>]) {
     }
 }
 
+/// The key of a map entry: the value bytes of field 1 (a missing key is the
+/// default, which is empty).
+fn entry_key<'a>(entry: &Record<'a>) -> Option<&'a [u8]> {
+    let payload = entry.len_payload?;
+    let recs = records(payload)?;
+    match recs.get(&1).map(Vec::as_slice) {
+        None => Some(&[]),
+        Some([k]) => Some(k.len_payload.unwrap_or(k.value)),
+        Some(_) => None,
+    }
+}
+
+/// Entries of a map by key; `None` when an entry cannot be read or a key
+/// repeats (then matching by key is not safe).
+fn by_key<'a>(entries: &[Record<'a>]) -> Option<HashMap<&'a [u8], Record<'a>>> {
+    let mut map = HashMap::with_capacity(entries.len());
+    for e in entries {
+        if map.insert(entry_key(e)?, *e).is_some() {
+            return None;
+        }
+    }
+    Some(map)
+}
+
+/// A changed map: entries are matched by key.
+fn merge_map(
+    out: &mut Vec<u8>,
+    field: u32,
+    o: &[Record<'_>],
+    c: &[Record<'_>],
+    n: &[Record<'_>],
+    value_is_message: bool,
+) -> Result<(), MergeError> {
+    let (Some(orig), Some(canon)) = (by_key(o), by_key(c)) else {
+        emit(out, n);
+        return Ok(());
+    };
+    for entry in n {
+        let key = entry_key(entry).ok_or(MergeError)?;
+        match (orig.get(key), canon.get(key)) {
+            // Unchanged entry: the original bytes.
+            (Some(oe), Some(ce)) if ce.whole == entry.whole => out.extend_from_slice(oe.whole),
+            // Changed message value: keep the unknown fields inside it.
+            (Some(oe), Some(ce)) if value_is_message => {
+                match (oe.len_payload, ce.len_payload, entry.len_payload) {
+                    (Some(op), Some(cp), Some(np)) => {
+                        let inner = merge_unknown(op, cp, np, Schema::MESSAGE_ENTRY)?;
+                        write_len_field(out, field, &inner);
+                    }
+                    _ => out.extend_from_slice(entry.whole),
+                }
+            }
+            _ => out.extend_from_slice(entry.whole),
+        }
+    }
+    Ok(())
+}
+
+/// A changed list: the original of each new element that equals an old one.
+fn merge_list(out: &mut Vec<u8>, o: &[Record<'_>], c: &[Record<'_>], n: &[Record<'_>]) {
+    if o.len() != c.len() {
+        // Not one record per element (packed versus unpacked, or a repeated
+        // singular field): no safe pairing, so the new encoding.
+        emit(out, n);
+        return;
+    }
+    let mut unused: HashMap<&[u8], Vec<usize>> = HashMap::with_capacity(c.len());
+    for (j, rec) in c.iter().enumerate().rev() {
+        unused.entry(rec.whole).or_default().push(j);
+    }
+    for rec in n {
+        match unused.get_mut(rec.whole).and_then(Vec::pop) {
+            Some(j) => out.extend_from_slice(o[j].whole),
+            None => out.extend_from_slice(rec.whole),
+        }
+    }
+}
+
 /// Builds the bytes to send for a changed message.
 ///
 /// - `original`: the bytes as the server sent them (may hold unknown fields);
 /// - `canonical`: this crate's encoding of what was decoded from `original`;
 /// - `new`: this crate's encoding of the changed value.
 ///
-/// See the module docs for the rules.
+/// See the module docs for the rules. The caller checks the result
+/// (`SyncedPreferences::encode_change`).
 pub(crate) fn merge_unknown(
     original: &[u8],
     canonical: &[u8],
@@ -182,35 +363,23 @@ pub(crate) fn merge_unknown(
                 if same(c, n) {
                     // Unchanged: the original encoding, unknown fields inside included.
                     emit(&mut out, o);
-                } else if schema.message_fields.contains(&f)
-                    && o.len() == 1
-                    && c.len() == 1
-                    && n.len() == 1
-                {
-                    match (o[0].len_payload, c[0].len_payload, n[0].len_payload) {
-                        (Some(op), Some(cp), Some(np)) => {
-                            let inner = merge_unknown(op, cp, np, Schema::FLAT)?;
-                            write_varint(&mut out, (u64::from(f) << 3) | 2);
-                            write_varint(&mut out, inner.len() as u64);
-                            out.extend_from_slice(&inner);
+                } else if let Some(value_is_message) = schema.map(f) {
+                    merge_map(&mut out, f, o, c, n, value_is_message)?;
+                } else if let Some(sub) = schema.message(f) {
+                    match (o, c.as_slice(), n.as_slice()) {
+                        ([or], [cr], [nr]) => {
+                            match (or.len_payload, cr.len_payload, nr.len_payload) {
+                                (Some(op), Some(cp), Some(np)) => {
+                                    let inner = merge_unknown(op, cp, np, *sub)?;
+                                    write_len_field(&mut out, f, &inner);
+                                }
+                                _ => emit(&mut out, n),
+                            }
                         }
                         _ => emit(&mut out, n),
                     }
-                } else if o.len() == c.len() {
-                    // A list or map: keep the original of each element that is still there.
-                    let mut used = vec![false; c.len()];
-                    for rec in n {
-                        let hit = (0..c.len()).find(|&j| !used[j] && c[j].whole == rec.whole);
-                        match hit {
-                            Some(j) => {
-                                used[j] = true;
-                                out.extend_from_slice(o[j].whole);
-                            }
-                            None => out.extend_from_slice(rec.whole),
-                        }
-                    }
                 } else {
-                    emit(&mut out, n);
+                    merge_list(&mut out, o, c, n);
                 }
             }
         }
@@ -257,56 +426,309 @@ mod tests {
         .unwrap()
     }
 
+    /// The fields of every generated struct: `(tag, kind, type)`, where kind
+    /// is `message` (singular message), `map:<key>, <value>` or `other`.
+    fn generated_structs() -> HashMap<String, Vec<(u32, String, String)>> {
+        let src = include_str!("preferences_v1.rs");
+        let mut structs: HashMap<String, Vec<(u32, String, String)>> = HashMap::new();
+        let mut current: Option<String> = None;
+        let mut pending: Option<(u32, String)> = None;
+        let mut field_text = String::new();
+        for line in src.lines() {
+            let t = line.trim();
+            if let Some(rest) = t.strip_prefix("pub struct ") {
+                let name = rest.trim_end_matches('{').trim().to_owned();
+                structs.insert(name.clone(), Vec::new());
+                current = Some(name);
+                continue;
+            }
+            if let Some(attr) = t.strip_prefix("#[prost(") {
+                let tag = attr
+                    .split("tag = \"")
+                    .nth(1)
+                    .and_then(|r| r.split('"').next())
+                    .and_then(|n| n.parse::<u32>().ok());
+                let kind = if attr.starts_with("message, optional") {
+                    "message".to_owned()
+                } else if let Some(m) = attr.strip_prefix("btree_map = \"") {
+                    format!("map:{}", m.split('"').next().unwrap_or_default())
+                } else {
+                    "other".to_owned()
+                };
+                pending = tag.map(|tag| (tag, kind));
+                field_text.clear();
+                continue;
+            }
+            if let Some((tag, kind)) = pending.clone() {
+                field_text.push_str(t);
+                if t.ends_with(',') {
+                    let ty = field_text
+                        .rsplit("Option<")
+                        .next()
+                        .unwrap_or_default()
+                        .trim_end_matches(',')
+                        .trim_end_matches('>')
+                        .to_owned();
+                    if let Some(name) = &current {
+                        structs
+                            .entry(name.clone())
+                            .or_default()
+                            .push((tag, kind, ty));
+                    }
+                    pending = None;
+                }
+            }
+        }
+        structs
+    }
+
     #[test]
-    fn message_field_table_matches_the_generated_code() {
-        // Every singular message field set to an empty message encodes as a
-        // length-delimited record with length 0; nothing else does.
-        let all = SyncedPreferences {
-            accessibility: Some(Default::default()),
-            accessibility_overrides: Some(Default::default()),
-            textual_preview: Some(Default::default()),
-            emoji_picker: Some(Default::default()),
-            sticker_picker: Some(Default::default()),
-            memes_picker: Some(Default::default()),
-            emoji: Some(Default::default()),
-            emoji_sticker_layout: Some(Default::default()),
-            favorite_gifs: Some(Default::default()),
-            favorites: Some(Default::default()),
-            recent_mentions: Some(Default::default()),
-            sidebar: Some(Default::default()),
-            member_list: Some(Default::default()),
-            unread_channels: Some(Default::default()),
-            mention_frecency: Some(Default::default()),
-            nagbars: Some(Default::default()),
-            dismissed_upsells: Some(Default::default()),
-            guild_nsfw_agreements: Some(Default::default()),
-            whats_new: Some(Default::default()),
-            privacy: Some(Default::default()),
-            local_spam_overrides: Some(Default::default()),
-            sanitize_urls: false,
-            sound: Some(Default::default()),
-            spellcheck: Some(Default::default()),
-            search_engines: Some(Default::default()),
-            permission_layout: Some(Default::default()),
-            guild_member_layout: Some(Default::default()),
-            guild_folders: Some(Default::default()),
-            hidden_guild_buttons: Some(Default::default()),
-            keyboard_mode_intro: Some(Default::default()),
-            input_monitoring: Some(Default::default()),
-            voice_prompts: Some(Default::default()),
-            sudo_prompt: Some(Default::default()),
-            keybinds: Some(Default::default()),
-            chat_input: Some(Default::default()),
-            save_camera_uploads_to_device: None,
-            double_tap_reaction: Some(Default::default()),
-            channel_frecency: Some(Default::default()),
-            announcement_prompts: Some(Default::default()),
-            double_tap_action: 0,
-            swipe_right_to_left_action: 0,
+    fn schema_table_matches_the_generated_code() {
+        let structs = generated_structs();
+        let top = &structs["SyncedPreferences"];
+        assert!(top.iter().all(|f| !f.1.starts_with("map:")));
+        let messages: Vec<(u32, &str)> = top
+            .iter()
+            .filter(|f| f.1 == "message")
+            .map(|f| (f.0, f.2.as_str()))
+            .collect();
+        let table: Vec<u32> = Schema::SYNCED_PREFERENCES
+            .message_fields
+            .iter()
+            .map(|(t, _)| *t)
+            .collect();
+        assert_eq!(messages.iter().map(|m| m.0).collect::<Vec<_>>(), table);
+        assert!(Schema::SYNCED_PREFERENCES.map_fields.is_empty());
+        for (tag, ty) in messages {
+            let fields = &structs[ty];
+            let sub = Schema::SYNCED_PREFERENCES.message(tag).unwrap();
+            // The merge does not descend below this level: a singular message
+            // here would need its own schema entry.
+            assert!(
+                fields.iter().all(|f| f.1 != "message"),
+                "{ty} has a singular message field; extend Schema"
+            );
+            assert!(sub.message_fields.is_empty());
+            let maps: Vec<(u32, bool)> = fields
+                .iter()
+                .filter_map(|f| {
+                    f.1.strip_prefix("map:")
+                        .map(|v| (f.0, v.ends_with(", message")))
+                })
+                .collect();
+            assert_eq!(maps.as_slice(), sub.map_fields, "{ty}");
+        }
+        // Map values that are messages are flat (merged with Schema::FLAT).
+        for name in ["UsageStat", "ChannelFrecencyEntry"] {
+            assert!(structs[name]
+                .iter()
+                .all(|f| f.1 != "message" && !f.1.starts_with("map:")));
+        }
+    }
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    fn entry(key_text: &str, value: &[u8]) -> Vec<u8> {
+        let mut e = len_field(1, key_text.as_bytes());
+        e.extend_from_slice(value);
+        e
+    }
+
+    /// A message value (`UsageStat` or `ChannelFrecencyEntry`: field 1 is a
+    /// count), optionally with an unknown field 9 inside.
+    fn msg_value(count: u64, unknown: bool) -> Vec<u8> {
+        let mut v = varint_field(1, count);
+        if unknown {
+            v.extend(varint_field(9, 1));
+        }
+        len_field(2, &v)
+    }
+
+    fn bool_value(b: bool) -> Vec<u8> {
+        varint_field(2, u64::from(b))
+    }
+
+    fn double_value(d: f64) -> Vec<u8> {
+        let mut v = key(2, 1);
+        v.extend(d.to_le_bytes());
+        v
+    }
+
+    /// A map at `parent.map` stored in insertion order `c, a, b` (not sorted),
+    /// with an unknown field 99 in the parent. `edit` changes `a`, removes `b`
+    /// and adds `d`. The merge must give exactly the changed value, keep `c`'s
+    /// original bytes and the parent's unknown field, and drop `b`.
+    fn check_map(
+        parent: u32,
+        map: u32,
+        values: [Vec<u8>; 3],
+        edit: impl FnOnce(&mut SyncedPreferences),
+    ) -> Vec<u8> {
+        let [vc, va, vb] = values;
+        let mut payload = Vec::new();
+        for (k, v) in [("c", &vc), ("a", &va), ("b", &vb)] {
+            payload.extend(len_field(map, &entry(k, v)));
+        }
+        payload.extend(varint_field(99, 5));
+        let original = len_field(parent, &payload);
+        let decoded = SyncedPreferences::decode(original.as_slice()).unwrap();
+        let canonical = decoded.encode_to_vec();
+        let mut changed = decoded;
+        edit(&mut changed);
+        let merged = merge_unknown(
+            &original,
+            &canonical,
+            &changed.encode_to_vec(),
+            Schema::SYNCED_PREFERENCES,
+        )
+        .unwrap();
+        let back = SyncedPreferences::decode(merged.as_slice()).unwrap();
+        assert_eq!(
+            back.encode_to_vec(),
+            changed.encode_to_vec(),
+            "map {parent}.{map}"
+        );
+        assert!(contains(&merged, &len_field(map, &entry("c", &vc))));
+        assert!(!contains(&merged, &len_field(map, &entry("b", &vb))));
+        assert!(contains(&merged, &varint_field(99, 5)));
+        merged
+    }
+
+    #[test]
+    fn every_map_is_merged_by_key_whatever_the_wire_order() {
+        let usage =
+            |parent: u32, pick: fn(&mut SyncedPreferences) -> &mut BTreeMap<String, UsageStat>| {
+                let merged = check_map(
+                    parent,
+                    1,
+                    [msg_value(1, false), msg_value(2, true), msg_value(3, false)],
+                    |p| {
+                        let m = pick(p);
+                        m.get_mut("a").unwrap().count = 7;
+                        m.remove("b");
+                        m.insert(
+                            "d".into(),
+                            UsageStat {
+                                count: 1,
+                                last_used_ms: 5,
+                            },
+                        );
+                    },
+                );
+                // The changed entry keeps the unknown field inside its value.
+                assert!(contains(&merged, &varint_field(9, 1)), "{parent}");
+            };
+        usage(20, |p| &mut p.emoji_picker.as_mut().unwrap().usage);
+        usage(21, |p| &mut p.sticker_picker.as_mut().unwrap().usage);
+        usage(22, |p| &mut p.memes_picker.as_mut().unwrap().usage);
+
+        let merged = check_map(
+            115,
+            1,
+            [msg_value(1, false), msg_value(2, true), msg_value(3, false)],
+            |p| {
+                let m = &mut p.channel_frecency.as_mut().unwrap().usage;
+                let a = m.get_mut("a").unwrap();
+                a.total_uses = 8;
+                a.recent_uses_ms.push(1_700_000_000_000);
+                m.remove("b");
+                m.insert("d".into(), ChannelFrecencyEntry::default());
+            },
+        );
+        assert!(contains(&merged, &varint_field(9, 1)));
+
+        check_map(
+            100,
+            3,
+            [bool_value(true), bool_value(false), bool_value(true)],
+            |p| {
+                let m = &mut p.sound.as_mut().unwrap().disabled_sounds;
+                m.insert("a".into(), true);
+                m.remove("b");
+                m.insert("d".into(), true);
+            },
+        );
+        check_map(
+            100,
+            4,
+            [double_value(0.5), double_value(0.25), double_value(1.0)],
+            |p| {
+                let m = &mut p.sound.as_mut().unwrap().sound_overrides;
+                m.insert("a".into(), 0.75);
+                m.remove("b");
+                m.insert("d".into(), 0.1);
+            },
+        );
+        for tag in 15..=19 {
+            check_map(
+                60,
+                tag,
+                [bool_value(true), bool_value(false), bool_value(true)],
+                |p| {
+                    let n = p.nagbars.as_mut().unwrap();
+                    let m = match tag {
+                        15 => &mut n.pending_bulk_deletion,
+                        16 => &mut n.invites_disabled,
+                        17 => &mut n.guild_mfa_requirement,
+                        18 => &mut n.price_announcement,
+                        _ => &mut n.legacy_price_opt_in,
+                    };
+                    m.insert("a".into(), true);
+                    m.remove("b");
+                    m.insert("d".into(), true);
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn the_review_scenario_keeps_both_entries() {
+        // usage stored as [wave, smile]; Inlet bumps smile. Before the fix the
+        // old smile came back and wave was lost.
+        let mut usage = len_field(1, &entry("wave", &msg_value(4, false)));
+        usage.extend(len_field(1, &entry("smile", &msg_value(1, false))));
+        let original = len_field(20, &usage);
+        let out = roundtrip(&original, |p| {
+            p.emoji_picker
+                .as_mut()
+                .unwrap()
+                .usage
+                .get_mut("smile")
+                .unwrap()
+                .count = 2;
+        });
+        let back = SyncedPreferences::decode(out.as_slice()).unwrap();
+        let usage = back.emoji_picker.unwrap().usage;
+        assert_eq!(usage["smile"].count, 2);
+        assert_eq!(usage["wave"].count, 4);
+    }
+
+    #[test]
+    fn merging_is_linear_for_long_lists() {
+        // 50,000 short list elements (a full 512 KiB snapshot) with one change.
+        let ids: Vec<String> = (0..50_000).map(|i| format!("{i:08}")).collect();
+        let prefs = SyncedPreferences {
+            local_spam_overrides: Some(LocalUserSpamOverrides {
+                spammer_user_ids: ids,
+                not_spammer_user_ids: Vec::new(),
+            }),
+            ..Default::default()
         };
-        let bytes = all.encode_to_vec();
-        let tags: Vec<u32> = records(&bytes).unwrap().keys().copied().collect();
-        assert_eq!(tags, SYNCED_PREFERENCES_MESSAGE_FIELDS);
+        let original = prefs.encode_to_vec();
+        let started = std::time::Instant::now();
+        let out = roundtrip(&original, |p| {
+            let list = &mut p.local_spam_overrides.as_mut().unwrap().spammer_user_ids;
+            list.remove(10);
+            list.push("new".into());
+        });
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        let back = SyncedPreferences::decode(out.as_slice()).unwrap();
+        assert_eq!(
+            back.local_spam_overrides.unwrap().spammer_user_ids.len(),
+            50_000
+        );
     }
 
     #[test]

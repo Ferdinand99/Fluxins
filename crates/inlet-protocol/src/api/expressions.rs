@@ -157,23 +157,17 @@ fn check_tags(tags: &[String]) -> Result<()> {
         )));
     }
     for t in tags {
-        crate::api::text(t, 30, "meme tag")?;
+        crate::api::nonblank(t, 30, "meme tag")?;
     }
     Ok(())
 }
 
-fn check_alt(alt: &str) -> Result<()> {
-    if alt.chars().count() > 500 || alt.chars().any(char::is_control) {
-        return Err(Error::InvalidInput(
-            "alt text: at most 500 characters without control characters".into(),
-        ));
-    }
-    Ok(())
-}
+/// Most memes kept from one list (Fluxer's default limit is 50 per account).
+pub const MAX_MEMES: usize = 1_000;
 
 impl NewMeme {
     fn to_json(&self) -> Result<Value> {
-        crate::api::text(&self.name, 100, "meme name")?;
+        crate::api::nonblank(&self.name, 100, "meme name")?;
         check_tags(&self.tags)?;
         let mut body = Map::new();
         body.insert("name".into(), json!(self.name));
@@ -183,8 +177,9 @@ impl NewMeme {
         if let Some(i) = self.embed_index {
             body.insert("embed_index".into(), json!(i));
         }
-        if let Some(alt) = &self.alt_text {
-            check_alt(alt)?;
+        if let Some(alt) =
+            crate::api::optional_text(self.alt_text.as_deref(), 500, "alt text", false)?
+        {
             body.insert("alt_text".into(), json!(alt));
         }
         if !self.tags.is_empty() {
@@ -198,13 +193,13 @@ impl MemeEdit {
     fn to_json(&self) -> Result<Value> {
         let mut body = Map::new();
         if let Some(n) = &self.name {
-            crate::api::text(n, 100, "meme name")?;
-            body.insert("name".into(), json!(n));
+            body.insert(
+                "name".into(),
+                json!(crate::api::nonblank(n, 100, "meme name")?),
+            );
         }
         if let Some(alt) = &self.alt_text {
-            if let Some(a) = alt {
-                check_alt(a)?;
-            }
+            let alt = crate::api::optional_text(alt.as_deref(), 500, "alt text", false)?;
             body.insert("alt_text".into(), json!(alt));
         }
         if let Some(tags) = &self.tags {
@@ -219,9 +214,14 @@ impl MemeEdit {
 }
 
 impl Ready {
-    /// The account's saved memes.
+    /// The account's saved memes (at most [`MAX_MEMES`]).
     pub fn favorite_memes(&self) -> Vec<Meme> {
-        crate::models::extra_list(&self.extra, "favorite_memes")
+        match self.extra.get("favorite_memes") {
+            Some(Value::Array(items)) => {
+                crate::models::parse_values(&items[..items.len().min(MAX_MEMES)], "favorite meme")
+            }
+            _ => Vec::new(),
+        }
     }
 }
 
@@ -274,7 +274,8 @@ impl Client {
 
     /// `GET /users/@me/memes`: saved memes, newest first.
     pub async fn memes(&self) -> Result<Vec<Meme>> {
-        self.get_list("/users/@me/memes", "meme").await
+        self.get_list_capped("/users/@me/memes", "meme", MAX_MEMES)
+            .await
     }
 
     /// `POST /channels/{channel}/messages/{message}/memes`: saves an

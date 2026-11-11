@@ -8,13 +8,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use base64::Engine;
+use inlet_protocol::api::invites::parse_invite;
 use inlet_protocol::api::preferences::Preferences;
-use inlet_protocol::proto::preferences::{
-    AccessibilitySettings, EmojiPickerState, EmojiState, UsageStat,
-};
+use inlet_protocol::proto::preferences::{AccessibilitySettings, EmojiState, UsageStat};
 use inlet_protocol::{
-    altcha, Client, Dispatch, Error, GroupDmOutcome, Instance, Ready, SyncedPreferences, Token,
-    Transform,
+    altcha, Client, Dispatch, Error, GroupDmOutcome, Instance, InviteLink, Ready,
+    SyncedPreferences, Token, Transform,
 };
 use prost::Message;
 use serde_json::{json, Value};
@@ -255,25 +254,43 @@ fn snapshot_from_a_newer_client(top_unknown: &[u8]) -> Vec<u8> {
         emoji: Some(EmojiState {
             skin_tone: "2".into(),
         }),
-        emoji_picker: Some(EmojiPickerState {
-            usage: [(
-                "smile".to_owned(),
-                UsageStat {
-                    count: 3,
-                    last_used_ms: 1_700_000_000_000,
-                },
-            )]
-            .into(),
-            favorite_emoji_ids: vec!["smile".into()],
-            ..Default::default()
-        }),
         ..Default::default()
     }
     .encode_to_vec();
+    // emoji_picker as Fluxer's client stores it: usage in insertion order
+    // (wave, smile, grin; not sorted), and an unknown field 9 inside wave.
+    let mut picker = Vec::new();
+    for e in [
+        wave_entry(),
+        usage_entry("smile", 3),
+        usage_entry("grin", 1),
+    ] {
+        picker.extend(len_field(1, &e));
+    }
+    picker.extend(len_field(2, b"smile"));
     let mut bytes = len_field(1, &acc);
+    bytes.extend(len_field(20, &picker));
     bytes.extend(rest);
     bytes.extend(len_field(950, top_unknown));
     bytes
+}
+
+/// A `usage` map entry: key, then `UsageStat { count, last_used_ms }`.
+fn usage_entry(key_text: &str, count: u64) -> Vec<u8> {
+    let mut stat = varint_field(1, count);
+    stat.extend(varint_field(2, 1_700_000_000_000));
+    let mut e = len_field(1, key_text.as_bytes());
+    e.extend(len_field(2, &stat));
+    e
+}
+
+/// The `wave` entry, with an unknown field 9 inside its value.
+fn wave_entry() -> Vec<u8> {
+    let mut stat = varint_field(1, 4);
+    stat.extend(varint_field(9, 1));
+    let mut e = len_field(1, b"wave");
+    e.extend(len_field(2, &stat));
+    e
 }
 
 fn b64(bytes: &[u8]) -> String {
@@ -384,16 +401,24 @@ async fn synced_preferences_round_trip_unknown_fields_kept() {
     assert_eq!(acc.font_size, Some(16.0));
     assert_eq!(base.get().emoji.as_ref().unwrap().skin_tone, "2");
 
-    // Write: change two known fields, one nested and one top-level.
+    // Write: change a nested field, a top-level field, a list and the map
+    // (bump smile, drop grin, add party; wave is untouched).
     let saved = c
         .update_synced_preferences(&base, |p| {
             p.accessibility
                 .get_or_insert_with(Default::default)
                 .font_size = Some(18.0);
-            p.emoji_picker
-                .get_or_insert_with(Default::default)
-                .favorite_emoji_ids
-                .push("wave".into());
+            let picker = p.emoji_picker.get_or_insert_with(Default::default);
+            picker.favorite_emoji_ids.push("wave".into());
+            picker.usage.get_mut("smile").unwrap().count = 4;
+            picker.usage.remove("grin");
+            picker.usage.insert(
+                "party".into(),
+                UsageStat {
+                    count: 1,
+                    last_used_ms: 1_800_000_000_000,
+                },
+            );
             p.sanitize_urls = true;
         })
         .await
@@ -420,7 +445,14 @@ async fn synced_preferences_round_trip_unknown_fields_kept() {
     assert_eq!(p.emoji.unwrap().skin_tone, "2");
     let picker = p.emoji_picker.unwrap();
     assert_eq!(picker.favorite_emoji_ids, ["smile", "wave"]);
-    assert_eq!(picker.usage["smile"].count, 3);
+    // The map: matched by key, whatever the stored order.
+    assert_eq!(picker.usage["smile"].count, 4);
+    assert_eq!(picker.usage["wave"].count, 4);
+    assert_eq!(picker.usage["party"].count, 1);
+    assert!(!picker.usage.contains_key("grin"));
+    assert_eq!(picker.usage.len(), 3);
+    // The untouched entry is sent as it was stored, unknown field included.
+    assert!(contains(&sent, &len_field(1, &wave_entry())));
     // The returned snapshot is what the server stored.
     assert_eq!(saved.bytes(), sent.as_slice());
     assert_eq!(saved.base_hash(), hex::encode(Sha256::digest(&sent)));
@@ -483,6 +515,127 @@ async fn synced_preferences_conflict_is_retried_on_the_new_snapshot() {
     let same = c.update_synced_preferences(&saved, |_| {}).await.unwrap();
     assert_eq!(same, saved);
     assert_eq!(server.received_requests().await.unwrap().len(), before);
+}
+
+fn add_favorite(id: String) -> impl Fn(&mut Preferences) + Send + Sync + 'static {
+    move |p: &mut Preferences| {
+        let favs = &mut p
+            .emoji_picker
+            .get_or_insert_with(Default::default)
+            .favorite_emoji_ids;
+        if !favs.contains(&id) {
+            favs.push(id.clone());
+        }
+    }
+}
+
+fn patches(reqs: &[Request]) -> usize {
+    reqs.iter()
+        .filter(|r| r.method.as_str() == "PATCH" && r.url.path() == "/api/v1/users/@me/settings")
+        .count()
+}
+
+fn gets(reqs: &[Request]) -> usize {
+    reqs.iter()
+        .filter(|r| r.method.as_str() == "GET" && r.url.path() == "/api/v1/users/@me/settings")
+        .count()
+}
+
+#[tokio::test]
+async fn synced_preference_writes_are_batched_and_paced() {
+    // Worst user behaviour: ten edits at once (emoji sent in a burst), then
+    // edits one after another, all built on the same stale snapshot.
+    let (server, instance) = common::instance().await;
+    Mock::given(method("PATCH"))
+        .and(path("/api/v1/users/@me/settings"))
+        .respond_with(EchoSettings)
+        .mount(&server)
+        .await;
+    let c = client(&instance, "tok-prefs-budget");
+    let stale = SyncedPreferences::decode(&snapshot_from_a_newer_client(b"x")).unwrap();
+
+    let mut tasks = Vec::new();
+    for i in 0..10 {
+        let (c, stale) = (c.clone(), stale.clone());
+        tasks.push(tokio::spawn(async move {
+            c.update_synced_preferences(&stale, add_favorite(format!("e{i}")))
+                .await
+        }));
+    }
+    let mut last = None;
+    for t in tasks {
+        last = Some(t.await.unwrap().unwrap());
+    }
+    // One PATCH carried all ten.
+    let reqs = server.received_requests().await.unwrap();
+    assert_eq!(patches(&reqs), 1);
+    let favs = last
+        .unwrap()
+        .get()
+        .emoji_picker
+        .clone()
+        .unwrap()
+        .favorite_emoji_ids;
+    for i in 0..10 {
+        assert!(favs.contains(&format!("e{i}")), "e{i}");
+    }
+
+    // Five more, one after another, still from the stale snapshot: the crate
+    // builds on what it stored (no self-conflicts, no GET), at least 1 s apart.
+    let started = Instant::now();
+    for i in 10..15 {
+        let saved = c
+            .update_synced_preferences(&stale, add_favorite(format!("e{i}")))
+            .await
+            .unwrap();
+        let favs = &saved
+            .get()
+            .emoji_picker
+            .as_ref()
+            .unwrap()
+            .favorite_emoji_ids;
+        assert!(favs.contains(&"e0".to_owned()) && favs.contains(&format!("e{i}")));
+    }
+    assert!(started.elapsed() >= Duration::from_millis(4_900));
+    let reqs = server.received_requests().await.unwrap();
+    assert_eq!((patches(&reqs), gets(&reqs)), (6, 0));
+    // Under Fluxer's 20 per 10 s for the settings bucket with room to spare:
+    // 6 PATCH in the 5+ s above, at most 10 in any 10 s.
+
+    // A server that always reports a conflict: one batch, bounded retries.
+    let (server, instance) = common::instance().await;
+    Mock::given(method("PATCH"))
+        .and(path("/api/v1/users/@me/settings"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "code": "SYNCED_PREFERENCES_CONFLICT", "message": "conflict"
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/users/@me/settings"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(settings_json(&snapshot_from_a_newer_client(b"other"))),
+        )
+        .mount(&server)
+        .await;
+    let c = client(&instance, "tok-prefs-storm");
+    let mut tasks = Vec::new();
+    for i in 0..10 {
+        let (c, stale) = (c.clone(), stale.clone());
+        tasks.push(tokio::spawn(async move {
+            c.update_synced_preferences(&stale, add_favorite(format!("s{i}")))
+                .await
+        }));
+    }
+    for t in tasks {
+        match t.await.unwrap() {
+            Err(Error::Api(e)) => assert_eq!(e.code, "SYNCED_PREFERENCES_CONFLICT"),
+            other => panic!("{other:?}"),
+        }
+    }
+    let reqs = server.received_requests().await.unwrap();
+    assert_eq!((patches(&reqs), gets(&reqs)), (3, 2));
 }
 
 #[test]
@@ -663,7 +816,7 @@ async fn gif_search_uses_the_instance_endpoint_only() {
         .await;
     Mock::given(method("GET"))
         .and(path("/api/v1/gifs/trending"))
-        .and(query_param("locale", "nb"))
+        .and(query_param("locale", "no"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
         .expect(1)
         .mount(&server)
@@ -734,13 +887,18 @@ async fn gif_search_uses_the_instance_endpoint_only() {
     let meme = c.save_gif_as_meme(&gifs[0]).await.unwrap();
     assert!(meme.proxied(&media, Transform::default()).is_some());
 
-    // Bad input never leaves the client.
-    for (q, locale) in [("", "en-US"), ("x", "en-US&q=y"), ("x", ""), ("a\nb", "en")] {
+    // Bad queries never leave the client; locales are mapped onto Fluxer's
+    // list, so `nb` went out as `no` above and nothing else can be injected.
+    for q in ["", "   ", "a\nb"] {
         assert!(matches!(
-            c.gif_search(q, locale).await,
+            c.gif_search(q, "en-US").await,
             Err(Error::InvalidInput(_))
         ));
     }
+    assert_eq!(
+        inlet_protocol::api::gifs::fluxer_locale("en-US&q=y"),
+        "en-US"
+    );
     // Every request went to the instance's API, under /gifs (or the meme save).
     for r in server.received_requests().await.unwrap() {
         let p = r.url.path();
@@ -857,17 +1015,67 @@ async fn invite_code_is_validated_before_use_in_a_path() {
     assert_eq!(joined.code, "aB3dEf7h");
     assert_eq!(invites(server.received_requests().await.unwrap()), 2);
 
-    // Links: only this instance's invite links give a code.
+    // Links: only this instance's invite links give a code; other hosts come
+    // back with their host, so the UI can route them.
     let base = server.uri();
-    let parse = |s: &str| inlet_protocol::api::invites::parse_invite(s, &instance);
-    assert_eq!(parse("aB3dEf7h").as_deref(), Some("aB3dEf7h"));
+    let parse = |s: &str| parse_invite(s, &instance);
+    let code = |c: &str| InviteLink::Code(c.into());
+    assert_eq!(parse("aB3dEf7h"), code("aB3dEf7h"));
+    assert_eq!(parse(&format!("{base}/invite/aB3dEf7h")), code("aB3dEf7h"));
     assert_eq!(
-        parse(&format!("{base}/invite/aB3dEf7h")).as_deref(),
-        Some("aB3dEf7h")
+        parse(&format!("{base}/invite/a%2F..")),
+        InviteLink::NotAnInvite
     );
-    assert_eq!(parse(&format!("{base}/invite/a%2F..")), None);
-    assert_eq!(parse(&format!("{base}/invite/a?x=1")).as_deref(), Some("a"));
-    assert_eq!(parse("https://evil.example/invite/aB3dEf7h"), None);
-    assert_eq!(parse("http://evil.example/invite/aB3dEf7h"), None);
-    assert_eq!(parse(&format!("{base}/channels/aB3dEf7h")), None);
+    assert_eq!(parse(&format!("{base}/invite/a?x=1")), code("a"));
+    assert_eq!(
+        parse(&format!("{base}/channels/aB3dEf7h")),
+        InviteLink::NotAnInvite
+    );
+    assert_eq!(parse("not a link"), InviteLink::NotAnInvite);
+    assert_eq!(
+        parse("https://Other.Example/invite/aB3dEf7h"),
+        InviteLink::OtherInstance {
+            host: "other.example".into(),
+            code: Some("aB3dEf7h".into())
+        }
+    );
+    assert_eq!(
+        parse("https://fluxer.gg/xyz"),
+        InviteLink::OtherInstance {
+            host: "fluxer.gg".into(),
+            code: Some("xyz".into())
+        }
+    );
+    // Plain http elsewhere is not followed at all.
+    assert_eq!(
+        parse("http://evil.example/invite/aB3dEf7h"),
+        InviteLink::NotAnInvite
+    );
+
+    // An instance whose `endpoints.invite` is a bare host: `{invite}/{code}`.
+    let short = MockServer::start().await;
+    let mut doc = common::discovery_json(&short.uri(), "ws://127.0.0.1:1/gateway");
+    doc["endpoints"]["invite"] = json!(short.uri());
+    Mock::given(method("GET"))
+        .and(path("/.well-known/fluxer"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(doc))
+        .mount(&short)
+        .await;
+    let short_instance = Instance::discover_with(
+        &short.uri(),
+        inlet_protocol::ClientInfo {
+            installation_id: "00000000-0000-4000-a000-000000000000".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        parse_invite(&format!("{}/aB3dEf7h", short.uri()), &short_instance),
+        code("aB3dEf7h")
+    );
+    assert_eq!(
+        parse_invite(&format!("{}/invite/aB3dEf7h", short.uri()), &short_instance),
+        code("aB3dEf7h")
+    );
 }

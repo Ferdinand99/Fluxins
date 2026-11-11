@@ -21,7 +21,8 @@ fn rate_limited(retry_after: serde_json::Value) -> ResponseTemplate {
 #[tokio::test]
 async fn huge_or_infinite_server_waits_do_not_panic() {
     let (server, instance) = common::instance().await;
-    // 1e20 seconds: clamped to 300 s and returned at once (too long to wait out).
+    // 1e20 seconds: returned at once (too long to wait out). The limiter waits
+    // at most 300 s; the caller is told the server's wait up to 6 hours.
     Mock::given(path("/api/v1/guilds/1/channels"))
         .respond_with(rate_limited(json!(1e20)).insert_header("Retry-After", "inf"))
         .mount(&server)
@@ -38,7 +39,9 @@ async fn huge_or_infinite_server_waits_do_not_panic() {
         .await;
     let client = Client::new(instance, Token::new("tok-hostile-1"));
     match client.channels("1").await.unwrap_err() {
-        Error::RateLimited { retry_after } => assert_eq!(retry_after, Duration::from_secs(300)),
+        Error::RateLimited { retry_after } => {
+            assert_eq!(retry_after, inlet_protocol::rest::MAX_REPORTED_WAIT)
+        }
         other => panic!("{other:?}"),
     }
     assert_eq!(client.me().await.unwrap().id, "10");
