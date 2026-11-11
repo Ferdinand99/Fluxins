@@ -2989,6 +2989,8 @@ dependencies = [
  "gpui",
  "gpui_platform",
  "image",
+ "inlet-editor",
+ "inlet-emoji",
  "inlet-media",
  "inlet-protocol",
  "inlet-state",

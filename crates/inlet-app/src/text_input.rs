@@ -84,8 +84,6 @@ pub struct TextInput {
     content: SharedString,
     placeholder: SharedString,
     masked: bool,
-    /// Drawn as the message composer (58 px box, 8 px radius) instead of a form field.
-    composer: bool,
     max_chars: usize,
     selected_range: Range<usize>,
     selection_reversed: bool,
@@ -104,7 +102,6 @@ impl TextInput {
             content: SharedString::default(),
             placeholder: placeholder.into(),
             masked: false,
-            composer: false,
             max_chars: 4_000,
             selected_range: 0..0,
             selection_reversed: false,
@@ -117,11 +114,6 @@ impl TextInput {
 
     pub fn masked(mut self) -> Self {
         self.masked = true;
-        self
-    }
-
-    pub fn composer(mut self) -> Self {
-        self.composer = true;
         self
     }
 
@@ -155,15 +147,6 @@ impl TextInput {
         self.selected_range = self.content.len()..self.content.len();
         self.selection_reversed = false;
         self.marked_range = None;
-        cx.notify();
-    }
-
-    pub fn set_placeholder(
-        &mut self,
-        placeholder: impl Into<SharedString>,
-        cx: &mut Context<Self>,
-    ) {
-        self.placeholder = placeholder.into();
         cx.notify();
     }
 
@@ -791,24 +774,14 @@ impl Render for TextInput {
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .w_full()
-            .when(self.composer, |d| {
-                d.h(px(58.))
-                    .items_center()
-                    .px_4()
-                    .rounded(px(8.))
-                    .border_1()
-                    .border_color(theme::ring())
-            })
-            .when(!self.composer, |d| {
-                d.px_3()
-                    .py(px(10.))
-                    .rounded(px(6.))
-                    .border_1()
-                    .border_color(if focused {
-                        theme::focus_ring()
-                    } else {
-                        theme::ring()
-                    })
+            .px_3()
+            .py(px(10.))
+            .rounded(px(6.))
+            .border_1()
+            .border_color(if focused {
+                theme::focus_ring()
+            } else {
+                theme::ring()
             })
             .bg(theme::bg_textarea())
             .text_color(theme::text())

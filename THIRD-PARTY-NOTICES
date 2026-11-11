@@ -6,12 +6,12 @@ Inlet is licensed under the GNU Affero General Public License, version 3 or late
 reproduced, followed by the crates that use that text. Fonts and icons built into
 the binary are listed at the end.
 
-- Apache License 2.0: 416 crate(s)
+- Apache License 2.0: 417 crate(s)
 - MIT License: 134 crate(s)
 - ISC License: 24 crate(s)
 - Unicode License v3: 23 crate(s)
 - BSD 3-Clause "New" or "Revised" License: 13 crate(s)
-- GNU Affero General Public License v3.0 or later: 5 crate(s)
+- GNU Affero General Public License v3.0 or later: 7 crate(s)
 - Community Data License Agreement Permissive 2.0: 2 crate(s)
 - Mozilla Public License 2.0: 2 crate(s)
 - zlib License: 2 crate(s)
@@ -23,6 +23,8 @@ GNU Affero General Public License v3.0 or later (AGPL-3.0-or-later)
 Used by:
   - fluxer_markdown_parser 0.1.0
   - inlet 0.0.1 (https://github.com/Ferdinand99/Inlet)
+  - inlet-editor 0.0.1 (https://github.com/Ferdinand99/Inlet)
+  - inlet-emoji 0.0.1 (https://github.com/Ferdinand99/Inlet)
   - inlet-media 0.0.1 (https://github.com/Ferdinand99/Inlet)
   - inlet-protocol 0.0.1 (https://github.com/Ferdinand99/Inlet)
   - inlet-state 0.0.1 (https://github.com/Ferdinand99/Inlet)
@@ -515,6 +517,7 @@ Used by:
   - itertools 0.14.0 (https://github.com/rust-itertools/itertools)
   - khronos-egl 6.0.0 (https://github.com/timothee-haudebourg/khronos-egl)
   - lazy_static 1.5.1 (https://github.com/rust-lang-nursery/lazy-static.rs)
+  - linkify 0.11.0 (https://github.com/robinst/linkify)
   - linux-raw-sys 0.12.1 (https://github.com/sunfishcode/linux-raw-sys)
   - lock_api 0.4.14 (https://github.com/Amanieu/parking_lot)
   - log 0.4.35 (https://github.com/rust-lang/log)

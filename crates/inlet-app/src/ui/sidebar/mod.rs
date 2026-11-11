@@ -9,13 +9,12 @@ mod user_panel;
 
 use std::collections::HashSet;
 
-use gpui::{div, prelude::*, px, AnyElement, Context, Focusable, Window};
+use gpui::{div, prelude::*, px, AnyElement, Context, Window};
 
 use crate::app::Inlet;
 use crate::backend::messages;
 use crate::model::{self, Channel, Guild};
 use crate::theme;
-use channel_list::channel_label;
 
 /// Channel list / DM list width.
 pub const SIDEBAR_WIDTH: f32 = 320.;
@@ -53,6 +52,9 @@ impl Inlet {
             if self.selected_channel.is_some() && !open_still_exists {
                 self.chat.notice = Some(t!("sidebar-channel-deleted"));
                 self.selected_channel = None;
+            } else if let Some(open) = self.selected_channel.clone() {
+                // The open channel may have changed (for example its slowmode).
+                self.composer_open_channel(&open, window, cx);
             }
             #[cfg(feature = "demo")]
             if let Some(wanted) = self.demo_channel.take() {
@@ -85,16 +87,7 @@ impl Inlet {
         cx: &mut Context<Self>,
     ) {
         self.selected_channel = Some(channel_id.clone());
-        let name = self
-            .channels
-            .iter()
-            .find(|c| c.id == channel_id)
-            .map(channel_label)
-            .unwrap_or_default();
-        self.composer.input.update(cx, |c, cx| {
-            c.set_placeholder(t!("composer-placeholder", channel = name), cx)
-        });
-        self.composer.input.focus_handle(cx).focus(window, cx);
+        self.composer_open_channel(&channel_id, window, cx);
         self.open_channel_messages(cx);
         cx.notify();
     }

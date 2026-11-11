@@ -241,12 +241,14 @@ pub fn data(scene: Scene) -> Data {
             channel_id: general.clone(),
             nonce: "demo-sending".into(),
             text: "On its way \u{2026}".into(),
+            reply_to: None,
             failed: None,
         });
         outgoing.push(Pending {
             channel_id: general.clone(),
             nonce: "demo-failed".into(),
             text: "This one did not go through.".into(),
+            reply_to: None,
             failed: Some("the network is unreachable".into()),
         });
     }
