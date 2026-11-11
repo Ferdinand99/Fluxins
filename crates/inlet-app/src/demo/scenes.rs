@@ -27,6 +27,10 @@
 //! - `chat-pins`: for `#general`, the pinned messages panel open.
 //! - `inbox-unreads`, `inbox-saved`, `inbox-mentions`: for `#general`, the inbox open on
 //!   that tab (with the unread state of `default`; see `inbox.rs`).
+//! - `custom-emoji`: for `#development`, still and animated custom emoji (inline, in a
+//!   quote, large) and stickers in PNG, APNG, GIF, WebP and animated WebP.
+//! - `emoji-100`: for `#development`, 100 different animated custom emoji at once (see
+//!   `emoji.rs`).
 //! - `composer-attachments`: for `#general`, three files in the composer's tray (a photo
 //!   with alt text, a spoiler, a document), an upload on its way above the box, and its
 //!   message pending in the list.
@@ -37,7 +41,7 @@ use inlet_protocol as p;
 use serde_json::{json, Value};
 
 use super::{
-    guilds, markdown, media, messages, snowflake, social, unread, user, user_id, ME,
+    emoji, guilds, markdown, media, messages, snowflake, social, unread, user, user_id, ME,
     ROLE_CONTRIBUTORS, ROLE_MODERATORS,
 };
 use crate::backend::messages::Pending;
@@ -67,6 +71,8 @@ pub enum Scene {
     InboxUnreads,
     InboxSaved,
     InboxMentions,
+    CustomEmoji,
+    Emoji100,
     ComposerAttachments,
 }
 
@@ -94,6 +100,8 @@ impl Scene {
             "inbox-unreads" => Scene::InboxUnreads,
             "inbox-saved" => Scene::InboxSaved,
             "inbox-mentions" => Scene::InboxMentions,
+            "custom-emoji" => Scene::CustomEmoji,
+            "emoji-100" => Scene::Emoji100,
             "composer-attachments" => Scene::ComposerAttachments,
             _ => return None,
         })
@@ -253,6 +261,12 @@ pub fn data(scene: Scene) -> Data {
         Scene::ChatReactions | Scene::ChatMenu | Scene::ChatDelete => {
             super::actions::add(&mut by_name);
         }
+        Scene::CustomEmoji => {
+            by_name.insert(markdown::SCENE_CHANNEL.into(), emoji::custom());
+        }
+        Scene::Emoji100 => {
+            by_name.insert(markdown::SCENE_CHANNEL.into(), emoji::hundred());
+        }
         _ => {}
     }
     super::inbox::add(&mut by_name);
@@ -384,6 +398,8 @@ mod tests {
             "inbox-unreads",
             "inbox-saved",
             "inbox-mentions",
+            "custom-emoji",
+            "emoji-100",
             "composer-attachments",
         ] {
             let scene = Scene::from_name(name).expect(name);

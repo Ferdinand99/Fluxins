@@ -6,6 +6,7 @@
 
 use gpui::{div, prelude::*, AnyElement, Context, ObjectFit, SharedString};
 
+use super::animation_budget::Motion;
 use super::image::{picture_of, Shown};
 use super::{requests, Viewer};
 use crate::app::Inlet;
@@ -44,7 +45,13 @@ impl Inlet {
             .id(SharedString::from(format!("embed-img-{key}")))
             .flex_none()
             .cursor_pointer()
-            .child(picture_of(shown, size, 4., ObjectFit::Contain))
+            .child(picture_of(
+                shown,
+                size,
+                4.,
+                ObjectFit::Contain,
+                &self.media.images.animator(Motion::Gif),
+            ))
             .on_click(cx.listener(move |this, _, _, cx| {
                 if let Some(v) = viewer.clone() {
                     this.open_viewer(v, cx);

@@ -220,6 +220,7 @@ pub fn config(proxy: &p::Media) -> MediaConfig {
     // still of a longer one).
     limits.attachment.max_animation_bytes = ANIMATION_MAX_BYTES;
     limits.avatar.max_animation_bytes = ANIMATION_MAX_BYTES;
+    limits.emoji.max_animation_bytes = ANIMATION_MAX_BYTES;
     MediaConfig {
         limits,
         // Only the media endpoint. Embeds' third-party URLs never get here, and if one

@@ -18,6 +18,7 @@ use gpui::{div, prelude::*, px, AnyElement, Context, FontWeight, ObjectFit, Shar
 use inlet_media::{FetchError, MediaError};
 use url::Url;
 
+use super::animation_budget::Motion;
 use super::image::{picture_of, placeholder, Shown};
 use super::{file_size, requests, MediaIcon};
 use crate::app::Inlet;
@@ -242,7 +243,13 @@ impl Inlet {
                 return placeholder(size, 4., false);
             }
         }
-        picture_of(shown, size, 4., ObjectFit::Contain)
+        picture_of(
+            shown,
+            size,
+            4.,
+            ObjectFit::Contain,
+            &self.media.images.animator(Motion::Gif),
+        )
     }
 
     fn image_attachment(
