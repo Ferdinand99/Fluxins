@@ -80,6 +80,29 @@ impl Inlet {
         }
     }
 
+    /// A group DM's icon, `size` logical pixels square, when it has one and it has
+    /// loaded (Fluxer keeps channel icons under the same `icons/` path as guild icons).
+    pub(crate) fn group_dm_icon_image(
+        &self,
+        channel_id: &str,
+        hash: &str,
+        size: f32,
+        cx: &mut Context<Self>,
+    ) -> Option<Img> {
+        let setup = self.media.setup.as_ref()?;
+        let req = requests::guild_icon(&setup.proxy, channel_id, hash, size, self.media.scale)?;
+        match self.image(&req, cx) {
+            Shown::Ready(image) => Some(
+                img(image)
+                    .size(px(size))
+                    .flex_none()
+                    .rounded_full()
+                    .object_fit(ObjectFit::Cover),
+            ),
+            _ => None,
+        }
+    }
+
     /// The banner of the open guild, `width` logical pixels wide, when it has one.
     pub(crate) fn guild_banner(&self, width: f32, cx: &mut Context<Self>) -> Option<AnyElement> {
         let setup = self.media.setup.as_ref()?;

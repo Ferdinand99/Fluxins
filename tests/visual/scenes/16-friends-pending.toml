@@ -1,0 +1,10 @@
+# Friends: the DM list (quick switcher, Friends and Personal notes rows, DMs with
+# avatars, status dots, BOT and SYSTEM tags, the pinned DM first, then newest
+# activity) and the friends page on its Pending tab (an incoming and an outgoing
+# request, the tab's count).
+name = "friends-pending"
+window = [1280, 860]
+scale = 1.0
+theme = "dark"
+ignore = []
+scene = "friends-pending"

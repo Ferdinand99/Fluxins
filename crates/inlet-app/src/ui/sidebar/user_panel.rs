@@ -24,6 +24,10 @@ impl Inlet {
             name: self.username.clone(),
         }
         .initials();
+        // The account's own picture when it has one; its initials until it loads.
+        let picture = self
+            .my_avatar(cx)
+            .map(|a| self.user_avatar(Some(&a), &self.username, 32., false, cx));
         let icon_button = |id: &'static str, icon: Icon| {
             div()
                 .id(id)
@@ -77,7 +81,10 @@ impl Inlet {
                                 .text_size(px(12.))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(theme::text_strong())
-                                .child(initials)
+                                .child(match picture {
+                                    Some(p) => p,
+                                    None => initials.into_any_element(),
+                                })
                                 .child(avatar_status(status, theme::panel_bg()))
                                 // The mentions of the other accounts sit top right,
                                 // so the status dot stays visible bottom right.

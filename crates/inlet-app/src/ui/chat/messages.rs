@@ -79,6 +79,13 @@ pub enum Row {
     System(Rc<SystemRow>),
     /// A message of this account that is being sent or could not be sent.
     Pending(Rc<PendingRow>),
+    /// A run of messages from blocked people, folded into one line ("2 blocked
+    /// messages") until it is shown; `first` names the run (see `ui/social/blocked.rs`).
+    Blocked {
+        first: MessageId,
+        count: usize,
+        revealed: bool,
+    },
 }
 
 impl Row {
@@ -431,6 +438,8 @@ pub struct MessageView {
     /// The banner's text, worked out with the rows.
     pub banner: Option<String>,
     revealed: HashSet<MessageId>,
+    /// Runs of blocked people's messages that are shown, by their first message.
+    blocked_shown: HashSet<MessageId>,
     jumped: Option<(MessageId, i64)>,
     pager: OlderPager,
     /// Newest-page requests waiting for their answer, per channel.
@@ -901,6 +910,8 @@ impl MessageView {
                 .filter(|(c, _)| *c == ch)
                 .map(|(_, id)| id);
             let mut prev: Option<(&p::Message, i64, Option<NaiveDate>)> = None;
+            // The open run of blocked people's messages: its first message and its row.
+            let mut run: Option<usize> = None;
             for m in window.iter() {
                 let Some(id) = MessageId::parse(&m.id) else {
                     continue;
@@ -924,7 +935,38 @@ impl MessageView {
                     _ if first_unread => rows.push(Row::Unread),
                     _ => {}
                 }
+                if (day.is_some() && new_day) || first_unread {
+                    run = None;
+                }
                 last_mine = UserId::parse(&m.author.id) == Some(me) && is_regular(m.kind);
+                // Fluxer folds messages from blocked people into one line per run.
+                let blocked = is_regular(m.kind)
+                    && UserId::parse(&m.author.id).is_some_and(|a| state.is_blocked(a));
+                if blocked {
+                    let at = *run.get_or_insert_with(|| {
+                        rows.push(Row::Blocked {
+                            first: id,
+                            count: 0,
+                            revealed: self.blocked_shown.contains(&id),
+                        });
+                        rows.len() - 1
+                    });
+                    let shown = match &mut rows[at] {
+                        Row::Blocked {
+                            count, revealed, ..
+                        } => {
+                            *count += 1;
+                            *revealed
+                        }
+                        _ => true,
+                    };
+                    if !shown {
+                        prev = Some((m, ms, day));
+                        continue;
+                    }
+                } else {
+                    run = None;
+                }
                 if !is_regular(m.kind) {
                     rows.push(Row::System(Rc::new(system_row(id, m, &c.shown))));
                     prev = Some((m, ms, day));
@@ -1049,6 +1091,13 @@ impl MessageView {
     /// Shows the spoilers of a message; whether they were hidden.
     pub(crate) fn reveal(&mut self, id: MessageId) -> bool {
         self.revealed.insert(id)
+    }
+
+    /// Shows or folds the run of blocked people's messages that starts at `first`.
+    pub(crate) fn toggle_blocked(&mut self, first: MessageId) {
+        if !self.blocked_shown.remove(&first) {
+            self.blocked_shown.insert(first);
+        }
     }
 
     /// Uses `other`'s outbox from now on (a second list over the same account).
@@ -1402,6 +1451,7 @@ impl Inlet {
         self.notifications
             .refresh_badges(account.read(cx), &changes);
         self.inbox.state_changed(&changes);
+        self.dm_rows_changed(&changes);
         self.typing_changed(&changes, cx);
         self.chat.view.conversions.prune(account.read(cx), &changes);
         self.threads_after_changes(&changes, members, cx);
@@ -1409,7 +1459,9 @@ impl Inlet {
             return;
         };
         let guild = account.read(cx).channels().guild_of(ch);
+        // A block or unblock folds or shows that person's messages at once.
         let relevant = changes.reset
+            || changes.relationships
             || changes.messages.contains(&ch)
             || changes.guilds
             || (members && guild.is_some_and(|g| changes.member_guilds.contains(&g)));
@@ -1451,6 +1503,7 @@ impl Inlet {
         view.rows.clear();
         view.unread_after = None;
         view.revealed.clear();
+        view.blocked_shown.clear();
         view.jumped = None;
         view.loaded = false;
         view.newest_retries = 0;

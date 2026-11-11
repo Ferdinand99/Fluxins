@@ -96,7 +96,7 @@ impl AccountState {
             guild_settings: GuildSettings::from_ready(&r.user_guild_settings()),
             windows: MessageWindows::default(),
             typing: Typing::default(),
-            relationships: Relationships::from_ready(&r.relationships()),
+            relationships: Relationships::from_ready(&r.relationships(), &r.pinned_dms()),
             threads: Threads::default(),
             settings: Settings::default(),
             voice: Voice::default(),
@@ -524,7 +524,12 @@ impl AccountState {
             }
             Dispatch::RelationshipAdd(_)
             | Dispatch::RelationshipUpdate(_)
-            | Dispatch::RelationshipRemove(_) => c.merge(self.relationships.apply(d)),
+            | Dispatch::RelationshipRemove(_)
+            | Dispatch::UserPinnedDmsUpdate(_) => c.merge(self.relationships.apply(d)),
+            Dispatch::ChannelRecipientAdd(e) | Dispatch::ChannelRecipientRemove(e) => {
+                let add = matches!(d, Dispatch::ChannelRecipientAdd(_));
+                self.recipient_change(&e.channel_id, &e.user, add, &mut c);
+            }
             Dispatch::Other { .. } => {
                 c.merge(self.relationships.apply(d));
                 c.merge(self.threads.apply(d));
@@ -717,6 +722,7 @@ impl AccountState {
             // A status pick still waiting is shown from the server's echo from now on.
             self.presences.drop_own_pending();
             self.users.set_cap(PASSIVE_MAX_USERS);
+            self.relationships.trim_for_passive();
         } else {
             self.presences.set_cap(MAX_PRESENCES);
             self.users.set_cap(MAX_USERS);
@@ -889,6 +895,81 @@ impl AccountState {
             .collect();
         v.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
         v.into_iter().map(|(_, _, c)| c).collect()
+    }
+
+    /// The DM list as Fluxer orders it: the pinned DMs first, in their pin order, then
+    /// the rest newest first by their last message (or their creation, when they have
+    /// none; a DM with a friend counts from when the friendship began, if later).
+    /// Personal notes are not in it (the list shows them in their own row).
+    pub fn dm_list(&self) -> Vec<&Channel> {
+        let pinned: std::collections::HashMap<ChannelId, usize> = self
+            .relationships
+            .pinned_dms()
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (*c, i))
+            .collect();
+        let mut v: Vec<(usize, u64, ChannelId, &Channel)> = self
+            .channels
+            .private()
+            .filter(|(id, c)| {
+                c.kind != inlet_protocol::models::channel_type::PERSONAL_NOTES
+                    && id.0 != self.me_id.0
+            })
+            .map(|(id, c)| {
+                let pin = pinned.get(&id).copied().unwrap_or(usize::MAX);
+                (pin, self.dm_sort_key(id, c), id, c)
+            })
+            .collect();
+        v.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)).then(a.2.cmp(&b.2)));
+        v.into_iter().map(|(_, _, _, c)| c).collect()
+    }
+
+    /// Fluxer's `getChannelSortSnowflake`: the last message (or the channel's own ID),
+    /// or for a DM with a friend the start of the friendship when that is later.
+    fn dm_sort_key(&self, id: ChannelId, c: &Channel) -> u64 {
+        let base = self
+            .read_states
+            .get(id)
+            .and_then(|e| e.last_message_id)
+            .or_else(|| MessageId::parse_opt(c.last_message_id.as_deref()))
+            .map_or(id.0, |m| m.0.max(id.0));
+        if c.kind != inlet_protocol::models::channel_type::DM {
+            return base;
+        }
+        let friend = c
+            .recipients
+            .first()
+            .and_then(|u| UserId::parse(&u.id))
+            .and_then(|u| self.relationships.friend_since_ms(u));
+        match friend {
+            Some(ms) if ms > 0 => {
+                let since = (ms as u64).saturating_sub(inlet_protocol::models::FLUXER_EPOCH_MS);
+                base.max(since.min(u64::MAX >> 22) << 22)
+            }
+            _ => base,
+        }
+    }
+
+    /// The account's relationships and pinned DMs.
+    pub fn relationships(&self) -> &Relationships {
+        &self.relationships
+    }
+
+    /// Makes sure the account's personal notes channel (type 999, its ID is the
+    /// account's) is known, so it can be opened like any DM. Returns its ID.
+    pub fn ensure_personal_notes(&mut self) -> ChannelId {
+        let id = ChannelId(self.me_id.0);
+        if self.channels.get(id).is_none() {
+            let notes: Channel = serde_json::from_value(serde_json::json!({
+                "id": id.to_string(),
+                "type": inlet_protocol::models::channel_type::PERSONAL_NOTES,
+            }))
+            .expect("a minimal channel parses");
+            let mut sink = Changes::default();
+            self.upsert_channel(&notes, &mut sink);
+        }
+        id
     }
 
     /// A cached user.
@@ -1307,6 +1388,36 @@ impl AccountState {
             }
         }
         self.store_channel(cid, ch, guild, c);
+    }
+
+    /// CHANNEL_RECIPIENT_ADD and CHANNEL_RECIPIENT_REMOVE: someone joined or left a
+    /// group DM the state knows. The account itself leaving is a CHANNEL_DELETE.
+    fn recipient_change(&mut self, channel: &str, user: &User, add: bool, c: &mut Changes) {
+        let (Some(cid), Some(uid)) = (ChannelId::parse(channel), UserId::parse(&user.id)) else {
+            return;
+        };
+        let Some(mut ch) = self
+            .channels
+            .get(cid)
+            .filter(|ch| is_private(ch.kind))
+            .cloned()
+        else {
+            return;
+        };
+        let at = ch
+            .recipients
+            .iter()
+            .position(|u| UserId::parse(&u.id) == Some(uid));
+        match (add, at) {
+            (true, None) => ch.recipients.push(user.clone()),
+            (true, Some(i)) => ch.recipients[i] = user.clone(),
+            (false, Some(i)) => {
+                ch.recipients.remove(i);
+            }
+            (false, None) => return,
+        }
+        self.upsert_channel(&ch, c);
+        c.channel(cid);
     }
 
     /// CHANNEL_DELETE: the channel and its threads go; a guild channel's ack

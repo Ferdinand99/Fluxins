@@ -3,3 +3,7 @@
 sidebar-direct-messages = Direct messages
 sidebar-guild-gone = You are no longer in that server.
 sidebar-channel-deleted = The channel you had open was deleted.
+sidebar-quick-switcher = Quick switcher
+sidebar-key-ctrl = Ctrl
+sidebar-key-command = ⌘
+sidebar-key-k = K

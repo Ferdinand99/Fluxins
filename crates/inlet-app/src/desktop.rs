@@ -925,10 +925,16 @@ impl Inlet {
 
     /// The layers over the chat that are open now.
     pub(crate) fn open_layers(&self) -> OpenLayers {
+        // The friend and DM windows show over the main screen only.
+        let main = self.screen == Screen::Main;
         OpenLayers {
             link_prompt: self.overlays.link_prompt.is_some(),
             link_confirm: self.overlays.pending_link.is_some(),
             quick_switcher: self.quick_switcher_open(),
+            social_confirm: main && self.social.confirm.is_some(),
+            dm_menu: main && self.social.dm_menu.is_some(),
+            group_dm: main && self.social.group_dm.is_some(),
+            add_friend: main && self.social.add_friend.is_some(),
             user_menu: self.profile.menu.is_some(),
             profile_popout: self.profile.popout.is_some(),
             profile_modal: self.profile.full.is_some(),
@@ -970,6 +976,7 @@ impl Inlet {
             // the layer), else the layer itself.
             let handle = match top {
                 Layer::Picker => self.composer.pickers.search_focus(cx).unwrap_or(layer),
+                Layer::AddFriend | Layer::GroupDm => self.social_field(cx).unwrap_or(layer),
                 _ => layer,
             };
             // One rule, from this frame's state only: a text field keeps the keyboard
@@ -1039,6 +1046,10 @@ impl Inlet {
             Some(Layer::LinkPrompt) => self.overlays.link_prompt = None,
             Some(Layer::LinkConfirm) => self.overlays.pending_link = None,
             Some(layer @ (Layer::QuickSwitcher | Layer::Search)) => self.close_search_layer(layer),
+            Some(Layer::SocialConfirm) => self.social.confirm = None,
+            Some(Layer::DmMenu) => self.social.dm_menu = None,
+            Some(Layer::GroupDm) => self.social.group_dm = None,
+            Some(Layer::AddFriend) => self.social.add_friend = None,
             Some(Layer::UserMenu) => self.profile.menu = None,
             Some(Layer::ProfilePopout) => self.profile.popout = None,
             Some(Layer::ProfileModal) => self.profile.full = None,
@@ -1129,6 +1140,9 @@ impl Inlet {
         if self.quick_switcher_field_focused(window, cx) {
             return Some(Layer::QuickSwitcher);
         }
+        if let Some(layer) = self.social_field_focused(window, cx) {
+            return Some(layer);
+        }
         if self.search_field_focused(window, cx) {
             return Some(Layer::Search);
         }
@@ -1143,6 +1157,14 @@ pub(crate) enum Layer {
     LinkConfirm,
     /// The quick switcher (Ctrl+K).
     QuickSwitcher,
+    /// A question before removing a friend, blocking or leaving a group.
+    SocialConfirm,
+    /// The menu of a DM row.
+    DmMenu,
+    /// The group DM window (new DM or group, add a friend, group settings).
+    GroupDm,
+    /// The add-friend window.
+    AddFriend,
     /// The user menu (right click on a member).
     UserMenu,
     /// The profile popout beside the member list.
@@ -1173,6 +1195,10 @@ pub(crate) struct OpenLayers {
     pub link_prompt: bool,
     pub link_confirm: bool,
     pub quick_switcher: bool,
+    pub social_confirm: bool,
+    pub dm_menu: bool,
+    pub group_dm: bool,
+    pub add_friend: bool,
     pub user_menu: bool,
     pub profile_popout: bool,
     pub profile_modal: bool,
@@ -1194,6 +1220,14 @@ impl OpenLayers {
             Some(Layer::LinkConfirm)
         } else if self.quick_switcher {
             Some(Layer::QuickSwitcher)
+        } else if self.social_confirm {
+            Some(Layer::SocialConfirm)
+        } else if self.dm_menu {
+            Some(Layer::DmMenu)
+        } else if self.group_dm {
+            Some(Layer::GroupDm)
+        } else if self.add_friend {
+            Some(Layer::AddFriend)
         } else if self.status_picker {
             Some(Layer::StatusPicker)
         } else if self.user_menu {
@@ -1228,6 +1262,10 @@ impl OpenLayers {
             Some(Layer::LinkPrompt) => self.link_prompt = false,
             Some(Layer::LinkConfirm) => self.link_confirm = false,
             Some(Layer::QuickSwitcher) => self.quick_switcher = false,
+            Some(Layer::SocialConfirm) => self.social_confirm = false,
+            Some(Layer::DmMenu) => self.dm_menu = false,
+            Some(Layer::GroupDm) => self.group_dm = false,
+            Some(Layer::AddFriend) => self.add_friend = false,
             Some(Layer::Search) => self.search = false,
             Some(Layer::UserMenu) => self.user_menu = false,
             Some(Layer::ProfilePopout) => self.profile_popout = false,
@@ -1568,6 +1606,33 @@ mod tests {
         assert!(!field_keeps_keyboard(status.topmost().unwrap(), None));
     }
 
+    /// The friend and DM windows are layers of their own: a confirmation over the
+    /// group DM window is the topmost layer, so the window's field loses the keyboard
+    /// in the same frame, and Escape closes the confirmation first.
+    #[test]
+    fn a_confirmation_over_the_group_dm_window_takes_the_keyboard() {
+        let layers = OpenLayers {
+            social_confirm: true,
+            group_dm: true,
+            ..OpenLayers::default()
+        };
+        let top = layers.topmost().unwrap();
+        assert_eq!(top, Layer::SocialConfirm);
+        assert!(!field_keeps_keyboard(top, Some(Layer::GroupDm)));
+        let under = layers.after_escape();
+        assert_eq!(under.topmost(), Some(Layer::GroupDm));
+        assert!(field_keeps_keyboard(Layer::GroupDm, Some(Layer::GroupDm)));
+        // The add-friend window keeps its field while it is the topmost layer.
+        let add = OpenLayers {
+            add_friend: true,
+            ..OpenLayers::default()
+        };
+        assert!(field_keeps_keyboard(
+            add.topmost().unwrap(),
+            Some(Layer::AddFriend)
+        ));
+    }
+
     /// Every layer closes before the one under it, in the order they are drawn.
     #[test]
     fn layers_close_from_the_top_down() {
@@ -1575,6 +1640,10 @@ mod tests {
             link_prompt: true,
             link_confirm: true,
             quick_switcher: true,
+            social_confirm: true,
+            dm_menu: true,
+            group_dm: true,
+            add_friend: true,
             user_menu: true,
             profile_popout: true,
             profile_modal: true,
@@ -1598,6 +1667,10 @@ mod tests {
                 Layer::LinkPrompt,
                 Layer::LinkConfirm,
                 Layer::QuickSwitcher,
+                Layer::SocialConfirm,
+                Layer::DmMenu,
+                Layer::GroupDm,
+                Layer::AddFriend,
                 Layer::StatusPicker,
                 Layer::UserMenu,
                 Layer::ProfilePopout,

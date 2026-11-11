@@ -168,7 +168,9 @@ impl Inlet {
     /// The chat (or the open forum), with the thread panel beside it and the thread list
     /// over its top right corner.
     pub(crate) fn render_center(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let main = if self.forum_selected() {
+        let main = if self.friends_page_shown() {
+            self.render_friends_page(cx)
+        } else if self.forum_selected() {
             self.render_forum(cx).into_any_element()
         } else {
             self.render_chat(cx).into_any_element()

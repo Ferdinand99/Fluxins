@@ -81,6 +81,15 @@ impl Inlet {
                 cx.listener(move |this, _, _, cx| this.open_full_profile(user, guild, cx)),
             ),
         );
+        // Message, add or remove the friend, block or unblock (`ui/social`).
+        for (id, label, action) in self.relationship_actions(user, cx) {
+            menu = menu.child(
+                item(id, label).on_click(cx.listener(move |this, _, window, cx| {
+                    this.profile.menu = None;
+                    this.run_relationship_action(action, user, window, cx);
+                })),
+            );
+        }
         menu = menu.child(separator());
         if let Some(name) = username {
             menu = menu.child(

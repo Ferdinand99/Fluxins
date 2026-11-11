@@ -1,0 +1,8 @@
+# A group DM with a blocked account's two messages folded into one line, as Fluxer
+# does.
+name = "dm-blocked"
+window = [1280, 860]
+scale = 1.0
+theme = "dark"
+ignore = []
+scene = "dm-blocked"

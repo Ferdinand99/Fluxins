@@ -485,7 +485,8 @@ impl Inlet {
             self.load_panel_newest(cx);
             return;
         }
-        let relevant = changes.messages.contains(&ch)
+        let relevant = changes.relationships
+            || changes.messages.contains(&ch)
             || changes.guilds
             || changes.channels.contains(&ch)
             || (members && changes.member_guilds.contains(&panel.guild));

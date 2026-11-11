@@ -12,6 +12,7 @@ impl Render for Inlet {
         self.media_frame(window, cx);
         self.take_channel_jump(window, cx);
         self.threads_frame(window, cx);
+        self.social_frame(window, cx);
         self.members_frame(window, cx);
         self.profile_frame(window, cx);
         self.focus_layer(window, cx);
