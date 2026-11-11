@@ -69,6 +69,9 @@ scene 10-markdown-inline markdown-inline c-dev
 scene 11-markdown-blocks markdown-blocks c-dev
 scene 12-markdown-alerts markdown-alerts c-dev
 scene 13-markdown-code markdown-code c-dev
+scene 14-chat-reactions chat-reactions c-general
+scene 15-chat-menu chat-menu c-general
+scene 16-chat-delete chat-delete c-general
 
 tail -n 20 "$out/signin.log" "$out/demo.log" >&2
 cat "$out/memory.txt" >&2

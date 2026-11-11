@@ -1,0 +1,35 @@
+# Message actions: the hover bar, the context menu, reactions and their dialogs.
+
+action-add-reaction = Add Reaction
+action-reply = Reply
+action-edit = Edit Message
+action-forward = Forward
+action-pin = Pin Message
+action-unpin = Unpin Message
+action-mark-unread = Mark as Unread
+action-save = Save Message
+action-unsave = Remove from Saved
+action-copy-text = Copy Text
+action-copy-link = Copy Message Link
+action-copy-id = Copy Message ID
+action-hide-embeds = Suppress Embeds
+action-show-embeds = Show Embeds
+action-delete = Delete Message
+action-picker-soon = More emoji arrive with the emoji picker.
+action-delete-title = Delete Message
+action-delete-body = Are you sure you want to delete this message? This cannot be undone.
+action-delete-shift-tip = Tip: hold Shift when you click Delete Message to skip this.
+action-forward-title = Forward Message
+action-forward-nowhere = There is nowhere you can forward this message to.
+action-forwarded = Message forwarded.
+action-saved = Message saved.
+action-react-failed = Could not change the reaction: { $reason }
+action-delete-failed = Could not delete the message: { $reason }
+action-pin-failed = Could not change the pin: { $reason }
+action-forward-failed = Could not forward the message: { $reason }
+action-save-failed = Could not change the saved message: { $reason }
+action-embeds-failed = Could not change the embeds: { $reason }
+reactors-loading = Loading…
+reactors-none = Nobody yet.
+reactors-more = And more.
+reactors-failed = Could not load who reacted: { $reason }

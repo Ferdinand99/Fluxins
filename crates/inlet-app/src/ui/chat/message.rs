@@ -3,11 +3,15 @@
 //! the channel's welcome or a message on its way.
 //!
 //! Two slots belong to later work: [`Inlet::attachments_slot`] (images and files under
-//! the text) and [`Inlet::actions_slot`] (the hover bar with reactions, reply, edit…).
+//! the text) and [`Inlet::actions_slot`] (the hover bar with reactions, reply, edit…,
+//! drawn by `action_bar.rs`). The reaction bubbles go under the attachments.
 
 use std::rc::Rc;
 
-use gpui::{div, prelude::*, px, AnyElement, Context, FontWeight, Hsla, SharedString};
+use gpui::{
+    div, prelude::*, px, AnyElement, Context, FontWeight, Hsla, MouseButton, MouseDownEvent,
+    SharedString,
+};
 
 use super::embed::render_embed;
 use super::messages::{MessageRow, PendingRow, Row, Tag};
@@ -84,8 +88,10 @@ impl Inlet {
                     .on_click(cx.listener(move |this, _, _, cx| this.expand(id, cx))),
             );
         }
-        for (i, e) in m.embeds.iter().enumerate() {
-            body = body.child(render_embed(&format!("m{}-e{i}", m.id), e, &ctx, cx));
+        if !row.meta.embeds_hidden {
+            for (i, e) in m.embeds.iter().enumerate() {
+                body = body.child(render_embed(&format!("m{}-e{i}", m.id), e, &ctx, cx));
+            }
         }
         if m.is_empty() {
             body = body.child(
@@ -96,6 +102,7 @@ impl Inlet {
             );
         }
         body.children(self.attachments_slot(row, cx))
+            .children(self.reactions_slot(row, cx))
     }
 
     /// Images and files under the text. In v0 they are links that open in the browser
@@ -128,14 +135,14 @@ impl Inlet {
         Some(list.into_any_element())
     }
 
-    /// The hover bar of a message (react, reply, edit, more). Empty until the message
-    /// actions are built; it is drawn over the row's top right corner.
+    /// The hover bar of a message (react, reply, edit, more), while the row is under the
+    /// pointer; it is drawn over the row's top right corner.
     pub(super) fn actions_slot(
         &self,
-        _row: &MessageRow,
-        _cx: &mut Context<Self>,
+        row: &MessageRow,
+        cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        None
+        self.render_action_bar(row, cx)
     }
 
     fn render_message(
@@ -250,15 +257,11 @@ impl Inlet {
         } else {
             (None, None)
         };
-        let actions = self.actions_slot(row, cx).map(|a| {
-            div()
-                .absolute()
-                .top(px(-16.))
-                .right(px(14.))
-                .opacity(0.)
-                .group_hover(ROW_GROUP, |s| s.opacity(1.))
-                .child(a)
-        });
+        // Only the row under the pointer has a bar, so no hidden bar takes clicks.
+        let actions = self
+            .actions_slot(row, cx)
+            .map(|a| div().absolute().top(px(-16.)).right(px(14.)).child(a));
+        let (id, channel) = (row.id, inlet_state::ChannelId::parse(&m.channel_id));
         let starts_group = !row.grouped || row.reply.is_some();
         div()
             .w_full()
@@ -278,6 +281,17 @@ impl Inlet {
                     .line_height(px(22.))
                     .when_some(bg, |d, bg| d.bg(bg))
                     .when(bg.is_none(), |d| d.hover(|s| s.bg(theme::hover_bg())))
+                    .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                        this.hover_message(id, *hovered, cx)
+                    }))
+                    .when_some(channel, |d, ch| {
+                        d.on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(move |this, e: &MouseDownEvent, window, cx| {
+                                this.open_message_menu(ch, id, e.position, window, cx)
+                            }),
+                        )
+                    })
                     // The bar is drawn over the row's edge, so the content does not move.
                     .children(bar.map(|bar| {
                         div()

@@ -9,7 +9,7 @@
 use gpui::{div, prelude::*, px, AnyElement, Context, Entity, Focusable, Subscription, Window};
 use inlet_editor::{Editor, EditorEvent, Id, Resolve};
 use inlet_protocol as p;
-use inlet_state::{AccountState, ChannelId, GuildId, RoleId, UserId};
+use inlet_state::{AccountState, ChannelId, GuildId, MessageId, RoleId, UserId};
 
 use super::editor::{new_editor, ComposerEvent, ComposerView};
 use crate::backend::composer::Mentions;
@@ -58,12 +58,26 @@ pub fn last_own(state: &AccountState, channel: ChannelId) -> Option<EditTarget> 
         .iter()
         .rev()
         .find(|m| UserId::parse(&m.author.id) == Some(me))?;
-    Some(EditTarget {
+    Some(target_of(channel, m))
+}
+
+/// One message of the account in the channel's window, never someone else's.
+pub fn own(state: &AccountState, channel: ChannelId, id: MessageId) -> Option<EditTarget> {
+    let me = state.me_id();
+    let m = state
+        .messages(channel)?
+        .get(id)
+        .filter(|m| UserId::parse(&m.author.id) == Some(me))?;
+    Some(target_of(channel, m))
+}
+
+fn target_of(channel: ChannelId, m: &p::Message) -> EditTarget {
+    EditTarget {
         message_id: m.id.clone(),
         channel_id: channel.to_string(),
         content: m.content.clone(),
         replied_user: reply_notified_author(m),
-    })
+    }
 }
 
 /// Pill labels from the account state, for a message being edited.

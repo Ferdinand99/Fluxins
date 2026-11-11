@@ -320,6 +320,39 @@ pub fn syntax_tag() -> Hsla {
     h(rgb(0x7ee787))
 }
 
+// ---- Message actions -----------------------------------------------------------
+
+/// The action bar, menus and popovers over the chat (`--background-tertiary`).
+pub fn floating_bg() -> Hsla {
+    h(rgb(0x2a2730))
+}
+/// The shadow under them (`0 6px 14px rgb(0 0 0 / 0.18)`).
+pub fn floating_shadow() -> Hsla {
+    h(rgba(0x0000002e))
+}
+/// An action button under the pointer (`--surface-interactive-hover-bg`).
+pub fn floating_hover() -> Hsla {
+    selected_bg()
+}
+/// A reaction bubble (`--background-secondary-alt`).
+pub fn reaction_bg() -> Hsla {
+    h(rgb(0x29262f))
+}
+/// A reaction of the account: brand at 15 % over the chat.
+pub fn reaction_me_bg() -> Hsla {
+    let mut c = brand();
+    c.a = 0.15;
+    c
+}
+/// The edge of a reaction of the account: the brand colour.
+pub fn reaction_me_border() -> Hsla {
+    brand()
+}
+/// The count of a reaction of the account (`--brand-primary-light`).
+pub fn reaction_me_text() -> Hsla {
+    h(rgb(0xb0adff))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

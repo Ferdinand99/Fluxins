@@ -10,6 +10,7 @@
 //!
 //! One file per domain (`guilds`, `messages`, `markdown`, `social`); `scenes` picks what to show.
 
+pub mod actions;
 pub mod composer;
 mod guilds;
 mod markdown;

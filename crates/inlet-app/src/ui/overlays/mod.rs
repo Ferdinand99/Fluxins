@@ -27,6 +27,7 @@ impl Inlet {
         if self.notifications.settings.is_some() {
             out.push(self.render_notification_settings(cx));
         }
+        out.extend(self.render_message_overlays(cx));
         out
     }
 }

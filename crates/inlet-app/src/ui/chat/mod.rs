@@ -2,6 +2,8 @@
 //! The chat column: channel header, error and notice bars, the message list (with the
 //! new-messages banner and "Jump to present" over it) and the composer.
 
+mod action_bar;
+mod context_menu;
 mod divider;
 mod embed;
 mod header;
@@ -9,6 +11,8 @@ pub mod header_buttons;
 mod jump;
 mod message;
 pub mod messages;
+mod reactions;
+mod reactors;
 mod reply_preview;
 mod system_message;
 pub mod time;
@@ -20,6 +24,7 @@ use crate::app::Inlet;
 use crate::backend::accounts::Cmd;
 use crate::theme;
 use crate::ui::widgets::button;
+pub use context_menu::bind_keys;
 use messages::MessageView;
 
 pub struct ChatState {
@@ -34,6 +39,8 @@ pub struct ChatState {
     pub gateway_down: Option<String>,
     /// A channel mention was clicked; opened on the next render (needs the window).
     pub pending_channel_jump: Option<String>,
+    /// The message actions: the open menu or dialog, reaction clicks, who reacted.
+    pub actions: context_menu::ActionsState,
 }
 
 impl ChatState {
@@ -48,6 +55,7 @@ impl ChatState {
             notice: None,
             gateway_down: None,
             pending_channel_jump: None,
+            actions: Default::default(),
         }
     }
 }

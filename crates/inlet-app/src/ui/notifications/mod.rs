@@ -85,6 +85,12 @@ impl State {
         self.badges.refresh(state, changes);
     }
 
+    /// Drops the acknowledgement waiting for `ch`: "mark as unread" moved the read mark
+    /// back, and the waiting one would move it forward again.
+    pub fn drop_pending_ack(&mut self, ch: inlet_state::ChannelId) {
+        self.gate.clear(ch, std::time::Instant::now());
+    }
+
     /// Forgets everything (signed out). The settings writes start a new session, so a
     /// late answer to this one's writes is not taken for the next account's; whether
     /// the window has focus is not about the account and stays.

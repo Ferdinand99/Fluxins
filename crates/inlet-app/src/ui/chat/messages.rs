@@ -29,6 +29,7 @@ use inlet_state::{
 };
 use serde_json::Value;
 
+use super::action_bar::RowMeta;
 use super::time;
 use crate::app::Inlet;
 use crate::backend::messages::outbox::{is_own_copy, Sent};
@@ -130,6 +131,8 @@ pub struct MessageRow {
     pub reply: Option<ReplyRow>,
     /// Time alone, for grouped and compact rows.
     pub clock: SharedString,
+    /// What the message actions need: own, pinned, hidden embeds, reactions.
+    pub meta: RowMeta,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -872,6 +875,7 @@ impl MessageView {
                     tag: tag(channel, m, &c.shown),
                     reply: reply_of(m, &c.shown),
                     clock: c.clock.clone(),
+                    meta: RowMeta::of(me, m),
                     message: Shown(c.shown.clone()),
                 })));
                 prev = Some((m, ms, day));
@@ -905,6 +909,12 @@ impl MessageView {
             )),
         };
         rows
+    }
+
+    /// "Mark as unread": the "NEW" line goes above the first message after `after`.
+    pub fn mark_unread_after(&mut self, ch: ChannelId, after: MessageId) {
+        self.unread_after = Some((ch, after));
+        self.divider_above = false;
     }
 
     /// Adds or updates an outbox entry: a message being sent, or one that failed.
@@ -1017,6 +1027,7 @@ impl Inlet {
                     cx.notify();
                 }
             }
+            Ev::Action(ev) => self.on_action_event(ev, cx),
         }
     }
 
@@ -1059,6 +1070,7 @@ impl Inlet {
         };
         let mut changes = account.update(cx, |s, _| s.apply(&dispatch));
         self.settings_applied(&dispatch, &mut changes, cx);
+        self.note_saved(&dispatch);
         let edits = match &dispatch {
             p::Dispatch::MessageCreate(m) | p::Dispatch::MessageUpdate(m) => edits_of([&**m]),
             _ => Edits::new(),
@@ -1260,6 +1272,7 @@ impl Inlet {
     pub(crate) fn reset_messages(&mut self) {
         self.clear_messages();
         self.account = None;
+        self.chat.actions.clear();
         let compact = self.chat.view.compact;
         self.chat.view = MessageView {
             compact,
