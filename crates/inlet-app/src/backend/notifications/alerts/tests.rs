@@ -277,6 +277,58 @@ fn mutes_and_levels_decide_what_notifies() {
 }
 
 #[test]
+fn silent_blocked_and_system_messages_do_not_notify() {
+    let mut engine = Engine::new(AlertPrefs::default());
+    let mut state = state_with("online", json!([]));
+    let t0 = Instant::now();
+    let mut at = 0;
+    let mut send = |engine: &mut Engine, state: &mut AccountState, m: &mut Message| {
+        at += 1;
+        m.id = id(at).to_string();
+        let now = t0 + Duration::from_secs(at * 60);
+        deliver(engine, state, None, m, None, now).is_some()
+    };
+
+    // @silent: no notification and no sound, but it still counts as a mention.
+    let mut silent = message(0, "100", "2", "<@1> quietly", true);
+    silent.flags = Some(json!(4096));
+    assert!(!send(&mut engine, &mut state, &mut silent));
+    assert_eq!(state.unread(ChannelId(100)).mentions, 1);
+
+    // A system message (a member joined) at "all messages".
+    let mut join = message(0, "100", "2", "", false);
+    join.kind = 7;
+    assert!(!send(&mut engine, &mut state, &mut join));
+    // A reply does notify.
+    let mut reply = message(0, "100", "2", "sure", false);
+    reply.kind = 19;
+    assert!(send(&mut engine, &mut state, &mut reply));
+
+    // A blocked author: never, not in a DM, not with a mention.
+    let blocked: inlet_protocol::Relationship =
+        serde_json::from_value(json!({"id": "2", "type": 2})).unwrap();
+    state.apply(&Dispatch::RelationshipAdd(Box::new(blocked)));
+    assert!(state.is_blocked(UserId(2)));
+    let mut dm = message(0, "300", "2", "hello", false);
+    assert!(!send(&mut engine, &mut state, &mut dm));
+    let mut ping = message(0, "100", "2", "<@1>", true);
+    assert!(!send(&mut engine, &mut state, &mut ping));
+    // Unblocked: the DM notifies again.
+    let removed = serde_json::from_value(json!({"id": "2"})).unwrap();
+    state.apply(&Dispatch::RelationshipRemove(removed));
+    let mut dm = message(0, "300", "2", "hello again", false);
+    assert!(send(&mut engine, &mut state, &mut dm));
+
+    // DMs set to "only mentions" still notify for every message, as in Fluxer.
+    let mut state = state_with(
+        "online",
+        json!([{"guild_id": null, "message_notifications": 1}]),
+    );
+    let mut dm = message(0, "300", "2", "no mention", false);
+    assert!(send(&mut engine, &mut state, &mut dm));
+}
+
+#[test]
 fn own_repeated_and_watched_messages_do_not_notify() {
     let mut engine = Engine::new(AlertPrefs::default());
     let mut state = state_with("online", json!([]));
@@ -354,6 +406,14 @@ fn clicks_find_their_account_and_channel() {
     assert_eq!(target.channel, "101");
     assert!(n.tag().len() <= 64);
     assert!(engine.target("m9-1").is_none());
+    // Read: the notification's tag comes back once for removal, and its target goes.
+    assert_eq!(
+        engine.forget_channel(Some(&a), ChannelId(101)).as_deref(),
+        Some(n.tag())
+    );
+    assert!(engine.target(n.tag()).is_none());
+    assert!(engine.forget_channel(Some(&a), ChannelId(101)).is_none());
+    assert!(engine.forget_channel(None, ChannelId(101)).is_none());
 }
 
 #[test]

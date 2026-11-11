@@ -52,7 +52,8 @@ pub fn install(cx: &mut App) {
     crate::linux_bus::query_body_markup();
 }
 
-/// Shows a notification.
+/// Shows a notification, always without a sound: play one yourself, after asking
+/// [`crate::quiet_mode`].
 ///
 /// - Windows: [`crate::notify`], from this crate's notification thread; `cx` is
 ///   not touched, so gpui never drops a frame for it.

@@ -36,7 +36,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use inlet_platform::{Notification, Preview};
-use inlet_protocol::models::channel_type;
+use inlet_protocol::models::{channel_type, message_type};
 use inlet_protocol::{Dispatch, Message};
 use inlet_state::guild_settings::notifications::{ALL_MESSAGES, NO_MESSAGES, ONLY_MENTIONS};
 use inlet_state::{AccountState, ChannelId, GuildId, MessageId, RoleId, UserId};
@@ -154,7 +154,17 @@ pub enum Why {
 /// account's mutes and levels (see the module docs). DND and focus are checked by
 /// [`Engine::on_message`].
 pub fn why(state: &AccountState, probe: &Probe, m: &Message) -> Option<Why> {
-    if UserId::parse(&m.author.id) == Some(state.me_id()) {
+    let author = UserId::parse(&m.author.id);
+    if author == Some(state.me_id()) {
+        return None;
+    }
+    // As Fluxer, before anything else: a blocked author, a message sent with @silent
+    // (it still counts as a mention in the unread state), and anything but an ordinary
+    // message or a reply (joins, pins, calls and other system messages) never notify.
+    if author.is_some_and(|a| state.is_blocked(a))
+        || m.is_silent()
+        || !matches!(m.kind, message_type::DEFAULT | message_type::REPLY)
+    {
         return None;
     }
     // No read state: a visited guild, or a channel kind without one.
@@ -181,6 +191,11 @@ pub fn why(state: &AccountState, probe: &Probe, m: &Message) -> Option<Why> {
             || m.mentions
                 .iter()
                 .any(|u| UserId::parse(&u.id) == Some(state.me_id())));
+    // As Fluxer, every message of an unmuted DM or group DM notifies, whatever level
+    // the direct messages have.
+    if private {
+        return Some(if mention { Why::Mention } else { Why::Message });
+    }
     match level(state, probe.channel) {
         NO_MESSAGES => None,
         ONLY_MENTIONS => mention.then_some(Why::Mention),
@@ -200,6 +215,9 @@ fn muted(state: &AccountState, ch: ChannelId) -> bool {
 
 /// The notification level that applies to a channel: its own override, its parents',
 /// the guild's, or the guild's default.
+// Deviation: for a thread Fluxer stops at the thread's parent channel and uses the
+// thread membership's own level; Inlet does not track thread membership yet, so a
+// thread follows its channel, then the channel's category.
 pub fn level(state: &AccountState, ch: ChannelId) -> i64 {
     let guild = state.channels().guild_of(ch);
     let settings = state.guild_settings().get(guild);
@@ -296,9 +314,25 @@ impl Engine {
         self.targets.iter().find(|(t, _)| t == tag).map(|(_, x)| x)
     }
 
+    /// The tag of the notification shown for a channel of an account, which is then
+    /// forgotten (the channel was read); `None` when none is shown.
+    pub fn forget_channel(
+        &mut self,
+        account: Option<&AccountKey>,
+        channel: ChannelId,
+    ) -> Option<String> {
+        let ix = self.accounts.iter().position(|a| a.as_ref() == account)?;
+        let tag = format!("m{ix}-{channel}");
+        let at = self.targets.iter().position(|(t, _)| *t == tag)?;
+        self.targets.remove(at);
+        Some(tag)
+    }
+
     /// A new message, already applied to the account's state: what to show and play.
     pub fn on_message(&mut self, input: Input<'_>, now: Instant) -> Option<Delivery> {
         let why = why(input.state, &input.probe, input.message)?;
+        // Deviation: in the channel on screen Fluxer plays a softer sound of its own; Inlet
+        // stays silent there.
         if self.is_dnd(input.account) || input.focused == Some(input.probe.channel) {
             return None;
         }

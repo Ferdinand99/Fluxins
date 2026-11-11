@@ -3115,6 +3115,7 @@ dependencies = [
  "inlet-protocol",
  "inlet-state",
  "keyring",
+ "libloading",
  "log",
  "reqwest",
  "serde",

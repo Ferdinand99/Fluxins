@@ -1,9 +1,17 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! The notification sound: Inlet's own (`assets/sounds`, CC0, made for Inlet), never
 //! Fluxer's. It plays on a thread of its own through the system's default output
-//! device (cpal): the UI thread only queues a request and never waits. The device is
-//! opened for each sound and closed after it, so Inlet holds no audio device while it
-//! is quiet. A sound that cannot play (no device, a busy one) is logged and skipped.
+//! device: the UI thread only queues a request and never waits. The device is opened
+//! for each sound and closed after it, so Inlet holds no audio device while it is
+//! quiet. A sound that cannot play (no device, a busy one) is logged once and skipped.
+//!
+//! - Before each sound the thread asks `inlet_platform::quiet_mode` whether the system
+//!   is in a quiet mode (do not disturb, presentation, full screen): then it stays
+//!   silent, as the system holds back the (silent) notification itself.
+//! - Windows and macOS play through cpal (WASAPI, CoreAudio).
+//! - Linux loads ALSA's `libasound.so.2` at run time, only when a sound plays. Inlet
+//!   does not link it, so a system without it starts normally and only has no sound.
+//!   ALSA's `default` device reaches PulseAudio or PipeWire on a desktop.
 
 // Tests never play a sound: the player is only started by the app.
 #![cfg_attr(test, allow(dead_code))]
@@ -26,6 +34,7 @@ pub struct Pcm {
 }
 
 impl Pcm {
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
     pub fn duration(&self) -> Duration {
         Duration::from_secs_f64(self.samples.len() as f64 / f64::from(self.rate.max(1)))
     }
@@ -89,9 +98,20 @@ impl SoundPlayer {
         std::thread::Builder::new()
             .name("inlet-sound".into())
             .spawn(move || {
+                // The same failure is logged once, not for every sound.
+                let mut last_error = None;
                 for () in rx {
-                    if let Err(err) = output::play(&pcm) {
-                        log::info!("the notification sound did not play: {err}");
+                    if inlet_platform::quiet_mode() {
+                        continue;
+                    }
+                    match output::play(&pcm) {
+                        Ok(()) => last_error = None,
+                        Err(err) => {
+                            if last_error.as_ref() != Some(&err) {
+                                log::info!("the notification sound did not play: {err}");
+                            }
+                            last_error = Some(err);
+                        }
                     }
                 }
             })
@@ -107,6 +127,7 @@ impl SoundPlayer {
 }
 
 /// The sound at the device's rate: linear interpolation between the samples.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 pub fn resample(pcm: &Pcm, rate: u32) -> Vec<f32> {
     if rate == 0 || pcm.samples.is_empty() {
         return Vec::new();
@@ -125,7 +146,7 @@ pub fn resample(pcm: &Pcm, rate: u32) -> Vec<f32> {
         .collect()
 }
 
-#[cfg(not(test))]
+#[cfg(all(not(test), any(windows, target_os = "macos")))]
 mod output {
     use std::sync::Arc;
     use std::time::Duration;
@@ -187,8 +208,108 @@ mod output {
     }
 }
 
-/// Tests never open an audio device.
-#[cfg(test)]
+/// ALSA, loaded at run time (see the module docs).
+#[cfg(all(not(test), target_os = "linux"))]
+mod output {
+    use std::ffi::{c_char, c_int, c_long, c_uint, c_ulong, c_void};
+    use std::sync::OnceLock;
+
+    use libloading::{Library, Symbol};
+
+    use super::Pcm;
+
+    const STREAM_PLAYBACK: c_int = 0;
+    const FORMAT_S16_LE: c_int = 2;
+    const ACCESS_RW_INTERLEAVED: c_int = 3;
+    /// Latency asked of ALSA, in microseconds.
+    const LATENCY_US: c_uint = 100_000;
+
+    type Open = unsafe extern "C" fn(*mut *mut c_void, *const c_char, c_int, c_int) -> c_int;
+    type SetParams =
+        unsafe extern "C" fn(*mut c_void, c_int, c_int, c_uint, c_uint, c_int, c_uint) -> c_int;
+    type WriteI = unsafe extern "C" fn(*mut c_void, *const c_void, c_ulong) -> c_long;
+    type Recover = unsafe extern "C" fn(*mut c_void, c_int, c_int) -> c_int;
+    type Handle = unsafe extern "C" fn(*mut c_void) -> c_int;
+
+    /// The library, loaded on the first sound; a failure is kept and not retried.
+    fn alsa() -> Result<&'static Library, String> {
+        static LIB: OnceLock<Result<Library, String>> = OnceLock::new();
+        LIB.get_or_init(|| {
+            // SAFETY: the system's own ALSA library under its versioned name; loading it
+            // runs only its initialisers.
+            unsafe { Library::new("libasound.so.2") }
+                .map_err(|e| format!("no ALSA library (libasound.so.2): {e}"))
+        })
+        .as_ref()
+        .map_err(Clone::clone)
+    }
+
+    /// One function of the library; `name` without the trailing NUL.
+    ///
+    /// # Safety
+    /// `T` must be the function's type as `alsa/pcm.h` declares it.
+    unsafe fn sym<T>(lib: &'static Library, name: &str) -> Result<Symbol<'static, T>, String> {
+        let c = format!("{name}\0");
+        // SAFETY: the caller gives the declared type.
+        unsafe { lib.get::<T>(c.as_bytes()) }.map_err(|e| format!("{name}: {e}"))
+    }
+
+    /// Plays `pcm` once on ALSA's default device and waits until it is done.
+    pub fn play(pcm: &Pcm) -> Result<(), String> {
+        let lib = alsa()?;
+        let samples: Vec<i16> = pcm
+            .samples
+            .iter()
+            .map(|s| (s.clamp(-1.0, 1.0) * 32767.0) as i16)
+            .collect();
+        // SAFETY: every symbol has the type `alsa/pcm.h` declares. The handle is used
+        // only between a successful open and the close, and the buffer outlives every
+        // write.
+        unsafe {
+            let open = sym::<Open>(lib, "snd_pcm_open")?;
+            let set_params = sym::<SetParams>(lib, "snd_pcm_set_params")?;
+            let writei = sym::<WriteI>(lib, "snd_pcm_writei")?;
+            let recover = sym::<Recover>(lib, "snd_pcm_recover")?;
+            let drain = sym::<Handle>(lib, "snd_pcm_drain")?;
+            let close = sym::<Handle>(lib, "snd_pcm_close")?;
+
+            let mut handle: *mut c_void = std::ptr::null_mut();
+            let rc = open(&mut handle, c"default".as_ptr(), STREAM_PLAYBACK, 0);
+            if rc < 0 || handle.is_null() {
+                return Err(format!("no ALSA output device ({rc})"));
+            }
+            let rc = set_params(
+                handle,
+                FORMAT_S16_LE,
+                ACCESS_RW_INTERLEAVED,
+                1,
+                pcm.rate,
+                1,
+                LATENCY_US,
+            );
+            if rc < 0 {
+                close(handle);
+                return Err(format!("ALSA refused the format ({rc})"));
+            }
+            let mut at = 0usize;
+            while at < samples.len() {
+                let left = &samples[at..];
+                let n = writei(handle, left.as_ptr().cast(), left.len() as c_ulong);
+                if n > 0 {
+                    at += n as usize;
+                } else if recover(handle, n as c_int, 1) < 0 {
+                    break;
+                }
+            }
+            drain(handle);
+            close(handle);
+        }
+        Ok(())
+    }
+}
+
+/// Tests never open an audio device; other systems have no sound.
+#[cfg(any(test, not(any(windows, target_os = "macos", target_os = "linux"))))]
 mod output {
     use super::Pcm;
 

@@ -47,6 +47,9 @@ pub struct Alerts {
     /// How often the window would have flashed, in tests.
     #[cfg(test)]
     pub flashes: usize,
+    /// The tags removed, in tests.
+    #[cfg(test)]
+    pub dismissed: Vec<String>,
 }
 
 impl Global for Alerts {}
@@ -61,6 +64,8 @@ impl Alerts {
             sent: Vec::new(),
             #[cfg(test)]
             flashes: 0,
+            #[cfg(test)]
+            dismissed: Vec::new(),
         }
     }
 
@@ -261,6 +266,27 @@ impl Inlet {
         delivery
     }
 
+    /// The open channel of the account on screen was read: its notification goes away
+    /// (Windows and macOS; on Linux gpui cannot remove one).
+    pub(crate) fn dismiss_channel_alert(
+        &mut self,
+        channel: inlet_state::ChannelId,
+        cx: &mut Context<Self>,
+    ) {
+        let account = self.switcher.active.clone();
+        let Some(tag) = alerts(cx).engine.forget_channel(account.as_ref(), channel) else {
+            return;
+        };
+        #[cfg(test)]
+        alerts(cx).dismissed.push(tag);
+        #[cfg(not(test))]
+        cx.defer(move |cx| {
+            if let Err(err) = gpui_glue::dismiss(cx, &tag) {
+                log::info!("notification not removed: {err}");
+            }
+        });
+    }
+
     /// A notification was clicked: its account and channel come up. A click on one the
     /// app no longer knows (shown before a restart, or of an account signed out since)
     /// only shows the window.
@@ -280,10 +306,15 @@ impl Inlet {
         if self.screen != Screen::Main {
             return;
         }
-        // What covers the chat closes, so the channel is what comes up.
-        self.settings.view = None;
-        self.inbox.open = None;
-        self.switcher.open = false;
+        // Everything over the chat closes (layers top down, the About view), so the
+        // channel is what comes up.
+        self.show_about = false;
+        for _ in 0..16 {
+            if !self.layer_open() {
+                break;
+            }
+            self.close_top_layer(cx);
+        }
         match target.account {
             Some(key) if !self.switcher.is_active(&key) => {
                 if !self.switcher.accounts.iter().any(|a| a.key == key) {
@@ -336,13 +367,14 @@ mod tests {
         }
     }
 
-    /// READY for `user` with guild `guild` and two text channels, `general` and `news`.
-    fn ready(user: &str, guild: &str, general: &str, news: &str) -> Value {
+    /// READY for `user` with guild `guild` and two text channels, `general` and `news`,
+    /// and the account's own `status`.
+    fn ready(user: &str, guild: &str, general: &str, news: &str, status: &str) -> Value {
         json!({
             "session_id": format!("s{user}"), "version": 1,
             "user": {"id": user, "username": format!("user{user}"), "discriminator": "0001",
                      "avatar": null, "flags": 0},
-            "user_settings": {"status": "online"},
+            "user_settings": {"status": status},
             "guilds": [{"id": guild,
                         "properties": {"id": guild, "name": format!("Guild {guild}"), "owner_id": "9",
                                        "features": []},
@@ -390,6 +422,15 @@ mod tests {
 
     impl Rig {
         fn start(cx: &mut TestAppContext, then: HashMap<String, Vec<(String, Value)>>) -> Rig {
+            Self::start_with(cx, "online", then)
+        }
+
+        /// As [`Rig::start`], with B's own status `b_status`.
+        fn start_with(
+            cx: &mut TestAppContext,
+            b_status: &str,
+            then: HashMap<String, Vec<(String, Value)>>,
+        ) -> Rig {
             cx.executor().allow_parking();
             let rt = tokio::runtime::Runtime::new().unwrap();
             let listener = rt
@@ -405,8 +446,14 @@ mod tests {
                 serve_gateway_then(
                     listener,
                     HashMap::from([
-                        ("tok-a".to_string(), ready("11", "600", "601", "602")),
-                        ("tok-b".to_string(), ready("12", "700", "701", "702")),
+                        (
+                            "tok-a".to_string(),
+                            ready("11", "600", "601", "602", "online"),
+                        ),
+                        (
+                            "tok-b".to_string(),
+                            ready("12", "700", "701", "702", b_status),
+                        ),
                     ]),
                     then,
                 );
@@ -592,6 +639,57 @@ mod tests {
         cx.update(|cx| assert_eq!(rig.inlet.read(cx).switcher.background_mentions(), 2));
         // Each mention notified once.
         rig.wait(cx, "three notifications", &|_, cx| sent(cx).len() == 3);
+        drop(rig);
+    }
+
+    /// Do Not Disturb of an account in the background, from its READY, silences its
+    /// mention; the settings update that ends it (as the echo of a status change) lets
+    /// the next one through. A click on that notification after the account was signed
+    /// out does nothing but show the window.
+    #[gpui::test]
+    fn background_dnd_is_followed_and_a_stale_click_does_nothing(cx: &mut TestAppContext) {
+        let rig = Rig::start_with(
+            cx,
+            "dnd",
+            HashMap::from([(
+                "tok-b".to_string(),
+                vec![
+                    mention(1, "700", "702", "12", "while in dnd"),
+                    (
+                        "USER_SETTINGS_UPDATE".to_string(),
+                        json!({"status": "online"}),
+                    ),
+                    mention(2, "700", "702", "12", "after dnd"),
+                ],
+            )]),
+        );
+        let ka = rig.ka.clone();
+        let kb = rig.kb.clone();
+        rig.wait(cx, "both mentions counted for B", &|i, _| {
+            i.screen == Screen::Main
+                && i.switcher.is_active(&rig.ka)
+                && i.switcher.background_mentions() == 2
+        });
+        rig.wait(cx, "one notification", &|_, cx| !sent(cx).is_empty());
+        let shown = cx.update(|cx| sent(cx));
+        assert_eq!(shown.len(), 1, "only the mention after DND notifies");
+        let n = shown[0].0.clone().unwrap();
+        assert!(n.body().contains("after dnd"), "{}", n.body());
+
+        // B is signed out; its notification is clicked afterwards.
+        rig.act(cx, move |this, _, cx| {
+            this.on_account_removed(kb.clone(), None, cx)
+        });
+        let tag = n.tag().to_string();
+        rig.act(cx, move |this, window, cx| {
+            this.on_platform_event(Ev::Os(PlatformEvent::NotificationClicked(tag)), window, cx)
+        });
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let i = rig.inlet.read(cx);
+            assert!(i.switcher.is_active(&ka));
+            assert!(i.screen == Screen::Main);
+        });
         drop(rig);
     }
 }

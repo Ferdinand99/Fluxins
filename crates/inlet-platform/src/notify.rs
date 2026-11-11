@@ -8,6 +8,11 @@
 //!   `gpui_glue::notify`. macOS needs an app bundle. On Linux the body is escaped
 //!   first when the notification server reads markup.
 //!
+//! Every notification is silent: the Windows toast XML says `<audio silent="true"/>`,
+//! and gpui sets no sound on macOS and sends no sound hint on Linux (where a server that
+//! plays its own sound per app can still do so). The app plays its own sound, after
+//! [`crate::quiet_mode`] says the system is not in a quiet mode.
+//!
 //! This module builds what is shown: text from the server is cleaned and capped
 //! here, and when the user has turned previews off the message content never
 //! enters the notification at all.
@@ -147,7 +152,8 @@ pub fn escape_markup(text: &str) -> String {
     out
 }
 
-/// Shows a notification. Windows only: the toast is queued for this crate's own
+/// Shows a notification, without a sound (see the module docs). Windows only: the
+/// toast is queued for this crate's own
 /// notification thread and this returns at once, so it is safe to call from
 /// anywhere, also while gpui's app is borrowed, and never makes the caller wait.
 /// The queue holds 64; beyond that the newest is dropped and logged. Errors from
