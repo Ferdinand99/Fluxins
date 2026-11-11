@@ -532,9 +532,9 @@ impl Inlet {
                     .into_any_element(),
             ],
         );
-        // The topmost layer (unless a link prompt is over it): it has the keyboard, so
-        // typing never reaches the composer behind it, and Escape closes it.
-        if self.overlays.link_prompt.is_none() {
+        // While topmost it has the keyboard, so typing never reaches the composer behind
+        // it, and Escape closes it.
+        if self.is_top_layer(crate::desktop::Layer::AccountSwitcher) {
             self.layer_keys(element, cx).into_any_element()
         } else {
             element.into_any_element()
