@@ -371,6 +371,22 @@ fn edits_set_values_and_refuse_bad_input_without_panicking() {
             key: String::new(),
             on: true,
         },
+        PrefEdit::FavouriteEmoji {
+            key: "unicode:".into(),
+            on: true,
+        },
+        PrefEdit::FavouriteEmoji {
+            key: "custom:".into(),
+            on: true,
+        },
+        PrefEdit::UsedEmoji {
+            key: "custom:1:not-an-id".into(),
+            at_ms: 0,
+        },
+        PrefEdit::UsedEmoji {
+            key: "custom:x:2".into(),
+            at_ms: 0,
+        },
         PrefEdit::SkinTone("blue".into()),
         PrefEdit::SkinTone("\u{1F3FB}\u{1F3FC}".into()),
         PrefEdit::FavouriteGif {
@@ -509,4 +525,24 @@ fn global_expressions_are_off_unless_the_instance_grants_them() {
     assert!(!Setup::of(&premium, &[]).global_expressions);
     let s = Setup::of(&premium, &["premium".to_string()]);
     assert!(s.gif_enabled && s.global_expressions);
+}
+
+#[test]
+fn only_fluxers_emoji_keys_are_accepted() {
+    for good in ["unicode:smile", "custom:1:2", "custom::2"] {
+        assert!(is_emoji_key(good), "{good}");
+    }
+    for bad in [
+        "",
+        "unicode:",
+        "unicode:a b",
+        "custom:",
+        "custom:1",
+        "custom:1:",
+        "custom:1:x",
+        "custom:g:2",
+        "smile",
+    ] {
+        assert!(!is_emoji_key(bad), "{bad}");
+    }
 }

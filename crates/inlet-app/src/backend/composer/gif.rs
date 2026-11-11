@@ -176,11 +176,25 @@ pub enum PrefEdit {
     },
 }
 
-/// Whether `key` is one of Fluxer's emoji usage keys.
+/// Whether `key` is one of Fluxer's emoji usage keys: `unicode:<name>` with a name, or
+/// `custom:<guild>:<id>` with a snowflake ID (the guild may be empty, as Fluxer writes
+/// it for an emoji without one).
 pub fn is_emoji_key(key: &str) -> bool {
-    !key.is_empty()
-        && key.len() <= MAX_KEY_LEN
-        && (key.starts_with(UNICODE_PREFIX) || key.starts_with(CUSTOM_PREFIX))
+    if key.is_empty() || key.len() > MAX_KEY_LEN {
+        return false;
+    }
+    let snowflake =
+        |s: &str| !s.is_empty() && s.len() <= 20 && s.bytes().all(|b| b.is_ascii_digit());
+    if let Some(name) = key.strip_prefix(UNICODE_PREFIX) {
+        return !name.is_empty() && !name.contains(char::is_whitespace);
+    }
+    match key
+        .strip_prefix(CUSTOM_PREFIX)
+        .and_then(|r| r.split_once(':'))
+    {
+        Some((guild, id)) => snowflake(id) && (guild.is_empty() || snowflake(guild)),
+        None => false,
+    }
 }
 
 /// Fluxer's frecency of a usage entry at `now_ms`: `log2(count + 1)`, halved every week.
@@ -440,14 +454,15 @@ impl Backend {
             Cmd::SharedGif { gif, query, locale } => {
                 self.spawn_guarded("gif share", None, async move {
                     let query = query.filter(|q| !q.trim().is_empty());
-                    if ctx
+                    let shared = ctx
                         .client
                         .register_gif_share(&gif, query.as_deref(), &locale)
-                        .await
-                        .is_err()
-                    {
-                        // Only a courtesy to the provider: nothing to show.
+                        .await;
+                    if let Err(err) = shared {
+                        // Only a courtesy to the provider: nothing to show, but a token
+                        // that is gone ends the session as anywhere else.
                         log::debug!("a GIF share was not registered");
+                        let _ = reason(&ctx.internal, ctx.gen, err);
                     }
                 });
             }
