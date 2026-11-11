@@ -95,6 +95,11 @@ sleep 6
 shot 15-link-prompt
 kill $pid; wait $pid 2>/dev/null
 
+# 7. Several accounts: the account switcher (two more accounts in the background, one
+#    on another instance) and the sign-in screen when adding one.
+scene 22-accounts accounts c-general
+scene 23-accounts-add accounts-add c-general
+
 tail -n 20 "$out/signin.log" "$out/demo.log" >&2
 cat "$out/memory.txt" >&2
 rm -rf "$out/config"
