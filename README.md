@@ -15,7 +15,7 @@ Fluxer's official desktop app is built on Electron. Inlet is a separate, native 
 >
 > Until the first release, development happens on the [`v0` branch](https://github.com/Ferdinand99/Inlet/tree/v0), which is the default branch for now. The `main` branch holds the release workflows and the macOS packaging, and becomes the default again at the first release.
 
-![Inlet on Windows, showing demo data](docs/images/inlet-windows.png)
+![Inlet on Windows with the member list open, showing demo data](docs/images/inlet-windows.png)
 
 *The Windows build with its built-in demo data. The names and messages in the picture are made up.*
 
