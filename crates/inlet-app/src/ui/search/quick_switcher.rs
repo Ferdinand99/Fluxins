@@ -238,14 +238,28 @@ fn score(title: &str, query: &str) -> Option<u32> {
     query.chars().all(|q| chars.any(|t| t == q)).then_some(200)
 }
 
+/// A fixed order among entries that are otherwise equal (the background states come
+/// from a map, so their order would change from run to run).
+fn settle(a: &Candidate, b: &Candidate) -> std::cmp::Ordering {
+    a.title
+        .cmp(&b.title)
+        .then_with(|| a.account.cmp(&b.account))
+        .then(a.guild.cmp(&b.guild))
+        .then(a.channel.cmp(&b.channel))
+}
+
+/// Newer activity first, then [`settle`].
+fn by_activity(a: &Candidate, b: &Candidate) -> std::cmp::Ordering {
+    b.activity.cmp(&a.activity).then_with(|| settle(a, b))
+}
+
 /// Visited first (newest visit first), then mentions, unread, newer activity, name.
 fn by_interest(a: &Candidate, b: &Candidate) -> std::cmp::Ordering {
     b.visited
         .cmp(&a.visited)
         .then(b.mentions.cmp(&a.mentions))
         .then(b.unread.cmp(&a.unread))
-        .then(b.activity.cmp(&a.activity))
-        .then_with(|| a.title.cmp(&b.title))
+        .then_with(|| by_activity(a, b))
 }
 
 /// The rows for `query` over the candidates of every account.
@@ -296,7 +310,7 @@ fn default_rows(candidates: &[Candidate]) -> Vec<Row> {
         .copied()
         .filter(|c| c.visited.is_some())
         .collect();
-    previous.sort_by_key(|c| std::cmp::Reverse(c.visited));
+    previous.sort_by(|a, b| b.visited.cmp(&a.visited).then_with(|| settle(a, b)));
     previous.truncate(HISTORY_LIMIT - 1);
     let seen = |c: &Candidate| {
         previous
@@ -309,14 +323,14 @@ fn default_rows(candidates: &[Candidate]) -> Vec<Row> {
         .copied()
         .filter(|c| c.mentions > 0 && !seen(c))
         .collect();
-    mentions.sort_by_key(|c| std::cmp::Reverse(c.activity));
+    mentions.sort_by(|a, b| by_activity(a, b));
     mentions.truncate(SECTION_LIMIT);
     let mut unread: Vec<&Candidate> = channels
         .iter()
         .copied()
         .filter(|c| c.unread && c.mentions == 0 && !seen(c))
         .collect();
-    unread.sort_by_key(|c| std::cmp::Reverse(c.activity));
+    unread.sort_by(|a, b| by_activity(a, b));
     unread.truncate(SECTION_LIMIT);
 
     let mut rows = Vec::new();
