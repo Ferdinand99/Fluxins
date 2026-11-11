@@ -59,10 +59,21 @@ impl Inlet {
     fn render_ctx(&self, row: &MessageRow, cx: &mut Context<Self>) -> RenderCtx {
         let weak = cx.entity().downgrade();
         let id = row.id;
+        let m = &row.message;
+        let custom = markdown::custom_emoji(&m.blocks)
+            .into_iter()
+            .chain(m.embeds.iter().flat_map(|e| {
+                markdown::custom_emoji(&e.description).into_iter().chain(
+                    e.fields
+                        .iter()
+                        .flat_map(|f| markdown::custom_emoji(&f.value)),
+                )
+            }));
         RenderCtx {
             revealed: row.revealed,
             names: self.mention_names(&row.message, cx),
             jumbo: !self.chat.view.compact,
+            emoji: self.emoji_pictures(custom, cx),
             off_thread: Some(self.markdown_off_thread(cx)),
             on_link: Rc::new({
                 let weak = weak.clone();
@@ -122,6 +133,7 @@ impl Inlet {
         }
         body.children(self.attachments_slot(row, cx))
             .children(self.reactions_slot(row, cx))
+            .children(self.render_stickers(&m.id, &m.stickers, cx))
     }
 
     /// Images and files under the text: previews, video stills, file cards (see
@@ -352,6 +364,7 @@ impl Inlet {
             revealed: true,
             names: self.mention_names_in_open_channel(&row.blocks, cx),
             jumbo: !compact,
+            emoji: self.emoji_pictures(markdown::custom_emoji(&row.blocks), cx),
             off_thread: Some(self.markdown_off_thread(cx)),
             on_link: Rc::new(move |url, masked, _window, cx| {
                 let url = url.to_string();

@@ -3,17 +3,23 @@
 //! the image viewer. Everything goes through the session's image client (`inlet-media`)
 //! and the media proxy; see `backend::media`.
 //!
+//! Custom emoji and Twemoji (`emoji`), stickers (`sticker`) and the rules every
+//! animation follows (`animation_budget`) live here too.
+//!
 //! **Memory.** Decoded images live in the client's cache, bounded in bytes. The views
 //! hold an image only while they draw it: every image a frame does not draw is let go at
 //! the next frame (its load is cancelled if it was still loading), and a texture is freed
 //! once the cache has let go of it and nothing draws it any more.
 
+pub(crate) mod animation_budget;
 mod attachment;
 mod audio_file;
 mod avatar;
 pub(crate) mod embed;
+pub(crate) mod emoji;
 mod image;
 pub mod requests;
+mod sticker;
 mod video_thumb;
 mod viewer;
 
@@ -25,6 +31,7 @@ use gpui::{Context, Pixels, RenderImage, Size, Task, Window};
 
 use crate::app::Inlet;
 use crate::backend::media::{Ev, Setup};
+use animation_budget::{MotionPrefs, Stage, IDLE_AFTER};
 
 pub(crate) use attachment::cover_box;
 pub use attachment::Refresh;
@@ -83,9 +90,16 @@ pub struct State {
     pub refresh: Refresh,
     /// The open image viewer.
     pub viewer: Option<Viewer>,
+    /// The last keyboard or mouse input in the window: animations stop after
+    /// [`IDLE_AFTER`] without one.
+    last_input: std::time::Instant,
     /// Demo screenshots: the viewer was opened once for the `image-viewer` scene.
     #[cfg(feature = "demo")]
     pub demo_viewer_done: bool,
+    /// Demo runs: frames drawn since this time, logged every few seconds with how many
+    /// animations moved (the CPU measurement of the screenshot runs reads it).
+    #[cfg(feature = "demo")]
+    demo_frames: (Option<std::time::Instant>, u32, usize),
 }
 
 impl Default for State {
@@ -104,13 +118,44 @@ impl Default for State {
             cover_explicit: true,
             refresh: Refresh::default(),
             viewer: None,
+            last_input: std::time::Instant::now(),
             #[cfg(feature = "demo")]
             demo_viewer_done: false,
+            #[cfg(feature = "demo")]
+            demo_frames: (None, 0, 0),
         }
     }
 }
 
 impl State {
+    /// The media state with the media settings of this installation (animated emoji
+    /// and stickers on or off).
+    pub fn with_settings() -> Self {
+        let state = Self::default();
+        state.images.animations().borrow_mut().prefs = MotionPrefs::current();
+        state
+    }
+
+    /// Demo runs: counts a frame (and the animations the last one moved), and logs the
+    /// counts every five seconds.
+    #[cfg(feature = "demo")]
+    fn demo_note_frame(&mut self, active: bool) {
+        let now = std::time::Instant::now();
+        let moving = self.images.animations().borrow().playing();
+        let (since, frames, most) = &mut self.demo_frames;
+        let start = *since.get_or_insert(now);
+        *frames += 1;
+        *most = (*most).max(moving);
+        let elapsed = now.saturating_duration_since(start);
+        if elapsed >= std::time::Duration::from_secs(5) {
+            log::info!(
+                "demo animations: {frames} frames in {:.1} s, up to {most} moving, window active: {active}",
+                elapsed.as_secs_f32()
+            );
+            self.demo_frames = (Some(now), 0, 0);
+        }
+    }
+
     /// Whether the spoiler or explicit item `key` was revealed.
     pub fn is_revealed(&self, key: &str) -> bool {
         self.revealed.contains(key)
@@ -132,6 +177,11 @@ impl State {
     pub fn reset(&mut self) {
         self.viewer = None;
         self.images.clear();
+        // What the animations of the last session knew (their URLs, sizes, players) goes
+        // too; the settings stay. Custom emoji and stickers live in the session's image
+        // client, cleared below. Twemoji are the bundled drawings, the same for every
+        // account, so they stay.
+        self.images.animations().borrow_mut().reset();
         if let Some(setup) = self.setup.take() {
             setup.client.clear_memory();
             self.pending_drop.extend(setup.evicted.drain());
@@ -158,10 +208,61 @@ impl Inlet {
             self.media.column_width = width;
             window.request_animation_frame();
         }
-        self.media.images.next_frame();
+        #[cfg(feature = "demo")]
+        self.media.demo_note_frame(window.is_window_active());
+        let stage = Stage {
+            active: window.is_window_active(),
+            idle: self.media.last_input.elapsed() >= IDLE_AFTER,
+            reduce_motion: cx.reduce_motion(),
+            layer_open: self.layer_open(),
+        };
+        self.media.images.next_frame(stage);
         self.release_evicted(Some(window), cx);
+        emoji::release_twemoji(window, cx);
         #[cfg(feature = "demo")]
         self.demo_open_viewer(cx);
+    }
+
+    /// Keyboard or mouse input in the window: animations that stopped for lack of
+    /// input go on.
+    pub(crate) fn note_input(&mut self, cx: &mut Context<Self>) {
+        self.media.last_input = std::time::Instant::now();
+        if self.media.images.animations().borrow().is_idle() {
+            cx.notify();
+        }
+    }
+
+    /// Follows the system's reduce-motion setting (read every 10 s off the UI thread)
+    /// into gpui's, which the animations and gpui's own elements follow. Demo runs keep
+    /// motion on unless `INLET_DEMO_REDUCE_MOTION=1`, so their screenshots do not
+    /// depend on the machine.
+    pub(crate) fn watch_reduce_motion(cx: &mut Context<Self>) {
+        if cfg!(feature = "demo") && std::env::var_os("INLET_DEMO").is_some() {
+            let reduce = std::env::var("INLET_DEMO_REDUCE_MOTION").as_deref() == Ok("1");
+            cx.set_reduce_motion(reduce);
+            return;
+        }
+        cx.spawn(async move |this, cx| loop {
+            let reduce = cx
+                .background_executor()
+                .spawn(async { inlet_platform::reduce_motion() })
+                .await;
+            let alive = this.update(cx, |_, cx| {
+                if let Some(reduce) = reduce {
+                    if cx.reduce_motion() != reduce {
+                        log::info!("system reduce-motion setting: {reduce}");
+                        cx.set_reduce_motion(reduce);
+                    }
+                }
+            });
+            if alive.is_err() {
+                break;
+            }
+            cx.background_executor()
+                .timer(std::time::Duration::from_secs(10))
+                .await;
+        })
+        .detach();
     }
 
     /// Takes the images the cache let go of and frees the texture of every one that

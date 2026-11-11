@@ -11,6 +11,7 @@ use super::tags;
 use crate::app::Inlet;
 use crate::model::{self, AttachmentKind};
 use crate::theme;
+use crate::ui::media::animation_budget::Motion;
 use crate::ui::media::requests;
 use crate::ui::media::{picture_of, placeholder};
 
@@ -61,9 +62,13 @@ impl Inlet {
                     })
                     .flatten();
                 match still {
-                    Some(req) => {
-                        picture_of(self.image(&req, cx), (TILE, TILE), 8., ObjectFit::Cover)
-                    }
+                    Some(req) => picture_of(
+                        self.image(&req, cx),
+                        (TILE, TILE),
+                        8.,
+                        ObjectFit::Cover,
+                        &self.media.images.animator(Motion::Gif),
+                    ),
                     None => placeholder((TILE, TILE), 8., false),
                 }
             }

@@ -14,6 +14,7 @@
 pub mod accounts;
 pub mod actions;
 pub mod composer;
+mod emoji;
 mod guilds;
 pub mod inbox;
 mod markdown;

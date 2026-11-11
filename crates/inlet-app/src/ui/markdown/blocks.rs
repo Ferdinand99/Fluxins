@@ -202,6 +202,9 @@ pub struct RenderCtx {
     pub names: Rc<MentionNames>,
     /// Emoji-only text may be drawn large (not in compact mode, as in Fluxer).
     pub jumbo: bool,
+    /// The pictures of the message's custom emoji (`None`: it has none, or no image
+    /// client; they show as faint boxes).
+    pub emoji: Option<Rc<crate::ui::media::emoji::EmojiPictures>>,
     /// Runs slow work (code highlighting) off the UI thread; `None` leaves code plain.
     pub off_thread: Option<super::OffThread>,
 }

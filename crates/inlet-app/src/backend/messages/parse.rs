@@ -102,6 +102,23 @@ pub fn to_channel(c: &p::Channel) -> Channel {
     }
 }
 
+/// The stickers of a message: at most [`model::MAX_STICKERS`], only with a snowflake ID
+/// (the picture's URL is built from it), names cleaned.
+fn to_stickers(m: &p::Message) -> Vec<model::Sticker> {
+    m.stickers()
+        .into_iter()
+        .filter(|s| {
+            !s.id.is_empty() && s.id.len() <= 20 && s.id.bytes().all(|b| b.is_ascii_digit())
+        })
+        .take(model::MAX_STICKERS)
+        .map(|s| model::Sticker {
+            id: s.id,
+            name: model::clean_name(&s.name),
+            animated: s.animated,
+        })
+        .collect()
+}
+
 /// Converts and parses a message. Runs on the backend thread, so markdown parsing never
 /// blocks the UI. The text and all embeds share one code highlighting budget.
 pub fn to_message(m: &p::Message, names: &SharedNames) -> Message {
@@ -144,6 +161,7 @@ fn convert_message(m: &p::Message, names: &SharedNames) -> Message {
             .filter_map(|e| to_embed(e, &snapshot))
             .take(10)
             .collect(),
+        stickers: to_stickers(m),
         reply,
         edited: m.edited_timestamp.is_some(),
     };

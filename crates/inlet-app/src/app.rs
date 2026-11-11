@@ -119,9 +119,14 @@ impl Inlet {
             if active {
                 let at_bottom = this.chat.message_list.is_following_tail();
                 this.read_if_watched(true, at_bottom, cx);
+                // Coming back to the window counts as input.
+                this.note_input(cx);
             }
+            // Animations stop without the focus and go on with it: draw once now.
+            cx.notify();
         }));
 
+        Self::watch_reduce_motion(cx);
         let (backend, _) = Self::spawn_backend_with(0, true, window, cx, start);
         let notifications = ui::notifications::State::new(window.is_window_active());
         Self {
@@ -143,7 +148,7 @@ impl Inlet {
             chat: ui::chat::ChatState::new(),
             composer,
             overlays: Default::default(),
-            media: Default::default(),
+            media: ui::media::State::with_settings(),
             members: Default::default(),
             profile: Default::default(),
             social: Default::default(),

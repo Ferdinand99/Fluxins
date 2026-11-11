@@ -14,6 +14,8 @@ pub const DISPLAY_CHARS: usize = 4_000;
 pub const MAX_CONTENT_BYTES: usize = 16 * 1024;
 /// Consecutive messages from the same author within this window share one header.
 pub const GROUP_WINDOW_MS: i64 = 7 * 60 * 1000;
+/// Stickers kept per message; a message carries at most a few.
+pub const MAX_STICKERS: usize = 3;
 
 #[derive(Clone, Debug)]
 pub struct Guild {
@@ -221,6 +223,16 @@ pub struct Attachment {
     pub expired: bool,
 }
 
+/// A sticker sent with a message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Sticker {
+    /// Its ID (a snowflake; the picture comes from the media proxy).
+    pub id: String,
+    /// Name, cleaned.
+    pub name: String,
+    pub animated: bool,
+}
+
 /// A user's avatar: the user and the image hash (`a_` = animated).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UserAvatar {
@@ -256,6 +268,8 @@ pub struct Message {
     pub spoiler_links: Vec<String>,
     pub attachments: Vec<Attachment>,
     pub embeds: Vec<Embed>,
+    /// Stickers sent with the message (at most [`MAX_STICKERS`] are kept).
+    pub stickers: Vec<Sticker>,
     pub reply: Option<Reply>,
     pub edited: bool,
 }
@@ -263,7 +277,10 @@ pub struct Message {
 impl Message {
     /// Whether there is anything to show under the header.
     pub fn is_empty(&self) -> bool {
-        self.blocks.is_empty() && self.embeds.is_empty() && self.attachments.is_empty()
+        self.blocks.is_empty()
+            && self.embeds.is_empty()
+            && self.attachments.is_empty()
+            && self.stickers.is_empty()
     }
 
     /// Fills `blocks` and `truncated` from `content`, without mention names.
@@ -429,6 +446,7 @@ mod tests {
             spoiler_links: vec![],
             attachments: vec![],
             embeds: vec![],
+            stickers: vec![],
             reply: None,
             edited: false,
         }
