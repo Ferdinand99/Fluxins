@@ -59,6 +59,8 @@ pub struct Channel {
     pub position: i64,
     /// Channel topic, cleaned; shown after the name in the header.
     pub topic: Option<String>,
+    /// Slowmode: seconds between two messages of one member (0 = off).
+    pub slowmode_secs: u32,
 }
 
 /// Names for resolving mentions (`<#id>`, `<@id>`, `<@&id>`) while parsing.
@@ -282,6 +284,7 @@ mod tests {
             parent_id: parent.map(Into::into),
             position: pos,
             topic: None,
+            slowmode_secs: 0,
         }
     }
 

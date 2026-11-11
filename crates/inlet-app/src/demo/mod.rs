@@ -10,6 +10,7 @@
 //!
 //! One file per domain (`guilds`, `messages`, `markdown`, `social`); `scenes` picks what to show.
 
+pub mod composer;
 mod guilds;
 mod markdown;
 mod messages;
@@ -113,6 +114,8 @@ pub(crate) fn channel(
         parent_id: parent.map(Into::into),
         position,
         topic: (id == "c-general").then(|| "General chat \u{2014} be nice, have fun".to_string()),
+        // The development channel shows the slowmode countdown in the demo.
+        slowmode_secs: if id == "c-dev" { 10 } else { 0 },
     }
 }
 
@@ -395,13 +398,7 @@ impl MockSession {
         self.page(channel_id, Some(before))
     }
 
-    pub fn send(&mut self, channel_id: String, text: String) {
-        self.next_seq += 1;
-        let nonce = format!("demo-{}", self.next_seq);
-        self.post(channel_id, nonce, text);
-    }
-
-    /// "Retry" in the demo: the message goes through this time, with its nonce.
+    /// A send in the demo, or its "Retry": the message goes through, with its nonce.
     pub fn resend(&mut self, channel_id: String, nonce: String, text: String) {
         self.next_seq += 1;
         self.post(channel_id, nonce.clone(), text);
