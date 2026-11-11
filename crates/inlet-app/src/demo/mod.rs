@@ -22,6 +22,7 @@ pub mod media;
 mod messages;
 pub mod scenes;
 mod social;
+pub mod threads;
 mod unread;
 
 use std::collections::HashMap;

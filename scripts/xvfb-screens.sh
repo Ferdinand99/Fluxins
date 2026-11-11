@@ -124,6 +124,13 @@ cpu_scene() {
 cpu_scene 28-custom-emoji custom-emoji
 cpu_scene 29-emoji-100 emoji-100
 
+# 9. Threads: the side panel with its own composer, the thread list, a forum and a
+#    media channel.
+scene 30-thread-panel thread-panel c-general
+scene 31-thread-list thread-list c-general
+scene 32-forum forum c-forum
+scene 33-media-channel media-channel c-gallery
+
 tail -n 20 "$out/signin.log" "$out/demo.log" >&2
 grep -H "demo animations" "$out/28-custom-emoji.log" "$out/29-emoji-100.log" >&2
 cat "$out/memory.txt" >&2
