@@ -98,6 +98,7 @@ fn bind_keys(cx: &mut App) {
     ui::composer::bind_keys(cx);
     ui::composer::pickers::bind_keys(cx);
     ui::chat::bind_keys(cx);
+    ui::members::bind_keys(cx);
 }
 
 #[cfg(test)]
@@ -112,7 +113,7 @@ mod tests {
 
     /// The domains with key bindings. A new `fn bind_keys` must be added here and to
     /// [`super::bind_keys`].
-    const DOMAINS: [(&str, Bind); 5] = [
+    const DOMAINS: [(&str, Bind); 6] = [
         ("text_input", crate::text_input::bind_keys),
         ("ui::notifications", crate::ui::notifications::bind_keys),
         ("ui::composer", crate::ui::composer::bind_keys),
@@ -121,6 +122,7 @@ mod tests {
             crate::ui::composer::pickers::bind_keys,
         ),
         ("ui::chat", crate::ui::chat::bind_keys),
+        ("ui::members", crate::ui::members::bind_keys),
     ];
 
     fn bound(cx: &mut TestAppContext, bind: Bind) -> BTreeSet<String> {

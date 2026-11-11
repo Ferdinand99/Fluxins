@@ -139,25 +139,46 @@ impl Inlet {
                     cx.notify();
                 }))
             }))
+            // Under the header: the messages and the composer, with the member list
+            // beside them (as Fluxer's channel layout).
             .child(
                 div()
-                    .relative()
                     .flex_1()
                     .min_h_0()
                     .w_full()
                     .flex()
-                    .flex_col()
+                    .flex_row()
                     .child(
-                        list(
-                            self.chat.message_list.clone(),
-                            cx.processor(|this, ix: usize, _window, cx| this.render_row(ix, cx)),
-                        )
-                        .flex_1()
-                        .w_full(),
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .relative()
+                                    .flex_1()
+                                    .min_h_0()
+                                    .w_full()
+                                    .flex()
+                                    .flex_col()
+                                    .child(
+                                        list(
+                                            self.chat.message_list.clone(),
+                                            cx.processor(|this, ix: usize, _window, cx| {
+                                                this.render_row(ix, cx)
+                                            }),
+                                        )
+                                        .flex_1()
+                                        .w_full(),
+                                    )
+                                    .children(self.render_new_messages_bar(cx))
+                                    .children(self.render_jump_to_present(cx)),
+                            )
+                            .when(has_channel, |d| d.child(self.render_composer())),
                     )
-                    .children(self.render_new_messages_bar(cx))
-                    .children(self.render_jump_to_present(cx)),
+                    .children(self.render_member_list(cx)),
             )
-            .when(has_channel, |d| d.child(self.render_composer()))
     }
 }

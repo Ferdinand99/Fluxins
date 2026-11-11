@@ -338,6 +338,13 @@ pub struct MemberListOp {
     /// Replacement items for the range.
     #[serde(default, deserialize_with = "lenient_vec")]
     pub items: Vec<MemberListItem>,
+    /// The row of an `INSERT`, `UPDATE` or `DELETE` (the item-wise operations of
+    /// the Discord-style list protocol; Fluxer sends only `SYNC` today).
+    #[serde(default, deserialize_with = "opt_u64")]
+    pub index: Option<u64>,
+    /// The new row of an `INSERT` or `UPDATE`.
+    #[serde(default, deserialize_with = "super::message::lenient_opt")]
+    pub item: Option<MemberListItem>,
 }
 
 /// GUILD_MEMBER_LIST_UPDATE: a subscribed member list changed.

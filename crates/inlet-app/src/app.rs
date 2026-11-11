@@ -66,9 +66,7 @@ pub struct Inlet {
     pub composer: ui::composer::ComposerState,
     pub overlays: ui::overlays::OverlayState,
     pub media: ui::media::State,
-    #[allow(dead_code)] // filled by the task that builds the domain
     pub members: ui::members::State,
-    #[allow(dead_code)] // filled by the task that builds the domain
     pub profile: ui::profile::State,
     pub social: ui::social::State,
     #[allow(dead_code)] // filled by the task that builds the domain

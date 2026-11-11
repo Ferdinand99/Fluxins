@@ -156,7 +156,11 @@ sleep 6
 shot 34-settings-notifications
 kill $pid; wait $pid 2>/dev/null
 
-# 11. The scene files of the visual checks. Xvfb's pointer cannot be moved and sits in
+# 11. The member list beside the chat, and the profile popout of a member.
+scene 39-members members c-general
+scene 40-profile-popout profile-popout c-general
+
+# 12. The scene files of the visual checks. Xvfb's pointer cannot be moved and sits in
 #     the middle of the screen; the demo puts a scene's window in the top left corner,
 #     and the screen is more than twice its size, so the pointer is never over it (no
 #     hover states). The app reads each file itself.

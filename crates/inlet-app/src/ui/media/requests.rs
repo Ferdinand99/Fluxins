@@ -199,6 +199,33 @@ pub fn guild_icon(
     )
 }
 
+/// A person's profile banner for a box of `w` x `h` logical pixels (drawn covering the
+/// box): the one of their profile in `guild_id`, or their account's.
+pub fn profile_banner(
+    proxy: &p::Media,
+    guild_id: Option<&str>,
+    user_id: &str,
+    hash: &str,
+    (w, h): (f32, f32),
+    scale: f32,
+) -> Option<MediaRequest> {
+    let px = snap_proxy_size(pixels(w, scale).max(pixels(h, scale)));
+    let opts = ImageOptions::size(px);
+    let url = match guild_id {
+        Some(g) => proxy.member_banner(g, user_id, Some(hash), opts),
+        None => proxy.banner(user_id, Some(hash), opts),
+    };
+    request(
+        url,
+        MediaKind::Avatar,
+        Fit::Contain {
+            max_width: px,
+            max_height: px,
+        },
+        px,
+    )
+}
+
 /// A guild banner for a box of `w` x `h` logical pixels (drawn covering the box).
 pub fn guild_banner(
     proxy: &p::Media,
