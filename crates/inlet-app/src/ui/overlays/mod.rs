@@ -7,6 +7,7 @@ mod link_confirm;
 mod link_prompt;
 pub mod modal;
 mod notification_settings;
+pub mod status_picker;
 mod tooltip;
 
 use gpui::{AnyElement, Context, FocusHandle, IntoElement};
@@ -51,6 +52,10 @@ impl Inlet {
         // The account switcher: over the notification settings, under the link prompts.
         if self.switcher_layer_open() {
             out.push(self.render_account_switcher(cx));
+        }
+        // The status picker: over the account switcher, under the link prompts.
+        if self.status_picker_open() {
+            out.push(self.render_status_picker(cx));
         }
         if let Some(url) = self.overlays.pending_link.clone() {
             // A layer like the link prompt: it has the keyboard while it is topmost, and

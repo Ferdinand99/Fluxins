@@ -142,7 +142,7 @@ pub struct ComposerView {
     pub(super) shared: Rc<RefCell<Shared>>,
     seen_generation: u64,
     /// The account state on the UI thread: roles, channels, emoji and rights.
-    account: Option<WeakEntity<AccountState>>,
+    pub(super) account: Option<WeakEntity<AccountState>>,
     /// Autocomplete data of the open channel, from the account state.
     pub(super) directory: Option<(String, Directory)>,
     /// Members per guild: from the account state and from searches.

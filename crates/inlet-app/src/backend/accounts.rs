@@ -966,6 +966,7 @@ impl Backend {
             legacy: None,
             down: false,
             composer,
+            presence: Default::default(),
             session,
             gateway,
             forward,
@@ -1066,6 +1067,7 @@ impl Backend {
             legacy: None,
             down: false,
             composer,
+            presence: Default::default(),
             session,
             gateway,
             forward,
@@ -1097,6 +1099,7 @@ impl Backend {
                 if let Some(guild) = r.active_guild.take() {
                     r.gateway.set_guild_active(&guild, false);
                 }
+                r.presence.to_background(&r.gateway);
                 for t in r.settings_writes.drain(..) {
                     t.abort();
                 }
@@ -1141,6 +1144,10 @@ impl Backend {
             Duration::ZERO
         };
         let guilds = r.guilds.lock().unwrap().clone();
+        if !restart {
+            // Its gateway stays: it shows the status asked for last, not `invisible`.
+            r.presence.to_front(&r.gateway);
+        }
         self.events = r.events.clone();
         self.session_activated(&r.session);
         self.active = Some(Active::Real(r));

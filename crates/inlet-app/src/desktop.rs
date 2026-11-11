@@ -929,6 +929,7 @@ impl Inlet {
             link_prompt: self.overlays.link_prompt.is_some(),
             link_confirm: self.overlays.pending_link.is_some(),
             notification_settings: self.notifications.settings.is_some(),
+            status_picker: self.status_picker_open(),
             switcher: self.switcher_layer_open(),
             panel: self.inbox.open.is_some(),
             settings: self.settings.view.is_some(),
@@ -965,7 +966,12 @@ impl Inlet {
                 Some(Layer::Picker) => self.composer.pickers.search_focus(cx).unwrap_or(layer),
                 _ => layer,
             };
-            if !handle.is_focused(window) {
+            // The status picker has a field that may keep the keyboard, but only while
+            // it is the topmost layer: any layer that opens over it takes the keyboard in
+            // the same frame.
+            let field_keeps_it = self.is_top_layer(Layer::StatusPicker)
+                && self.status_picker_field_focused(window, cx);
+            if !handle.is_focused(window) && !field_keeps_it {
                 if !self.overlays.layer_had_focus {
                     // Where the keyboard was, to give it back when the layers close.
                     self.overlays.focus_before = window.focused(cx);
@@ -1013,6 +1019,7 @@ impl Inlet {
             Some(Layer::LinkPrompt) => self.overlays.link_prompt = None,
             Some(Layer::LinkConfirm) => self.overlays.pending_link = None,
             Some(Layer::NotificationSettings) => self.notifications.settings = None,
+            Some(Layer::StatusPicker) => self.social.picker = None,
             Some(Layer::AccountSwitcher) => self.switcher.open = false,
             Some(Layer::Panel) => self.inbox.open = None,
             Some(Layer::Settings) => self.settings.view = None,
@@ -1070,6 +1077,8 @@ pub(crate) enum Layer {
     LinkPrompt,
     LinkConfirm,
     NotificationSettings,
+    /// The status picker over the user panel.
+    StatusPicker,
     AccountSwitcher,
     /// The pinned messages or the inbox, under the channel header.
     Panel,
@@ -1081,13 +1090,14 @@ pub(crate) enum Layer {
 
 /// Which layers are open. They are drawn bottom first (a panel, the image viewer, the
 /// picker, the settings view, the notification settings window, the account switcher,
-/// the link confirmation, the link prompt, see `ui/overlays`), and the topmost one has
-/// the keyboard: Escape closes it first.
+/// the status picker, the link confirmation, the link prompt, see `ui/overlays`), and
+/// the topmost one has the keyboard: Escape closes it first.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct OpenLayers {
     pub link_prompt: bool,
     pub link_confirm: bool,
     pub notification_settings: bool,
+    pub status_picker: bool,
     pub switcher: bool,
     pub panel: bool,
     pub settings: bool,
@@ -1101,6 +1111,8 @@ impl OpenLayers {
             Some(Layer::LinkPrompt)
         } else if self.link_confirm {
             Some(Layer::LinkConfirm)
+        } else if self.status_picker {
+            Some(Layer::StatusPicker)
         } else if self.switcher {
             Some(Layer::AccountSwitcher)
         } else if self.notification_settings {
@@ -1125,6 +1137,7 @@ impl OpenLayers {
             Some(Layer::LinkPrompt) => self.link_prompt = false,
             Some(Layer::LinkConfirm) => self.link_confirm = false,
             Some(Layer::NotificationSettings) => self.notification_settings = false,
+            Some(Layer::StatusPicker) => self.status_picker = false,
             Some(Layer::AccountSwitcher) => self.switcher = false,
             Some(Layer::Panel) => self.panel = false,
             Some(Layer::Settings) => self.settings = false,
@@ -1328,6 +1341,7 @@ mod tests {
             link_prompt: true,
             link_confirm: true,
             notification_settings: true,
+            status_picker: true,
             switcher: true,
             panel: true,
             settings: true,
@@ -1344,6 +1358,7 @@ mod tests {
             [
                 Layer::LinkPrompt,
                 Layer::LinkConfirm,
+                Layer::StatusPicker,
                 Layer::AccountSwitcher,
                 Layer::NotificationSettings,
                 Layer::Settings,

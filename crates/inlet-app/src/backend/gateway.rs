@@ -14,12 +14,13 @@ use super::accounts::BACKGROUND_IGNORED_EVENTS;
 use super::messages::parse::{
     remember_channels, remember_roles, to_channel, to_message, ChannelCache, SharedNames,
 };
-use super::{accounts, composer, messages, Backend, Internal, RealActive, Ui};
+use super::{accounts, composer, messages, social, Backend, Internal, RealActive, Ui};
 use crate::model::{self, Channel, Guild};
 use crate::reconnect::{Decision, Stop};
 
 /// The gateway settings of an account: a background account does not ask for typing
-/// events (and has no active guild, see `accounts`).
+/// events (and has no active guild, see `accounts`), and starts invisible and away (see
+/// `social/presence`).
 pub fn gateway_options(background: bool) -> p::GatewayOptions {
     let mut options = p::GatewayOptions::default();
     if background {
@@ -27,6 +28,8 @@ pub fn gateway_options(background: bool) -> p::GatewayOptions {
             .iter()
             .map(|e| (*e).to_string())
             .collect();
+        options.initial_status = Some(social::presence::BACKGROUND_STATUS.to_string());
+        options.initial_afk = social::presence::BACKGROUND_AFK;
     }
     options
 }
@@ -138,6 +141,9 @@ impl Backend {
         // A new gateway handle does not know the guild on screen yet.
         if let Some(guild) = r.active_guild.as_ref().filter(|_| !background) {
             gateway.set_guild_active(guild, true);
+        }
+        if !background {
+            r.presence.to_front(&gateway);
         }
         if let Some(r) = self.engine_mut(gen) {
             r.gateway = gateway;
