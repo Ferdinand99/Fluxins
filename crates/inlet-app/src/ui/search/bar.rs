@@ -207,12 +207,13 @@ pub fn header_button(this: &Inlet, cx: &mut Context<Inlet>) -> Option<AnyElement
     Some(
         div()
             .id("header-search")
-            // Fluxer's width; it gives way first when the chat narrows (the search
-            // column open beside it), so the channel's name stays in sight.
+            // Fluxer's width. While the search column is open the chat beside it is
+            // narrow and the column holds the field itself, so the header keeps a
+            // short one and the channel's name stays in sight.
             .flex_shrink(1.)
             .min_w(px(FIELD_MIN_WIDTH))
             .ml(px(8.))
-            .w(px(FIELD_WIDTH))
+            .w(px(if open { FIELD_MIN_WIDTH } else { FIELD_WIDTH }))
             .h(px(FIELD_HEIGHT))
             .px(px(8.))
             .rounded(px(6.))
