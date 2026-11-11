@@ -1578,6 +1578,13 @@ mod tests {
         })
     }
 
+    /// The editor's paste key on this platform.
+    const PASTE: &str = if cfg!(target_os = "macos") {
+        "cmd-v"
+    } else {
+        "ctrl-v"
+    };
+
     #[gpui::test]
     fn pasting_a_screenshot_attaches_a_png_that_stays_in_memory(cx: &mut TestAppContext) {
         let (_host, view, cx) = host(cx);
@@ -1590,7 +1597,7 @@ mod tests {
         cx.write_to_clipboard(gpui::ClipboardItem {
             entries: vec![gpui::ClipboardEntry::Image(screenshot)],
         });
-        cx.simulate_keystrokes("ctrl-v");
+        cx.simulate_keystrokes(PASTE);
         cx.run_until_parked();
         assert_eq!(staged(&view, "9", cx), [("image.png".to_owned(), true)]);
         let text = view.read_with(cx, |v, cx| v.editor.read(cx).buffer().text().to_owned());
@@ -1600,12 +1607,12 @@ mod tests {
         cx.write_to_clipboard(gpui::ClipboardItem {
             entries: vec![gpui::ClipboardEntry::Image(svg)],
         });
-        cx.simulate_keystrokes("ctrl-v");
+        cx.simulate_keystrokes(PASTE);
         assert!(view.read_with(cx, |v, _| v.error.is_some()));
         assert_eq!(staged(&view, "9", cx).len(), 1);
         // Without the right to attach files in a guild channel, nothing is attached.
         open(&view, "1", cx);
-        cx.simulate_keystrokes("ctrl-v");
+        cx.simulate_keystrokes(PASTE);
         assert!(staged(&view, "1", cx).is_empty());
     }
 
