@@ -3013,6 +3013,7 @@ name = "inlet"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "bytes",
  "chrono",
  "dirs",
  "env_logger",
@@ -3025,6 +3026,7 @@ dependencies = [
  "image",
  "inlet-editor",
  "inlet-emoji",
+ "inlet-media",
  "inlet-platform",
  "inlet-protocol",
  "inlet-state",

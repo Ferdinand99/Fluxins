@@ -211,6 +211,7 @@ impl Backend {
             self.active = Some(Active::Demo(crate::demo::MockSession::start(
                 self.events.clone(),
             )));
+            super::media::demo_started(self);
             return;
         }
         let events = self.events.clone();
@@ -595,6 +596,7 @@ impl Backend {
             instance: instance.clone(),
         });
         self.emit(messages::Ev::Guilds(connected.guilds));
+        super::media::session_started(self, &session);
 
         if save {
             let token = session.token().clone();

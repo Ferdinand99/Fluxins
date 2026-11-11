@@ -2,8 +2,8 @@
 //! One row of the message list: a message (cozy or compact), a divider, a system line,
 //! the channel's welcome or a message on its way.
 //!
-//! Two slots belong to later work: [`Inlet::attachments_slot`] (images and files under
-//! the text) and [`Inlet::actions_slot`] (the hover bar with reactions, reply, edit…,
+//! Two slots: [`Inlet::attachments_slot`] (images and files under the text, drawn by the
+//! media views) and [`Inlet::actions_slot`] (the hover bar with reactions, reply, edit…,
 //! drawn by `action_bar.rs`). The reaction bubbles go under the attachments.
 
 use std::rc::Rc;
@@ -17,7 +17,6 @@ use super::embed::render_embed;
 use super::messages::{MessageRow, PendingRow, Row, Tag};
 use super::{divider, reply_preview, system_message, welcome};
 use crate::app::Inlet;
-use crate::model::Guild;
 use crate::theme;
 use crate::ui::markdown::{self, RenderCtx};
 
@@ -88,10 +87,22 @@ impl Inlet {
                     .on_click(cx.listener(move |this, _, _, cx| this.expand(id, cx))),
             );
         }
-        if !row.meta.embeds_hidden {
-            for (i, e) in m.embeds.iter().enumerate() {
-                body = body.child(render_embed(&format!("m{}-e{i}", m.id), e, &ctx, cx));
+        // Links the text hides in spoilers hide their embeds too, until shown. A cut
+        // text is read whole for this, so a spoiler past the cut still counts. Embeds
+        // hidden with "Suppress Embeds" are not drawn at all.
+        let hidden = if row.revealed || m.embeds.is_empty() || row.meta.embeds_hidden {
+            Vec::new()
+        } else if m.truncated {
+            markdown::spoilered_links(&markdown::parse(&m.content))
+        } else {
+            markdown::spoilered_links(&m.blocks)
+        };
+        for (i, e) in m.embeds.iter().enumerate() {
+            if row.meta.embeds_hidden {
+                break;
             }
+            let id = format!("m{}-e{i}", m.id);
+            body = body.child(render_embed(self, &id, e, &hidden, &ctx, cx));
         }
         if m.is_empty() {
             body = body.child(
@@ -105,34 +116,15 @@ impl Inlet {
             .children(self.reactions_slot(row, cx))
     }
 
-    /// Images and files under the text. In v0 they are links that open in the browser
-    /// after the link check; the media task draws them here instead.
+    /// Images and files under the text: previews, video stills, file cards (see
+    /// `ui/media`).
     pub(super) fn attachments_slot(
         &self,
         row: &MessageRow,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let m = &row.message;
-        if m.attachments.is_empty() {
-            return None;
-        }
-        let mut list = div().flex().flex_col().gap_1();
-        for (i, a) in m.attachments.iter().enumerate() {
-            let url = a.url.clone();
-            list = list.child(
-                div()
-                    .id(SharedString::from(format!("att-{}-{i}", m.id)))
-                    .text_color(theme::link())
-                    .cursor_pointer()
-                    .child(t!(
-                        "message-attachment",
-                        filename = a.filename,
-                        host = markdown::link_target_label(&a.url)
-                    ))
-                    .on_click(cx.listener(move |this, _, _, cx| this.open_link(&url, false, cx))),
-            );
-        }
-        Some(list.into_any_element())
+        self.render_attachments(&m.channel_id, &m.id, &m.attachments, cx)
     }
 
     /// The hover bar of a message (react, reply, edit, more), while the row is under the
@@ -220,7 +212,7 @@ impl Inlet {
                     )
             });
             // Grouped rows show their time in the avatar column under the pointer.
-            let side = if row.grouped {
+            let side: AnyElement = if row.grouped {
                 div()
                     .w_full()
                     .flex()
@@ -232,8 +224,16 @@ impl Inlet {
                     .opacity(0.)
                     .group_hover(ROW_GROUP, |s| s.opacity(1.))
                     .child(row.clock.clone())
+                    .into_any_element()
             } else {
-                avatar(&m.author)
+                let playing = self.media.hovered_message.as_deref() == Some(m.id.as_str());
+                self.user_avatar(
+                    m.author_avatar.as_deref(),
+                    &m.author,
+                    AVATAR_COLUMN,
+                    playing,
+                    cx,
+                )
             };
             div()
                 .flex()
@@ -263,6 +263,13 @@ impl Inlet {
             .map(|a| div().absolute().top(px(-16.)).right(px(14.)).child(a));
         let (id, channel) = (row.id, inlet_state::ChannelId::parse(&m.channel_id));
         let starts_group = !row.grouped || row.reply.is_some();
+        // An animated avatar plays while the pointer is over its message.
+        let animated_avatar = !compact
+            && !row.grouped
+            && m.author_avatar
+                .as_ref()
+                .is_some_and(|a| a.hash.starts_with("a_"));
+        let hover_id = m.id.clone();
         div()
             .w_full()
             .when(starts_group && !compact, |d| d.pt(px(GROUP_SPACING)))
@@ -302,6 +309,18 @@ impl Inlet {
                             .w(px(2.))
                             .bg(bar)
                     }))
+                    .when(animated_avatar, |d| {
+                        d.on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                            if *hovered {
+                                this.media.hovered_message = Some(hover_id.clone());
+                            } else if this.media.hovered_message.as_ref() == Some(&hover_id) {
+                                // Only this row's own leave: another row may have
+                                // taken over already (hover changes come in paint order).
+                                this.media.hovered_message = None;
+                            }
+                            cx.notify();
+                        }))
+                    })
                     .children(reply)
                     .child(main)
                     .children(actions),
@@ -383,7 +402,10 @@ impl Inlet {
                 .child(name())
                 .child(body)
         } else {
-            let side = (!row.grouped).then(|| avatar(&row.author));
+            let side = (!row.grouped).then(|| {
+                let mine = self.my_avatar(cx);
+                self.user_avatar(mine.as_ref(), &row.author, AVATAR_COLUMN, false, cx)
+            });
             div()
                 .flex()
                 .flex_row()
@@ -414,27 +436,6 @@ impl Inlet {
             )
             .into_any_element()
     }
-}
-
-/// The initials circle in the avatar column (images arrive with the media work).
-fn avatar(name: &str) -> gpui::Div {
-    div()
-        .size(px(AVATAR_COLUMN))
-        .rounded_full()
-        .bg(theme::guild_item())
-        .flex()
-        .items_center()
-        .justify_center()
-        .text_size(px(14.))
-        .font_weight(FontWeight::MEDIUM)
-        .text_color(theme::text_muted())
-        .child(
-            Guild {
-                id: String::new(),
-                name: name.to_string(),
-            }
-            .initials(),
-        )
 }
 
 /// The BOT, SYSTEM or OP tag after a name.
