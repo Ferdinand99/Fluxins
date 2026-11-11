@@ -43,6 +43,9 @@ const MAX_KNOWN_ANIMATIONS: usize = 512;
 /// Shortest wait before a redraw for the next frame (50 frames a second at most, as
 /// browsers clamp GIF delays).
 const MIN_FRAME_GAP: Duration = Duration::from_millis(20);
+/// Frames due this soon are shown now, so animations whose frames change at nearly
+/// the same time share one redraw.
+const LOOKAHEAD: Duration = Duration::from_millis(8);
 /// The key of the media settings in `settings.json`.
 const SETTINGS_KEY: &str = "media";
 
@@ -139,6 +142,10 @@ pub struct AnimationBudget {
     /// The window has the focus.
     active: bool,
     frame: u64,
+    /// Every animation counts its frames from this time (the first frame of the
+    /// session), so animations with the same frame lengths change frames together and
+    /// share their redraws.
+    epoch: Option<Instant>,
     /// Where each image drawn last frame is in its animation. Images that show the
     /// same animation share one (they move together).
     players: HashMap<ImageId, Player>,
@@ -165,11 +172,20 @@ impl AnimationBudget {
             playing: 0,
             active: true,
             frame: 0,
+            epoch: None,
             players: HashMap::new(),
             wake: None,
             scheduled: None,
             prefs: MotionPrefs::default(),
         }
+    }
+
+    /// Forgets the last session's animations (sizes by URL, players, the redraw asked
+    /// for), on sign-out or an account switch. The settings stay.
+    pub fn reset(&mut self) {
+        let prefs = self.prefs;
+        *self = Self::new(self.budget);
+        self.prefs = prefs;
     }
 
     /// A new frame: nothing plays yet. `active` is whether the window has the focus;
@@ -179,6 +195,7 @@ impl AnimationBudget {
         self.playing = 0;
         self.wake = None;
         self.frame += 1;
+        self.epoch.get_or_insert(now);
         if active != self.active {
             self.active = active;
             for p in self.players.values_mut() {
@@ -240,9 +257,9 @@ impl AnimationBudget {
             return 0;
         }
         self.playing += 1;
-        let (frame, active) = (self.frame, self.active);
+        let (frame, active, epoch) = (self.frame, self.active, self.epoch);
         let player = self.players.entry(id).or_insert_with(|| {
-            let mut playback = Playback::new(delays(), now);
+            let mut playback = Playback::new(delays(), epoch.unwrap_or(now));
             if !active {
                 playback.pause(now);
             }
@@ -252,9 +269,10 @@ impl AnimationBudget {
             }
         });
         player.used = frame;
-        let shown = player.playback.frame_at(now);
-        if let Some(next) = player.playback.time_to_next_frame(now) {
-            let at = now + next.max(MIN_FRAME_GAP);
+        let soon = now + LOOKAHEAD;
+        let shown = player.playback.frame_at(soon);
+        if let Some(next) = player.playback.time_to_next_frame(soon) {
+            let at = soon + next.max(MIN_FRAME_GAP);
             self.wake = Some(self.wake.map_or(at, |w| w.min(at)));
         }
         shown
@@ -452,7 +470,8 @@ mod tests {
         let back = t0 + ms(7_200_000);
         b.next_frame(true, back);
         assert_eq!(b.frame_to_draw(id, Motion::Gif, three, back), 1);
-        assert_eq!(b.wake(), Some(back + ms(50)));
+        // It stopped 58 ms into the frame (frames due within 8 ms show early).
+        assert_eq!(b.wake(), Some(back + ms(42)));
         b.next_frame(true, back + ms(60));
         assert_eq!(b.frame_to_draw(id, Motion::Gif, three, back + ms(60)), 2);
     }
@@ -492,6 +511,46 @@ mod tests {
     }
 
     #[test]
+    fn animations_of_the_same_pace_share_their_redraws() {
+        let t0 = Instant::now();
+        let mut b = AnimationBudget::default();
+        let pace = || vec![ms(90); 8];
+        b.next_frame(true, t0);
+        // Thirty animations that show up at different times over the first second.
+        let mut now = t0;
+        let mut redraws = 0;
+        let end = t0 + ms(3_000);
+        while now < end {
+            b.next_frame(true, now);
+            let shown = ((now - t0).as_millis() / 33).min(30) as usize;
+            for n in 0..shown {
+                b.frame_to_draw(ImageId(n), Motion::Emoji, pace, now);
+            }
+            redraws += 1;
+            // The next redraw: when asked for, else the next one an image load causes.
+            now = b.wake().unwrap_or(now + ms(33)).max(now + ms(1));
+        }
+        // After the first second they all change frames together: about one redraw per
+        // 90 ms frame, not one per animation.
+        assert!(redraws <= 30 + 3_000 / 90 + 2, "{redraws} redraws");
+    }
+
+    #[test]
+    fn an_account_switch_forgets_the_last_sessions_animations() {
+        let t0 = Instant::now();
+        let mut b = AnimationBudget::default();
+        b.prefs.animate_stickers = false;
+        b.next_frame(true, t0);
+        b.remember(&req(1), 5);
+        b.frame_to_draw(ImageId(1), Motion::Gif, three, t0);
+        b.reset();
+        assert!(b.known.is_empty());
+        assert!(b.players.is_empty());
+        assert_eq!(b.wake(), None);
+        assert!(!b.prefs.animate_stickers, "the settings stay");
+    }
+
+    #[test]
     fn animated_emoji_setting_off_shows_the_first_frame() {
         let t0 = Instant::now();
         let mut b = AnimationBudget::default();
@@ -508,10 +567,10 @@ mod tests {
         assert_eq!(b.playing(), 0);
         // Other kinds still move.
         b.next_frame(true, t0 + ms(2_000));
-        b.frame_to_draw(ImageId(2), Motion::Gif, three, t0 + ms(2_000));
-        assert_eq!(
+        let before = b.frame_to_draw(ImageId(2), Motion::Gif, three, t0 + ms(2_000));
+        assert_ne!(
             b.frame_to_draw(ImageId(2), Motion::Gif, three, t0 + ms(2_150)),
-            1
+            before
         );
 
         // The setting lives in settings.json next to the other settings.

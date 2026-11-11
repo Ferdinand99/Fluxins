@@ -82,19 +82,6 @@ scene 18-image-viewer image-viewer c-attachments
 scene 19-chat-reactions chat-reactions c-general
 scene 20-chat-menu chat-menu c-general
 scene 21-chat-delete chat-delete c-general
-scene 22-custom-emoji custom-emoji c-dev
-# 100 animated custom emoji: the CPU the app takes over 10 s, as a share of one core.
-RUST_LOG=info INLET_DEMO=1 INLET_DEMO_LIVE_SECS=3600 INLET_DEMO_SCENE=emoji-100 INLET_DEMO_GUILD=g1 INLET_DEMO_CHANNEL=c-dev "$bin" >"$out/emoji-100.log" 2>&1 &
-pid=$!
-sleep 6
-# Without a window manager nothing has the focus (and animations stop): give it.
-xdotool windowfocus "$(win)" 2>/dev/null; sleep 1
-cpu() { awk '{print $14 + $15}' "/proc/$pid/stat" 2>/dev/null || echo 0; }
-c0=$(cpu); sleep 10; c1=$(cpu)
-echo "23-emoji-100: cpu $(( (c1 - c0) * 100 / $(getconf CLK_TCK) / 10 )) % of one core over 10 s" >> "$out/memory.txt"
-shot 23-emoji-100
-echo "23-emoji-100: $(grep -E 'VmRSS|VmHWM' /proc/$pid/status | paste -sd ' ')" >> "$out/memory.txt"
-kill $pid; wait $pid 2>/dev/null
 
 # 6. The Desktop settings tab, and the prompt a link from outside opens.
 INLET_DEMO=1 INLET_DEMO_LIVE_SECS=3600 INLET_DEMO_GUILD=g1 INLET_DEMO_CHANNEL=c-general INLET_DEMO_SETTINGS=desktop "$bin" >>"$out/demo.log" 2>&1 &
@@ -106,6 +93,26 @@ INLET_DEMO=1 INLET_DEMO_LIVE_SECS=3600 INLET_DEMO_GUILD=g1 INLET_DEMO_CHANNEL=c-
 pid=$!
 sleep 6
 shot 15-link-prompt
+kill $pid; wait $pid 2>/dev/null
+
+# 7. Several accounts: the account switcher (two more accounts in the background, one
+#    on another instance) and the sign-in screen when adding one.
+scene 22-accounts accounts c-general
+scene 23-accounts-add accounts-add c-general
+
+# 8. Custom emoji and stickers; 100 animated custom emoji.
+scene 24-custom-emoji custom-emoji c-dev
+# 100 animated custom emoji: the CPU the app takes over 10 s, as a share of one core.
+RUST_LOG=info INLET_DEMO=1 INLET_DEMO_LIVE_SECS=3600 INLET_DEMO_SCENE=emoji-100 INLET_DEMO_GUILD=g1 INLET_DEMO_CHANNEL=c-dev "$bin" >"$out/emoji-100.log" 2>&1 &
+pid=$!
+sleep 6
+# Without a window manager nothing has the focus (and animations stop): give it.
+xdotool windowfocus "$(win)" 2>/dev/null; sleep 1
+cpu() { awk '{print $14 + $15}' "/proc/$pid/stat" 2>/dev/null || echo 0; }
+c0=$(cpu); sleep 10; c1=$(cpu)
+echo "25-emoji-100: cpu $(( (c1 - c0) * 100 / $(getconf CLK_TCK) / 10 )) % of one core over 10 s" >> "$out/memory.txt"
+shot 25-emoji-100
+echo "25-emoji-100: $(grep -E 'VmRSS|VmHWM' /proc/$pid/status | paste -sd ' ')" >> "$out/memory.txt"
 kill $pid; wait $pid 2>/dev/null
 
 tail -n 20 "$out/signin.log" "$out/demo.log" >&2

@@ -70,6 +70,10 @@ image-webp = { version = "0.2", optional = true }
 gpui = { workspace = true, features = ["test-support"] }
 # Mock server for the acknowledgement, settings and composer send tests.
 wiremock = "0.6"
+# A mock gateway (WebSocket) for the background account test; the versions the
+# protocol crate already uses.
+tokio = { version = "1", features = ["net", "test-util"] }
+tokio-tungstenite = { version = "0.26", default-features = false, features = ["handshake"] }
 # Reads the catalogue files in the i18n tests (same version fluent-bundle uses).
 fluent-syntax = "0.12"
 # Writes WebP test pictures (stickers).

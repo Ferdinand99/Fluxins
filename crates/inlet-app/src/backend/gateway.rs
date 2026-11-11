@@ -3,20 +3,38 @@
 //! events to the UI while keeping the guild and channel caches current.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use inlet_protocol as p;
 use tokio::task::AbortHandle;
 
+use super::accounts::BACKGROUND_IGNORED_EVENTS;
 use super::messages::parse::{
     remember_channels, remember_roles, to_channel, to_message, ChannelCache, SharedNames,
 };
-use super::{accounts, composer, messages, Active, Backend, Internal, Ui};
+use super::{accounts, composer, messages, Backend, Internal, RealActive, Ui};
 use crate::model::{self, Channel, Guild};
 use crate::reconnect::{Decision, Stop};
 
+/// The gateway settings of an account: a background account does not ask for typing
+/// events (and has no active guild, see `accounts`).
+pub fn gateway_options(background: bool) -> p::GatewayOptions {
+    let mut options = p::GatewayOptions::default();
+    if background {
+        options.ignored_events = BACKGROUND_IGNORED_EVENTS
+            .iter()
+            .map(|e| (*e).to_string())
+            .collect();
+    }
+    options
+}
+
 impl Backend {
+    /// Starts the gateway of an account. `background` picks its options; the task reads
+    /// `foreground` for every event, so the account can change role while it runs.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn spawn_gateway(
         &self,
         gen: u64,
@@ -24,12 +42,17 @@ impl Backend {
         guilds: &Arc<Mutex<Vec<Guild>>>,
         cache: &ChannelCache,
         names: &SharedNames,
+        events: &Ui,
+        foreground: &Arc<AtomicBool>,
+        composer: &composer::State,
+        background: bool,
     ) -> (p::GatewayHandle, AbortHandle) {
-        let (gateway, rx) = session.connect_gateway(p::GatewayOptions::default());
-        let events = self.events.clone();
+        let (gateway, rx) = session.connect_gateway(gateway_options(background));
+        let events = events.clone();
         let internal = self.internal.clone();
         let (guilds, cache, names) = (guilds.clone(), cache.clone(), names.clone());
-        let composer = self.composer.clone();
+        let foreground = foreground.clone();
+        let composer = composer.clone();
         let forward = self.spawn_guarded("gateway", Some(gen), async move {
             let on_connected = {
                 let internal = internal.clone();
@@ -37,34 +60,43 @@ impl Backend {
                     let _ = internal.send(Internal::GatewayConnected { gen });
                 }
             };
-            let end =
-                forward_gateway(rx, events, guilds, cache, names, composer, on_connected).await;
+            let end = forward_gateway(
+                rx,
+                events,
+                guilds,
+                cache,
+                names,
+                foreground,
+                composer,
+                on_connected,
+            )
+            .await;
             let _ = internal.send(Internal::GatewayEnded { gen, end });
         });
         (gateway, forward)
     }
 
-    /// The gateway of the active session stopped: restart it later, or ask the user.
+    /// The gateway of an account stopped: restart it later, or (for the active account)
+    /// ask the person.
     pub(super) fn gateway_stopped(&mut self, gen: u64, stop: Stop) {
-        let Some(Active::Real(r)) = &mut self.active else {
+        let Some(r) = self.engine_mut(gen) else {
             return;
         };
-        if r.gen != gen {
-            return;
-        }
         r.gateway.close();
         r.forward.abort();
+        let events = r.events.clone();
         match r.policy.on_stop(stop, Instant::now()) {
             Decision::RestartAfter(delay) => {
-                self.emit(accounts::Ev::Status(t!(
+                let _ = events.unbounded_send(accounts::Ev::Status(t!(
                     "status-reconnecting-in",
                     seconds = delay.as_secs()
                 )));
                 self.schedule_restart(gen, delay);
             }
             Decision::WaitForUser(message) => {
-                self.emit(accounts::Ev::Status(t!("status-disconnected")));
-                self.emit(accounts::Ev::GatewayDown(message));
+                r.down = true;
+                let _ = events.unbounded_send(accounts::Ev::Status(t!("status-disconnected")));
+                let _ = events.unbounded_send(accounts::Ev::GatewayDown(message));
             }
         }
     }
@@ -75,31 +107,53 @@ impl Backend {
             tokio::time::sleep(delay).await;
             let _ = internal.send(Internal::GatewayRestart { gen });
         });
-        if let Some(Active::Real(r)) = &mut self.active {
+        if let Some(r) = self.engine_mut(gen) {
             if let Some(old) = r.restart_timer.replace(timer) {
                 old.abort();
             }
+        } else {
+            timer.abort();
         }
     }
 
-    pub(super) fn restart_gateway(&mut self) {
-        let Some(Active::Real(r)) = &self.active else {
+    /// Starts the gateway of session `gen` again, with the options of its current role.
+    pub(super) fn restart_gateway(&mut self, gen: u64) {
+        let Some(r) = self.engine(gen) else {
             return;
         };
         r.forward.abort();
         r.gateway.close();
-        let (gateway, forward) =
-            self.spawn_gateway(r.gen, &r.session, &r.guilds, &r.cache, &r.names);
+        let background = !r.is_foreground();
+        let (gateway, forward) = self.spawn_gateway(
+            r.gen,
+            &r.session,
+            &r.guilds,
+            &r.cache,
+            &r.names,
+            &r.events,
+            &r.foreground,
+            &r.composer,
+            background,
+        );
         // A new gateway handle does not know the guild on screen yet.
-        if let Some(guild) = &r.active_guild {
+        if let Some(guild) = r.active_guild.as_ref().filter(|_| !background) {
             gateway.set_guild_active(guild, true);
         }
-        if let Some(Active::Real(r)) = &mut self.active {
+        if let Some(r) = self.engine_mut(gen) {
             r.gateway = gateway;
             r.forward = forward;
             r.restart_timer = None;
+            r.ignores_typing = background;
+            r.down = false;
             r.policy.started(Instant::now());
         }
+    }
+}
+
+impl RealActive {
+    /// Whether this account is the active one.
+    pub(super) fn is_foreground(&self) -> bool {
+        self.foreground.load(Ordering::Relaxed)
     }
 }
 
@@ -151,12 +205,18 @@ pub fn close_message(reason: &p::CloseReason) -> Option<String> {
 
 /// Forwards gateway events to the UI and keeps the guild and channel caches current.
 /// `connected` is called on every READY/RESUMED. Returns how the gateway stopped.
+///
+/// While `foreground` is false (a background account) the caches are still kept, but
+/// messages are not rendered, typing events are dropped, and no channel or guild lists
+/// go to the UI: only the events its account state needs for unread counts.
+#[allow(clippy::too_many_arguments)]
 pub async fn forward_gateway(
     mut rx: tokio::sync::mpsc::Receiver<p::GatewayEvent>,
     events: Ui,
     guilds: Arc<Mutex<Vec<Guild>>>,
     cache: ChannelCache,
     names: SharedNames,
+    foreground: Arc<AtomicBool>,
     composer: composer::State,
     connected: impl Fn(),
 ) -> GatewayEnd {
@@ -204,6 +264,10 @@ pub async fn forward_gateway(
                 send!(accounts::Ev::Status(text));
             }
             p::GatewayEvent::Dispatch { event, .. } => {
+                let fg = foreground.load(Ordering::Relaxed);
+                if !fg && matches!(event, p::Dispatch::TypingStart(_)) {
+                    continue;
+                }
                 let mut reconnected = false;
                 // Messages the event carries, converted and parsed here, off the UI thread.
                 let mut rendered = Vec::new();
@@ -234,11 +298,30 @@ pub async fn forward_gateway(
                             cache.keys().cloned().collect()
                         };
                         lists.extend(keys);
+                        // The guild list of an account restored without REST (background)
+                        // comes from READY.
+                        let mut list = guilds.lock().unwrap();
+                        let before = list.len();
+                        for g in &ready.guilds {
+                            if g.unavailable || list.iter().any(|x| x.id == g.id) {
+                                continue;
+                            }
+                            if let Some(name) = g.name() {
+                                list.push(Guild {
+                                    id: g.id.clone(),
+                                    name: model::clean_name(name),
+                                });
+                            }
+                        }
+                        if list.len() != before {
+                            guild_list = Some(list.clone());
+                        }
+                        drop(list);
                         // Messages may have been missed while disconnected.
                         reconnected = ready_seen;
                         ready_seen = true;
                     }
-                    p::Dispatch::MessageCreate(m) | p::Dispatch::MessageUpdate(m) => {
+                    p::Dispatch::MessageCreate(m) | p::Dispatch::MessageUpdate(m) if fg => {
                         rendered.push(to_message(m, &names));
                     }
                     p::Dispatch::ChannelCreate(c) | p::Dispatch::ChannelUpdate(c) => {
@@ -295,6 +378,9 @@ pub async fn forward_gateway(
                     dispatch: Box::new(event),
                     rendered,
                 });
+                if !fg {
+                    continue;
+                }
                 for key in lists {
                     channels_event(key);
                 }

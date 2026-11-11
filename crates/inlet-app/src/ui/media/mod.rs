@@ -172,6 +172,11 @@ impl State {
     pub fn reset(&mut self) {
         self.viewer = None;
         self.images.clear();
+        // What the animations of the last session knew (their URLs, sizes, players) goes
+        // too; the settings stay. Custom emoji and stickers live in the session's image
+        // client, cleared below. Twemoji are the bundled drawings, the same for every
+        // account, so they stay.
+        self.images.animations().borrow_mut().reset();
         if let Some(setup) = self.setup.take() {
             setup.client.clear_memory();
             self.pending_drop.extend(setup.evicted.drain());
