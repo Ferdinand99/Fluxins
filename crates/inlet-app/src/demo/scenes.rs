@@ -55,6 +55,9 @@
 //!   the guild (see `search.rs`).
 //! - `quick-switcher`: for `#general`, the quick switcher open over the accounts of
 //!   `accounts` (their channels with mentions and unread messages).
+//! - `media-errors`: the DM with Ada holds GIFs that cannot be shown (a proxy that does
+//!   not answer, a file that does not decode, a host Inlet does not load from), each as
+//!   a tile with its reason, and a GIF page that only has a video (see `media.rs`).
 //!
 //! `INLET_DEMO_SCENE` may also name a scene file of the visual checks
 //! (`tests/visual/scenes/*.toml`, see `scene_file.rs`): it then sets the scene, the guild,
@@ -116,6 +119,7 @@ pub enum Scene {
     ProfilePopout,
     SearchResults,
     QuickSwitcher,
+    MediaErrors,
 }
 
 impl Scene {
@@ -159,6 +163,7 @@ impl Scene {
             "profile-popout" => Scene::ProfilePopout,
             "search-results" => Scene::SearchResults,
             "quick-switcher" => Scene::QuickSwitcher,
+            "media-errors" => Scene::MediaErrors,
             _ => return None,
         })
     }
@@ -400,6 +405,9 @@ pub fn data(scene: Scene) -> Data {
         Scene::Emoji100 => {
             by_name.insert(markdown::SCENE_CHANNEL.into(), emoji::hundred());
         }
+        Scene::MediaErrors => {
+            by_name.insert("dm-ada".into(), media::dm_errors());
+        }
         _ => {}
     }
     super::inbox::add(&mut by_name);
@@ -567,6 +575,7 @@ mod tests {
             "profile-popout",
             "search-results",
             "quick-switcher",
+            "media-errors",
         ] {
             let scene = Scene::from_name(name).expect(name);
             let data = data(scene);
