@@ -160,6 +160,8 @@ pub struct State {
     timer: Option<AbortHandle>,
 }
 
+/// Sends the ops. Called with the pacer locked: gateway commands only go into the
+/// gateway's queue (they never wait), and the lock keeps sends in pacer order.
 fn run(ops: Vec<Op<p::GatewayHandle>>) {
     for op in ops {
         match op {
@@ -183,12 +185,12 @@ impl State {
         if let Some(t) = self.timer.take() {
             t.abort();
         }
-        let ops = {
-            let mut p = self.pacer.lock().unwrap_or_else(|e| e.into_inner());
-            p.timer = false;
-            p.stop()
-        };
-        run(ops);
+        // The ops go out under the lock, as the timer's do: a timer that woke just
+        // before this stop has either sent its subscription already (and this
+        // unsubscribes it) or finds nothing left to send.
+        let mut p = self.pacer.lock().unwrap_or_else(|e| e.into_inner());
+        p.timer = false;
+        run(p.stop());
     }
 }
 
@@ -239,9 +241,7 @@ pub(super) fn handle(backend: &mut Backend, cmd: Cmd) {
     let mut p = shared.lock().unwrap_or_else(|e| e.into_inner());
     let due = p.want(wish, now);
     if due <= now {
-        let ops = p.flush(now);
-        drop(p);
-        run(ops);
+        run(p.flush(now));
         return;
     }
     if p.timer {
@@ -253,12 +253,10 @@ pub(super) fn handle(backend: &mut Backend, cmd: Cmd) {
     let pacer = shared.clone();
     let task = backend.spawn_guarded("member list", None, async move {
         tokio::time::sleep_until(due).await;
-        let ops = {
-            let mut p = pacer.lock().unwrap_or_else(|e| e.into_inner());
-            p.timer = false;
-            p.flush(Instant::now())
-        };
-        run(ops);
+        // Sent under the lock, so a `stop` cannot come between the flush and the send.
+        let mut p = pacer.lock().unwrap_or_else(|e| e.into_inner());
+        p.timer = false;
+        run(p.flush(Instant::now()));
     });
     backend.social.members.timer = Some(task);
 }

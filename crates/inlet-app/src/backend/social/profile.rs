@@ -14,7 +14,7 @@
 //!   waiting or running: at most 2 profiles (4 requests) a second however fast the
 //!   person clicks through the member list.
 //! - A note is saved only when its text changed, when the field is left or Enter is
-//!   pressed: one `PUT` per change.
+//!   pressed: one `PUT` per change, one at a time ([`NoteQueue`]), the newest text last.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -197,11 +197,54 @@ impl Profile {
     }
 }
 
-/// The profile part of the backend: the fetch on its way and when the last started.
+/// Notes waiting to be saved: the newest text per account session and person, and
+/// whether a writer runs. One writer saves them one at a time, so two saves of the
+/// same note never race and the newest text is always the last one sent.
+#[derive(Debug)]
+pub struct NoteQueue<T> {
+    pending: Vec<((u64, String), T)>,
+    running: bool,
+}
+
+impl<T> Default for NoteQueue<T> {
+    fn default() -> Self {
+        NoteQueue {
+            pending: Vec::new(),
+            running: false,
+        }
+    }
+}
+
+impl<T> NoteQueue<T> {
+    /// Queues a save (it replaces one of the same note not sent yet). Returns whether
+    /// a writer must start.
+    pub fn push(&mut self, gen: u64, user: String, job: T) -> bool {
+        let key = (gen, user);
+        self.pending.retain(|(k, _)| *k != key);
+        self.pending.push((key, job));
+        !std::mem::replace(&mut self.running, true)
+    }
+
+    /// The next save for the writer, or `None` (and the writer stops).
+    pub fn next(&mut self) -> Option<((u64, String), T)> {
+        if self.pending.is_empty() {
+            self.running = false;
+            return None;
+        }
+        Some(self.pending.remove(0))
+    }
+}
+
+/// One note to save, with its account's client and event sender.
+type NoteJob = (p::Client, crate::backend::Ui, String);
+
+/// The profile part of the backend: the fetch on its way and when the last started,
+/// and the notes waiting to be saved.
 #[derive(Default)]
 pub struct State {
     fetch: Option<AbortHandle>,
     last_start: Arc<tokio::sync::Mutex<Option<Instant>>>,
+    notes: Arc<std::sync::Mutex<NoteQueue<NoteJob>>>,
 }
 
 impl State {
@@ -284,12 +327,28 @@ pub(super) fn handle(backend: &mut Backend, cmd: Cmd) {
         }
         Cmd::SetNote { user_id, note } => {
             let note: String = note.chars().take(MAX_NOTE_CHARS).collect();
+            let queue = backend.social.profile.notes.clone();
+            let start = queue.lock().unwrap_or_else(|e| e.into_inner()).push(
+                gen,
+                user_id,
+                (client, events, note),
+            );
+            if !start {
+                // The running writer saves it after the save on its way.
+                return;
+            }
             backend.spawn_guarded("note", None, async move {
-                let value = Some(note.as_str()).filter(|n| !n.trim().is_empty());
-                if let Err(err) = client.set_note(&user_id, value).await {
-                    let reason = reason(&internal, gen, err);
-                    let _ = events
-                        .unbounded_send(super::Ev::Profile(Ev::NoteFailed { user_id, reason }));
+                loop {
+                    let next = queue.lock().unwrap_or_else(|e| e.into_inner()).next();
+                    let Some(((gen, user_id), (client, events, note))) = next else {
+                        break;
+                    };
+                    let value = Some(note.as_str()).filter(|n| !n.trim().is_empty());
+                    if let Err(err) = client.set_note(&user_id, value).await {
+                        let reason = reason(&internal, gen, err);
+                        let _ = events
+                            .unbounded_send(super::Ev::Profile(Ev::NoteFailed { user_id, reason }));
+                    }
                 }
             });
         }
@@ -350,6 +409,29 @@ mod tests {
         // Without a guild the account's banner and bio show.
         let plain = Profile::of(&full, None, None);
         assert_eq!(plain.banner.unwrap().guild_id, None);
+    }
+
+    /// Two saves of the same note never run at once, and the newest text is sent last:
+    /// one writer works through the queue, and a text not sent yet is replaced.
+    #[test]
+    fn note_saves_go_one_at_a_time_and_the_newest_wins() {
+        let mut q = NoteQueue::default();
+        // The first save starts the writer; it takes the job.
+        assert!(q.push(1, "5".into(), "a"));
+        assert_eq!(q.next(), Some(((1, "5".into()), "a")));
+        // While "a" is on its way, two more saves of the note: no second writer, and
+        // only the newest waits.
+        assert!(!q.push(1, "5".into(), "b"));
+        assert!(!q.push(1, "5".into(), "c"));
+        // Another person's note and the same person's in another session wait too.
+        assert!(!q.push(1, "6".into(), "x"));
+        assert!(!q.push(2, "5".into(), "y"));
+        assert_eq!(q.next(), Some(((1, "5".into()), "c")));
+        assert_eq!(q.next(), Some(((1, "6".into()), "x")));
+        assert_eq!(q.next(), Some(((2, "5".into()), "y")));
+        // Empty: the writer stops, and the next save starts a new one.
+        assert_eq!(q.next(), None);
+        assert!(q.push(1, "5".into(), "d"));
     }
 
     #[tokio::test(start_paused = true)]
