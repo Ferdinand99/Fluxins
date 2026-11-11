@@ -58,6 +58,9 @@ pub enum Motion {
     Sticker,
 }
 
+// Deviation: with animated emoji (or stickers) off, Fluxer still plays one while the
+// pointer is over it; here it always shows its first frame and only the still is
+// fetched. A 33rd animation on screen shows its first frame (Fluxer has no such cap).
 /// The media settings, under `"media"` in `settings.json`. As in Fluxer, animated
 /// emoji and stickers move by default.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
