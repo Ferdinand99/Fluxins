@@ -60,6 +60,28 @@ fn the_dm_list_is_pinned_first_then_newest_activity_first() {
 }
 
 #[test]
+fn a_new_friendship_lifts_its_dm_and_a_request_does_not() {
+    let at = |ms: u64| (ms << 22).to_string();
+    // The friendship began 2026-01-01, long after both DMs' last messages.
+    let since = "2026-01-01T00:00:00.000Z";
+    let s = state_with(
+        json!([
+            {"id": at(10), "type": 1, "last_message_id": at(100),
+             "recipients": [{"id": "61", "username": "friend"}]},
+            {"id": at(20), "type": 1, "last_message_id": at(200),
+             "recipients": [{"id": "62", "username": "other"}]},
+            {"id": at(30), "type": 1, "last_message_id": at(150),
+             "recipients": [{"id": "63", "username": "asked"}]},
+        ]),
+        json!({"relationships": [
+            {"id": "61", "type": 1, "since": since},
+            {"id": "63", "type": 3, "since": since},
+        ]}),
+    );
+    assert_eq!(order(&s), [at(10), at(20), at(30)]);
+}
+
+#[test]
 fn group_dm_recipients_follow_the_events() {
     let mut s = state_with(
         json!([{"id": "300", "type": 3, "recipients": [{"id": "61", "username": "a"}]}]),

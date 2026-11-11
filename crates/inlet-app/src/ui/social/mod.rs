@@ -50,6 +50,13 @@ pub struct State {
     pub dm_menu: Option<DmMenu>,
     /// A question before a lasting action (remove a friend, block, leave a group).
     pub confirm: Option<Confirm>,
+    /// DMs this client is closing: their deletion is not reported as a lost channel.
+    pub closing: HashSet<String>,
+    /// The DM last open in the DM list, which the DM list opens again (Fluxer's home
+    /// button), until the Friends row is picked.
+    pub last_dm: Option<String>,
+    /// The DM list's rows, until something they show changes (see `dm_rows_changed`).
+    pub dm_rows: Option<Vec<crate::ui::sidebar::dm_list::DmRow>>,
     /// Input in the window ends "away" at once.
     _input: Option<Subscription>,
 }
@@ -95,6 +102,9 @@ impl State {
     /// Another account is shown: the friend and DM windows, their waiting calls and the
     /// last failure were the old account's.
     pub fn close_windows(&mut self) {
+        self.closing.clear();
+        self.last_dm = None;
+        self.dm_rows = None;
         self.busy.clear();
         self.notice = None;
         self.add_friend = None;
@@ -281,9 +291,65 @@ impl Inlet {
         cx.notify();
     }
 
+    /// The channel as the account state knows it (the server's own type and data).
+    pub(crate) fn state_channel(
+        &self,
+        channel: ChannelId,
+        cx: &gpui::App,
+    ) -> Option<Box<inlet_protocol::Channel>> {
+        let state = self.account.as_ref()?.read(cx);
+        state.channel(channel).cloned().map(Box::new)
+    }
+
+    /// Closes a DM or leaves a group DM. Nothing is sent for a channel the state does
+    /// not know; the protocol refuses anything but a DM or group DM.
+    pub(crate) fn close_dm(&mut self, channel: ChannelId, cx: &mut Context<Self>) {
+        let Some(ch) = self.state_channel(channel, cx) else {
+            return;
+        };
+        // Its CHANNEL_DELETE closes it quietly (no "was deleted" line).
+        self.social.closing.insert(channel.to_string());
+        self.social_action(rel::Cmd::CloseDm { channel: ch }, cx);
+    }
+
+    /// Renames a group DM or changes its icon.
+    pub(crate) fn edit_group_dm(
+        &mut self,
+        channel: ChannelId,
+        name: Option<Option<String>>,
+        icon: Option<rel::Icon>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ch) = self.state_channel(channel, cx) else {
+            return;
+        };
+        self.social_action(
+            rel::Cmd::EditGroupDm {
+                channel: ch,
+                name,
+                icon,
+            },
+            cx,
+        );
+    }
+
     /// Whether the call named `key` runs.
     pub(crate) fn social_busy(&self, key: &str) -> bool {
         self.social.busy.contains(key)
+    }
+
+    /// The DM list's rows are worked out again when channels, read states (a new message
+    /// moves a DM up), relationships, presences or users change.
+    pub(crate) fn dm_rows_changed(&mut self, changes: &inlet_state::Changes) {
+        if changes.reset
+            || !changes.channels.is_empty()
+            || changes.read_state
+            || changes.relationships
+            || changes.presence
+            || changes.users
+        {
+            self.social.dm_rows = None;
+        }
     }
 
     /// Whether the friends page fills the middle: the DM list is up and no DM is open.
@@ -295,6 +361,7 @@ impl Inlet {
 
     /// The Friends row: the friends page shows, and the open DM closes.
     pub(crate) fn show_friends(&mut self, cx: &mut Context<Self>) {
+        self.social.last_dm = None;
         if self.selected_guild.is_some() {
             self.select_guild(None, cx);
             return;
@@ -388,8 +455,11 @@ impl Inlet {
                     self.add_friend_failed(reason);
                 } else if let Some(w) = self.social.group_dm.as_mut().filter(|w| w.key() == key) {
                     w.message = Some(reason);
-                } else {
+                } else if self.friends_page_shown() {
                     self.social.notice = Some(reason);
+                } else {
+                    // A DM is open: the line over the chat says it.
+                    self.chat.notice = Some(reason);
                 }
             }
             rel::Ev::GroupDm { key, result } => {
@@ -412,6 +482,35 @@ impl Inlet {
         cx.notify();
     }
 
+    /// Opens the DM with `user`: the one the account state has, or a new one (Fluxer
+    /// sends nothing when the DM is already there).
+    pub(crate) fn open_dm_with(
+        &mut self,
+        user: UserId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let existing = self.account.as_ref().and_then(|a| {
+            a.read(cx)
+                .dm_list()
+                .into_iter()
+                .find(|c| {
+                    c.kind == inlet_protocol::models::channel_type::DM
+                        && c.recipients.first().and_then(|u| UserId::parse(&u.id)) == Some(user)
+                })
+                .cloned()
+        });
+        match existing {
+            Some(channel) => self.open_dm_channel(&channel, window, cx),
+            None => self.social_action(
+                rel::Cmd::OpenDm {
+                    user_id: user.to_string(),
+                },
+                cx,
+            ),
+        }
+    }
+
     /// Shows a DM the backend just opened or created: the state and the DM list learn
     /// it now (the gateway's CHANNEL_CREATE comes too, and changes nothing more).
     pub(crate) fn open_dm_channel(
@@ -425,6 +524,7 @@ impl Inlet {
             account.update(cx, |s, _| s.apply(&create));
         }
         let shown = backend::messages::parse::to_channel(channel);
+        self.social.dm_rows = None;
         if self.selected_guild.is_none() {
             if !self.channels.iter().any(|c| c.id == shown.id) {
                 self.channels.push(shown.clone());
@@ -479,6 +579,10 @@ impl Inlet {
         let mut out = Vec::new();
         if self.screen != Screen::Main {
             return out;
+        }
+        // The DM menu is drawn deferred: it goes when a link prompt opens over it.
+        if self.overlays.pending_link.is_some() || self.overlays.link_prompt.is_some() {
+            self.social.dm_menu = None;
         }
         if self.social.add_friend.is_some() {
             out.push(self.render_add_friend(cx));
@@ -603,19 +707,23 @@ impl Inlet {
                             .bg(theme::danger())
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.social.confirm = None;
-                                let cmd = match &action {
-                                    Confirm::RemoveFriend { user, .. } => rel::Cmd::Remove {
-                                        user_id: user.to_string(),
-                                    },
-                                    Confirm::Block { user, .. } => rel::Cmd::Block {
-                                        user_id: user.to_string(),
-                                    },
-                                    Confirm::LeaveGroup { channel, .. } => rel::Cmd::CloseDm {
-                                        channel_id: channel.to_string(),
-                                        kind: inlet_protocol::models::channel_type::GROUP_DM,
-                                    },
-                                };
-                                this.social_action(cmd, cx);
+                                match &action {
+                                    Confirm::RemoveFriend { user, .. } => this.social_action(
+                                        rel::Cmd::Remove {
+                                            user_id: user.to_string(),
+                                        },
+                                        cx,
+                                    ),
+                                    Confirm::Block { user, .. } => this.social_action(
+                                        rel::Cmd::Block {
+                                            user_id: user.to_string(),
+                                        },
+                                        cx,
+                                    ),
+                                    Confirm::LeaveGroup { channel, .. } => {
+                                        this.close_dm(*channel, cx)
+                                    }
+                                }
                             })),
                     )
                     .into_any_element(),

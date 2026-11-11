@@ -9,8 +9,8 @@
 //! Bounded: at most [`MAX_RELATIONSHIPS`] people (the protocol keeps at most as many
 //! from one list) and [`MAX_PINNED_DMS`] pins. A block always finds room: when the map
 //! is full, it pushes out a record that is not a block. Each stored user is trimmed like
-//! every other cached user. The list is kept for an account in the background too: its
-//! incoming requests are a DM-list badge, and it is small.
+//! every other cached user. The list is kept for an account in the background too (its
+//! blocks keep its notifications quiet), with each user cut to its name and avatar.
 
 use std::collections::BTreeMap;
 
@@ -162,6 +162,16 @@ impl Relationships {
         changed
     }
 
+    /// The account went to the background: the stored users keep their names and
+    /// avatars, nothing more (the DM list's names and the blocks are what it needs).
+    pub fn trim_for_passive(&mut self) {
+        for p in self.people.values_mut() {
+            if let Some(u) = p.user.as_mut() {
+                u.extra.clear();
+            }
+        }
+    }
+
     /// Whether the account blocked `user`.
     pub fn is_blocked(&self, user: UserId) -> bool {
         self.kind(user) == Some(Kind::Blocked)
@@ -253,6 +263,30 @@ mod tests {
         // The same again changes nothing.
         let c = r.apply(&Dispatch::RelationshipUpdate(Box::new(rel("5", 1))));
         assert!(!c.relationships);
+    }
+
+    #[test]
+    fn a_passive_account_keeps_names_but_not_the_rest() {
+        let big: Relationship = serde_json::from_value(json!({
+            "id": "5", "type": 1,
+            "user": {"id": "5", "username": "ada", "bio": "x".repeat(8000)}
+        }))
+        .unwrap();
+        let mut r = Relationships::default();
+        r.apply(&Dispatch::RelationshipAdd(Box::new(big)));
+        assert!(!r
+            .get(UserId(5))
+            .unwrap()
+            .user
+            .as_ref()
+            .unwrap()
+            .extra
+            .is_empty());
+        r.trim_for_passive();
+        let u = r.get(UserId(5)).unwrap().user.as_ref().unwrap();
+        assert!(u.extra.is_empty());
+        assert_eq!(u.username, "ada");
+        assert_eq!(r.kind(UserId(5)), Some(Kind::Friend));
     }
 
     #[test]

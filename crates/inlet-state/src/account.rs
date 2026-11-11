@@ -722,6 +722,7 @@ impl AccountState {
             // A status pick still waiting is shown from the server's echo from now on.
             self.presences.drop_own_pending();
             self.users.set_cap(PASSIVE_MAX_USERS);
+            self.relationships.trim_for_passive();
         } else {
             self.presences.set_cap(MAX_PRESENCES);
             self.users.set_cap(MAX_USERS);
@@ -901,7 +902,13 @@ impl AccountState {
     /// none; a DM with a friend counts from when the friendship began, if later).
     /// Personal notes are not in it (the list shows them in their own row).
     pub fn dm_list(&self) -> Vec<&Channel> {
-        let pinned = self.relationships.pinned_dms();
+        let pinned: std::collections::HashMap<ChannelId, usize> = self
+            .relationships
+            .pinned_dms()
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (*c, i))
+            .collect();
         let mut v: Vec<(usize, u64, ChannelId, &Channel)> = self
             .channels
             .private()
@@ -910,7 +917,7 @@ impl AccountState {
                     && id.0 != self.me_id.0
             })
             .map(|(id, c)| {
-                let pin = pinned.iter().position(|p| *p == id).unwrap_or(usize::MAX);
+                let pin = pinned.get(&id).copied().unwrap_or(usize::MAX);
                 (pin, self.dm_sort_key(id, c), id, c)
             })
             .collect();

@@ -178,16 +178,18 @@ impl Inlet {
     }
 
     /// Create (or open the DM, with one friend picked), or add the picked friend.
-    fn group_dm_go(&mut self, cx: &mut Context<Self>) {
+    fn group_dm_go(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(w) = self.social.group_dm.as_mut() else {
             return;
         };
         let picked: Vec<String> = w.picked.iter().map(|u| u.to_string()).collect();
         let cmd = match (w.mode, picked.as_slice()) {
             (_, []) => return,
-            (Mode::Create, [one]) => Cmd::OpenDm {
-                user_id: one.clone(),
-            },
+            (Mode::Create, [_]) => {
+                let user = w.picked[0];
+                self.social.group_dm = None;
+                return self.open_dm_with(user, window, cx);
+            }
             (Mode::Create, _) => Cmd::CreateGroupDm { recipients: picked },
             (Mode::Add { channel }, [one, ..]) => Cmd::AddRecipient {
                 channel_id: channel.to_string(),
@@ -197,9 +199,6 @@ impl Inlet {
         };
         // A new try clears the last answer; it is never sent by itself.
         w.message = None;
-        if let Cmd::OpenDm { .. } = cmd {
-            self.social.group_dm = None;
-        }
         self.social_action(cmd, cx);
     }
 
@@ -209,14 +208,7 @@ impl Inlet {
             return;
         };
         let text = name.read(cx).text().trim().to_owned();
-        self.social_action(
-            Cmd::EditGroupDm {
-                channel_id: channel.to_string(),
-                name: Some((!text.is_empty()).then_some(text)),
-                icon: None,
-            },
-            cx,
-        );
+        self.edit_group_dm(channel, Some((!text.is_empty()).then_some(text)), None, cx);
     }
 
     /// Asks for a picture and sets it as the group's icon.
@@ -235,14 +227,16 @@ impl Inlet {
                 return;
             };
             let _ = this.update(cx, |this, cx| {
-                this.social_action(
-                    Cmd::EditGroupDm {
-                        channel_id: channel.to_string(),
-                        name: None,
-                        icon: Some(Icon::File(path)),
-                    },
-                    cx,
-                )
+                // Only while the same group's settings are still open (not after a close
+                // or an account switch).
+                let open = this
+                    .social
+                    .group_dm
+                    .as_ref()
+                    .is_some_and(|w| w.mode == Mode::Settings { channel });
+                if open {
+                    this.edit_group_dm(channel, None, Some(Icon::File(path)), cx);
+                }
             });
         })
         .detach();
@@ -393,7 +387,7 @@ impl Inlet {
                     true,
                 )
                 .when(!ready, |b| b.opacity(0.5))
-                .on_click(cx.listener(|this, _, _, cx| this.group_dm_go(cx))),
+                .on_click(cx.listener(|this, _, window, cx| this.group_dm_go(window, cx))),
             );
         }
         parts.push(actions.into_any_element());
@@ -510,14 +504,7 @@ impl Inlet {
                 .child(
                     button("group-icon-remove", t!("social-group-icon-remove"), false).on_click(
                         cx.listener(move |this, _, _, cx| {
-                            this.social_action(
-                                Cmd::EditGroupDm {
-                                    channel_id: channel.to_string(),
-                                    name: None,
-                                    icon: Some(Icon::Remove),
-                                },
-                                cx,
-                            )
+                            this.edit_group_dm(channel, None, Some(Icon::Remove), cx)
                         }),
                     ),
                 )

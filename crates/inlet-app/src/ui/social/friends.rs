@@ -66,7 +66,8 @@ fn matches(row: &PersonRow, query: &str) -> bool {
         || row.tag.to_lowercase().contains(query)
 }
 
-/// The rows of a tab, sorted by name, filtered by `query`, at most [`MAX_ROWS`].
+/// The rows of a tab, sorted by name, filtered by `query` (the page draws at most
+/// [`MAX_ROWS`] of them).
 pub fn rows(state: &AccountState, tab: Tab, query: &str) -> Vec<PersonRow> {
     let query = query.trim().to_lowercase();
     let kinds: &[Kind] = match tab {
@@ -95,7 +96,6 @@ pub fn rows(state: &AccountState, tab: Tab, query: &str) -> Vec<PersonRow> {
             .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
             .then(a.user.cmp(&b.user))
     });
-    out.truncate(MAX_ROWS);
     out
 }
 
@@ -105,7 +105,7 @@ impl Inlet {
         let search = self.friends_search(cx);
         let tab = self.social.friends.tab;
         let query = search.read(cx).text().to_owned();
-        let (list, pending) = match self.account.as_ref().map(|a| a.read(cx)) {
+        let (mut list, pending) = match self.account.as_ref().map(|a| a.read(cx)) {
             Some(state) => (
                 match tab {
                     Tab::Pending => super::pending::pending_rows(state, &query),
@@ -115,11 +115,14 @@ impl Inlet {
             ),
             None => (Vec::new(), 0),
         };
+        // The count is of everyone in the tab, before the drawn rows are cut.
+        let total = list.len();
+        list.truncate(MAX_ROWS);
         let title = match tab {
-            Tab::Online => t!("social-online-count", count = list.len()),
-            Tab::All => t!("social-all-count", count = list.len()),
-            Tab::Pending => t!("social-pending-count", count = list.len()),
-            Tab::Blocked => t!("social-blocked-count", count = list.len()),
+            Tab::Online => t!("social-online-count", count = total),
+            Tab::All => t!("social-all-count", count = total),
+            Tab::Pending => t!("social-pending-count", count = total),
+            Tab::Blocked => t!("social-blocked-count", count = total),
         };
         let empty = list.is_empty().then(|| {
             div()
@@ -360,15 +363,9 @@ impl Inlet {
             .gap(px(12.))
             .hover(|s| s.bg(theme::hover_bg()))
             .when(row.kind == Kind::Friend, |d| {
-                d.cursor_pointer()
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.social_action(
-                            Cmd::OpenDm {
-                                user_id: user.to_string(),
-                            },
-                            cx,
-                        )
-                    }))
+                d.cursor_pointer().on_click(
+                    cx.listener(move |this, _, window, cx| this.open_dm_with(user, window, cx)),
+                )
             })
             .child(
                 div()
@@ -462,7 +459,10 @@ impl Inlet {
             Kind::Friend => {
                 out.push(
                     round_action(format!("friend-message-{id}"), SocialIcon::Message, false)
-                        .on_click(send(|user_id| Cmd::OpenDm { user_id }))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.open_dm_with(user, window, cx)
+                        }))
                         .into_any_element(),
                 );
                 let n = name.clone();

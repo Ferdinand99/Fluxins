@@ -179,3 +179,57 @@ fn a_huge_server_wait_is_capped() {
         other => panic!("{other:?}"),
     }
 }
+
+#[tokio::test]
+async fn closing_or_editing_a_channel_that_is_not_a_dm_sends_nothing() {
+    let (server, instance) = mock_instance("ws://127.0.0.1:9", &[]).await;
+    let client = p::Client::new(instance, p::Token::new("tok-guard"));
+    let (internal, _irx) = tokio::sync::mpsc::unbounded_channel();
+    let account = key("4");
+    // A guild text channel as the state knows it: the protocol's check refuses it.
+    let text: p::Channel = serde_json::from_value(json!({
+        "id": "900", "type": 0, "guild_id": "1", "name": "general"
+    }))
+    .unwrap();
+    for cmd in [
+        Cmd::CloseDm {
+            channel: Box::new(text.clone()),
+        },
+        Cmd::EditGroupDm {
+            channel: Box::new(text.clone()),
+            name: Some(Some("renamed".into())),
+            icon: None,
+        },
+    ] {
+        match run(&client, &internal, 1, &account, &cmd.key(), cmd.clone()).await {
+            Ev::Failed { .. } => {}
+            other => panic!("{other:?}"),
+        }
+    }
+    let writes = requests(&server)
+        .await
+        .into_iter()
+        .filter(|r| matches!(r.method.as_str(), "DELETE" | "PATCH"))
+        .count();
+    assert_eq!(writes, 0, "nothing reaches the server");
+}
+
+#[test]
+fn friend_requests_stay_within_ten_a_minute() {
+    let t0 = Instant::now();
+    let mut g = Gate::default();
+    let sent = (0..30u64)
+        .filter(|i| {
+            let ok = g
+                .admit(
+                    "add-friend",
+                    Budget::FriendRequest,
+                    t0 + Duration::from_secs(2 * i),
+                )
+                .is_ok();
+            g.finish("add-friend");
+            ok
+        })
+        .count();
+    assert_eq!(sent, FRIEND_REQUESTS_PER_MINUTE, "30 tries in a minute");
+}

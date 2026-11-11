@@ -40,6 +40,7 @@ impl Inlet {
         let shown = to_channel(notes);
         if !self.channels.iter().any(|c| c.id == shown.id) {
             self.channels.push(shown);
+            self.social.dm_rows = None;
         }
     }
 }

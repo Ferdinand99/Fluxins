@@ -45,6 +45,7 @@ impl Inlet {
     ) {
         if guild_id == self.selected_guild {
             self.channels = model::sidebar_order(&channels);
+            self.social.dm_rows = None;
             // The DM list keeps the personal notes channel (it is not in the REST list).
             self.keep_personal_notes(cx);
             let open_still_exists = self
@@ -52,7 +53,14 @@ impl Inlet {
                 .as_ref()
                 .is_some_and(|id| self.channels.iter().any(|c| &c.id == id));
             if self.selected_channel.is_some() && !open_still_exists {
-                self.chat.notice = Some(t!("sidebar-channel-deleted"));
+                // A DM this client closed goes quietly, as in Fluxer.
+                let closed_here = self
+                    .selected_channel
+                    .as_ref()
+                    .is_some_and(|id| self.social.closing.remove(id));
+                if !closed_here {
+                    self.chat.notice = Some(t!("sidebar-channel-deleted"));
+                }
                 self.selected_channel = None;
             } else if let Some(open) = self.selected_channel.clone() {
                 // The open channel may have changed (for example its slowmode).
@@ -75,9 +83,18 @@ impl Inlet {
             // A guild opens its first channel; the DM list opens the friends page, as
             // in Fluxer.
             if self.selected_channel.is_none() {
+                // The DM list opens the DM open last (Fluxer's home button), else Friends.
+                let last_dm = self
+                    .social
+                    .last_dm
+                    .clone()
+                    .filter(|id| self.channels.iter().any(|c| &c.id == id));
                 match self.channels.iter().find(|c| c.is_messageable()).cloned() {
                     Some(first) if guild_id.is_some() => self.select_channel(first.id, window, cx),
-                    _ => self.clear_messages(),
+                    _ => match last_dm {
+                        Some(id) if guild_id.is_none() => self.select_channel(id, window, cx),
+                        _ => self.clear_messages(),
+                    },
                 }
             }
         }
@@ -100,6 +117,9 @@ impl Inlet {
         cx: &mut Context<Self>,
     ) {
         self.selected_channel = Some(channel_id.clone());
+        if self.selected_guild.is_none() {
+            self.social.last_dm = Some(channel_id.clone());
+        }
         // A forum opens the forum view; any other channel closes it.
         if self.open_forum(&channel_id, window, cx) {
             cx.notify();

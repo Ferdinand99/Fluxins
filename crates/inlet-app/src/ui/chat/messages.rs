@@ -1447,6 +1447,7 @@ impl Inlet {
         self.notifications
             .refresh_badges(account.read(cx), &changes);
         self.inbox.state_changed(&changes);
+        self.dm_rows_changed(&changes);
         self.typing_changed(&changes, cx);
         self.chat.view.conversions.prune(account.read(cx), &changes);
         self.threads_after_changes(&changes, members, cx);
@@ -1454,7 +1455,9 @@ impl Inlet {
             return;
         };
         let guild = account.read(cx).channels().guild_of(ch);
+        // A block or unblock folds or shows that person's messages at once.
         let relevant = changes.reset
+            || changes.relationships
             || changes.messages.contains(&ch)
             || changes.guilds
             || (members && guild.is_some_and(|g| changes.member_guilds.contains(&g)));

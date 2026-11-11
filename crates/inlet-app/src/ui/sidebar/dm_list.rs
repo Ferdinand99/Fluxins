@@ -195,14 +195,17 @@ impl Inlet {
 
     /// The rows of the DM list.
     pub(super) fn dm_rows(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let cached = self.social.dm_rows.clone();
         let (rows, pending, notes_id) = match self.account.as_ref().map(|a| a.read(cx)) {
             Some(state) => (
-                dm_rows_of(state, &self.channels),
+                cached.unwrap_or_else(|| dm_rows_of(state, &self.channels)),
                 state.relationships().incoming_count(),
                 Some(state.me_id().to_string()),
             ),
             None => (Vec::new(), 0, None),
         };
+        // Sorted and worked out again only when something they show changes.
+        self.social.dm_rows = Some(rows.clone());
         let mut out = Vec::with_capacity(rows.len() + 3);
         let friends_selected = self.friends_page_shown();
         let open_friends =
@@ -359,13 +362,7 @@ impl Inlet {
                     });
                     cx.notify();
                 } else {
-                    this.social_action(
-                        Cmd::CloseDm {
-                            channel_id: close_id.clone(),
-                            kind,
-                        },
-                        cx,
-                    );
+                    this.close_dm(channel, cx);
                 }
             }));
         let row_el = div()
@@ -543,13 +540,7 @@ impl Inlet {
                 )
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.social.dm_menu = None;
-                    this.social_action(
-                        Cmd::CloseDm {
-                            channel_id: channel.to_string(),
-                            kind: channel_type::DM,
-                        },
-                        cx,
-                    );
+                    this.close_dm(channel, cx);
                 })),
             );
         }

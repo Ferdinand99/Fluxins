@@ -8,7 +8,10 @@
 //! - One call per target at a time ([`Gate`]): a second click on the same person or DM
 //!   while the first call runs sends nothing.
 //! - At most [`WRITES_PER_WINDOW`] relationship and DM writes per [`WRITE_WINDOW`] per
-//!   account; more are refused at once, without a request.
+//!   account; more are refused at once, without a request. Friend requests by name
+//!   also stay within Fluxer's 10 per minute ([`FRIEND_REQUESTS_PER_MINUTE`]).
+//! - Closing a DM and editing a group DM take the channel as the account state knows
+//!   it, so the protocol's check that it is a DM or group DM sees the server's type.
 //! - Group DMs: Fluxer allows 10 creations and 10 additions per hour per account, every
 //!   attempt counts, and one call can use up to three (the CAPTCHA). Inlet makes at most
 //!   [`GROUP_CALLS_PER_HOUR`] create calls and as many add calls per hour per account
@@ -32,6 +35,8 @@ use super::super::{Active, Backend, Internal};
 pub const WRITES_PER_WINDOW: usize = 10;
 /// The window of [`WRITES_PER_WINDOW`].
 pub const WRITE_WINDOW: Duration = Duration::from_secs(10);
+/// Friend requests by name per minute and account (Fluxer's bucket).
+pub const FRIEND_REQUESTS_PER_MINUTE: usize = 10;
 /// Group DM create calls (and, apart, add calls) per hour and account.
 pub const GROUP_CALLS_PER_HOUR: usize = 3;
 /// The window of [`GROUP_CALLS_PER_HOUR`].
@@ -84,14 +89,14 @@ pub enum Cmd {
         channel_id: String,
         user_id: String,
     },
-    /// Closes a DM or leaves a group DM (`kind` is the channel's type).
+    /// Closes a DM or leaves a group DM: the channel as the account state has it.
     CloseDm {
-        channel_id: String,
-        kind: i64,
+        channel: Box<p::Channel>,
     },
-    /// Renames a group DM (`Some(None)` clears the name) or changes its icon.
+    /// Renames a group DM (`Some(None)` clears the name) or changes its icon: the
+    /// channel as the account state has it.
     EditGroupDm {
-        channel_id: String,
+        channel: Box<p::Channel>,
         name: Option<Option<String>>,
         icon: Option<Icon>,
     },
@@ -111,17 +116,18 @@ impl Cmd {
             }
             Cmd::OpenDm { user_id } => format!("open:{user_id}"),
             Cmd::CreateGroupDm { .. } => "group-dm".into(),
-            Cmd::AddRecipient { channel_id, .. }
-            | Cmd::RemoveRecipient { channel_id, .. }
-            | Cmd::EditGroupDm { channel_id, .. } => format!("group:{channel_id}"),
-            Cmd::CloseDm { channel_id, .. } | Cmd::PinDm { channel_id, .. } => {
-                format!("dm:{channel_id}")
+            Cmd::AddRecipient { channel_id, .. } | Cmd::RemoveRecipient { channel_id, .. } => {
+                format!("group:{channel_id}")
             }
+            Cmd::EditGroupDm { channel, .. } => format!("group:{}", channel.id),
+            Cmd::CloseDm { channel } => format!("dm:{}", channel.id),
+            Cmd::PinDm { channel_id, .. } => format!("dm:{channel_id}"),
         }
     }
 
     fn budget(&self) -> Budget {
         match self {
+            Cmd::AddFriend { .. } => Budget::FriendRequest,
             Cmd::CreateGroupDm { .. } => Budget::GroupCreate,
             Cmd::AddRecipient { .. } => Budget::GroupAdd,
             _ => Budget::Write,
@@ -165,6 +171,8 @@ pub enum Ev {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Budget {
     Write,
+    /// A write that is also a friend request by name.
+    FriendRequest,
     GroupCreate,
     GroupAdd,
 }
@@ -185,6 +193,7 @@ pub enum Refusal {
 pub struct Gate {
     busy: HashSet<String>,
     writes: VecDeque<Instant>,
+    requests: VecDeque<Instant>,
     creates: VecDeque<Instant>,
     adds: VecDeque<Instant>,
     /// The server's `retry_after` for group DM calls ends here.
@@ -219,6 +228,23 @@ impl Gate {
         match budget {
             Budget::Write => take_slot(&mut self.writes, WRITES_PER_WINDOW, WRITE_WINDOW, now)
                 .map_err(|_| Refusal::TooFast)?,
+            Budget::FriendRequest => {
+                // Checked first, so a refused request does not use a write slot.
+                let minute = Duration::from_secs(60);
+                while self
+                    .requests
+                    .front()
+                    .is_some_and(|t| now.saturating_duration_since(*t) >= minute)
+                {
+                    self.requests.pop_front();
+                }
+                if self.requests.len() >= FRIEND_REQUESTS_PER_MINUTE {
+                    return Err(Refusal::TooFast);
+                }
+                take_slot(&mut self.writes, WRITES_PER_WINDOW, WRITE_WINDOW, now)
+                    .map_err(|_| Refusal::TooFast)?;
+                self.requests.push_back(now);
+            }
             Budget::GroupCreate | Budget::GroupAdd => {
                 if let Some(until) = self.group_wait_until.filter(|u| *u > now) {
                     return Err(Refusal::GroupLimit {
@@ -268,12 +294,12 @@ pub fn refusal_text(r: &Refusal) -> String {
     }
 }
 
-/// A wait as people say it: seconds, minutes or hours, rounded up.
+/// A wait as people say it, rounded up: seconds, minutes up to 90 minutes, then hours.
 pub fn wait_text(wait: Duration) -> String {
     let secs = wait.as_secs().max(1);
     if secs < 60 {
         t!("social-wait-seconds", count = secs)
-    } else if secs < 3600 {
+    } else if secs <= 90 * 60 {
         t!("social-wait-minutes", count = secs.div_ceil(60))
     } else {
         t!("social-wait-hours", count = secs.div_ceil(3600))
@@ -343,11 +369,6 @@ fn read_icon(path: &PathBuf) -> Result<p::ImageData, String> {
     p::ImageData::new(kind, bytes).map_err(|e| e.to_string())
 }
 
-/// A channel the protocol's DM calls take: its ID and type are all they check.
-fn channel_of(id: &str, kind: i64) -> Option<p::Channel> {
-    serde_json::from_value(serde_json::json!({"id": id, "type": kind})).ok()
-}
-
 pub(in crate::backend) fn handle(backend: &mut Backend, cmd: Cmd) {
     let key = cmd.key();
     let (client, gen, account, events) = match &backend.active {
@@ -392,14 +413,15 @@ pub(in crate::backend) fn handle(backend: &mut Backend, cmd: Cmd) {
         return;
     }
     let internal = backend.internal.clone();
+    // Made before the task, so the target is freed and the UI answered even when the
+    // task panics, is aborted, or is dropped before it first runs.
+    let mut call = Call {
+        account,
+        key,
+        events,
+        answered: false,
+    };
     backend.spawn_guarded("social action", None, async move {
-        // Frees the target and answers the UI even when the call panics or is aborted.
-        let mut call = Call {
-            account,
-            key,
-            events,
-            answered: false,
-        };
         let ev = run(&client, &internal, gen, &call.account, &call.key, cmd).await;
         call.answer(ev);
     });
@@ -500,15 +522,9 @@ async fn run(
                 .await,
             key,
         ),
-        Cmd::CloseDm { channel_id, kind } => match channel_of(&channel_id, kind) {
-            Some(ch) => done(client.close_dm(&ch, false).await, key),
-            None => Ev::Failed {
-                key,
-                reason: t!("social-not-a-dm"),
-            },
-        },
+        Cmd::CloseDm { channel } => done(client.close_dm(&channel, false).await, key),
         Cmd::EditGroupDm {
-            channel_id,
+            channel,
             name,
             icon,
         } => {
@@ -533,13 +549,7 @@ async fn run(
                 icon,
                 owner_id: None,
             };
-            match channel_of(&channel_id, p::models::channel_type::GROUP_DM) {
-                Some(ch) => done(client.edit_group_dm(&ch, &edit).await.map(drop), key),
-                None => Ev::Failed {
-                    key,
-                    reason: t!("social-not-a-dm"),
-                },
-            }
+            done(client.edit_group_dm(&channel, &edit).await.map(drop), key)
         }
         Cmd::PinDm { channel_id, pin } => done(
             if pin {

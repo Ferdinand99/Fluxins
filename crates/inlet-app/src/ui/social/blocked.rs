@@ -41,20 +41,146 @@ impl Inlet {
             } else {
                 t!("social-blocked-messages", count = count)
             })
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.chat.view.toggle_blocked(first);
-                if let Some(panel) = this.threads.panel.as_mut() {
-                    panel.view.toggle_blocked(first);
-                }
-                this.refresh_rows(cx);
-                cx.notify();
-            }))
+            .on_click(cx.listener(move |this, _, _, cx| this.toggle_blocked_run(first, cx)))
             .into_any_element()
+    }
+
+    /// Shows or folds the run that starts at `first`, in the chat and in the thread
+    /// panel (the run is in one of them), and rebuilds both lists.
+    pub(crate) fn toggle_blocked_run(&mut self, first: MessageId, cx: &mut Context<Self>) {
+        self.chat.view.toggle_blocked(first);
+        self.refresh_rows(cx);
+        if let Some(panel) = self.threads.panel.as_mut() {
+            panel.view.toggle_blocked(first);
+            self.refresh_panel_rows(cx);
+        }
+        cx.notify();
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "demo")]
+    mod live {
+        use gpui::{AppContext, TestAppContext};
+        use inlet_protocol::Dispatch;
+        use inlet_state::{AccountState, ChannelId, GuildId, MessagesPage};
+        use serde_json::json;
+
+        use crate::app::Inlet;
+        use crate::backend::{messages, Event};
+        use crate::ui::chat::messages::Row;
+        use crate::ui::threads::panel::Panel;
+
+        const DM: &str = "100";
+        const GUILD: &str = "500";
+        const GENERAL: &str = "501";
+        const THREAD: &str = "502";
+
+        fn msg(id: u64, channel: &str, author: &str) -> inlet_protocol::Message {
+            serde_json::from_value(json!({
+                "id": (id << 22).to_string(), "channel_id": channel, "type": 0,
+                "content": format!("m{id}"), "timestamp": "2026-01-01T10:00:00+00:00",
+                "author": {"id": author, "username": format!("u{author}")}
+            }))
+            .unwrap()
+        }
+
+        fn state() -> AccountState {
+            let ready: inlet_protocol::Ready = serde_json::from_value(json!({
+                "session_id": "s", "user": {"id": "1", "username": "me"}, "users": [],
+                "guilds": [{
+                    "id": GUILD,
+                    "properties": {"id": GUILD, "name": "g", "owner_id": "1"},
+                    "roles": [{"id": GUILD, "name": "@everyone", "position": 0,
+                               "permissions": "274877975552"}],
+                    "channels": [{"id": GENERAL, "type": 0, "name": "general", "position": 0}],
+                    "threads": [{"id": THREAD, "type": 11, "parent_id": GENERAL, "name": "t"}],
+                    "members": [{"user": {"id": "1", "username": "me"}, "roles": [],
+                                 "joined_at": "2026-01-01T00:00:00Z"}]
+                }],
+                "private_channels": [{"id": DM, "type": 3,
+                    "recipients": [{"id": "2", "username": "u2"}, {"id": "3", "username": "u3"}]}],
+                "relationships": [], "read_states": [], "user_guild_settings": []
+            }))
+            .unwrap();
+            let mut s = AccountState::from_ready_at(&ready, 1_800_000_000_000);
+            for ch in [DM, THREAD] {
+                let id = ChannelId::parse(ch).unwrap();
+                let _ = s.begin_load(id);
+                let page = vec![msg(3, ch, "2"), msg(2, ch, "3"), msg(1, ch, "2")];
+                let _ = s.apply_messages(id, MessagesPage::latest(page, 50));
+            }
+            s
+        }
+
+        fn folded(rows: &[Row]) -> Vec<String> {
+            rows.iter()
+                .filter_map(|r| match r {
+                    Row::Message(m) => Some(format!("m{}", m.id.0 >> 22)),
+                    Row::Blocked {
+                        count, revealed, ..
+                    } => Some(format!(
+                        "blocked {count}{}",
+                        if *revealed { " shown" } else { "" }
+                    )),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// A block from the gateway folds the open DM's messages at once, through the
+        /// path every event takes, and the thread panel's fold opens on a click.
+        #[gpui::test]
+        fn blocking_is_live_and_the_panel_fold_opens(cx: &mut TestAppContext) {
+            let (inlet, cx) = cx.add_window_view(Inlet::detached);
+            inlet.update_in(cx, |this, window, cx| {
+                this.account = Some(cx.new(|_| state()));
+                this.selected_channel = Some(DM.into());
+                this.refresh_rows(cx);
+                assert_eq!(folded(&this.chat.view.rows), ["m1", "m2", "m3"]);
+
+                let block = Dispatch::parse(
+                    "RELATIONSHIP_ADD",
+                    json!({"id": "3", "type": 2, "user": {"id": "3", "username": "u3"}}),
+                );
+                let event = Event::Messages(messages::Ev::Dispatch {
+                    dispatch: Box::new(block),
+                    rendered: Vec::new(),
+                });
+                this.handle_event(event, window, cx);
+                assert_eq!(
+                    folded(&this.chat.view.rows),
+                    ["m1", "blocked 1", "m3"],
+                    "folded without a new message"
+                );
+
+                // The same person's message in a thread: the panel folds it, and a
+                // click on the line shows it there.
+                let thread = ChannelId::parse(THREAD).unwrap();
+                let guild = GuildId::parse(GUILD).unwrap();
+                let parent = ChannelId::parse(GENERAL).unwrap();
+                this.threads.panel = Some(Panel::new(thread, guild, parent, &this.chat.view, 0));
+                this.refresh_panel_rows(cx);
+                let panel_rows =
+                    |this: &Inlet| folded(&this.threads.panel.as_ref().unwrap().view.rows);
+                assert_eq!(panel_rows(this), ["m1", "blocked 1", "m3"]);
+                this.toggle_blocked_run(inlet_state::MessageId(2 << 22), cx);
+                assert_eq!(panel_rows(this), ["m1", "blocked 1 shown", "m2", "m3"]);
+
+                // Unblocked from elsewhere: both lists show the messages again.
+                let unblock = Dispatch::parse("RELATIONSHIP_REMOVE", json!({"id": "3"}));
+                let event = Event::Messages(messages::Ev::Dispatch {
+                    dispatch: Box::new(unblock),
+                    rendered: Vec::new(),
+                });
+                this.handle_event(event, window, cx);
+                assert_eq!(folded(&this.chat.view.rows), ["m1", "m2", "m3"]);
+                assert_eq!(panel_rows(this), ["m1", "m2", "m3"]);
+            });
+        }
+    }
+
     use inlet_protocol::{Dispatch, Ready};
     use inlet_state::{AccountState, ChannelId, MessageId, MessagesPage};
     use serde_json::json;
