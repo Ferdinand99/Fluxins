@@ -17,6 +17,11 @@ impl Inlet {
             cx.notify();
             return;
         }
+        // Invite links open the invite prompt first (see `desktop`).
+        if let Some(invite) = crate::backend::platform::links::web_invite(url) {
+            self.ask_about_link(invite, cx);
+            return;
+        }
         if markdown::openable(url).is_none() {
             self.chat.error = Some(t!("link-only-http"));
         } else if masked {

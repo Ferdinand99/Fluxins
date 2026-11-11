@@ -98,6 +98,21 @@ impl Tray {
         }
     }
 
+    /// Whether a tray host shows the icon right now. Always true on Windows and
+    /// macOS; on Linux false while the tray host (plasmashell, the GNOME extension)
+    /// is gone, and true again once the icon has registered with its next start.
+    /// Never hide the window to the tray while this is false.
+    pub fn has_host(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            self.inner.has_host()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            true
+        }
+    }
+
     /// Sets the hover text, for example "Inlet – 3 mentions".
     #[cfg_attr(not(feature = "gpui"), allow(dead_code))]
     pub(crate) fn set_tooltip(&self, text: &str) {

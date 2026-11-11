@@ -21,6 +21,7 @@ mod error;
 mod events;
 mod icon;
 mod idle;
+pub mod jump_list;
 #[cfg(target_os = "linux")]
 mod linux_bus;
 mod notify;

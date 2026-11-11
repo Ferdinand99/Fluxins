@@ -70,6 +70,18 @@ scene 11-markdown-blocks markdown-blocks c-dev
 scene 12-markdown-alerts markdown-alerts c-dev
 scene 13-markdown-code markdown-code c-dev
 
+# 6. The Desktop settings tab, and the prompt a link from outside opens.
+INLET_DEMO=1 INLET_DEMO_LIVE_SECS=3600 INLET_DEMO_GUILD=g1 INLET_DEMO_CHANNEL=c-general INLET_DEMO_SETTINGS=desktop "$bin" >>"$out/demo.log" 2>&1 &
+pid=$!
+sleep 6
+shot 14-settings-desktop
+kill $pid; wait $pid 2>/dev/null
+INLET_DEMO=1 INLET_DEMO_LIVE_SECS=3600 INLET_DEMO_GUILD=g1 INLET_DEMO_CHANNEL=c-general INLET_DEMO_DEEP_LINK=inlet://invite/abc123 "$bin" >>"$out/demo.log" 2>&1 &
+pid=$!
+sleep 6
+shot 15-link-prompt
+kill $pid; wait $pid 2>/dev/null
+
 tail -n 20 "$out/signin.log" "$out/demo.log" >&2
 cat "$out/memory.txt" >&2
 rm -rf "$out/config"
