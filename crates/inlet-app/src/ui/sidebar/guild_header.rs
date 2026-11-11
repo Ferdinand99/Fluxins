@@ -23,6 +23,7 @@ impl Inlet {
         // with the name over it (see `ui/media/avatar.rs`).
         let banner = self.guild_banner(super::SIDEBAR_WIDTH, cx);
         let name = div()
+            .debug_selector(|| "guild-header".into())
             .h(px(HEADER_HEIGHT))
             .flex_none()
             .px_4()

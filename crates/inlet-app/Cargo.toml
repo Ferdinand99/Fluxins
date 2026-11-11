@@ -10,8 +10,9 @@ publish = false
 
 [features]
 # Built-in sample data, started with INLET_DEMO=1. Only for screenshots and UI checks;
-# off in normal builds.
-demo = ["dep:image-webp"]
+# off in normal builds. Also builds `inlet-visual`, the screenshot comparison tool, and
+# the layout tests.
+demo = ["dep:toml", "dep:image-webp"]
 # Trust the private test instance's CA (REST, gateway and media). Debug builds only:
 # inlet-protocol refuses it in a release build.
 test-extra-ca = ["inlet-protocol/test-extra-ca"]
@@ -19,6 +20,19 @@ test-extra-ca = ["inlet-protocol/test-extra-ca"]
 [[bin]]
 name = "inlet"
 path = "src/main.rs"
+
+# Compares CI screenshots with the committed baselines (tests/visual). Demo builds only.
+[[bin]]
+name = "inlet-visual"
+path = "src/bin/visual.rs"
+required-features = ["demo"]
+
+# Measures the main layout with gpui's test platform. Needs the demo data:
+# cargo test -p inlet --features demo --test layout_metrics
+[[test]]
+name = "layout_metrics"
+path = "tests/layout_metrics.rs"
+required-features = ["demo"]
 
 [dependencies]
 inlet-editor = { path = "../inlet-editor" }
@@ -44,6 +58,9 @@ env_logger = "0.11"
 # The text catalogue (Project Fluent): `src/i18n.rs`, `locales/`.
 fluent-bundle = "0.16"
 futures = "0.3"
+# Decodes the built-in window icon (X11) and, in `inlet-visual`, the screenshots. gpui
+# and inlet-media already depend on image 0.25 on every platform.
+image = { version = "0.25", default-features = false, features = ["png"] }
 keyring = { version = "3.6", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust", "vendored"] }
 log = "0.4"
 # The media proxy client (images, saved files): no cookies, no token, no redirects.
@@ -56,6 +73,8 @@ serde_json = "1"
 syntect = { version = "5.3", default-features = false, features = ["default-syntaxes", "regex-fancy"] }
 # The system locale, for the date and time format in the chat.
 sys-locale = "0.3"
+# Demo scene files (tests/visual/scenes/*.toml). Demo builds only.
+toml = { version = "1", default-features = false, features = ["parse", "serde"], optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "fs", "io-util"] }
 unic-langid = "0.9"
 unicode-segmentation = "1"
@@ -78,10 +97,6 @@ tokio-tungstenite = { version = "0.26", default-features = false, features = ["h
 fluent-syntax = "0.12"
 # Writes WebP test pictures (stickers).
 image-webp = "0.2"
-
-# Decodes the built-in window icon (X11). gpui already depends on image 0.25.
-[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
-image = { version = "0.25", default-features = false, features = ["png"] }
 
 # Embeds the app icon and version info in inlet.exe.
 [target.'cfg(windows)'.build-dependencies]

@@ -1,0 +1,7 @@
+# The sign-in screen: no saved session, no demo account.
+name = "sign-in"
+window = [1280, 860]
+scale = 1.0
+theme = "dark"
+ignore = []
+demo = false

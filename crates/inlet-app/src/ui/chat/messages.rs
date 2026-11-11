@@ -806,6 +806,12 @@ impl MessageView {
         }
     }
 
+    /// The request whose answer the newest page of `ch` must carry, while it loads.
+    #[cfg(feature = "demo")]
+    pub(crate) fn waiting_request(&self, ch: ChannelId) -> Option<u64> {
+        self.loading.get(&ch).copied()
+    }
+
     /// A view whose channel's newest page has landed, for tests of the read rules.
     #[cfg(test)]
     pub fn loaded_for_tests() -> Self {

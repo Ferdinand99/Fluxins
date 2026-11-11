@@ -112,6 +112,7 @@ impl Inlet {
             Some(_) => self.channel_rows(cx),
         };
         div()
+            .debug_selector(|| "sidebar".into())
             .w(px(SIDEBAR_WIDTH))
             .h_full()
             .flex_none()
