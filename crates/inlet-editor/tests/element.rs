@@ -436,3 +436,26 @@ fn a_composition_that_shrinks_over_limit_text_is_kept(cx: &mut TestAppContext) {
         })
         .unwrap();
 }
+
+#[gpui::test]
+fn a_picked_custom_emoji_is_a_pill_and_never_a_mention(cx: &mut TestAppContext) {
+    let window = cx.add_window(|_, cx| Editor::new(2000, cx));
+    window
+        .update(cx, |ed, window, cx| {
+            ed.insert_text("hi ", window, cx).unwrap();
+            assert!(ed.insert_custom_emoji(Id(41), "wave", false, window, cx));
+            assert!(ed.insert_custom_emoji(Id(42), "party", true, window, cx));
+            assert_eq!(ed.buffer().text(), "hi :wave::party:");
+            assert_eq!(ed.to_wire(), "hi <:wave:41><a:party:42>");
+            let allowed = ed.buffer().allowed_mentions();
+            assert!(allowed.users.is_empty() && allowed.roles.is_empty() && !allowed.everyone);
+            // An empty name is refused.
+            assert!(!ed.insert_custom_emoji(Id(43), "", false, window, cx));
+            // Nothing goes in while an input method is composing.
+            ed.replace_and_mark_text_in_range(None, "n", Some(1..1), window, cx);
+            let before = ed.buffer().text().to_owned();
+            assert!(!ed.insert_custom_emoji(Id(44), "x", false, window, cx));
+            assert_eq!(ed.buffer().text(), before);
+        })
+        .unwrap();
+}

@@ -53,7 +53,11 @@ pub fn classify(err: &p::Error) -> FailureKind {
         p::Error::Unauthorized
         | p::Error::GlobalRateLimited
         | p::Error::EndpointsChanged { .. } => FailureKind::SessionEnded,
-        p::Error::Http(_) | p::Error::RateLimited { .. } => FailureKind::Offline,
+        // `Network` is a failed request passed on by a shared write (preferences): the
+        // same as `Http`.
+        p::Error::Http(_) | p::Error::Network(_) | p::Error::RateLimited { .. } => {
+            FailureKind::Offline
+        }
         p::Error::Api(api) if api.status >= 500 || api.status == 0 => FailureKind::Offline,
         _ => FailureKind::Other,
     }
@@ -72,7 +76,7 @@ pub fn describe(err: &p::Error) -> String {
                 format!("{} ({code})", model::clean_name(&api.message))
             }
         }
-        p::Error::Http(_) => t!("error-unreachable"),
+        p::Error::Http(_) | p::Error::Network(_) => t!("error-unreachable"),
         p::Error::EndpointsChanged { .. } => t!("error-endpoints-changed"),
         p::Error::Url(msg) => t!("error-bad-address", reason = model::clean_name(msg)),
         p::Error::TooLarge { .. } => t!("error-too-large"),

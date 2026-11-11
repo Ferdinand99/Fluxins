@@ -93,6 +93,33 @@ pub fn emoji_picture(id: &str, animated: bool) -> Option<Vec<u8>> {
     Some(png::encode_apng(SIZE, SIZE, &frames, 90))
 }
 
+/// The custom emoji and stickers of the demo's first guild (the pickers list them): the
+/// still and animated emoji, 30 more animated ones, and the stickers in every format.
+pub fn guild_expressions() -> (Value, Value) {
+    let mut emojis = vec![
+        json!({"id": INLET, "name": "inlet", "animated": false}),
+        json!({"id": PARTY, "name": "party", "animated": true}),
+        json!({"id": WAVE, "name": "wave", "animated": true}),
+        json!({"id": SPIN, "name": "spin", "animated": true}),
+    ];
+    emojis.extend((0..30).map(|i| {
+        json!({"id": (MANY_BASE + i).to_string(), "name": format!("demo_{i}"), "animated": true})
+    }));
+    let stickers: Vec<Value> = [
+        (STICKER_PNG, "card", false),
+        (STICKER_APNG, "wave", true),
+        (STICKER_GIF, "party", true),
+        (STICKER_WEBP, "sun", false),
+        (STICKER_AWEBP, "spin", true),
+    ]
+    .iter()
+    .map(|(id, name, animated)| {
+        json!({"id": id, "name": name, "description": "", "tags": ["demo"], "animated": animated})
+    })
+    .collect();
+    (Value::Array(emojis), Value::Array(stickers))
+}
+
 /// The sticker picture the demo proxy serves for `id`, in the format of its kind
 /// (every one under a `.webp` URL, as the real proxy).
 pub fn sticker_picture(id: &str, animated: bool) -> Option<Vec<u8>> {

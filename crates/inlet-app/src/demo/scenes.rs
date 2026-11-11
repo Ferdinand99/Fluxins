@@ -45,6 +45,9 @@
 //! - `group-dm-captcha`: the new group DM window with two friends picked and the
 //!   message for a CAPTCHA Inlet could not pass.
 //! - `dm-blocked`: the group DM open, with a blocked account's messages folded.
+//! - `picker-emoji`, `picker-gif`: for `#general`, the composer's picker open on the
+//!   emoji tab (favourites, frequently used, the guild's custom emoji) or the GIF tab
+//!   (the featured search terms; see `pickers.rs`).
 //!
 //! `INLET_DEMO_SCENE` may also name a scene file of the visual checks
 //! (`tests/visual/scenes/*.toml`, see `scene_file.rs`): it then sets the scene, the guild,
@@ -100,6 +103,8 @@ pub enum Scene {
     FriendsPending,
     GroupDmCaptcha,
     DmBlocked,
+    PickerEmoji,
+    PickerGif,
 }
 
 impl Scene {
@@ -137,6 +142,8 @@ impl Scene {
             "friends-pending" => Scene::FriendsPending,
             "group-dm-captcha" => Scene::GroupDmCaptcha,
             "dm-blocked" => Scene::DmBlocked,
+            "picker-emoji" => Scene::PickerEmoji,
+            "picker-gif" => Scene::PickerGif,
             _ => return None,
         })
     }
@@ -297,6 +304,12 @@ fn ready(
                 })
                 .unwrap_or_default();
             let (icon, banner) = media::guild_art(&g.name);
+            // The first guild's custom emoji and stickers, for the pickers.
+            let (emojis, stickers) = if guilds.first().is_some_and(|f| f.id == g.id) {
+                super::pickers::guild_expressions()
+            } else {
+                (json!([]), json!([]))
+            };
             json!({
                 "id": g.id,
                 "properties": {"id": g.id, "name": g.name, "owner_id": user_id(ME), "icon": icon, "banner": banner},
@@ -311,7 +324,9 @@ fn ready(
                     "roles": [ROLE_MODERATORS],
                     "joined_at": "2026-01-01T00:00:00+00:00"
                 }],
-                "member_count": 5
+                "member_count": 5,
+                "emojis": emojis,
+                "stickers": stickers
             })
         })
         .collect();
@@ -526,12 +541,18 @@ mod tests {
             "friends-pending",
             "group-dm-captcha",
             "dm-blocked",
+            "picker-emoji",
+            "picker-gif",
         ] {
             let scene = Scene::from_name(name).expect(name);
             let data = data(scene);
             assert_eq!(data.guilds.len(), 3);
             assert!(data.channels.contains_key(&None));
             let state = inlet_state::AccountState::from_ready_at(&data.ready, 1);
+            // The pickers' custom emoji and stickers are in the first guild.
+            let first = inlet_state::GuildId::parse(&data.guilds[0].id).expect("a guild");
+            let g = state.guild(first).expect("the first guild");
+            assert!(g.emojis.len() > 30 && g.stickers.len() == 5, "{name}");
             for id in [
                 "c-general",
                 "c-system",

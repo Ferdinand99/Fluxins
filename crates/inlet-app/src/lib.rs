@@ -96,6 +96,7 @@ fn bind_keys(cx: &mut App) {
     text_input::bind_keys(cx);
     ui::notifications::bind_keys(cx);
     ui::composer::bind_keys(cx);
+    ui::composer::pickers::bind_keys(cx);
     ui::chat::bind_keys(cx);
 }
 
@@ -111,10 +112,14 @@ mod tests {
 
     /// The domains with key bindings. A new `fn bind_keys` must be added here and to
     /// [`super::bind_keys`].
-    const DOMAINS: [(&str, Bind); 4] = [
+    const DOMAINS: [(&str, Bind); 5] = [
         ("text_input", crate::text_input::bind_keys),
         ("ui::notifications", crate::ui::notifications::bind_keys),
         ("ui::composer", crate::ui::composer::bind_keys),
+        (
+            "ui::composer::pickers",
+            crate::ui::composer::pickers::bind_keys,
+        ),
         ("ui::chat", crate::ui::chat::bind_keys),
     ];
 
