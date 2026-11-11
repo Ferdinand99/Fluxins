@@ -242,7 +242,11 @@ impl Inlet {
             _ => 0,
         };
         let old = self.members.list_state.item_count();
-        if n > old {
+        if old == 0 && n > 0 {
+            // A new list starts at the top. (Splicing rows in at 0 would move a scroll
+            // position at row 0 down past them, to the end of the list.)
+            self.members.list_state.reset(n);
+        } else if n > old {
             self.members.list_state.splice(old..old, n - old);
         } else if n < old {
             self.members.list_state.splice(n..old, 0);

@@ -423,9 +423,8 @@ impl Inlet {
     pub(super) fn member_since_line(&self, prof: &Profile) -> AnyElement {
         let mut line = div()
             .flex()
-            .flex_row()
-            .flex_wrap()
-            .gap(px(12.))
+            .flex_col()
+            .gap(px(2.))
             .text_size(px(14.))
             .text_color(theme::text());
         if let Some(ms) = prof.created_ms {
