@@ -47,7 +47,7 @@ impl Inlet {
         };
         self.threads.browser = Some(Browser {
             channel,
-            archived: ThreadPages::new(PageBy::ArchiveTime),
+            archived: ThreadPages::continuing(PageBy::ArchiveTime, self.threads.list_requests),
             error: None,
         });
         self.subscribe_threads();
@@ -63,6 +63,7 @@ impl Inlet {
         let Some(next) = b.archived.next_page() else {
             return;
         };
+        self.threads.list_requests = next.request;
         b.error = None;
         self.backend
             .send(messages::Cmd::Thread(backend::Cmd::Archived {
@@ -91,8 +92,9 @@ impl Inlet {
                 b.archived.on_page(request, threads, has_more);
             }
             Err(reason) => {
-                b.archived.on_failed(request);
-                b.error = Some(t!("threads-error-list", error = reason));
+                if b.archived.on_failed(request) {
+                    b.error = Some(t!("threads-error-list", error = reason));
+                }
             }
         }
     }

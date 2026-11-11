@@ -91,6 +91,9 @@ pub struct State {
     /// Newest-page requests of the panel waiting for their answer, so every
     /// `begin_load` meets its answer even after the panel closed.
     loads: HashMap<ChannelId, u64>,
+    /// The newest request of the thread list or forum list, so the next list numbers
+    /// its requests after it and an old answer never pairs with a new list.
+    list_requests: u64,
     /// Demo screenshots: the scene's thread or list was opened once.
     #[cfg(feature = "demo")]
     demo_done: bool,

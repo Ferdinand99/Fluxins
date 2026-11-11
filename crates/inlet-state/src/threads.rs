@@ -630,6 +630,20 @@ pub struct ThreadPages {
 }
 
 impl ThreadPages {
+    /// An empty list that pages `by`, numbering its requests after `last_request`
+    /// (the newest request of a list it replaces), so an answer meant for that list
+    /// never pairs with this one.
+    pub fn continuing(by: PageBy, last_request: u64) -> Self {
+        let mut pages = ThreadPages::new(by);
+        pages.next_request = last_request;
+        pages
+    }
+
+    /// The newest request this list made.
+    pub fn last_request(&self) -> u64 {
+        self.next_request
+    }
+
     /// An empty list that pages `by`.
     pub fn new(by: PageBy) -> Self {
         ThreadPages {
@@ -731,11 +745,14 @@ impl ThreadPages {
         true
     }
 
-    /// The request failed: the same page may be asked for again.
-    pub fn on_failed(&mut self, request: u64) {
+    /// The request failed: the same page may be asked for again. Returns whether it
+    /// was the one waited for (a failure of another request changes nothing).
+    pub fn on_failed(&mut self, request: u64) -> bool {
         if self.in_flight == Some(request) {
             self.in_flight = None;
+            return true;
         }
+        false
     }
 }
 
@@ -847,8 +864,10 @@ mod tests {
         assert_eq!(second.before.as_deref(), Some("2026-01-08T00:00:00Z"));
         // An answer to an old request changes nothing.
         assert!(!pages.on_page(first.request, vec![at(1, "2026-01-01T00:00:00Z")], true));
-        // A failure frees the slot; the same page is asked for again.
-        pages.on_failed(second.request);
+        // A failure frees the slot; the same page is asked for again. A failure of
+        // another request changes nothing.
+        assert!(!pages.on_failed(first.request));
+        assert!(pages.on_failed(second.request));
         let again = pages.next_page().expect("a retry");
         assert_eq!(again.before.as_deref(), Some("2026-01-08T00:00:00Z"));
         // A thread already listed is not listed twice.
@@ -881,6 +900,12 @@ mod tests {
         assert!(!search.on_page(r2.request, vec![at(99, "y")], true));
         assert!(search.threads().is_empty() && !search.is_loaded());
         assert_eq!(search.next_page().unwrap().offset, 0);
+
+        // A list that replaces another numbers its requests after the old one's.
+        let next = ThreadPages::continuing(PageBy::Offset, search.last_request())
+            .next_page()
+            .unwrap();
+        assert!(next.request > r2.request);
 
         // Bounded: never more than the cap, and no page past it.
         let mut big = ThreadPages::new(PageBy::Offset);

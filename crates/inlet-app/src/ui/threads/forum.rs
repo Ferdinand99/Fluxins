@@ -136,7 +136,7 @@ impl Inlet {
             sort: ForumSort::default_of(channel),
             tags: Vec::new(),
             how: TagMatch::default_of(channel),
-            pages: ThreadPages::new(PageBy::Offset),
+            pages: ThreadPages::continuing(PageBy::Offset, self.threads.list_requests),
             error: None,
             previews: HashMap::new(),
             preview_order: VecDeque::new(),
@@ -166,6 +166,7 @@ impl Inlet {
         let Some(next) = f.pages.next_page() else {
             return;
         };
+        self.threads.list_requests = next.request;
         f.error = None;
         self.backend
             .send(messages::Cmd::Thread(backend::Cmd::ForumPage {
@@ -232,8 +233,9 @@ impl Inlet {
                 }
             }
             Err(reason) => {
-                f.pages.on_failed(request);
-                f.error = Some(reason);
+                if f.pages.on_failed(request) {
+                    f.error = Some(reason);
+                }
             }
         }
         self.ask_forum_extras(cx);

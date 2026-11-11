@@ -69,6 +69,77 @@ impl PostPreview {
     }
 }
 
+/// The one answer to a list request (archived threads, a forum page). Sending the
+/// result uses it up; if it is dropped unused (the task was aborted because a newer list
+/// request replaced it, or it panicked), it answers with a failure, so no list ever waits
+/// for an answer that does not come.
+struct ListAnswer {
+    events: Ui,
+    kind: ListKind,
+    id: String,
+    request: u64,
+    answered: bool,
+}
+
+#[derive(Clone, Copy)]
+enum ListKind {
+    Archived,
+    Forum,
+}
+
+impl ListAnswer {
+    fn new(events: &Ui, kind: ListKind, id: String, request: u64) -> Self {
+        ListAnswer {
+            events: events.clone(),
+            kind,
+            id,
+            request,
+            answered: false,
+        }
+    }
+
+    fn archived(mut self, result: Result<(Vec<p::Channel>, bool), String>) {
+        self.answered = true;
+        self.send_archived(result);
+    }
+
+    fn forum(mut self, result: Result<ForumPage, String>) {
+        self.answered = true;
+        self.send_forum(result);
+    }
+
+    fn send_archived(&mut self, result: Result<(Vec<p::Channel>, bool), String>) {
+        let _ = self.events.unbounded_send(MessagesEv::Thread(Ev::Archived {
+            channel_id: std::mem::take(&mut self.id),
+            request: self.request,
+            result,
+        }));
+    }
+
+    fn send_forum(&mut self, result: Result<ForumPage, String>) {
+        let _ = self
+            .events
+            .unbounded_send(MessagesEv::Thread(Ev::ForumPage {
+                forum_id: std::mem::take(&mut self.id),
+                request: self.request,
+                result,
+            }));
+    }
+}
+
+impl Drop for ListAnswer {
+    fn drop(&mut self) {
+        if self.answered {
+            return;
+        }
+        let stopped = t!("threads-error-stopped");
+        match self.kind {
+            ListKind::Archived => self.send_archived(Err(stopped)),
+            ListKind::Forum => self.send_forum(Err(stopped)),
+        }
+    }
+}
+
 /// Thread commands.
 pub enum Cmd {
     /// The newest page of the thread in the side panel. Answered with exactly one
@@ -373,20 +444,18 @@ pub(super) fn handle(backend: &mut Backend, cmd: Cmd) {
             before,
             request,
         } => {
+            // A newer list replaces the one before: its request is answered as stopped.
             if let Some(task) = backend.threads.archived.take() {
                 task.abort();
             }
+            let answer = ListAnswer::new(&events, ListKind::Archived, channel_id.clone(), request);
             let task = backend.spawn_guarded("archived threads", None, async move {
                 let result = client
                     .public_archived_threads(&channel_id, before.as_deref(), LIST_PAGE)
                     .await
                     .map(|l| (l.threads, l.has_more))
                     .map_err(|err| reason(&internal, gen, err));
-                let _ = events.unbounded_send(MessagesEv::Thread(Ev::Archived {
-                    channel_id,
-                    request,
-                    result,
-                }));
+                answer.archived(result);
             });
             backend.threads.archived = Some(task);
         }
@@ -401,6 +470,7 @@ pub(super) fn handle(backend: &mut Backend, cmd: Cmd) {
             if let Some(task) = backend.threads.forum.take() {
                 task.abort();
             }
+            let answer = ListAnswer::new(&events, ListKind::Forum, forum_id.clone(), request);
             let search = p::ThreadSearch {
                 archived: Some(true),
                 // Fluxer sends the tag setting only with more than one tag.
@@ -422,11 +492,7 @@ pub(super) fn handle(backend: &mut Backend, cmd: Cmd) {
                     Ok(_) => Err(t!("threads-error-indexing")),
                     Err(err) => Err(reason(&internal, gen, err)),
                 };
-                let _ = events.unbounded_send(MessagesEv::Thread(Ev::ForumPage {
-                    forum_id,
-                    request,
-                    result,
-                }));
+                answer.forum(result);
             });
             backend.threads.forum = Some(task);
         }

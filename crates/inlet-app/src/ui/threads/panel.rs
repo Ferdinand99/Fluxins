@@ -35,6 +35,8 @@ use crate::ui::HEADER_HEIGHT;
 
 /// The message length limit until the instance's own is known (as the chat's composer).
 const DEFAULT_MAX_LEN: usize = 2000;
+/// The narrowest the panel gets.
+const MIN_PANEL_WIDTH: f32 = 280.;
 /// `/msg` sends of the panel's composer remembered for their failure.
 const MAX_DM_NONCES: usize = 8;
 
@@ -82,6 +84,17 @@ pub fn can_open(state: &AccountState, thread: ChannelId) -> Option<(GuildId, Cha
         .permissions(guild, thread)
         .can_view()
         .then_some((guild, parent))
+}
+
+/// The panel's width in a window `window_width` wide: Fluxer's 450 px, but at most
+/// half of the space beside the guild rail and the channel list (Fluxer caps it at 60%
+/// of the window), and never under 280 px, so a narrow window keeps a usable chat.
+pub fn panel_width(window_width: f32) -> f32 {
+    let center = window_width - crate::ui::rail::RAIL_WIDTH - crate::ui::sidebar::SIDEBAR_WIDTH;
+    if window_width <= 0. {
+        return PANEL_WIDTH;
+    }
+    (center * 0.5).clamp(MIN_PANEL_WIDTH, PANEL_WIDTH)
 }
 
 /// The panel composer's channel: the thread, its guild and slowmode, "Message <name>".
@@ -702,7 +715,7 @@ impl Inlet {
         Some(
             div()
                 .id("thread-panel")
-                .w(px(PANEL_WIDTH))
+                .w(px(panel_width(self.media.viewport.width.as_f32())))
                 .h_full()
                 .flex_none()
                 .flex()
@@ -844,6 +857,19 @@ mod tests {
                 seq: 0,
             }),
         );
+    }
+
+    #[test]
+    fn the_panel_leaves_room_for_the_chat() {
+        assert_eq!(
+            panel_width(1920.),
+            PANEL_WIDTH,
+            "Fluxer's width when there is room"
+        );
+        // A narrow window: half of the space beside the rail and the channel list.
+        assert_eq!(panel_width(1000.), 304.);
+        assert_eq!(panel_width(700.), MIN_PANEL_WIDTH);
+        assert_eq!(panel_width(0.), PANEL_WIDTH, "before the first layout");
     }
 
     #[gpui::test]
