@@ -6,7 +6,17 @@ on:
   pull_request:
     branches: [v0, main]
   workflow_dispatch:
+    inputs:
+      release:
+        description: Build the optimised release binaries, as on main and tags
+        type: boolean
+        default: false
   workflow_call:
+    inputs:
+      release:
+        description: Build the optimised release binaries (release.yml)
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -23,10 +33,64 @@ env:
   # The About view links to the exact commit the binary was built from.
   # Release builds never enable the `demo` feature of the app.
   INLET_SOURCE_REV: ${{ github.sha }}
+  # The profile of the app binaries. Pushes to main, tags (release.yml) and runs that
+  # ask for it build the optimised binaries that can be shipped ([profile.release]).
+  # Pull requests and v0 build the app once with [profile.ci], the profile of the
+  # tests; nothing built with it is shipped.
+  INLET_PROFILE: ${{ (inputs.release || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) && 'release' || 'ci' }}
+
+# Caches: one rust-cache entry per compiling job (shared-key), saved only by pushes to
+# v0. Pull requests restore the entry of v0 and save nothing, so the repository holds
+# one entry per job (a target folder without debug info) and stays within GitHub's
+# 10 GB limit.
 
 jobs:
+  # Pull requests that only change documentation skip every other job. A skipped job
+  # counts as passed for a required check, so nothing is left waiting.
+  changes:
+    name: Changed files
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.files.outputs.code }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event_name == 'pull_request'
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+
+      # Markdown files, docs/ and the README pictures cannot change what is built or
+      # tested. The other brand files are embedded in the app (icons), so they count
+      # as code.
+      - name: Does the change touch code?
+        id: files
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT" != pull_request ]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # The checkout is the merge commit; its first parent is the base branch.
+          files=$(git diff --name-only HEAD^1 HEAD)
+          code=false
+          while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            case "$f" in
+              *.md | docs/* | assets/brand/readme/*) echo "documentation: $f" ;;
+              *) echo "code: $f"; code=true ;;
+            esac
+          done <<< "$files"
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+
+  # Builds the app: on main and tags the release binary (checked and packaged), and
+  # always the demo binary that screenshots-windows photographs. The tests run next to
+  # it in windows-tests.
   windows:
     name: Windows (x86_64)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: windows-latest
     timeout-minutes: 60
     steps:
@@ -41,38 +105,119 @@ jobs:
           rustc --version
           cargo --version
 
+      # Binaries that can be shipped keep the default linker.
+      - name: Link CI builds with rust-lld
+        if: env.INLET_PROFILE == 'ci'
+        shell: bash
+        run: echo "RUSTFLAGS=-C linker=rust-lld" >> "$GITHUB_ENV"
+
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          prefix-key: v0-windows-x86_64
+          shared-key: windows-ci-build
+          save-if: ${{ github.ref == 'refs/heads/v0' }}
 
-      - name: Build
+      - name: Build the release binary
+        if: env.INLET_PROFILE == 'release'
         run: cargo build --release --locked -p inlet
+
+      - name: Package
+        if: env.INLET_PROFILE == 'release'
+        shell: bash
+        run: |
+          mkdir dist
+          cp target/release/inlet.exe dist/inlet.exe
+          cp THIRD-PARTY-NOTICES dist/THIRD-PARTY-NOTICES
+          cp LICENSE dist/LICENSE
 
       # The test-only extra CA must not be in a shipped binary in any form.
       - name: The release binary has no test CA code
+        if: env.INLET_PROFILE == 'release'
         shell: bash
         run: |
-          if ! test -s target/release/inlet.exe; then
-            echo "target/release/inlet.exe is missing or empty; nothing was checked"
+          if ! test -s dist/inlet.exe; then
+            echo "dist/inlet.exe is missing or empty; nothing was checked"
             exit 1
           fi
-          if grep -aqF INLET_TEST_EXTRA_CA_FILE target/release/inlet.exe; then
-            echo "target/release/inlet.exe contains the test CA variable"
+          if grep -aqF INLET_TEST_EXTRA_CA_FILE dist/inlet.exe; then
+            echo "dist/inlet.exe contains the test CA variable"
             exit 1
           fi
           # Demo data and scene files are for screenshots only.
-          if grep -aqF "demo scene file" target/release/inlet.exe; then
-            echo "target/release/inlet.exe contains demo code"
+          if grep -aqF "demo scene file" dist/inlet.exe; then
+            echo "dist/inlet.exe contains demo code"
             exit 1
           fi
 
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: env.INLET_PROFILE == 'release'
+        with:
+          name: inlet-windows-x86_64
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+      # Demo data only: never shipped. Built after the release binary is packaged, with
+      # the same profile, for screenshots-windows.
+      - name: Build with demo data
+        shell: bash
+        run: |
+          cargo build --profile "$INLET_PROFILE" --locked -p inlet --features demo
+          mkdir demo-build
+          cp "target/$INLET_PROFILE/inlet.exe" "target/$INLET_PROFILE/inlet-visual.exe" demo-build/
+
+      # Holds for every build of the app, so pull requests check it too.
+      - name: The demo binary has no test CA code
+        shell: bash
+        run: |
+          if ! test -s demo-build/inlet.exe; then
+            echo "demo-build/inlet.exe is missing or empty; nothing was checked"
+            exit 1
+          fi
+          if grep -aqF INLET_TEST_EXTRA_CA_FILE demo-build/inlet.exe; then
+            echo "demo-build/inlet.exe contains the test CA variable"
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: inlet-demo-windows
+          path: demo-build/
+          if-no-files-found: error
+          retention-days: 3
+
+  windows-tests:
+    name: Windows tests (x86_64)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      # Nothing built here is shipped.
+      RUSTFLAGS: -C linker=rust-lld
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned Rust toolchain
+        shell: bash
+        run: |
+          rustup toolchain install
+          rustc --version
+          cargo --version
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: windows-ci-test
+          save-if: ${{ github.ref == 'refs/heads/v0' }}
+
       - name: Test
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --profile ci --locked
 
       # inlet-platform tests that touch the real system (registry, notification
       # area) are ignored in a plain `cargo test`; they run here.
       - name: Platform tests on the real system
-        run: cargo test --locked -p inlet-platform -- --include-ignored
+        run: cargo test --profile ci --locked -p inlet-platform -- --include-ignored
 
       # Runs the platform demo (window, tray icon, badge, notification) and keeps a
       # screenshot. It fails if the tray icon could not be created or gpui logged a
@@ -80,10 +225,10 @@ jobs:
       - name: Platform demo
         shell: pwsh
         run: |
-          cargo build --locked -p inlet-platform --features gpui --example tray_demo
+          cargo build --profile ci --locked -p inlet-platform --features gpui --example tray_demo
           if ($LASTEXITCODE -ne 0) { exit 1 }
           New-Item -ItemType Directory -Force -Path platform-demo | Out-Null
-          $p = Start-Process -FilePath target/debug/examples/tray_demo.exe -ArgumentList '--exit-after', '15' -PassThru -RedirectStandardOutput platform-demo/windows.log
+          $p = Start-Process -FilePath target/ci/examples/tray_demo.exe -ArgumentList '--exit-after', '15' -PassThru -RedirectStandardOutput platform-demo/windows.log
           Start-Sleep -Seconds 8
           Add-Type -AssemblyName System.Windows.Forms
           Add-Type -AssemblyName System.Drawing
@@ -106,61 +251,39 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-      - name: Package
-        shell: bash
-        run: |
-          mkdir dist
-          cp target/release/inlet.exe dist/inlet.exe
-          cp THIRD-PARTY-NOTICES dist/THIRD-PARTY-NOTICES
-          cp LICENSE dist/LICENSE
-
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: inlet-windows-x86_64
-          path: dist/
-          if-no-files-found: error
-          retention-days: 7
-
   # Screenshots of the demo build: numbered runs to check by eye, and the scene files
   # of tests/visual compared with the committed baselines (inlet-visual). The runner
   # image is pinned so its fonts stay the same; the script sets the screen to
   # 1920x1080 at 100 %. A difference fails the job; the artifact visual-<os> holds the
   # screenshots, the differences and report.md. scripts/update-visual-baselines.sh
-  # takes a run's screenshots as the new baselines.
+  # takes a run's screenshots as the new baselines. Uses the demo build of the Windows
+  # job.
   screenshots-windows:
     name: Windows screenshots (demo)
+    needs: windows
     runs-on: windows-2025
-    timeout-minutes: 60
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: Install the pinned Rust toolchain
-        shell: bash
-        run: |
-          rustup toolchain install
-          rustc --version
-
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          prefix-key: v0-windows-x86_64-demo
-
-      # Demo data only: this binary is never shipped.
-      - name: Build with demo data
-        run: cargo build --release --locked -p inlet --features demo
+          name: inlet-demo-windows
+          path: demo-build
 
       # The runner has no GPU; Direct3D falls back to WARP (software), which gpui can use.
       - name: Take screenshots
         shell: pwsh
-        run: ./scripts/windows-screenshot.ps1 -Exe target/release/inlet.exe -OutDir screenshots
+        run: ./scripts/windows-screenshot.ps1 -Exe demo-build/inlet.exe -OutDir screenshots
 
       - name: Compare with the baselines
         if: ${{ !cancelled() }}
         shell: bash
         run: |
           set -o pipefail
-          target/release/inlet-visual.exe compare --scenes tests/visual/scenes \
+          demo-build/inlet-visual.exe compare --scenes tests/visual/scenes \
             --actual screenshots/visual --baseline tests/visual/baseline/windows \
             --out visual-report | tee -a "$GITHUB_STEP_SUMMARY"
 
@@ -205,9 +328,12 @@ jobs:
           Write-Host "no COM or borrow errors in $($logs.Count) logs ($runs demo runs)"
 
   # Pinned like screenshots-macos: the demo build made here is photographed there, and
-  # a new Xcode or Metal compiler could move pixels.
+  # a new Xcode or Metal compiler could move pixels. The macOS screenshots are quick,
+  # so the tests stay in this job.
   macos:
     name: macOS (aarch64)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: macos-15
     timeout-minutes: 60
     steps:
@@ -232,44 +358,111 @@ jobs:
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          prefix-key: v0-macos-aarch64
+          shared-key: macos-ci
+          save-if: ${{ github.ref == 'refs/heads/v0' }}
 
-      - name: Build
+      - name: Build the release binary
+        if: env.INLET_PROFILE == 'release'
         run: cargo build --release --locked -p inlet
+
+      # The binary is not signed or notarised yet. On the first start Gatekeeper
+      # blocks it: right-click the file and choose Open, or run
+      # `xattr -d com.apple.quarantine inlet` after unzipping.
+      - name: Package
+        if: env.INLET_PROFILE == 'release'
+        run: |
+          mkdir dist
+          cp target/release/inlet dist/inlet
+          cp THIRD-PARTY-NOTICES dist/THIRD-PARTY-NOTICES
+          cp LICENSE dist/LICENSE
+          cd dist
+          zip inlet-macos-aarch64.zip inlet THIRD-PARTY-NOTICES LICENSE
 
       # The test-only extra CA must not be in a shipped binary in any form.
       - name: The release binary has no test CA code
+        if: env.INLET_PROFILE == 'release'
         run: |
-          if ! test -s target/release/inlet; then
-            echo "target/release/inlet is missing or empty; nothing was checked"
+          if ! test -s dist/inlet; then
+            echo "dist/inlet is missing or empty; nothing was checked"
             exit 1
           fi
-          if grep -aqF INLET_TEST_EXTRA_CA_FILE target/release/inlet; then
-            echo "target/release/inlet contains the test CA variable"
+          if grep -aqF INLET_TEST_EXTRA_CA_FILE dist/inlet; then
+            echo "dist/inlet contains the test CA variable"
             exit 1
           fi
           # Demo data and scene files are for screenshots only.
-          if grep -aqF "demo scene file" target/release/inlet; then
-            echo "target/release/inlet contains demo code"
+          if grep -aqF "demo scene file" dist/inlet; then
+            echo "dist/inlet contains demo code"
             exit 1
           fi
 
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: env.INLET_PROFILE == 'release'
+        with:
+          name: inlet-macos-aarch64
+          path: dist/inlet-macos-aarch64.zip
+          if-no-files-found: error
+          retention-days: 7
+
+      # Unsigned Inlet.app. On tags, release.yml hands it to macos-sign.yml,
+      # which signs and notarises it. The tarball keeps the file modes.
+      - name: Assemble Inlet.app
+        if: env.INLET_PROFILE == 'release'
+        run: |
+          packaging/macos/build-app.sh dist/inlet dist-app
+          tar -czf inlet-macos-aarch64-app.tar.gz -C dist-app Inlet.app
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: env.INLET_PROFILE == 'release'
+        with:
+          name: inlet-macos-aarch64-app
+          path: inlet-macos-aarch64-app.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+      # Demo data only: never shipped. Built after the release binary is packaged, with
+      # the same profile, for the screenshots job. Only the app crate is compiled again.
+      - name: Build with demo data
+        run: |
+          cargo build --profile "$INLET_PROFILE" --locked -p inlet --features demo
+          mkdir demo-build
+          cp "target/$INLET_PROFILE/inlet" "target/$INLET_PROFILE/inlet-visual" demo-build/
+
+      # Holds for every build of the app, so pull requests check it too.
+      - name: The demo binary has no test CA code
+        run: |
+          if ! test -s demo-build/inlet; then
+            echo "demo-build/inlet is missing or empty; nothing was checked"
+            exit 1
+          fi
+          if grep -aqF INLET_TEST_EXTRA_CA_FILE demo-build/inlet; then
+            echo "demo-build/inlet contains the test CA variable"
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: inlet-demo-macos
+          path: demo-build/
+          if-no-files-found: error
+          retention-days: 3
+
       - name: Test
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --profile ci --locked
 
       # inlet-platform tests that touch the real system (LaunchAgents, pipes) are
       # ignored in a plain `cargo test`; they run here.
       - name: Platform tests on the real system
-        run: cargo test --locked -p inlet-platform -- --include-ignored
+        run: cargo test --profile ci --locked -p inlet-platform -- --include-ignored
 
       # The menu bar only accepts a status item from the main thread, which test
       # threads are not, so the tray is checked with the demo. It fails if the
       # tray icon could not be created.
       - name: Platform demo
         run: |
-          cargo build --locked -p inlet-platform --features gpui --example tray_demo
+          cargo build --profile ci --locked -p inlet-platform --features gpui --example tray_demo
           mkdir -p platform-demo
-          ./target/debug/examples/tray_demo --exit-after 15 > platform-demo/macos.log 2>&1 &
+          ./target/ci/examples/tray_demo --exit-after 15 > platform-demo/macos.log 2>&1 &
           pid=$!
           sleep 8
           screencapture -x platform-demo/macos.png || echo "no screenshot"
@@ -284,54 +477,6 @@ jobs:
           path: platform-demo/
           if-no-files-found: ignore
           retention-days: 7
-
-      # The binary is not signed or notarised yet. On the first start Gatekeeper
-      # blocks it: right-click the file and choose Open, or run
-      # `xattr -d com.apple.quarantine inlet` after unzipping.
-      - name: Package
-        run: |
-          mkdir dist
-          cp target/release/inlet dist/inlet
-          cp THIRD-PARTY-NOTICES dist/THIRD-PARTY-NOTICES
-          cp LICENSE dist/LICENSE
-          cd dist
-          zip inlet-macos-aarch64.zip inlet THIRD-PARTY-NOTICES LICENSE
-
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: inlet-macos-aarch64
-          path: dist/inlet-macos-aarch64.zip
-          if-no-files-found: error
-          retention-days: 7
-
-      # Unsigned Inlet.app. On tags, release.yml hands it to macos-sign.yml,
-      # which signs and notarises it. The tarball keeps the file modes.
-      - name: Assemble Inlet.app
-        run: |
-          packaging/macos/build-app.sh target/release/inlet dist-app
-          tar -czf inlet-macos-aarch64-app.tar.gz -C dist-app Inlet.app
-
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: inlet-macos-aarch64-app
-          path: inlet-macos-aarch64-app.tar.gz
-          if-no-files-found: error
-          retention-days: 7
-
-      # Demo data only: never shipped. Built last, after the release binary is packaged,
-      # for the screenshots job. Only the app crate is compiled again.
-      - name: Build with demo data
-        run: |
-          cargo build --release --locked -p inlet --features demo
-          mkdir demo-build
-          cp target/release/inlet target/release/inlet-visual demo-build/
-
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: inlet-demo-macos
-          path: demo-build/
-          if-no-files-found: error
-          retention-days: 3
 
   # See screenshots-windows. Uses the demo build of the macOS job; the script sets the
   # screen to 1920x1080 at one pixel per point.
@@ -375,8 +520,13 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+  # Builds the app, as the Windows job does. Here pull requests build the app without
+  # demo data too, so its checks run on every change. The tests and clippy run next to
+  # it in linux-tests.
   linux:
     name: Linux (x86_64)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -389,7 +539,120 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential cmake clang lld pkg-config \
+            build-essential cmake clang lld mold pkg-config \
+            libasound2-dev \
+            libfontconfig-dev \
+            libglib2.0-dev \
+            libssl-dev \
+            libvulkan1 libvulkan-dev \
+            libwayland-dev \
+            libx11-xcb-dev \
+            libxcb1-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libzstd-dev
+
+      - name: Install the pinned Rust toolchain
+        run: |
+          rustup toolchain install
+          rustc --version
+          cargo --version
+
+      # Binaries that can be shipped keep the default linker.
+      - name: Link CI builds with mold
+        if: env.INLET_PROFILE == 'ci'
+        run: echo "RUSTFLAGS=-C link-arg=-fuse-ld=mold" >> "$GITHUB_ENV"
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: linux-ci-build
+          save-if: ${{ github.ref == 'refs/heads/v0' }}
+
+      # The extra test CA of inlet-protocol is for tests only. The crate also
+      # refuses to compile it in release mode; this checks the feature graph.
+      - name: The app does not enable test-only features
+        run: |
+          if cargo tree --locked -p inlet -e features,no-dev | grep -F 'test-extra-ca'; then
+            echo "inlet enables the test-extra-ca feature"
+            exit 1
+          fi
+
+      # The app without demo data: the release binary on main and tags, a CI build on
+      # pull requests and v0.
+      - name: Build
+        run: cargo build --profile "$INLET_PROFILE" --locked -p inlet
+
+      - name: Package
+        run: |
+          mkdir dist
+          cp "target/$INLET_PROFILE/inlet" dist/inlet
+          cp THIRD-PARTY-NOTICES dist/THIRD-PARTY-NOTICES
+          cp LICENSE dist/LICENSE
+
+      # And the binary holds none of its code, whatever the profile says.
+      - name: The binary has no test CA code
+        run: |
+          if ! test -s dist/inlet; then
+            echo "dist/inlet is missing or empty; nothing was checked"
+            exit 1
+          fi
+          if grep -aqF INLET_TEST_EXTRA_CA_FILE dist/inlet; then
+            echo "dist/inlet contains the test CA variable"
+            exit 1
+          fi
+          # Demo data and scene files are for screenshots only.
+          if grep -aqF "demo scene file" dist/inlet; then
+            echo "dist/inlet contains demo code"
+            exit 1
+          fi
+
+      - name: Pack the release archive
+        if: env.INLET_PROFILE == 'release'
+        run: tar -czf dist/inlet-linux-x86_64.tar.gz -C dist inlet THIRD-PARTY-NOTICES LICENSE
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: env.INLET_PROFILE == 'release'
+        with:
+          name: inlet-linux-x86_64
+          path: dist/inlet-linux-x86_64.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+      # Demo data only: never shipped. Built after the binary above is packaged, with
+      # the same profile, for the screenshots job. Only the app crate is compiled again.
+      - name: Build with demo data
+        run: |
+          cargo build --profile "$INLET_PROFILE" --locked -p inlet --features demo
+          mkdir demo-build
+          cp "target/$INLET_PROFILE/inlet" "target/$INLET_PROFILE/inlet-visual" demo-build/
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: inlet-demo-linux
+          path: demo-build/
+          if-no-files-found: error
+          retention-days: 3
+
+  linux-tests:
+    name: Linux tests and clippy (x86_64)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      # Nothing built here is shipped.
+      RUSTFLAGS: -C link-arg=-fuse-ld=mold
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Package list follows Zed's script/linux.
+      - name: Install system packages for gpui
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake clang lld mold pkg-config \
             libasound2-dev \
             libfontconfig-dev \
             libglib2.0-dev \
@@ -410,89 +673,30 @@ jobs:
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          prefix-key: v0-linux-x86_64
-
-      - name: Build
-        run: cargo build --release --locked -p inlet
+          shared-key: linux-ci-test
+          save-if: ${{ github.ref == 'refs/heads/v0' }}
 
       - name: Test
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --profile ci --locked
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --profile ci --locked -- -D warnings
 
       # The layout measures (rail, sidebar, headers, rows, message grid, composer) are
       # taken from the real view with the demo data, so they need the demo feature; so
       # do the demo's own tests and the screenshot comparison tool.
       - name: Layout tests and demo tests
-        run: cargo test --locked -p inlet --features demo --lib --bins --test layout_metrics
+        run: cargo test --profile ci --locked -p inlet --features demo --lib --bins --test layout_metrics
 
       - name: Clippy with demo data
-        run: cargo clippy --locked -p inlet --features demo --all-targets -- -D warnings
+        run: cargo clippy --profile ci --locked -p inlet --features demo --all-targets -- -D warnings
 
       # The tray test needs a session bus to register on. The gpui glue and the
       # demo are behind a feature, so they are linted here separately.
       - name: Platform tests with a session bus
         run: |
-          dbus-run-session -- cargo test --locked -p inlet-platform
-          cargo clippy --locked -p inlet-platform --features gpui --all-targets -- -D warnings
-
-      # The extra test CA of inlet-protocol is for tests only. The crate also
-      # refuses to compile it in release mode; this checks the feature graph.
-      - name: The app does not enable test-only features
-        run: |
-          if cargo tree --locked -p inlet -e features,no-dev | grep -F 'test-extra-ca'; then
-            echo "inlet enables the test-extra-ca feature"
-            exit 1
-          fi
-
-      # And the shipped binary holds none of its code, whatever the profile says.
-      - name: The release binary has no test CA code
-        run: |
-          if ! test -s target/release/inlet; then
-            echo "target/release/inlet is missing or empty; nothing was checked"
-            exit 1
-          fi
-          if grep -aqF INLET_TEST_EXTRA_CA_FILE target/release/inlet; then
-            echo "target/release/inlet contains the test CA variable"
-            exit 1
-          fi
-          # Demo data and scene files are for screenshots only.
-          if grep -aqF "demo scene file" target/release/inlet; then
-            echo "target/release/inlet contains demo code"
-            exit 1
-          fi
-
-      - name: Package
-        run: |
-          mkdir dist
-          cp target/release/inlet dist/inlet
-          cp THIRD-PARTY-NOTICES dist/THIRD-PARTY-NOTICES
-          cp LICENSE dist/LICENSE
-          tar -czf inlet-linux-x86_64.tar.gz -C dist inlet THIRD-PARTY-NOTICES LICENSE
-          mv inlet-linux-x86_64.tar.gz dist/
-
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: inlet-linux-x86_64
-          path: dist/inlet-linux-x86_64.tar.gz
-          if-no-files-found: error
-          retention-days: 7
-
-      # Demo data only: never shipped. Built last, after the release binary is packaged,
-      # for the screenshots job. Only the app crate is compiled again.
-      - name: Build with demo data
-        run: |
-          cargo build --release --locked -p inlet --features demo
-          mkdir demo-build
-          cp target/release/inlet target/release/inlet-visual demo-build/
-
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: inlet-demo-linux
-          path: demo-build/
-          if-no-files-found: error
-          retention-days: 3
+          dbus-run-session -- cargo test --profile ci --locked -p inlet-platform
+          cargo clippy --profile ci --locked -p inlet-platform --features gpui --all-targets -- -D warnings
 
   # See screenshots-windows. Uses the demo build of the Linux job, under Xvfb with
   # software Vulkan (lavapipe) at 96 DPI and a scale of 1.
@@ -559,6 +763,8 @@ jobs:
 
   notices:
     name: Third-party notices are up to date
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -571,16 +777,11 @@ jobs:
           rustup toolchain install
           rustc --version
 
-      - name: Cache cargo-about
-        id: cargo-about
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      # The released cargo-about binary, checked against the hash in the action's
+      # manifest, instead of compiling it.
+      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
         with:
-          path: ~/.cargo/bin/cargo-about
-          key: cargo-about-0.9.3-${{ runner.os }}-rust-1.99.1
-
-      - name: Install cargo-about
-        if: steps.cargo-about.outputs.cache-hit != 'true'
-        run: cargo install cargo-about --locked --version 0.9.3 --features cli
+          tool: cargo-about@0.9.3
 
       - name: Regenerate THIRD-PARTY-NOTICES
         run: scripts/third-party-notices.sh
@@ -590,6 +791,8 @@ jobs:
 
   deny:
     name: cargo-deny
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -618,6 +821,8 @@ jobs:
 
   fuzz-build:
     name: Fuzz target builds (inlet-media)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -646,6 +851,7 @@ jobs:
         with:
           prefix-key: v0-fuzz
           workspaces: crates/inlet-media/fuzz
+          save-if: ${{ github.ref == 'refs/heads/v0' }}
 
       # Builds the target with libFuzzer and the sanitizer, and does not run it.
       - name: Build the fuzz target

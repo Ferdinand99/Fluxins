@@ -24,3 +24,33 @@ khronos-egl = { git = "https://github.com/zed-industries/khronos-egl", rev = "42
 
 [profile.release]
 strip = true
+
+# CI builds of pull requests and of v0: one profile for the tests, clippy and the demo
+# build that the screenshot jobs photograph. Release builds keep [profile.release].
+[profile.ci]
+inherits = "dev"
+opt-level = 1
+debug = 0
+incremental = false
+
+# Dependencies and build scripts are compiled as in a release build. gpui's Windows
+# renderer would otherwise read its shaders from the source tree at run time (a demo
+# binary copied to the screenshot runner has no source tree) and turn on the DirectX
+# debug layer.
+[profile.ci.package."*"]
+debug-assertions = false
+overflow-checks = false
+
+[profile.ci.build-override]
+debug-assertions = false
+
+# Except gpui itself: it records element bounds for `debug_selector` only with debug
+# assertions, and the layout tests read them. It draws nothing extra unless asked.
+[profile.ci.package.gpui]
+debug-assertions = true
+
+# The app as in a release build too: a GUI program on Windows, not a console one.
+# The other workspace crates keep their debug assertions and overflow checks for the
+# tests.
+[profile.ci.package.inlet]
+debug-assertions = false
