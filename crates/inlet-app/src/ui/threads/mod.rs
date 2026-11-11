@@ -97,9 +97,13 @@ pub struct State {
 }
 
 impl State {
-    /// Signed out or a new session: nothing of the old account stays on screen.
+    /// Signed out, or another account shown: nothing of the old account stays on
+    /// screen or on its way. The panel's composer goes too (its text was saved with the
+    /// old account's drafts); the next thread opens a new one.
     pub fn reset(&mut self) {
         self.panel = None;
+        self.composer = None;
+        self.composer_events = None;
         self.browser = None;
         self.forum = None;
         self.loads.clear();

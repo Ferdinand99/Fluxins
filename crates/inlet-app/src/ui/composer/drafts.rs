@@ -5,7 +5,7 @@
 //! account signs out. A draft is the wire text plus the labels of its pills, so it comes
 //! back with the same pills.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -117,6 +117,9 @@ pub struct Drafts {
     /// Held while a file is written or deleted, so a late write cannot bring a deleted
     /// file back.
     disk: Arc<Mutex<()>>,
+    /// Files of accounts that signed out while another account was active; a write
+    /// still on its way to one of them is dropped.
+    deleted: Arc<Mutex<HashSet<PathBuf>>>,
     dirty: bool,
 }
 
@@ -127,12 +130,21 @@ pub struct PendingWrite {
     generation: u64,
     current: Arc<AtomicU64>,
     disk: Arc<Mutex<()>>,
+    deleted: Arc<Mutex<HashSet<PathBuf>>>,
 }
 
 impl PendingWrite {
     pub fn run(self) {
         let _guard = self.disk.lock().unwrap_or_else(|e| e.into_inner());
         if self.current.load(Ordering::SeqCst) != self.generation {
+            return;
+        }
+        if self
+            .deleted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&self.path)
+        {
             return;
         }
         if let Err(err) = write_private(&self.path, &self.bytes) {
@@ -148,6 +160,10 @@ impl Drafts {
         if self.file.as_deref() == Some(path.as_path()) {
             return;
         }
+        self.deleted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&path);
         let stored = read_file(&path);
         for (channel, draft) in stored.drafts {
             self.seq = self.seq.max(draft.seq);
@@ -202,7 +218,44 @@ impl Drafts {
             generation: self.generation.load(Ordering::SeqCst),
             current: self.generation.clone(),
             disk: self.disk.clone(),
+            deleted: self.deleted.clone(),
         })
+    }
+
+    /// Another account becomes active: every draft so far goes to this account's file
+    /// (the returned write; run it off the UI thread), then the drafts are forgotten here
+    /// but not deleted, so the next account's file is read on its own. Writes prepared
+    /// before are dropped; the returned one holds all of them.
+    pub fn switch_account(&mut self) -> Option<PendingWrite> {
+        self.dirty = true;
+        let write = self.prepare_write();
+        let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        self.file = None;
+        self.drafts.clear();
+        self.dirty = false;
+        write.map(|mut w| {
+            w.generation = generation;
+            w
+        })
+    }
+
+    /// An account that is not the active one signed out: its drafts file goes (the
+    /// returned job; run it off the UI thread), and no write still on its way can bring
+    /// it back.
+    pub fn forget_file(&self, path: PathBuf) -> impl FnOnce() + Send + 'static {
+        self.deleted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(path.clone());
+        let disk = self.disk.clone();
+        move || {
+            let _guard = disk.lock().unwrap_or_else(|e| e.into_inner());
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => log::warn!("the drafts file could not be deleted: {err}"),
+            }
+        }
     }
 
     /// Sign-out: forgets every draft and deletes the file.
@@ -373,6 +426,47 @@ mod tests {
         drafts.sign_out();
         late.run();
         assert!(!path.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn switching_accounts_keeps_each_accounts_drafts_apart() {
+        let dir = temp_dir("switch");
+        let a = path_for(&dir, "fluxer.example", "1").unwrap();
+        let b = path_for(&dir, "fluxer.example", "2").unwrap();
+        let mut drafts = Drafts::default();
+        drafts.attach(a.clone());
+        drafts.put("10", draft("from a "));
+        // A write of account A still on its way is replaced by the switch's own write.
+        let late = drafts.prepare_write().unwrap();
+        drafts
+            .switch_account()
+            .expect("a's drafts are written")
+            .run();
+        late.run();
+        assert!(drafts.get("10").is_none(), "nothing of a stays in memory");
+        drafts.attach(b.clone());
+        assert!(drafts.get("10").is_none(), "b does not see a's draft");
+        drafts.put("20", draft("from b "));
+        drafts.prepare_write().unwrap().run();
+        // Back to a: its draft is there, b's is not.
+        drafts.switch_account().unwrap().run();
+        drafts.attach(a.clone());
+        assert_eq!(
+            drafts.get("10").map(|d| d.wire.as_str()),
+            Some("from a <@42>")
+        );
+        assert!(drafts.get("20").is_none());
+        // B signs out while a is active: its file goes, and the write the switch away
+        // from b left on its way cannot bring it back.
+        drafts.switch_account().unwrap().run();
+        drafts.attach(b.clone());
+        drafts.put("22", draft("late "));
+        let late_b = drafts.switch_account().expect("b's write");
+        drafts.forget_file(b.clone())();
+        late_b.run();
+        assert!(!b.exists(), "a signed-out account's drafts stay gone");
+        assert!(a.exists());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

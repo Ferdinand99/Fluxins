@@ -448,6 +448,12 @@ fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
+/// Builds an account's state from its READY: the one place that does, for the active
+/// account here and for the accounts in the background (one state per account).
+pub(crate) fn account_state_from(ready: &p::Ready) -> AccountState {
+    AccountState::from_ready_at(ready, now_ms())
+}
+
 /// Default and reply messages; everything else is a system line.
 fn is_regular(kind: i64) -> bool {
     kind == message_type::DEFAULT || kind == message_type::REPLY
@@ -1143,7 +1149,7 @@ impl Inlet {
         if let p::Dispatch::Ready(ready) = &dispatch {
             let mut changes = match self.account.clone() {
                 None => {
-                    let state = AccountState::from_ready_at(ready, now_ms());
+                    let state = account_state_from(ready);
                     self.account = Some(cx.new(|_| state));
                     self.start_ticker(cx);
                     let mut c = Changes::default();
@@ -1372,6 +1378,9 @@ impl Inlet {
     /// Signed out: no messages, no account state, nothing on its way.
     pub(crate) fn reset_messages(&mut self) {
         self.clear_messages();
+        // The thread panel, its composer, the thread list and the forum view were the
+        // old account's (sign-out or a switch).
+        self.threads.reset();
         self.account = None;
         self.chat.actions.clear();
         let compact = self.chat.view.compact;
@@ -1531,7 +1540,7 @@ impl Inlet {
     }
 
     /// Ticks the account state about once a second (typing, timeouts, load timeouts).
-    fn start_ticker(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn start_ticker(&mut self, cx: &mut Context<Self>) {
         self.chat.view.ticker = Some(cx.spawn(async move |this, cx| loop {
             cx.background_executor().timer(Duration::from_secs(1)).await;
             let alive = this.update(cx, |this, cx| this.tick_account(cx));

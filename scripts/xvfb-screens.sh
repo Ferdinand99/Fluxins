@@ -82,10 +82,6 @@ scene 18-image-viewer image-viewer c-attachments
 scene 19-chat-reactions chat-reactions c-general
 scene 20-chat-menu chat-menu c-general
 scene 21-chat-delete chat-delete c-general
-scene 22-thread-panel thread-panel c-general
-scene 23-thread-list thread-list c-general
-scene 24-forum forum c-forum
-scene 25-media-channel media-channel c-gallery
 
 # 6. The Desktop settings tab, and the prompt a link from outside opens.
 INLET_DEMO=1 INLET_DEMO_LIVE_SECS=3600 INLET_DEMO_GUILD=g1 INLET_DEMO_CHANNEL=c-general INLET_DEMO_SETTINGS=desktop "$bin" >>"$out/demo.log" 2>&1 &
@@ -98,6 +94,18 @@ pid=$!
 sleep 6
 shot 15-link-prompt
 kill $pid; wait $pid 2>/dev/null
+
+# 7. Several accounts: the account switcher (two more accounts in the background, one
+#    on another instance) and the sign-in screen when adding one.
+scene 22-accounts accounts c-general
+scene 23-accounts-add accounts-add c-general
+
+# 8. Threads: the side panel with its own composer, the thread list, a forum and a
+#    media channel.
+scene 24-thread-panel thread-panel c-general
+scene 25-thread-list thread-list c-general
+scene 26-forum forum c-forum
+scene 27-media-channel media-channel c-gallery
 
 tail -n 20 "$out/signin.log" "$out/demo.log" >&2
 cat "$out/memory.txt" >&2

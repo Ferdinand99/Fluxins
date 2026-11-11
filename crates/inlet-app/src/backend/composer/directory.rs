@@ -301,7 +301,7 @@ impl Backend {
                     Some(&nonce),
                 );
                 if sent {
-                    let Some(mut inner) = self.composer.of(r.gen) else {
+                    let Some(mut inner) = r.composer.of(r.gen) else {
                         return;
                     };
                     if inner.searches.len() >= MAX_SEARCHES {

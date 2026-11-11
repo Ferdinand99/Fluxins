@@ -7,6 +7,7 @@ use crate::app::Inlet;
 use crate::assets::Icon;
 use crate::model::Guild;
 use crate::theme;
+use crate::ui::notifications::badge::rail_badge;
 
 impl Inlet {
     /// The floating user panel under the rail and channel list.
@@ -29,6 +30,8 @@ impl Inlet {
                 .hover(|s| s.bg(theme::hover_bg()))
                 .child(icon.el(px(20.), theme::text_muted()))
         };
+        // Mentions waiting in the other signed-in accounts, on the avatar.
+        let elsewhere = self.switcher.background_mentions();
         div().flex_none().p(px(6.)).bg(theme::bg_app()).child(
             div()
                 .h(px(58.))
@@ -42,45 +45,39 @@ impl Inlet {
                 .border_1()
                 .border_color(theme::ring())
                 .child(
+                    // Avatar and name open the account switcher, as in Fluxer.
                     div()
-                        .size(px(32.))
-                        .flex_none()
-                        .rounded_full()
-                        .bg(theme::brand())
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .text_size(px(12.))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(theme::text_strong())
-                        .child(initials),
-                )
-                .child(
-                    div()
+                        .id("user-area")
                         .flex_1()
                         .min_w_0()
                         .flex()
-                        .flex_col()
-                        .overflow_hidden()
-                        .whitespace_nowrap()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .cursor_pointer()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.switcher.open = true;
+                            cx.notify();
+                        }))
                         .child(
                             div()
-                                .text_size(px(14.))
-                                .line_height(px(18.))
-                                .font_weight(FontWeight::MEDIUM)
+                                .relative()
+                                .size(px(32.))
+                                .flex_none()
+                                .rounded_full()
+                                .bg(theme::brand())
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_size(px(12.))
+                                .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(theme::text_strong())
-                                .text_ellipsis()
-                                .child(self.username.clone()),
+                                .child(initials)
+                                .when(elsewhere > 0, |d| {
+                                    d.child(rail_badge(elsewhere, theme::panel_bg()))
+                                }),
                         )
-                        .child(
-                            div()
-                                .text_size(px(11.))
-                                .line_height(px(14.))
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(theme::text_muted())
-                                .text_ellipsis()
-                                .child(self.instance.clone()),
-                        ),
+                        .child(self.render_user_name()),
                 )
                 .child(
                     icon_button("settings", Icon::Gear)
@@ -96,5 +93,34 @@ impl Inlet {
                     icon_button("sign-out", Icon::SignOut).on_click(cx.listener(Self::sign_out)),
                 ),
         )
+    }
+
+    /// The name and instance in the user panel.
+    fn render_user_name(&self) -> impl IntoElement {
+        div()
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .child(
+                div()
+                    .text_size(px(14.))
+                    .line_height(px(18.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(theme::text_strong())
+                    .text_ellipsis()
+                    .child(self.username.clone()),
+            )
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .line_height(px(14.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(theme::text_muted())
+                    .text_ellipsis()
+                    .child(self.instance.clone()),
+            )
     }
 }

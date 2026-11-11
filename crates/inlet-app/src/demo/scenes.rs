@@ -21,6 +21,9 @@
 //! - `chat-reactions`, `chat-menu`, `chat-delete`: for `#general`, reactions under a few
 //!   messages and an own message; the hover bar shown on one message, the context menu
 //!   open on the own message, or its delete confirmation (see `actions.rs`).
+//! - `accounts`: as `default`, with two more accounts in the background (one on the same
+//!   instance with mentions, one on another instance) and the account switcher open.
+//! - `accounts-add`: the same accounts, on the sign-in screen to add one more.
 //! - `thread-panel`, `thread-list`: for `#general`, with a thread, archived threads, a
 //!   forum and a media channel (see `threads.rs`); the thread open in the side panel, or
 //!   the thread list open.
@@ -57,6 +60,8 @@ pub enum Scene {
     ChatReactions,
     ChatMenu,
     ChatDelete,
+    Accounts,
+    AccountsAdd,
     ThreadPanel,
     ThreadList,
     Forum,
@@ -81,6 +86,8 @@ impl Scene {
             "chat-reactions" => Scene::ChatReactions,
             "chat-menu" => Scene::ChatMenu,
             "chat-delete" => Scene::ChatDelete,
+            "accounts" => Scene::Accounts,
+            "accounts-add" => Scene::AccountsAdd,
             "thread-panel" => Scene::ThreadPanel,
             "thread-list" => Scene::ThreadList,
             "forum" => Scene::Forum,
@@ -319,7 +326,7 @@ pub fn data(scene: Scene) -> Data {
         });
     }
     let mut guild_settings = Vec::new();
-    let unread_demo = scene == Scene::Default;
+    let unread_demo = matches!(scene, Scene::Default | Scene::Accounts | Scene::AccountsAdd);
     if unread_demo {
         // Unread messages, mentions and mutes in the sidebar and the rail.
         read_states.extend(unread::read_states());
@@ -367,6 +374,8 @@ mod tests {
             "chat-reactions",
             "chat-menu",
             "chat-delete",
+            "accounts",
+            "accounts-add",
             "thread-panel",
             "thread-list",
             "forum",

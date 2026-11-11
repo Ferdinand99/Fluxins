@@ -187,6 +187,24 @@ impl State {
         true
     }
 
+    /// The active account changes or ends: its thread requests stop, and its next
+    /// subscription is sent again.
+    pub fn stop(&mut self) {
+        for task in [
+            self.open.take(),
+            self.older.take(),
+            self.archived.take(),
+            self.forum.take(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            task.abort();
+        }
+        self.older_last = None;
+        self.subscribed = None;
+    }
+
     /// Whether the subscription differs from the last one of session `gen`; records it.
     fn fresh_subscription(&mut self, gen: u64, guild: &str, lists: &[String]) -> bool {
         let same = self
@@ -527,5 +545,8 @@ mod tests {
         assert!(!s.fresh_subscription(1, "100", &lists));
         assert!(s.fresh_subscription(1, "200", &[]), "another guild");
         assert!(s.fresh_subscription(2, "200", &[]), "a new session");
+        // A switch to another account stops everything and forgets the last one.
+        s.stop();
+        assert!(s.fresh_subscription(2, "200", &[]));
     }
 }

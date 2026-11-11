@@ -56,6 +56,12 @@ impl Inlet {
                 // The open channel may have changed (for example its slowmode).
                 self.composer_open_channel(&open, window, cx);
             }
+            // Back to an account: the channel it had open.
+            if let Some(wanted) = self.switcher.take_wanted_channel() {
+                if self.channels.iter().any(|c| c.id == wanted) {
+                    self.select_channel(wanted, window, cx);
+                }
+            }
             #[cfg(feature = "demo")]
             if let Some(wanted) = self.demo_channel.take() {
                 if self.channels.iter().any(|c| c.id == wanted) {
