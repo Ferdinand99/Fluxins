@@ -638,6 +638,126 @@ async fn synced_preference_writes_are_batched_and_paced() {
     assert_eq!((patches(&reqs), gets(&reqs)), (3, 2));
 }
 
+#[tokio::test]
+async fn every_caller_of_a_failed_batch_gets_a_network_error_not_a_decode_error() {
+    // The API host does not answer (nothing listens on its port): the PATCH
+    // fails on the network. The writer and the callers that only waited must
+    // all see that kind, so the UI can say "offline" and not "the server sent
+    // something odd".
+    let closed_port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let discovery = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/.well-known/fluxer"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(common::discovery_json(
+                &format!("http://127.0.0.1:{closed_port}"),
+                "ws://127.0.0.1:1/gateway",
+            )),
+        )
+        .mount(&discovery)
+        .await;
+    let instance = Instance::discover_with(
+        &discovery.uri(),
+        inlet_protocol::ClientInfo {
+            installation_id: "00000000-0000-4000-a000-000000000000".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let c = client(&instance, "tok-prefs-offline");
+    let base = SyncedPreferences::decode(&snapshot_from_a_newer_client(b"x")).unwrap();
+    let mut tasks = Vec::new();
+    for i in 0..3 {
+        let (c, base) = (c.clone(), base.clone());
+        tasks.push(tokio::spawn(async move {
+            c.update_synced_preferences(&base, add_favorite(format!("n{i}")))
+                .await
+        }));
+    }
+    for t in tasks {
+        match t.await.unwrap() {
+            Err(Error::Network(text)) => assert!(!text.is_empty()),
+            other => panic!("{other:?}"),
+        }
+    }
+}
+
+/// Answers a settings PATCH like [`EchoSettings`], after a delay.
+struct SlowEcho(Duration);
+
+impl Respond for SlowEcho {
+    fn respond(&self, req: &Request) -> ResponseTemplate {
+        EchoSettings.respond(req).set_delay(self.0)
+    }
+}
+
+#[tokio::test]
+async fn dropping_the_caller_that_holds_the_writer_does_not_cancel_the_batch() {
+    let (server, instance) = common::instance().await;
+    Mock::given(method("PATCH"))
+        .and(path("/api/v1/users/@me/settings"))
+        .respond_with(SlowEcho(Duration::from_millis(1_500)))
+        .mount(&server)
+        .await;
+    let c = client(&instance, "tok-prefs-drop");
+    let stale = SyncedPreferences::decode(&snapshot_from_a_newer_client(b"x")).unwrap();
+
+    let first = {
+        let (c, stale) = (c.clone(), stale.clone());
+        tokio::spawn(async move {
+            c.update_synced_preferences(&stale, add_favorite("first".into()))
+                .await
+        })
+    };
+    let second = {
+        let (c, stale) = (c.clone(), stale.clone());
+        tokio::spawn(async move {
+            c.update_synced_preferences(&stale, add_favorite("second".into()))
+                .await
+        })
+    };
+    // Wait until the PATCH of the batch is in flight, then drop the first caller.
+    for _ in 0..200 {
+        if patches(&server.received_requests().await.unwrap()) == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(patches(&server.received_requests().await.unwrap()), 1);
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+
+    // The other caller gets the real result, with both edits in it.
+    let saved = second.await.unwrap().unwrap();
+    let favs = &saved
+        .get()
+        .emoji_picker
+        .as_ref()
+        .unwrap()
+        .favorite_emoji_ids;
+    assert!(favs.contains(&"first".to_owned()) && favs.contains(&"second".to_owned()));
+
+    // The write was stored, so the next one, from the same stale snapshot,
+    // does not conflict with it: no GET and no second PATCH of the old base.
+    let third = c
+        .update_synced_preferences(&stale, add_favorite("third".into()))
+        .await
+        .unwrap();
+    assert!(third
+        .get()
+        .emoji_picker
+        .as_ref()
+        .unwrap()
+        .favorite_emoji_ids
+        .contains(&"first".to_owned()));
+    let reqs = server.received_requests().await.unwrap();
+    assert_eq!((patches(&reqs), gets(&reqs)), (2, 0));
+}
+
 #[test]
 fn synced_preferences_decoding_is_lenient_about_base64_and_strict_about_size() {
     let bytes = snapshot_from_a_newer_client(b"x");
@@ -1015,8 +1135,9 @@ async fn invite_code_is_validated_before_use_in_a_path() {
     assert_eq!(joined.code, "aB3dEf7h");
     assert_eq!(invites(server.received_requests().await.unwrap()), 2);
 
-    // Links: only this instance's invite links give a code; other hosts come
-    // back with their host, so the UI can route them.
+    // Links: only this instance's invite links give a code; invite-shaped
+    // links of other origins come back with their origin, so the UI can route
+    // them.
     let base = server.uri();
     let parse = |s: &str| parse_invite(s, &instance);
     let code = |c: &str| InviteLink::Code(c.into());
@@ -1032,20 +1153,39 @@ async fn invite_code_is_validated_before_use_in_a_path() {
         InviteLink::NotAnInvite
     );
     assert_eq!(parse("not a link"), InviteLink::NotAnInvite);
+    let other = |origin: &str, c: &str| InviteLink::OtherInstance {
+        origin: origin.into(),
+        code: c.into(),
+    };
     assert_eq!(
         parse("https://Other.Example/invite/aB3dEf7h"),
-        InviteLink::OtherInstance {
-            host: "other.example".into(),
-            code: Some("aB3dEf7h".into())
-        }
+        other("https://other.example", "aB3dEf7h")
+    );
+    // The port is part of the origin; a default port is not.
+    assert_eq!(
+        parse("https://chat.example:8443/invite/aB3dEf7h"),
+        other("https://chat.example:8443", "aB3dEf7h")
+    );
+    assert_eq!(
+        parse("https://chat.example:443/invite/aB3dEf7h"),
+        other("https://chat.example", "aB3dEf7h")
     );
     assert_eq!(
         parse("https://fluxer.gg/xyz"),
-        InviteLink::OtherInstance {
-            host: "fluxer.gg".into(),
-            code: Some("xyz".into())
-        }
+        other("https://fluxer.gg", "xyz")
     );
+    // Not invite paths: any other https link, even with a code-like segment.
+    for link in [
+        "https://github.com/foo",
+        "https://github.com/foo/bar",
+        "https://github.com/",
+        "https://chat.example:8443/channels/1/2",
+        "https://other.example/invite/a%2F..",
+        "https://other.example/invite/",
+        "https://user:pw@other.example/invite/aB3dEf7h",
+    ] {
+        assert_eq!(parse(link), InviteLink::NotAnInvite, "{link}");
+    }
     // Plain http elsewhere is not followed at all.
     assert_eq!(
         parse("http://evil.example/invite/aB3dEf7h"),

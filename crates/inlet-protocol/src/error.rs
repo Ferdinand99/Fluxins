@@ -41,6 +41,13 @@ pub enum Error {
     /// query string can carry a ticket.
     #[error("network error: {0}")]
     Http(reqwest::Error),
+    /// The same kind of failure as [`Error::Http`] (network or TLS failure, or
+    /// a timeout), as text. A request that several callers share (the
+    /// preference writes of [`crate::Client::update_synced_preferences`])
+    /// hands this to the callers, because [`Error::Http`] cannot be copied.
+    /// Treat both the same: the instance was not reached.
+    #[error("network error: {0}")]
+    Network(String),
     /// The instance answered with an error.
     #[error("API error: {0}")]
     Api(Box<ApiError>),
