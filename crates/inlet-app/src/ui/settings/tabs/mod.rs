@@ -3,10 +3,14 @@
 //! line to [`all`].
 
 mod desktop;
+mod notifications;
 
 use super::SettingsTab;
 
 /// Every tab, in the order the list shows them.
 pub fn all() -> Vec<Box<dyn SettingsTab>> {
-    vec![Box::new(desktop::DesktopTab)]
+    vec![
+        Box::new(desktop::DesktopTab),
+        Box::new(notifications::NotificationsTab),
+    ]
 }

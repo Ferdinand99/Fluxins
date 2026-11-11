@@ -19,6 +19,7 @@
 //! the bottom. The "NEW" divider keeps using
 //! the position the view captured when the channel was opened.
 
+pub mod alerts;
 pub mod badge;
 mod reading;
 pub mod settings;

@@ -554,6 +554,15 @@ pub fn show_main_window(cx: &mut App) {
     });
 }
 
+/// Flashes the taskbar button (bounces the dock icon) while the window has no focus,
+/// for a new notification.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn flash_main_window(cx: &mut App) {
+    with_main_window(cx, "flash the window", |window, _| {
+        gpui_glue::flash_window(window)
+    });
+}
+
 fn hide_main_window(cx: &mut App) {
     with_main_window(cx, "hide the window", |window, cx| {
         gpui_glue::hide_window(window, cx)
@@ -823,6 +832,9 @@ impl Inlet {
             }
             Ev::Os(PlatformEvent::DeepLink(link)) => self.offer_deep_link(link, cx),
             Ev::Os(PlatformEvent::TrayMenu(id)) if id == TRAY_QUIT => quit(cx),
+            Ev::Os(PlatformEvent::NotificationClicked(tag)) => {
+                self.open_notification(&tag, window, cx)
+            }
             Ev::Os(_) => {}
         }
     }
@@ -831,7 +843,7 @@ impl Inlet {
     /// with several accounts, this is the one place that sums them.
     /// Every signed-in account counts: the active one from its state, the others from
     /// their marks in the account switcher.
-    fn desktop_unread(&self, cx: &App) -> DesktopUnread {
+    pub(crate) fn desktop_unread(&self, cx: &App) -> DesktopUnread {
         let active = self
             .account
             .as_ref()
