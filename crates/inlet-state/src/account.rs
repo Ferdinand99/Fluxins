@@ -118,6 +118,9 @@ impl AccountState {
         for p in r.presences() {
             s.presences.upsert(&p);
         }
+        if let Some(settings) = r.user_settings() {
+            s.presences.set_own(&settings);
+        }
         s
     }
 
@@ -500,6 +503,9 @@ impl AccountState {
                 }
             }
             Dispatch::UserSettingsUpdate(_) | Dispatch::SessionsReplace(_) => {
+                if let Dispatch::UserSettingsUpdate(u) = d {
+                    c.presence |= self.presences.set_own(u);
+                }
                 c.merge(self.settings.apply(d));
             }
             Dispatch::VoiceStateUpdate(_) => c.merge(self.voice.apply(d)),
@@ -708,12 +714,46 @@ impl AccountState {
             }
             self.member_total = 0;
             self.presences.set_cap(PASSIVE_MAX_PRESENCES);
+            // A status pick still waiting is shown from the server's echo from now on.
+            self.presences.drop_own_pending();
             self.users.set_cap(PASSIVE_MAX_USERS);
         } else {
             self.presences.set_cap(MAX_PRESENCES);
             self.users.set_cap(MAX_USERS);
         }
         c
+    }
+
+    /// Shows a pick of the account's own status or custom status at once, before the
+    /// server confirms it. A `None` part stays; `Some(None)` clears the custom status.
+    /// The pick shows until [`AccountState::confirm_own_status`] or
+    /// [`AccountState::drop_own_status_pick`]; an echo of an older write does not
+    /// replace it.
+    pub fn set_own_status(
+        &mut self,
+        status: Option<&str>,
+        custom: Option<Option<inlet_protocol::models::CustomStatus>>,
+    ) -> Changes {
+        Changes {
+            presence: self.presences.set_own_parts(status, custom),
+            ..Changes::default()
+        }
+    }
+
+    /// The server took the account's status picks; `settings` is its answer.
+    pub fn confirm_own_status(&mut self, settings: &inlet_protocol::UserSettings) -> Changes {
+        Changes {
+            presence: self.presences.confirm_own(settings),
+            ..Changes::default()
+        }
+    }
+
+    /// A write of the account's status failed: the saved status shows again.
+    pub fn drop_own_status_pick(&mut self) -> Changes {
+        Changes {
+            presence: self.presences.drop_own_pending(),
+            ..Changes::default()
+        }
     }
 
     /// Whether the account is in the background (see [`AccountState::set_passive`]).
@@ -881,9 +921,11 @@ impl AccountState {
         &self.windows
     }
 
-    /// Users typing in a channel (never the account itself).
+    /// Users typing in a channel (never the account itself, nor anyone it blocked).
     pub fn typing(&self, ch: ChannelId) -> Vec<UserId> {
-        self.typing.users(ch, self.now_ms)
+        let mut users = self.typing.users(ch, self.now_ms);
+        users.retain(|u| !self.relationships.is_blocked(*u));
+        users
     }
 
     /// A channel's raw read state.

@@ -140,6 +140,9 @@ scene 31-thread-list thread-list c-general
 scene 32-forum forum c-forum
 scene 33-media-channel media-channel c-gallery
 
+# Presence: the status picker open over the user panel, two people typing in #general.
+scene 35-status-picker status-picker c-general
+
 # 10. The Notifications settings tab.
 INLET_DEMO=1 INLET_DEMO_LIVE_SECS=3600 INLET_DEMO_GUILD=g1 INLET_DEMO_CHANNEL=c-general INLET_DEMO_SETTINGS=notifications "$bin" >>"$out/demo.log" 2>&1 &
 pid=$!

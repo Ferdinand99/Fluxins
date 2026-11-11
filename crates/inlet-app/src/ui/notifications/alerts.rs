@@ -179,13 +179,7 @@ impl Inlet {
         event: &crate::backend::Event,
         cx: &mut Context<Self>,
     ) {
-        if let crate::backend::Event::Messages(crate::backend::messages::Ev::Dispatch {
-            dispatch,
-            ..
-        }) = event
-        {
-            alerts(cx).engine.note_status(Some(account), dispatch);
-        }
+        alerts(cx).engine.note_status_of(Some(account), event);
     }
 
     /// The read state of a MESSAGE_CREATE's channel before the event is applied.

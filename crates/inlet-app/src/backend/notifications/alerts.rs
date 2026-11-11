@@ -309,6 +309,23 @@ impl Engine {
         self.dnd.insert(account.cloned(), status == "dnd");
     }
 
+    /// Follows the account's own status from one of its events: a gateway event (READY,
+    /// the settings echo), or the server's answer to a status saved from Inlet, so a Do
+    /// Not Disturb picked here holds even before the echo arrives.
+    pub fn note_status_of(&mut self, account: Option<&AccountKey>, event: &crate::backend::Event) {
+        use crate::backend::social::{presence, Ev as SocialEv};
+        match event {
+            crate::backend::Event::Messages(crate::backend::messages::Ev::Dispatch {
+                dispatch,
+                ..
+            }) => self.note_status(account, dispatch),
+            crate::backend::Event::Social(SocialEv::Presence(presence::Ev::Saved(settings))) => {
+                self.note_status(account, &Dispatch::UserSettingsUpdate(settings.clone()))
+            }
+            _ => {}
+        }
+    }
+
     /// Whether the account is in Do Not Disturb.
     pub fn is_dnd(&self, account: Option<&AccountKey>) -> bool {
         self.dnd.get(&account.cloned()).copied().unwrap_or(false)

@@ -154,6 +154,12 @@ pub struct GatewayOptions {
     pub ignored_events: Vec<String>,
     /// A guild that starts active.
     pub initial_guild_id: Option<String>,
+    /// The status Identify asks for (`online`, `idle`, `dnd` or `invisible`),
+    /// until [`GatewayHandle::set_presence`] sets one. `None` lets Fluxer use
+    /// the account's saved status.
+    pub initial_status: Option<String>,
+    /// The `afk` that goes with [`GatewayOptions::initial_status`].
+    pub initial_afk: bool,
     /// First reconnect delay.
     pub backoff_base: Duration,
     /// Longest reconnect delay.
@@ -176,6 +182,8 @@ impl Default for GatewayOptions {
             compress: true,
             ignored_events: Vec::new(),
             initial_guild_id: None,
+            initial_status: None,
+            initial_afk: false,
             backoff_base: Duration::from_secs(1),
             backoff_max: Duration::from_secs(60),
             event_buffer: 1024,
@@ -529,7 +537,7 @@ pub enum GatewayEvent {
 enum Command {
     Raw(Value),
     GuildActive(String, bool),
-    Status(String),
+    Status(PresenceWanted),
     /// Guild, channel, ranges (empty: unsubscribe).
     MemberList(String, String, Vec<[u32; 2]>),
     /// Request Guild Members: sent only while connected, never replayed.
@@ -546,7 +554,7 @@ impl std::fmt::Debug for Command {
         match self {
             Command::Raw(v) => write!(f, "Raw(op {})", v.get("op").unwrap_or(&Value::Null)),
             Command::GuildActive(g, a) => write!(f, "GuildActive({g}, {a})"),
-            Command::Status(s) => write!(f, "Status({s})"),
+            Command::Status(s) => write!(f, "Status({}, afk {})", s.status, s.afk),
             Command::MemberList(g, c, r) => write!(f, "MemberList({g}, {c}, {r:?})"),
             Command::Search(_) => write!(f, "Search"),
             Command::Threads(g, l) => write!(f, "Threads({g}, {l:?})"),
@@ -586,7 +594,18 @@ impl GatewayHandle {
 
     /// Presence Update (op 3): `online`, `idle`, `dnd` or `invisible`. Remembered across reconnects.
     pub fn set_status(&self, status: &str) {
-        self.push(Command::Status(status.to_owned()));
+        self.set_presence(status, false);
+    }
+
+    /// Presence Update (op 3) with `afk`: the person is away from this device,
+    /// so Fluxer may send push notifications to their phone. Remembered across
+    /// reconnects (and asked for in the next Identify). Updates are coalesced:
+    /// at most 5 go out per 20 s, and a waiting one is replaced by a newer one.
+    pub fn set_presence(&self, status: &str, afk: bool) {
+        self.push(Command::Status(PresenceWanted {
+            status: status.to_owned(),
+            afk,
+        }));
     }
 
     /// Lazy Request (op 14) for a guild's member list: the rows in `ranges`
@@ -853,7 +872,7 @@ struct Task {
     /// Thread subscriptions per guild: the thread member lists.
     thread_subs: Recent<Vec<String>>,
     /// Last status the UI set; replayed after Identify and Resume.
-    status: Option<String>,
+    status: Option<PresenceWanted>,
     /// Raw commands sent while disconnected.
     queued: VecDeque<Value>,
     /// Events waiting for room in the event channel.
@@ -1053,7 +1072,7 @@ impl Task {
                 Some(lazy_request_subs(vec![(g, sub)]))
             }
             Command::Status(s) => {
-                let payload = presence(&s);
+                let payload = presence(Some(&s));
                 self.remember(Command::Status(s));
                 Some(payload)
             }
@@ -1117,7 +1136,7 @@ impl Task {
             out.push(lazy_request_subs(subs));
         }
         if let Some(s) = &self.status {
-            out.push(presence(s));
+            out.push(presence(Some(s)));
         }
         out.extend(self.queued.drain(..));
         out
@@ -1235,7 +1254,7 @@ impl Task {
             let wake = pacer.next_wakeup();
             tokio::select! {
                 _ = tokio::time::sleep_until(wake.unwrap_or_else(|| Instant::now() + HEARTBEAT_MAX)), if wake.is_some() => {
-                    if let Err(e) = flush(&mut ws, &mut codec, &mut pacer, self.status.as_deref()).await {
+                    if let Err(e) = flush(&mut ws, &mut codec, &mut pacer, self.status.as_ref()).await {
                         return reconnect(e, false, Duration::ZERO);
                     }
                 }
@@ -1274,7 +1293,7 @@ impl Task {
                         if let Some(payload) = self.live(c) {
                             pacer.push(payload);
                         }
-                        if let Err(e) = flush(&mut ws, &mut codec, &mut pacer, self.status.as_deref()).await {
+                        if let Err(e) = flush(&mut ws, &mut codec, &mut pacer, self.status.as_ref()).await {
                             return reconnect(e, false, Duration::ZERO);
                         }
                     }
@@ -1326,7 +1345,7 @@ impl Task {
                                 for p in self.replay() {
                                     pacer.push(p);
                                 }
-                                if let Err(e) = flush(&mut ws, &mut codec, &mut pacer, self.status.as_deref()).await {
+                                if let Err(e) = flush(&mut ws, &mut codec, &mut pacer, self.status.as_ref()).await {
                                     return reconnect(e, false, Duration::ZERO);
                                 }
                             }
@@ -1390,6 +1409,16 @@ impl Task {
         }
         if let Some(g) = &o.initial_guild_id {
             d["initial_guild_id"] = json!(g);
+        }
+        // The status set last, else the one the options start with.
+        let wanted = self.status.clone().or_else(|| {
+            o.initial_status.as_ref().map(|s| PresenceWanted {
+                status: s.clone(),
+                afk: o.initial_afk,
+            })
+        });
+        if let Some(p) = wanted {
+            d["presence"] = presence(Some(&p))["d"].clone();
         }
         json!({ "op": 2, "d": d })
     }
@@ -1494,7 +1523,7 @@ impl Pacer {
     }
 
     /// Takes every payload that may go out now.
-    fn take_ready(&mut self, status: Option<&str>) -> Vec<Value> {
+    fn take_ready(&mut self, status: Option<&PresenceWanted>) -> Vec<Value> {
         let now = Instant::now();
         prune(&mut self.bounded_sent, BOUNDED_WINDOW, now);
         prune(&mut self.presence_sent, PRESENCE_WINDOW, now);
@@ -1528,7 +1557,7 @@ impl Pacer {
         }
         if self.presence_due && self.presence_sent.len() < PRESENCE_PER_WINDOW {
             if let Some(s) = status {
-                out.push(presence(s));
+                out.push(presence(Some(s)));
                 self.presence_sent.push_back(now);
             }
             self.presence_due = false;
@@ -1576,7 +1605,7 @@ async fn flush(
     ws: &mut Ws,
     codec: &mut Option<ZstdStream>,
     pacer: &mut Pacer,
-    status: Option<&str>,
+    status: Option<&PresenceWanted>,
 ) -> Result<(), String> {
     for payload in pacer.take_ready(status) {
         send_payload(ws, codec, &payload).await?;
@@ -1654,8 +1683,18 @@ fn lazy_request<'a>(guilds: impl Iterator<Item = (&'a str, bool)>) -> Value {
     json!({ "op": 14, "d": { "subscriptions": subs } })
 }
 
-fn presence(status: &str) -> Value {
-    json!({ "op": 3, "d": { "status": status, "afk": false, "mobile": false } })
+/// A status the UI asked for (Presence Update, op 3).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PresenceWanted {
+    status: String,
+    afk: bool,
+}
+
+/// The Presence Update payload (op 3); `None` only builds the shape the pacer
+/// coalesces, the status that goes out is the latest one.
+fn presence(p: Option<&PresenceWanted>) -> Value {
+    let (status, afk) = p.map_or(("online", false), |p| (p.status.as_str(), p.afk));
+    json!({ "op": 3, "d": { "status": status, "afk": afk, "mobile": false } })
 }
 
 enum ReadEnd {
@@ -1832,6 +1871,13 @@ mod tests {
         assert!(sent.len() >= 20);
     }
 
+    fn wanted(status: &str) -> PresenceWanted {
+        PresenceWanted {
+            status: status.into(),
+            afk: false,
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn pacer_limits_bounded_commands_and_presence() {
         let mut pacer = Pacer::default();
@@ -1842,31 +1888,31 @@ mod tests {
             ))));
         }
         for _ in 0..7 {
-            pacer.push(presence("idle"));
+            pacer.push(presence(Some(&wanted("idle"))));
         }
-        let first = pacer.take_ready(Some("idle"));
+        let first = pacer.take_ready(Some(&wanted("idle")));
         // 4 lazy requests and one coalesced presence update.
         assert_eq!(first.iter().filter(|p| p["op"] == 14).count(), 4);
         assert_eq!(first.iter().filter(|p| p["op"] == 3).count(), 1);
         let wake = pacer.next_wakeup().expect("more waiting");
         assert!(wake - Instant::now() <= BOUNDED_WINDOW);
         tokio::time::advance(BOUNDED_WINDOW).await;
-        assert_eq!(pacer.take_ready(Some("idle")).len(), 4);
+        assert_eq!(pacer.take_ready(Some(&wanted("idle"))).len(), 4);
         tokio::time::advance(BOUNDED_WINDOW).await;
-        assert_eq!(pacer.take_ready(Some("idle")).len(), 2);
+        assert_eq!(pacer.take_ready(Some(&wanted("idle"))).len(), 2);
         assert!(pacer.next_wakeup().is_none());
 
         // Presence: at most 5 per 20 s.
         let mut sent = 0;
         for _ in 0..8 {
-            pacer.push(presence("dnd"));
-            sent += pacer.take_ready(Some("dnd")).len();
+            pacer.push(presence(Some(&wanted("dnd"))));
+            sent += pacer.take_ready(Some(&wanted("dnd"))).len();
         }
         // One went out above, so four more fit in this window.
         assert_eq!(sent, 4);
         let wake = pacer.next_wakeup().expect("presence waiting");
         tokio::time::advance(wake - Instant::now()).await;
-        assert_eq!(pacer.take_ready(Some("dnd")).len(), 1);
+        assert_eq!(pacer.take_ready(Some(&wanted("dnd"))).len(), 1);
     }
 
     #[tokio::test(start_paused = true)]
