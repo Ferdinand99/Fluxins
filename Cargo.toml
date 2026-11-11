@@ -46,7 +46,11 @@ debug-assertions = false
 
 # Except gpui itself: it records element bounds for `debug_selector` only with debug
 # assertions, and the layout tests read them. It draws nothing extra unless asked.
+# Its proc macros must agree with it on debug assertions.
 [profile.ci.package.gpui]
+debug-assertions = true
+
+[profile.ci.package.gpui_macros]
 debug-assertions = true
 
 # The app as in a release build too: a GUI program on Windows, not a console one.
