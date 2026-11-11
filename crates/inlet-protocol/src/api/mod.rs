@@ -8,18 +8,41 @@
 //! - [`messages`]: messages around or after an ID (jump to a message),
 //!   forwarding and hiding embeds.
 //!
+//! Social, profiles and settings:
+//!
+//! - [`relationships`]: friends, friend requests, blocks, friend nicknames
+//!   and private notes.
+//! - [`dms`]: DMs and group DMs (create with the ALTCHA CAPTCHA solved,
+//!   add and remove participants, rename, leave, pin).
+//! - [`profiles`]: the account's profile, account-wide and per guild.
+//! - [`folders`]: guild order and folders in the user settings.
+//! - [`preferences`]: `SyncedPreferences` (read, and write without losing
+//!   fields this crate does not know).
+//! - [`expressions`]: custom emoji and sticker lookups, and memes.
+//! - [`gifs`]: GIF search through the instance's GIF service.
+//! - [`invites`]: look up and accept invites (codes checked before use).
+//!
 //! Every call is a method on [`crate::Client`] and goes through the
 //! account's shared rate limiter like the rest. On top of that, message and
 //! thread searches of one account start at least
-//! [`crate::coalesce::SEARCH_INTERVAL`] apart ([`crate::coalesce`]).
+//! [`crate::coalesce::SEARCH_INTERVAL`] apart, and GIF searches
+//! [`crate::coalesce::GIF_SEARCH_INTERVAL`] apart ([`crate::coalesce`]).
 //!
 //! Thread, forum and media channel routes need the `channel_threads` client
 //! capability; the crate sends it on every request
 //! ([`crate::rest::FLUXER_FEATURES`]) and sets the matching Identify flag
 //! ([`crate::gateway::FLAG_CHANNEL_THREADS`]) by default.
 
+pub mod dms;
+pub mod expressions;
+pub mod folders;
+pub mod gifs;
 pub mod inbox;
+pub mod invites;
 pub mod messages;
+pub mod preferences;
+pub mod profiles;
+pub mod relationships;
 pub mod saved;
 pub mod search;
 pub mod threads;

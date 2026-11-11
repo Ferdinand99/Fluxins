@@ -14,6 +14,7 @@ futures-util = { version = "0.3", default-features = false, features = ["sink", 
 hex = "0.4"
 http-body = "1"
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+prost = { version = "0.14", default-features = false, features = ["std", "derive"] }
 psl = "2"
 rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "http2"] }

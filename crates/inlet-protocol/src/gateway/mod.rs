@@ -42,6 +42,8 @@ use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, WebSocketConfig};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
+use crate::api::expressions::Meme;
+use crate::api::relationships::Relationship;
 use crate::api::threads::ThreadMember;
 use crate::instance::{require_scheme, Instance};
 use crate::models::{
@@ -49,14 +51,15 @@ use crate::models::{
     GuildEmojisUpdate, GuildMember, GuildMemberListUpdate, GuildMemberRemove, GuildMembersChunk,
     GuildReady, GuildRoleDelete, GuildRoleEvent, GuildRolesUpdate, GuildStickersUpdate, Message,
     MessageAck, MessageDelete, MessageDeleteBulk, PassiveUpdates, Presence, PresenceUpdateBulk,
-    ReactionAddMany, ReactionClear, ReactionEvent, Ready, SessionPresence, TypingStart,
+    ReactionAddMany, ReactionClear, ReactionEvent, Ready, SessionPresence, Snowflake, TypingStart,
     UserSettings, VoiceState,
 };
 use crate::token::Token;
 use codec::ZstdStream;
 use events::{
-    ForumUnreadRequest, ForumUnreads, RecentMentionDelete, SavedMessageDelete, ThreadDelete,
-    ThreadListSync, ThreadMemberListUpdate, ThreadMembersUpdate,
+    ChannelRecipientEvent, FavoriteMemeDelete, ForumUnreadRequest, ForumUnreads,
+    RecentMentionDelete, RelationshipRemove, SavedMessageDelete, ThreadDelete, ThreadListSync,
+    ThreadMemberListUpdate, ThreadMembersUpdate, UserNoteUpdate,
 };
 
 /// Identify session flag: merge DM reaction bursts.
@@ -333,6 +336,30 @@ pub enum Dispatch {
     SavedMessageDelete(SavedMessageDelete),
     /// The account removed a message from its recent mentions.
     RecentMentionDelete(RecentMentionDelete),
+    /// A new relationship (friend request in or out, friendship, block).
+    /// Store it by [`Relationship::id`].
+    RelationshipAdd(Box<Relationship>),
+    /// A relationship changed, for example a request became a friendship
+    /// (`kind` goes from `INCOMING_REQUEST` to `FRIEND`). Apply it with
+    /// [`Relationship::apply_update`], which keeps the stored `user` when the
+    /// event has none.
+    RelationshipUpdate(Box<Relationship>),
+    /// A relationship ended.
+    RelationshipRemove(RelationshipRemove),
+    /// The account wrote or cleared a private note (empty `note`).
+    UserNoteUpdate(Box<UserNoteUpdate>),
+    /// Every pinned DM channel ID, in order; replaces READY `pinned_dms`.
+    UserPinnedDmsUpdate(Vec<Snowflake>),
+    /// Someone joined a group DM the account is in.
+    ChannelRecipientAdd(Box<ChannelRecipientEvent>),
+    /// Someone left a group DM the account is in.
+    ChannelRecipientRemove(Box<ChannelRecipientEvent>),
+    /// The account saved a meme.
+    FavoriteMemeCreate(Box<Meme>),
+    /// One of the account's memes changed.
+    FavoriteMemeUpdate(Box<Meme>),
+    /// The account deleted a meme.
+    FavoriteMemeDelete(FavoriteMemeDelete),
     /// Any other event, or a known one whose payload did not parse.
     Other {
         /// Event name, for example `PRESENCE_UPDATE`.
@@ -455,6 +482,28 @@ impl Dispatch {
             }
             "SAVED_MESSAGE_DELETE" => typed(name, data, Dispatch::SavedMessageDelete),
             "RECENT_MENTION_DELETE" => typed(name, data, Dispatch::RecentMentionDelete),
+            "RELATIONSHIP_ADD" => typed(name, data, |v| Dispatch::RelationshipAdd(Box::new(v))),
+            "RELATIONSHIP_UPDATE" => {
+                typed(name, data, |v| Dispatch::RelationshipUpdate(Box::new(v)))
+            }
+            "RELATIONSHIP_REMOVE" => typed(name, data, Dispatch::RelationshipRemove),
+            "USER_NOTE_UPDATE" => typed(name, data, |v| Dispatch::UserNoteUpdate(Box::new(v))),
+            "USER_PINNED_DMS_UPDATE" if data.is_array() => {
+                Dispatch::UserPinnedDmsUpdate(crate::models::sf_list(data).unwrap_or_default())
+            }
+            "CHANNEL_RECIPIENT_ADD" => {
+                typed(name, data, |v| Dispatch::ChannelRecipientAdd(Box::new(v)))
+            }
+            "CHANNEL_RECIPIENT_REMOVE" => typed(name, data, |v| {
+                Dispatch::ChannelRecipientRemove(Box::new(v))
+            }),
+            "FAVORITE_MEME_CREATE" => {
+                typed(name, data, |v| Dispatch::FavoriteMemeCreate(Box::new(v)))
+            }
+            "FAVORITE_MEME_UPDATE" => {
+                typed(name, data, |v| Dispatch::FavoriteMemeUpdate(Box::new(v)))
+            }
+            "FAVORITE_MEME_DELETE" => typed(name, data, Dispatch::FavoriteMemeDelete),
             _ => Dispatch::Other {
                 name: name.to_owned(),
                 data,

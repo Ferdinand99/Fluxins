@@ -13,6 +13,8 @@
 //! - Search: message and thread searches of one account start at least
 //!   [`SEARCH_INTERVAL`] apart. A search whose slot is more than
 //!   [`MAX_SEARCH_WAIT`] away returns [`crate::Error::RateLimited`] without a request.
+//! - GIF search: GIF searches and suggestions of one account start at least
+//!   [`GIF_SEARCH_INTERVAL`] apart, with the same [`MAX_SEARCH_WAIT`].
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
@@ -35,6 +37,9 @@ pub const SEARCH_INTERVAL: Duration = Duration::from_secs(1);
 /// A search that would wait longer than this for its slot is refused with
 /// [`crate::Error::RateLimited`] instead of queued.
 pub const MAX_SEARCH_WAIT: Duration = Duration::from_secs(3);
+/// Shortest time between two GIF searches or suggestions of one account
+/// (Fluxer allows 40 per 10 s).
+pub const GIF_SEARCH_INTERVAL: Duration = Duration::from_millis(500);
 
 /// One pending acknowledgement.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -138,6 +143,39 @@ pub(crate) struct Shared {
     pub(crate) traits: Mutex<Option<Vec<String>>>,
     /// Start time of the last search slot handed out.
     search: Mutex<Option<Instant>>,
+    /// Start time of the last GIF search slot handed out.
+    gif_search: Mutex<Option<Instant>>,
+}
+
+/// Claims the next slot at least `interval` after the previous one:
+/// `Ok(wait)`, or `Err(retry_after)` when it is more than [`MAX_SEARCH_WAIT`]
+/// away (nothing is reserved).
+fn reserve_slot(
+    last: &Mutex<Option<Instant>>,
+    interval: Duration,
+    now: Instant,
+) -> Result<Duration, Duration> {
+    let mut last = last.lock().unwrap_or_else(|e| e.into_inner());
+    let slot = match *last {
+        Some(prev) => (prev + interval).max(now),
+        None => now,
+    };
+    let wait = slot.saturating_duration_since(now);
+    if wait > MAX_SEARCH_WAIT {
+        return Err(wait);
+    }
+    *last = Some(slot);
+    Ok(wait)
+}
+
+/// Keeps the later of two slots, so moving to another state cannot skip an interval.
+fn keep_later(mine: &Mutex<Option<Instant>>, theirs: &Mutex<Option<Instant>>) {
+    let theirs = *theirs.lock().unwrap_or_else(|e| e.into_inner());
+    let mut mine = mine.lock().unwrap_or_else(|e| e.into_inner());
+    *mine = match (*mine, theirs) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    };
 }
 
 impl Shared {
@@ -145,17 +183,13 @@ impl Shared {
     /// previous one: `Ok(wait)` before the request may start, or `Err(retry_after)`
     /// when the slot is more than [`MAX_SEARCH_WAIT`] away (nothing is reserved).
     pub(crate) fn reserve_search(&self, now: Instant) -> Result<Duration, Duration> {
-        let mut last = self.search.lock().unwrap_or_else(|e| e.into_inner());
-        let slot = match *last {
-            Some(prev) => (prev + SEARCH_INTERVAL).max(now),
-            None => now,
-        };
-        let wait = slot.saturating_duration_since(now);
-        if wait > MAX_SEARCH_WAIT {
-            return Err(wait);
-        }
-        *last = Some(slot);
-        Ok(wait)
+        reserve_slot(&self.search, SEARCH_INTERVAL, now)
+    }
+
+    /// Claims the next GIF search slot, like [`Shared::reserve_search`] with
+    /// [`GIF_SEARCH_INTERVAL`].
+    pub(crate) fn reserve_gif_search(&self, now: Instant) -> Result<Duration, Duration> {
+        reserve_slot(&self.gif_search, GIF_SEARCH_INTERVAL, now)
     }
 
     /// Whether a typing request for `channel_id` may go out now; records it if so.
@@ -231,13 +265,9 @@ impl Shared {
                 *mine = traits;
             }
         }
-        // Keep the later search slot so a move cannot skip the interval.
-        let theirs = *other.search.lock().unwrap_or_else(|e| e.into_inner());
-        let mut mine = self.search.lock().unwrap_or_else(|e| e.into_inner());
-        *mine = match (*mine, theirs) {
-            (Some(a), Some(b)) => Some(a.max(b)),
-            (a, b) => a.or(b),
-        };
+        // Keep the later search slots so a move cannot skip the interval.
+        keep_later(&self.search, &other.search);
+        keep_later(&self.gif_search, &other.gif_search);
     }
 }
 
