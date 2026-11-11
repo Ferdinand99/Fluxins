@@ -7,8 +7,9 @@
 # first (report.md, and the red pixels in diff/) and make sure every difference is
 # wanted. The script downloads those artifacts with the GitHub CLI and copies their
 # actual/*.png (already cut to the window and compressed by inlet-visual) to
-# tests/visual/baseline/<os>/. It commits nothing: look at the new pictures, then
-# commit them with the change that caused them.
+# tests/visual/baseline/<os>/, and runs oxipng over them when it is installed. It
+# commits nothing: look at the new pictures, then commit them with the change that
+# caused them.
 #
 # Baselines always come from CI, from the same pinned runner images that compare
 # them; screenshots from another machine would differ in fonts and rendering.
@@ -43,4 +44,10 @@ for os in "${oses[@]}"; do
   cp "${pictures[@]}" "tests/visual/baseline/$os/"
   echo "$os: ${#pictures[@]} baselines from run $run"
 done
+# Lossless, about a tenth smaller again; the pictures stay valid without it.
+if command -v oxipng >/dev/null 2>&1; then
+  oxipng -q -o 4 --strip safe tests/visual/baseline/*/*.png
+else
+  echo "oxipng not found: the baselines are not compressed further (optional)" >&2
+fi
 git status --short tests/visual/baseline
