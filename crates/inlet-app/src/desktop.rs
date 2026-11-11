@@ -930,8 +930,12 @@ impl Inlet {
                 .layer_focus
                 .get_or_insert_with(|| cx.focus_handle())
                 .clone();
-            // A field inside the layer (the status picker's text) may keep the keyboard.
-            if !handle.contains_focused(window, cx) {
+            // Only the status picker has a field that may keep the keyboard, and only
+            // while it is the topmost layer: any layer that opens over it takes the
+            // keyboard in the same frame.
+            let field_keeps_it = self.is_top_layer(Layer::StatusPicker)
+                && self.status_picker_field_focused(window, cx);
+            if !handle.is_focused(window) && !field_keeps_it {
                 if !self.overlays.layer_had_focus {
                     // Where the keyboard was, to give it back when the layers close.
                     self.overlays.focus_before = window.focused(cx);

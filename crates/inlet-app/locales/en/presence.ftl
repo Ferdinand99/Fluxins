@@ -16,6 +16,7 @@ presence-custom-clear = Clear
 presence-custom-title = Custom status
 presence-custom-placeholder = What's happening?
 presence-clear-after = Clear after
+presence-clear-keep = Keep the time left
 presence-clear-never = Don't clear
 presence-clear-30m = 30 minutes
 presence-clear-1h = 1 hour

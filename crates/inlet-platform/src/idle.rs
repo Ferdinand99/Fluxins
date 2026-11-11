@@ -103,14 +103,33 @@ mod imp {
         Some(Duration::from_secs(u64::from(seconds)))
     }
 
+    /// One X connection for every read, made on the first and again after a failure.
+    static X11: std::sync::Mutex<Option<(x11rb::rust_connection::RustConnection, u32)>> =
+        std::sync::Mutex::new(None);
+
     fn x11() -> Option<Duration> {
         use x11rb::connection::Connection as _;
         use x11rb::protocol::screensaver::ConnectionExt as _;
 
-        let (conn, screen) = x11rb::connect(None).ok()?;
-        let root = conn.setup().roots.get(screen)?.root;
-        let info = conn.screensaver_query_info(root).ok()?.reply().ok()?;
-        Some(Duration::from_millis(u64::from(info.ms_since_user_input)))
+        let mut held = X11.lock().unwrap_or_else(|e| e.into_inner());
+        if held.is_none() {
+            let (conn, screen) = x11rb::connect(None).ok()?;
+            let root = conn.setup().roots.get(screen)?.root;
+            *held = Some((conn, root));
+        }
+        let (conn, root) = held.as_ref()?;
+        let info = conn
+            .screensaver_query_info(*root)
+            .ok()
+            .and_then(|cookie| cookie.reply().ok());
+        match info {
+            Some(info) => Some(Duration::from_millis(u64::from(info.ms_since_user_input))),
+            None => {
+                // The server went away or refused: connect again next time.
+                *held = None;
+                None
+            }
+        }
     }
 }
 

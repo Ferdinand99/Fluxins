@@ -158,6 +158,8 @@ pub struct GatewayOptions {
     /// until [`GatewayHandle::set_presence`] sets one. `None` lets Fluxer use
     /// the account's saved status.
     pub initial_status: Option<String>,
+    /// The `afk` that goes with [`GatewayOptions::initial_status`].
+    pub initial_afk: bool,
     /// First reconnect delay.
     pub backoff_base: Duration,
     /// Longest reconnect delay.
@@ -181,6 +183,7 @@ impl Default for GatewayOptions {
             ignored_events: Vec::new(),
             initial_guild_id: None,
             initial_status: None,
+            initial_afk: false,
             backoff_base: Duration::from_secs(1),
             backoff_max: Duration::from_secs(60),
             event_buffer: 1024,
@@ -1411,7 +1414,7 @@ impl Task {
         let wanted = self.status.clone().or_else(|| {
             o.initial_status.as_ref().map(|s| PresenceWanted {
                 status: s.clone(),
-                afk: false,
+                afk: o.initial_afk,
             })
         });
         if let Some(p) = wanted {

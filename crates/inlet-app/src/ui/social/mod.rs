@@ -53,6 +53,9 @@ impl Inlet {
     ) {
         match event {
             backend::social::Ev::Presence(PresenceEv::SaveFailed) => self.status_save_failed(cx),
+            backend::social::Ev::Presence(PresenceEv::Saved(settings)) => {
+                self.status_saved(&settings, cx)
+            }
         }
     }
 }

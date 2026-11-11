@@ -131,11 +131,57 @@ fn a_picked_status_shows_at_once_until_the_server_answers() {
     assert!(s.set_own_status(Some("idle"), None).presence);
     assert!(s.presences().own().custom_at(0).is_some());
     assert!(!s.set_own_status(Some("idle"), None).presence);
-    // The server's USER_SETTINGS_UPDATE has the last word.
+    // The echo of an older write does not replace the pick that waits.
+    s.apply(&d(
+        "USER_SETTINGS_UPDATE",
+        json!({"status": "online", "custom_status": null}),
+    ));
+    assert_eq!(s.presences().own().status(), "idle");
+    assert_eq!(s.presences().own().saved_status(), "online");
+    assert!(s.presences().own().is_pending());
+    // A failed write: the saved status shows again.
+    assert!(s.drop_own_status_pick().presence);
+    assert_eq!(s.presences().own().status(), "online");
+    assert!(s.presences().own().custom_at(0).is_none());
+    // A confirmed write: the server's answer shows, nothing waits.
+    s.set_own_status(Some("dnd"), None);
+    let answer: inlet_protocol::UserSettings =
+        serde_json::from_value(json!({"status": "dnd", "custom_status": null})).unwrap();
+    s.confirm_own_status(&answer);
+    assert!(!s.presences().own().is_pending());
+    assert_eq!(s.presences().own().saved_status(), "dnd");
+    // From then on the server's settings have the last word.
     s.apply(&d(
         "USER_SETTINGS_UPDATE",
         json!({"status": "online", "custom_status": null}),
     ));
     assert_eq!(s.presences().own().status(), "online");
+}
+
+#[test]
+fn the_custom_status_limit_counts_utf16_units() {
+    use inlet_state::presence::{truncate_utf16, CUSTOM_STATUS_TEXT_LIMIT};
+    let plain = "a".repeat(200);
+    assert_eq!(truncate_utf16(&plain, CUSTOM_STATUS_TEXT_LIMIT).len(), 128);
+    // 100 letters and 20 emoji outside the BMP: 140 units, cut at 128 on a boundary.
+    let mixed = format!("{}{}", "a".repeat(100), "\u{1F600}".repeat(20));
+    let cut = truncate_utf16(&mixed, CUSTOM_STATUS_TEXT_LIMIT);
+    assert_eq!(cut.encode_utf16().count(), 128);
+    assert_eq!(cut.chars().count(), 114);
+    let odd = format!("{}{}", "a".repeat(127), "\u{1F600}");
+    assert_eq!(
+        truncate_utf16(&odd, CUSTOM_STATUS_TEXT_LIMIT)
+            .chars()
+            .count(),
+        127
+    );
+}
+
+#[test]
+fn a_custom_status_of_invisible_characters_does_not_show() {
+    let s = ready_with_settings(json!({
+        "status": "online",
+        "custom_status": {"text": "\u{200B}\u{202E} "}
+    }));
     assert!(s.presences().own().custom_at(0).is_none());
 }

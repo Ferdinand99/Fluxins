@@ -15,6 +15,7 @@ impl Inlet {
     pub(crate) fn render_user_panel(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         // The status this session shows follows the account (a pick, a switch, READY).
         self.sync_presence(cx);
+        self.watch_status_expiry(cx);
         #[cfg(feature = "demo")]
         self.demo_status_picker(cx);
         let status = self.shown_status(cx);
@@ -78,8 +79,14 @@ impl Inlet {
                                 .text_color(theme::text_strong())
                                 .child(initials)
                                 .child(avatar_status(status, theme::panel_bg()))
+                                // The mentions of the other accounts sit top right,
+                                // so the status dot stays visible bottom right.
                                 .when(elsewhere > 0, |d| {
-                                    d.child(rail_badge(elsewhere, theme::panel_bg()))
+                                    d.child(
+                                        rail_badge(elsewhere, theme::panel_bg())
+                                            .bottom_auto()
+                                            .top(px(-7.)),
+                                    )
                                 }),
                         )
                         .child(self.render_user_name(status, cx)),

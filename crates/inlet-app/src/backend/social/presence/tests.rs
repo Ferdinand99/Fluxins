@@ -18,7 +18,7 @@ use crate::token_store::MemoryStore;
 fn status(s: &str) -> Save {
     Save {
         status: Some(s.into()),
-        custom: None,
+        ..Save::default()
     }
 }
 
@@ -45,8 +45,8 @@ fn status_updates_are_coalesced_five_per_twenty_seconds() {
             status(["online", "idle", "dnd", "invisible"][(i / 2 % 4) as usize])
         } else {
             Save {
-                status: None,
                 custom: Some(Some(custom(&format!("pick {i}")))),
+                ..Save::default()
             }
         });
         c.want(wish.clone());
@@ -80,7 +80,7 @@ fn status_updates_are_coalesced_five_per_twenty_seconds() {
     let (_, last) = writes.last().unwrap();
     assert_eq!(last.status, wish.status);
     assert_eq!(last.custom_status, wish.custom);
-    // The same wish again writes nothing.
+    // The same wish again (no new pick) writes nothing.
     c.want(wish.clone());
     assert_eq!(c.next(now + SAVE_WINDOW), Next::Idle);
     // A new wish goes out at once while the window has a free slot.
@@ -98,12 +98,55 @@ fn status_updates_are_coalesced_five_per_twenty_seconds() {
 }
 
 #[test]
+fn a_pick_equal_to_an_earlier_write_is_written_again() {
+    let t0 = Instant::now();
+    let mut c = Coalescer::default();
+    let mut wish = Save::default();
+    wish.merge(status("dnd"));
+    c.want(wish.clone());
+    assert!(matches!(c.next(t0), Next::Write(u) if u.status.as_deref() == Some("dnd")));
+    assert!(!c.has_unwritten());
+    // Another client sets "online" (Inlet only sees the echo); the person picks "dnd"
+    // again here: that is a new wish, and it is written.
+    wish.merge(status("dnd"));
+    c.want(wish.clone());
+    assert!(c.has_unwritten());
+    match c.next(t0 + Duration::from_secs(1)) {
+        Next::Write(u) => {
+            assert_eq!(u.status.as_deref(), Some("dnd"));
+            assert_eq!(u.custom_status, None, "only the field picked");
+        }
+        other => panic!("the same pick again is written: {other:?}"),
+    }
+    // The custom status the same way.
+    let lunch = Save {
+        custom: Some(Some(custom("Lunch"))),
+        ..Save::default()
+    };
+    wish.merge(lunch.clone());
+    c.want(wish.clone());
+    assert!(matches!(
+        c.next(t0 + Duration::from_secs(2)),
+        Next::Write(_)
+    ));
+    wish.merge(lunch);
+    c.want(wish);
+    match c.next(t0 + Duration::from_secs(3)) {
+        Next::Write(u) => assert_eq!(u.custom_status, Some(Some(custom("Lunch")))),
+        other => panic!("the same custom status again is written: {other:?}"),
+    }
+}
+
+#[test]
 fn a_custom_status_is_trimmed_and_capped() {
     let c = clean_custom(CustomStatus {
         emoji_name: Some(" ".into()),
         ..custom(&format!("  {}  ", "x".repeat(300)))
     });
     assert_eq!(c.text.as_deref().map(|t| t.chars().count()), Some(128));
+    // Fluxer counts UTF-16 units: emoji outside the BMP count twice.
+    let wide = clean_custom(custom(&"\u{1F600}".repeat(100)));
+    assert_eq!(wide.text.as_deref().map(|t| t.chars().count()), Some(64));
     assert_eq!(c.emoji_name, None);
     let only_emoji = clean_custom(CustomStatus {
         emoji_name: Some("\u{1F600}".into()),
@@ -218,6 +261,8 @@ async fn a_background_account_is_invisible_and_gets_no_more_presence() {
         background_identify["d"]["presence"]["status"], "invisible",
         "{background_identify}"
     );
+    // Away, so the phone still gets its mentions.
+    assert_eq!(background_identify["d"]["presence"]["afk"], true);
 
     // Active: the UI's presence goes out.
     b.command(Some(key.clone()), presence_cmd("dnd"));

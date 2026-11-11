@@ -23,7 +23,14 @@ impl Inlet {
             .iter()
             .zip(statuses)
             .map(|(c, status)| {
-                let row = self.channel_row(c, selected.as_deref() == Some(c.id.as_str()), cx);
+                let active = selected.as_deref() == Some(c.id.as_str());
+                let row = self.channel_row(c, active, cx);
+                // The ring takes the row's colour (a selected row is lighter).
+                let ring = if active {
+                    theme::bg_app().blend(theme::selected_bg())
+                } else {
+                    theme::bg_app()
+                };
                 match status {
                     None => row,
                     Some(status) => div()
@@ -39,7 +46,7 @@ impl Inlet {
                                 .top(px(26. - DOT + 2.))
                                 .p(px(2.))
                                 .rounded_full()
-                                .bg(theme::bg_app())
+                                .bg(ring)
                                 .child(status_dot(status, DOT)),
                         )
                         .into_any_element(),

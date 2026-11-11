@@ -15,7 +15,7 @@ use gpui::{
     MouseDownEvent, SharedString, Subscription, Window,
 };
 use inlet_protocol::models::CustomStatus;
-use inlet_state::presence::{CUSTOM_STATUS_TEXT_LIMIT, STATUSES};
+use inlet_state::presence::{truncate_utf16, CUSTOM_STATUS_TEXT_LIMIT, STATUSES};
 
 use crate::app::{Inlet, Screen};
 use crate::backend::social::presence::Cmd;
@@ -43,6 +43,8 @@ pub const EMOJI: [&str; 8] = [
 /// When a custom status clears.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClearAfter {
+    /// The expiry the status being edited has (offered only then).
+    Keep,
     Never,
     ThirtyMinutes,
     OneHour,
@@ -61,7 +63,7 @@ impl ClearAfter {
 
     fn duration(self) -> Option<Duration> {
         let minutes = match self {
-            ClearAfter::Never => return None,
+            ClearAfter::Keep | ClearAfter::Never => return None,
             ClearAfter::ThirtyMinutes => 30,
             ClearAfter::OneHour => 60,
             ClearAfter::FourHours => 4 * 60,
@@ -72,6 +74,7 @@ impl ClearAfter {
 
     fn label(self) -> String {
         match self {
+            ClearAfter::Keep => t!("presence-clear-keep"),
             ClearAfter::Never => t!("presence-clear-never"),
             ClearAfter::ThirtyMinutes => t!("presence-clear-30m"),
             ClearAfter::OneHour => t!("presence-clear-1h"),
@@ -92,26 +95,33 @@ struct CustomEditor {
     input: Entity<TextInput>,
     emoji: Option<String>,
     clear: ClearAfter,
+    /// The expiry of the status being edited, kept with [`ClearAfter::Keep`].
+    kept_expiry: Option<String>,
     _submit: Subscription,
 }
 
 /// The custom status to save from the editor's parts, or `None` to clear it. `now_ms`
-/// is the time the expiry counts from.
+/// is the time the expiry counts from; `kept` is the expiry [`ClearAfter::Keep`] keeps.
+/// The text is cut to 128 UTF-16 units, as Fluxer counts.
 pub fn custom_from(
     text: &str,
     emoji: Option<&str>,
     clear: ClearAfter,
+    kept: Option<&str>,
     now_ms: i64,
 ) -> Option<CustomStatus> {
-    let text: String = text.trim().chars().take(CUSTOM_STATUS_TEXT_LIMIT).collect();
+    let text = truncate_utf16(text.trim(), CUSTOM_STATUS_TEXT_LIMIT).to_owned();
     if text.is_empty() && emoji.is_none() {
         return None;
     }
-    let expires_at = clear.duration().and_then(|d| {
-        let at = now_ms.saturating_add(d.as_millis() as i64);
-        chrono::DateTime::from_timestamp_millis(at)
-            .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
-    });
+    let expires_at = match clear {
+        ClearAfter::Keep => kept.map(str::to_owned),
+        _ => clear.duration().and_then(|d| {
+            let at = now_ms.saturating_add(d.as_millis() as i64);
+            chrono::DateTime::from_timestamp_millis(at)
+                .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+        }),
+    };
     Some(CustomStatus {
         text: (!text.is_empty()).then_some(text),
         expires_at,
@@ -131,6 +141,15 @@ impl Inlet {
         self.social.picker.is_some() && self.screen == Screen::Main
     }
 
+    /// Whether the picker's text field has the keyboard.
+    pub(crate) fn status_picker_field_focused(&self, window: &Window, cx: &gpui::App) -> bool {
+        self.social
+            .picker
+            .as_ref()
+            .and_then(|p| p.editor.as_ref())
+            .is_some_and(|e| e.input.focus_handle(cx).is_focused(window))
+    }
+
     pub(crate) fn open_status_picker(&mut self, cx: &mut Context<Self>) {
         self.social.picker = Some(Picker::default());
         cx.notify();
@@ -141,19 +160,9 @@ impl Inlet {
         cx.notify();
     }
 
-    /// Remembers the saved status before a change shown ahead of the server.
-    fn remember_before_save(&mut self, cx: &mut Context<Self>) {
-        if let Some(account) = &self.account {
-            let own = account.read(cx).presences().own();
-            self.social.presence.before_save =
-                Some((own.status().to_owned(), own.custom().cloned()));
-        }
-    }
-
     /// A status was picked: shown at once, saved on the account, and sent as this
     /// session's presence.
     pub(crate) fn pick_status(&mut self, status: &str, cx: &mut Context<Self>) {
-        self.remember_before_save(cx);
         if let Some(account) = self.account.clone() {
             account.update(cx, |s, _| s.set_own_status(Some(status), None));
         }
@@ -170,12 +179,17 @@ impl Inlet {
             return;
         };
         let text = editor.input.read(cx).text().to_owned();
-        let custom = custom_from(&text, editor.emoji.as_deref(), editor.clear, now_ms());
+        let custom = custom_from(
+            &text,
+            editor.emoji.as_deref(),
+            editor.clear,
+            editor.kept_expiry.as_deref(),
+            now_ms(),
+        );
         self.set_custom_status(custom, cx);
     }
 
     fn set_custom_status(&mut self, custom: Option<CustomStatus>, cx: &mut Context<Self>) {
-        self.remember_before_save(cx);
         if let Some(account) = self.account.clone() {
             let shown = custom.clone();
             account.update(cx, |s, _| s.set_own_status(None, Some(shown)));
@@ -186,13 +200,22 @@ impl Inlet {
 
     /// A save failed: the saved status shows again.
     pub(crate) fn status_save_failed(&mut self, cx: &mut Context<Self>) {
-        let (Some((status, custom)), Some(account)) = (
-            self.social.presence.before_save.take(),
-            self.account.clone(),
-        ) else {
-            return;
-        };
-        account.update(cx, |s, _| s.set_own_status(Some(&status), Some(custom)));
+        if let Some(account) = self.account.clone() {
+            account.update(cx, |s, _| s.drop_own_status_pick());
+        }
+        self.sync_presence(cx);
+        cx.notify();
+    }
+
+    /// Every pick is saved: the server's answer is the saved status.
+    pub(crate) fn status_saved(
+        &mut self,
+        settings: &inlet_protocol::UserSettings,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(account) = self.account.clone() {
+            account.update(cx, |s, _| s.confirm_own_status(settings));
+        }
         self.sync_presence(cx);
         cx.notify();
     }
@@ -210,6 +233,7 @@ impl Inlet {
             .as_ref()
             .and_then(|c| c.emoji_name.clone())
             .filter(|_| current.as_ref().is_some_and(|c| c.emoji_id.is_none()));
+        let kept_expiry = current.as_ref().and_then(|c| c.expires_at.clone());
         let input = cx.new(|cx| {
             TextInput::new(t!("presence-custom-placeholder"), cx)
                 .max_chars(CUSTOM_STATUS_TEXT_LIMIT)
@@ -223,7 +247,12 @@ impl Inlet {
             picker.editor = Some(CustomEditor {
                 input,
                 emoji,
-                clear: ClearAfter::Never,
+                clear: if kept_expiry.is_some() {
+                    ClearAfter::Keep
+                } else {
+                    ClearAfter::Never
+                },
+                kept_expiry,
                 _submit: submit,
             });
         }
@@ -353,6 +382,9 @@ impl Inlet {
                         })),
                 )
             });
+        // Deviation: Fluxer offers each status for a time (`status_resets_at`) and says
+        // under Do Not Disturb that desktop notifications stop; Inlet sets a status until
+        // it is changed, and shows only the hint under Invisible.
         let rows = STATUSES.iter().map(|status| {
             let status: &'static str = status;
             let description = (status == "invisible").then(|| t!("presence-invisible-hint"));
@@ -424,6 +456,14 @@ impl Inlet {
             return div().into_any_element();
         };
         let (input, picked, clear) = (editor.input.clone(), editor.emoji.clone(), editor.clear);
+        // "Keep" is offered only for a status that has an expiry.
+        let choices: Vec<ClearAfter> = editor
+            .kept_expiry
+            .is_some()
+            .then_some(ClearAfter::Keep)
+            .into_iter()
+            .chain(ClearAfter::ALL)
+            .collect();
         let heading = |text: String| {
             div()
                 .mt_1()
@@ -454,7 +494,7 @@ impl Inlet {
                 }))
                 .into_any_element()
         });
-        let clear_row = ClearAfter::ALL.iter().enumerate().map(|(ix, c)| {
+        let clear_row = choices.iter().enumerate().map(|(ix, c)| {
             let c = *c;
             div()
                 .id(("status-clear", ix))
@@ -533,14 +573,24 @@ mod tests {
     #[test]
     fn the_editor_builds_the_custom_status_fluxer_takes() {
         let now = 1_767_225_600_000; // 2026-01-01T00:00:00Z
-        assert_eq!(custom_from("   ", None, ClearAfter::OneHour, now), None);
-        let c = custom_from("  Lunch ", Some("\u{1F355}"), ClearAfter::OneHour, now).unwrap();
+        let build = |text: &str, emoji, clear| custom_from(text, emoji, clear, None, now);
+        assert_eq!(build("   ", None, ClearAfter::OneHour), None);
+        let c = build("  Lunch ", Some("\u{1F355}"), ClearAfter::OneHour).unwrap();
         assert_eq!(c.text.as_deref(), Some("Lunch"));
         assert_eq!(c.emoji_name.as_deref(), Some("\u{1F355}"));
         assert_eq!(c.expires_at.as_deref(), Some("2026-01-01T01:00:00.000Z"));
-        let only_emoji = custom_from("", Some("\u{1F3A7}"), ClearAfter::Never, now).unwrap();
+        let only_emoji = build("", Some("\u{1F3A7}"), ClearAfter::Never).unwrap();
         assert_eq!((only_emoji.text, only_emoji.expires_at), (None, None));
-        let long = custom_from(&"y".repeat(500), None, ClearAfter::Never, now).unwrap();
+        let long = build(&"y".repeat(500), None, ClearAfter::Never).unwrap();
         assert_eq!(long.text.unwrap().chars().count(), CUSTOM_STATUS_TEXT_LIMIT);
+        // 128 UTF-16 units: emoji outside the BMP count twice.
+        let wide = build(&"\u{1F600}".repeat(100), None, ClearAfter::Never).unwrap();
+        assert_eq!(wide.text.unwrap().encode_utf16().count(), 128);
+        // Editing a status with an expiry keeps it unless another choice is made.
+        let kept = "2026-01-01T03:00:00.000Z";
+        let edited = custom_from("Lunch", None, ClearAfter::Keep, Some(kept), now).unwrap();
+        assert_eq!(edited.expires_at.as_deref(), Some(kept));
+        let forever = custom_from("Lunch", None, ClearAfter::Never, Some(kept), now).unwrap();
+        assert_eq!(forever.expires_at, None);
     }
 }

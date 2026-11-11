@@ -11,11 +11,17 @@
 //!   replaces one that waits with the newest, so a burst ends with the last status.
 //! - `PATCH /users/@me/settings` (status, custom status): only the newest wish is
 //!   written, at most 5 per 20 s per account ([`SAVES_PER_WINDOW`]), through the
-//!   protocol's limiter. A failed write is reported once and not retried.
-//! - An account in the background is `invisible`, as in Fluxer's client: its gateway
-//!   starts with that status (`gateway_options`), and an account that goes to the
-//!   background sends it once. After that it sends nothing: no idle changes and no
-//!   picks reach it, because a command for an account that is not active is dropped.
+//!   protocol's limiter. Every pick is a new wish, even one equal to what Inlet wrote
+//!   before (another client may have changed the status since). A failed write is
+//!   reported once and not retried by itself. A wish that waits for the budget when the
+//!   account goes to the background is still written from there.
+//! - When the last wish is written, the server's answer goes to the UI
+//!   ([`Ev::Saved`]), which shows the pick until then; a failure or a pick that cannot
+//!   run (no session, another account) answers [`Ev::SaveFailed`].
+//! - An account in the background is `invisible` and `afk`: its gateway starts with
+//!   that (`gateway_options`), and an account that goes to the background sends it once.
+//!   After that it sends nothing: no idle changes and no picks reach it, because a
+//!   command for an account that is not active is dropped.
 
 use std::collections::VecDeque;
 use std::time::Duration;
@@ -31,6 +37,13 @@ use super::super::{report, Active, Backend, Internal, RealActive, Ui};
 
 /// The status an account in the background shows (Fluxer's background sessions do the same).
 pub const BACKGROUND_STATUS: &str = "invisible";
+/// An account in the background reports `afk`: nobody looks at it, so Fluxer still
+/// sends its mentions to the phone.
+// Deviation: Fluxer's client sends `afk: false` when it retires a session on an account
+// switch. With `afk`, a mention in a background account can notify both the phone and
+// the desktop (Inlet's own notification); without it the phone gets nothing while Inlet
+// runs.
+pub const BACKGROUND_AFK: bool = true;
 /// Settings writes per window and account.
 pub const SAVES_PER_WINDOW: usize = 5;
 /// The window of [`SAVES_PER_WINDOW`].
@@ -52,8 +65,10 @@ pub enum Cmd {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Ev {
     /// A status or custom status was not saved (the reason is already in the notice
-    /// line). The UI shows the saved status again.
+    /// line), or the pick could not run. The UI shows the saved status again.
     SaveFailed,
+    /// Every wish is written; the server's settings after the last write.
+    Saved(Box<p::UserSettings>),
 }
 
 /// The presence state of one account, kept with the account (see `RealActive`).
@@ -79,7 +94,7 @@ impl Presence {
     /// The account went to the background: it shows [`BACKGROUND_STATUS`]. Sent once;
     /// the gateway remembers it for reconnects.
     pub fn to_background(&self, gateway: &p::GatewayHandle) {
-        gateway.set_presence(BACKGROUND_STATUS, false);
+        gateway.set_presence(BACKGROUND_STATUS, BACKGROUND_AFK);
     }
 
     /// The account is in front again, or has a new gateway: the status the UI asked for
@@ -92,20 +107,25 @@ impl Presence {
     }
 }
 
-/// What the account's settings should say. `None` fields are not asked for.
+/// What the account's settings should say. `None` fields are not asked for. Each pick
+/// counts up its field's number, so a pick equal to an earlier one is still a new wish.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Save {
     status: Option<String>,
     custom: Option<Option<CustomStatus>>,
+    status_pick: u64,
+    custom_pick: u64,
 }
 
 impl Save {
     fn merge(&mut self, other: Save) {
         if other.status.is_some() {
             self.status = other.status;
+            self.status_pick += 1;
         }
         if other.custom.is_some() {
             self.custom = other.custom;
+            self.custom_pick += 1;
         }
     }
 }
@@ -137,16 +157,27 @@ impl Coalescer {
         self.wanted = wanted;
     }
 
-    /// The write due at `now`, if any. Taking a write uses a slot of the budget, and the
-    /// wish counts as written (a failed write is not retried).
-    pub fn next(&mut self, now: Instant) -> Next {
+    /// The fields picked since the last write.
+    fn unwritten(&self) -> p::UserSettingsUpdate {
         let mut update = p::UserSettingsUpdate::default();
-        if self.wanted.status.is_some() && self.wanted.status != self.written.status {
+        if self.wanted.status.is_some() && self.wanted.status_pick != self.written.status_pick {
             update.status = self.wanted.status.clone();
         }
-        if self.wanted.custom.is_some() && self.wanted.custom != self.written.custom {
+        if self.wanted.custom.is_some() && self.wanted.custom_pick != self.written.custom_pick {
             update.custom_status = self.wanted.custom.clone();
         }
+        update
+    }
+
+    /// Whether a picked field waits to be written.
+    pub fn has_unwritten(&self) -> bool {
+        self.unwritten() != p::UserSettingsUpdate::default()
+    }
+
+    /// The write due at `now`, if any. Taking a write uses a slot of the budget, and the
+    /// wish counts as written (a failed write is not retried by itself).
+    pub fn next(&mut self, now: Instant) -> Next {
+        let update = self.unwritten();
         if update == p::UserSettingsUpdate::default() {
             return Next::Idle;
         }
@@ -186,8 +217,17 @@ async fn write_task(
     loop {
         c.want(rx.borrow_and_update().clone());
         match c.next(Instant::now()) {
-            Next::Write(update) => {
-                if let Err(err) = client.update_user_settings(&update).await {
+            Next::Write(update) => match client.update_user_settings(&update).await {
+                Ok(settings) => {
+                    // A newer wish may have come meanwhile: the UI keeps showing it
+                    // until that one is written too.
+                    c.want(rx.borrow().clone());
+                    if !c.has_unwritten() {
+                        let _ = events
+                            .unbounded_send(super::Ev::Presence(Ev::Saved(Box::new(settings))));
+                    }
+                }
+                Err(err) => {
                     c.failed();
                     report(
                         &events,
@@ -202,7 +242,7 @@ async fn write_task(
                         return;
                     }
                 }
-            }
+            },
             Next::Wait(wait) => {
                 tokio::select! {
                     _ = tokio::time::sleep(wait) => {}
@@ -227,7 +267,13 @@ pub(in crate::backend) fn handle(backend: &mut Backend, cmd: Cmd) {
     }
     let Some(Active::Real(r)) = &mut backend.active else {
         // Not signed in, or the command was for an account that is not active: nothing
-        // is sent (an account in the background keeps its status).
+        // is sent (an account in the background keeps its status). A pick is answered,
+        // tagged with its account, so its state shows the saved status again.
+        if !matches!(cmd, Cmd::Presence { .. }) {
+            let _ = backend
+                .events
+                .unbounded_send(super::Ev::Presence(Ev::SaveFailed));
+        }
         return;
     };
     match cmd {
@@ -243,7 +289,7 @@ pub(in crate::backend) fn handle(backend: &mut Backend, cmd: Cmd) {
                 internal,
                 Save {
                     status: Some(status),
-                    custom: None,
+                    ..Save::default()
                 },
             );
         }
@@ -251,8 +297,8 @@ pub(in crate::backend) fn handle(backend: &mut Backend, cmd: Cmd) {
             r,
             internal,
             Save {
-                status: None,
                 custom: Some(custom.map(clean_custom)),
+                ..Save::default()
             },
         ),
     }
@@ -280,17 +326,13 @@ fn save(r: &mut RealActive, internal: TokioSender<Internal>, wish: Save) {
     }
 }
 
-/// A custom status as Fluxer takes it: trimmed text of at most 128 characters, and no
+/// A custom status as Fluxer takes it: trimmed text of at most 128 UTF-16 units, and no
 /// empty emoji name.
 fn clean_custom(mut c: CustomStatus) -> CustomStatus {
+    use inlet_state::presence::{truncate_utf16, CUSTOM_STATUS_TEXT_LIMIT};
     c.text = c
         .text
-        .map(|t| {
-            t.trim()
-                .chars()
-                .take(inlet_state::presence::CUSTOM_STATUS_TEXT_LIMIT)
-                .collect::<String>()
-        })
+        .map(|t| truncate_utf16(t.trim(), CUSTOM_STATUS_TEXT_LIMIT).to_owned())
         .filter(|t| !t.is_empty());
     c.emoji_name = c.emoji_name.filter(|e| !e.trim().is_empty());
     c

@@ -19,7 +19,7 @@ use crate::model::{self, Channel, Guild};
 use crate::reconnect::{Decision, Stop};
 
 /// The gateway settings of an account: a background account does not ask for typing
-/// events (and has no active guild, see `accounts`), and starts invisible (see
+/// events (and has no active guild, see `accounts`), and starts invisible and away (see
 /// `social/presence`).
 pub fn gateway_options(background: bool) -> p::GatewayOptions {
     let mut options = p::GatewayOptions::default();
@@ -29,6 +29,7 @@ pub fn gateway_options(background: bool) -> p::GatewayOptions {
             .map(|e| (*e).to_string())
             .collect();
         options.initial_status = Some(social::presence::BACKGROUND_STATUS.to_string());
+        options.initial_afk = social::presence::BACKGROUND_AFK;
     }
     options
 }

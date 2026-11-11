@@ -22,6 +22,8 @@ use crate::backend::social::presence::Cmd;
 use crate::theme;
 
 /// No input for this long counts as away (Fluxer's `IDLE_DURATION_MS`, 10 minutes).
+// Deviation: Fluxer sets `afk` after the account's `afk_timeout` setting (60 to 600 s)
+// and idle after 10 minutes; Inlet uses 10 minutes for both.
 pub const IDLE_AFTER: Duration = Duration::from_secs(10 * 60);
 /// How often the idle time is read while the person is there.
 pub const POLL_ACTIVE: Duration = Duration::from_secs(30);
@@ -82,10 +84,9 @@ pub struct PresenceState {
     pub idle: IdleTracker,
     /// The presence last sent, with the session it was sent for.
     sent: Option<(String, &'static str, bool)>,
-    /// The own status before the last change shown ahead of the server, to show it
-    /// again when the save fails.
-    pub before_save: Option<(String, Option<CustomStatus>)>,
     watch: Option<Task<()>>,
+    /// Redraws when the custom status shown expires (its time, and the timer).
+    expiry: Option<(i64, Task<()>)>,
 }
 
 impl PresenceState {
@@ -119,7 +120,7 @@ impl PresenceState {
     /// Forgets what was sent (sign-out): the next session sends its presence again.
     pub fn reset(&mut self) {
         self.sent = None;
-        self.before_save = None;
+        self.expiry = None;
     }
 }
 
@@ -141,6 +142,38 @@ impl Inlet {
     /// The status the account shows here: the chosen one, or idle while away.
     pub(crate) fn shown_status(&self, cx: &gpui::App) -> &'static str {
         shown(self.own_status(cx), self.social.presence.idle.is_idle()).0
+    }
+
+    /// Draws again when the custom status shown expires, so it goes away on time.
+    pub(crate) fn watch_status_expiry(&mut self, cx: &mut Context<Self>) {
+        let now = chrono::Utc::now().timestamp_millis();
+        let at = self
+            .account
+            .as_ref()
+            .and_then(|a| a.read(cx).presences().own().custom_expires_ms())
+            .filter(|at| *at > now);
+        let Some(at) = at else {
+            self.social.presence.expiry = None;
+            return;
+        };
+        if self
+            .social
+            .presence
+            .expiry
+            .as_ref()
+            .is_some_and(|(t, _)| *t == at)
+        {
+            return;
+        }
+        let wait = Duration::from_millis((at - now) as u64 + 50);
+        let task = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(wait).await;
+            let _ = this.update(cx, |this, cx| {
+                this.social.presence.expiry = None;
+                cx.notify();
+            });
+        });
+        self.social.presence.expiry = Some((at, task));
     }
 
     /// Sends this session's presence when it changed: after a pick, away or back, a new
@@ -232,13 +265,16 @@ pub fn emoji(glyph: &str, size: f32) -> AnyElement {
         if cache.len() >= MAX_EMOJI_IMAGES {
             return None;
         }
+        // Only drawings take a place in the cache; an emoji without one shows as text.
         let made = inlet_emoji::twemoji_svg(glyph).map(|svg| {
             Arc::new(Image::from_bytes(
                 ImageFormat::Svg,
                 crate::assets::sized_svg(&svg, 64),
             ))
         });
-        cache.insert(glyph.to_owned(), made.clone());
+        if let Some(image) = &made {
+            cache.insert(glyph.to_owned(), Some(image.clone()));
+        }
         made
     });
     match image {
@@ -254,6 +290,7 @@ pub fn emoji(glyph: &str, size: f32) -> AnyElement {
 /// A custom status in one line: its emoji and its text (cleaned, shortened by the
 /// caller's layout).
 pub fn custom_status_line(c: &CustomStatus, text_size: f32) -> AnyElement {
+    // Deviation: a custom emoji (by ID) is not drawn; Fluxer shows its image.
     let emoji_el = c
         .emoji_name
         .as_deref()
@@ -262,7 +299,7 @@ pub fn custom_status_line(c: &CustomStatus, text_size: f32) -> AnyElement {
     let text = c
         .text
         .as_deref()
-        .map(crate::model::clean_name)
+        .map(clean_custom_text)
         .filter(|t| !t.is_empty());
     div()
         .flex()
@@ -274,6 +311,17 @@ pub fn custom_status_line(c: &CustomStatus, text_size: f32) -> AnyElement {
         .children(emoji_el)
         .children(text.map(|t| div().min_w_0().text_ellipsis().child(t)))
         .into_any_element()
+}
+
+/// A custom status text for display: no control, format or direction characters, and at
+/// most 128 UTF-16 units (Fluxer's limit). Empty when nothing visible is left.
+pub fn clean_custom_text(text: &str) -> String {
+    use inlet_state::presence::{is_visible, truncate_utf16, CUSTOM_STATUS_TEXT_LIMIT};
+    let kept: String = text
+        .chars()
+        .filter(|c| is_visible(*c) || *c == ' ')
+        .collect();
+    truncate_utf16(kept.trim(), CUSTOM_STATUS_TEXT_LIMIT).to_owned()
 }
 
 #[cfg(test)]
@@ -304,6 +352,13 @@ mod tests {
         // A system that cannot tell is never away.
         assert!(!idle.observe(None));
         assert!(!idle.is_idle());
+    }
+
+    #[test]
+    fn a_custom_status_text_is_cleaned_for_display() {
+        assert_eq!(clean_custom_text("\u{200B}\u{202E} "), "");
+        assert_eq!(clean_custom_text(" Lunch\u{202E} break "), "Lunch break");
+        assert_eq!(clean_custom_text(&"x".repeat(300)).len(), 128);
     }
 
     #[test]
