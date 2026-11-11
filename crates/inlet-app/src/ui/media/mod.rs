@@ -31,7 +31,7 @@ use gpui::{Context, Pixels, RenderImage, Size, Task, Window};
 
 use crate::app::Inlet;
 use crate::backend::media::{Ev, Setup};
-use animation_budget::MotionPrefs;
+use animation_budget::{MotionPrefs, Stage, IDLE_AFTER};
 
 pub(crate) use attachment::cover_box;
 pub use attachment::Refresh;
@@ -89,6 +89,9 @@ pub struct State {
     pub refresh: Refresh,
     /// The open image viewer.
     pub viewer: Option<Viewer>,
+    /// The last keyboard or mouse input in the window: animations stop after
+    /// [`IDLE_AFTER`] without one.
+    last_input: std::time::Instant,
     /// Demo screenshots: the viewer was opened once for the `image-viewer` scene.
     #[cfg(feature = "demo")]
     pub demo_viewer_done: bool,
@@ -114,6 +117,7 @@ impl Default for State {
             cover_explicit: true,
             refresh: Refresh::default(),
             viewer: None,
+            last_input: std::time::Instant::now(),
             #[cfg(feature = "demo")]
             demo_viewer_done: false,
             #[cfg(feature = "demo")]
@@ -205,11 +209,59 @@ impl Inlet {
         }
         #[cfg(feature = "demo")]
         self.media.demo_note_frame(window.is_window_active());
-        self.media.images.next_frame(window.is_window_active());
+        let stage = Stage {
+            active: window.is_window_active(),
+            idle: self.media.last_input.elapsed() >= IDLE_AFTER,
+            reduce_motion: cx.reduce_motion(),
+            layer_open: self.layer_open(),
+        };
+        self.media.images.next_frame(stage);
         self.release_evicted(Some(window), cx);
         emoji::release_twemoji(window, cx);
         #[cfg(feature = "demo")]
         self.demo_open_viewer(cx);
+    }
+
+    /// Keyboard or mouse input in the window: animations that stopped for lack of
+    /// input go on.
+    pub(crate) fn note_input(&mut self, cx: &mut Context<Self>) {
+        self.media.last_input = std::time::Instant::now();
+        if self.media.images.animations().borrow().is_idle() {
+            cx.notify();
+        }
+    }
+
+    /// Follows the system's reduce-motion setting (read every 10 s off the UI thread)
+    /// into gpui's, which the animations and gpui's own elements follow. Demo runs keep
+    /// motion on unless `INLET_DEMO_REDUCE_MOTION=1`, so their screenshots do not
+    /// depend on the machine.
+    pub(crate) fn watch_reduce_motion(cx: &mut Context<Self>) {
+        if cfg!(feature = "demo") && std::env::var_os("INLET_DEMO").is_some() {
+            let reduce = std::env::var("INLET_DEMO_REDUCE_MOTION").as_deref() == Ok("1");
+            cx.set_reduce_motion(reduce);
+            return;
+        }
+        cx.spawn(async move |this, cx| loop {
+            let reduce = cx
+                .background_executor()
+                .spawn(async { inlet_platform::reduce_motion() })
+                .await;
+            let alive = this.update(cx, |_, cx| {
+                if let Some(reduce) = reduce {
+                    if cx.reduce_motion() != reduce {
+                        log::info!("system reduce-motion setting: {reduce}");
+                        cx.set_reduce_motion(reduce);
+                    }
+                }
+            });
+            if alive.is_err() {
+                break;
+            }
+            cx.background_executor()
+                .timer(std::time::Duration::from_secs(10))
+                .await;
+        })
+        .detach();
     }
 
     /// Takes the images the cache let go of and frees the texture of every one that

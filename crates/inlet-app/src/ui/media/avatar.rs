@@ -33,18 +33,12 @@ impl Inlet {
             return initials(name, size).into_any_element();
         };
         let scale = self.media.scale;
+        // Through the animation budget, like every other animation.
         let moving = (animate && a.hash.starts_with("a_"))
             .then(|| requests::avatar(&setup.proxy, a, size, scale, true))
-            .flatten()
-            .map(|req| self.image(&req, cx))
-            .filter(|s| matches!(s, Shown::Ready(_)));
-        let shown = match moving {
-            Some(shown) => shown,
-            None => match requests::avatar(&setup.proxy, a, size, scale, false) {
-                Some(req) => self.image(&req, cx),
-                None => Shown::Unavailable,
-            },
-        };
+            .flatten();
+        let still = requests::avatar(&setup.proxy, a, size, scale, false);
+        let shown = self.moving(moving.as_ref(), still.as_ref(), cx);
         match shown {
             Shown::Ready(image) if image.frame_count() > 1 => animated(
                 image,

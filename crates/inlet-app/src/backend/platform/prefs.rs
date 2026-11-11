@@ -108,25 +108,41 @@ pub fn load_section<T: DeserializeOwned + Default>(path: &Path, key: &str) -> T 
 }
 
 /// Writes `value` under `key` into `path`, keeping the file's other keys, through a
-/// temporary file so a crash never leaves half a file.
+/// temporary file written to disk before it replaces the old one, so a crash or a
+/// power cut never leaves half a file. A file that cannot be read is kept as
+/// `settings.json.bad` (the settings of other parts are in it) before a new one
+/// takes its place.
 pub fn save_section<T: Serialize>(path: &Path, key: &str, value: &T) -> std::io::Result<()> {
+    use std::io::Write;
     // One writer at a time: two sections saved at once from different threads would
     // each read the file before the other wrote it, and one change would be lost.
     static WRITING: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _one = WRITING.lock().unwrap_or_else(|e| e.into_inner());
-    let mut root = std::fs::read_to_string(path)
-        .ok()
-        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-        .filter(|v| v.is_object())
-        .unwrap_or_else(|| serde_json::json!({}));
-    root[key] = serde_json::to_value(value).map_err(std::io::Error::other)?;
-    let text = serde_json::to_string_pretty(&root).map_err(std::io::Error::other)?;
     let dir = path
         .parent()
         .ok_or_else(|| std::io::Error::other("settings path has no folder"))?;
+    let mut root = match std::fs::read_to_string(path) {
+        Ok(text) => match serde_json::from_str::<serde_json::Value>(&text) {
+            Ok(value) if value.is_object() => value,
+            _ => {
+                let bad = path.with_extension("json.bad");
+                log::warn!("settings.json could not be read; kept as {}", bad.display());
+                std::fs::rename(path, &bad)?;
+                serde_json::json!({})
+            }
+        },
+        Err(_) => serde_json::json!({}),
+    };
+    root[key] = serde_json::to_value(value).map_err(std::io::Error::other)?;
+    let text = serde_json::to_string_pretty(&root).map_err(std::io::Error::other)?;
     std::fs::create_dir_all(dir)?;
     let tmp = dir.join(format!(".settings.json.{}.tmp", std::process::id()));
-    let result = std::fs::write(&tmp, text).and_then(|()| std::fs::rename(&tmp, path));
+    let result = std::fs::File::create(&tmp)
+        .and_then(|mut f| {
+            f.write_all(text.as_bytes())?;
+            f.sync_all()
+        })
+        .and_then(|()| std::fs::rename(&tmp, path));
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
@@ -190,10 +206,12 @@ mod tests {
         let prefs = load(&path);
         assert_eq!(prefs.zoom, 2.0);
         assert!(!prefs.close_to_tray);
-        // A broken file is replaced by a whole one on save.
+        // A broken file is kept aside as settings.json.bad and replaced by a whole one.
         std::fs::write(&path, "{not json").unwrap();
         save(&path, &prefs).unwrap();
         assert_eq!(load(&path), prefs);
+        let bad = path.with_extension("json.bad");
+        assert_eq!(std::fs::read_to_string(&bad).unwrap(), "{not json");
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 

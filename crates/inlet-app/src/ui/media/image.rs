@@ -22,7 +22,7 @@ use std::time::Instant;
 use gpui::{div, img, prelude::*, px, AnyElement, Context, ObjectFit, RenderImage, Task};
 use inlet_media::{MediaError, MediaRequest};
 
-use super::animation_budget::{animated, AnimationBudget, Motion};
+use super::animation_budget::{animated, AnimationBudget, Motion, Stage};
 use super::MediaIcon;
 use crate::app::Inlet;
 use crate::theme;
@@ -81,14 +81,14 @@ impl Default for Images {
 }
 
 impl Images {
-    /// Starts a frame: lets go of every image the previous frame did not draw. `active`
-    /// is whether the window has the focus (animations stop without it).
-    pub fn next_frame(&self, active: bool) {
+    /// Starts a frame: lets go of every image the previous frame did not draw. `stage`
+    /// is what the window is like (see [`Stage`]).
+    pub fn next_frame(&self, stage: Stage) {
         let frame = self.frame.get() + 1;
         self.frame.set(frame);
         self.animations
             .borrow_mut()
-            .next_frame(active, Instant::now());
+            .next_frame(stage, Instant::now());
         self.entries
             .borrow_mut()
             .retain(|_, e| e.used.saturating_add(1) >= frame);
@@ -221,7 +221,7 @@ impl Inlet {
                         let bytes = decoded_bytes(&image);
                         let mut budget = images.animations.borrow_mut();
                         budget.remember(anim, bytes);
-                        if budget.admit(bytes) {
+                        if budget.admit_image(image.id, bytes) {
                             return Shown::Ready(image);
                         }
                         drop(budget);
@@ -323,20 +323,20 @@ mod tests {
         )
         .unwrap();
         let image = Arc::new(RenderImage::new(decoded.into_gpui_frames()));
-        images.next_frame(true);
+        images.next_frame(Stage::LIVE);
         images.insert_ready(req(1), image.clone());
         images.insert_ready(req(2), image.clone());
         assert_eq!(Arc::strong_count(&image), 3);
         // Frame 2 draws only the first; both survive into it.
-        images.next_frame(true);
+        images.next_frame(Stage::LIVE);
         images.touch(&req(1));
         assert_eq!(images.len(), 2);
         // Frame 3: the second was not drawn in frame 2 and goes.
-        images.next_frame(true);
+        images.next_frame(Stage::LIVE);
         assert_eq!(images.len(), 1);
         assert_eq!(Arc::strong_count(&image), 2);
         // Nothing drawn for a frame: everything goes.
-        images.next_frame(true);
+        images.next_frame(Stage::LIVE);
         assert_eq!(images.len(), 0);
         assert_eq!(Arc::strong_count(&image), 1);
     }

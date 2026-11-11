@@ -127,6 +127,15 @@ impl Inlet {
         let zoom = viewer.zoom.unwrap_or_else(|| viewer.fit_zoom(viewport));
         let shown = (viewer.size.0 * zoom, viewer.size.1 * zoom);
         let image = self.moving(viewer.moving.as_ref(), viewer.request.as_ref(), cx);
+        // The viewer's animation keeps its place however many the chat holds: reserved
+        // here, before anything is painted (the chat under it stands still meanwhile).
+        if let super::image::Shown::Ready(image) = &image {
+            self.media
+                .images
+                .animations()
+                .borrow_mut()
+                .reserve(image.id);
+        }
         let picture = picture_of(
             image,
             shown,

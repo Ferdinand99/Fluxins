@@ -5,19 +5,26 @@
 //! - **Memory.** Animations keep every frame decoded, so the ones a frame draws share
 //!   [`ANIMATION_BUDGET_BYTES`]; one that does not fit shows its still (see
 //!   `Inlet::moving`). Each is capped on its own by the client (`ANIMATION_MAX_BYTES`).
+//!   Only an image admitted to that budget this frame moves; a still that happens to
+//!   decode with several frames shows its first.
 //! - **Count.** At most [`MAX_PLAYING`] animations move at once on screen; the others
-//!   show their first frame.
-//! - **Focus.** Everything stops on its current frame while the window does not have
-//!   the focus, and goes on from there when it gets it back.
+//!   show their first frame. The image viewer reserves its place before the chat is
+//!   drawn, and nothing under an open layer moves.
+//! - **One clock.** Every animation takes its frame from one clock that runs only while
+//!   the window has the focus, the user has touched it within [`IDLE_AFTER`], and the
+//!   system does not ask for reduced motion (then every animation shows its first
+//!   frame). Stopped animations keep their frame and go on from there.
+//! - **Redraws** come only when a frame is due, rounded up to a shared grid of the clock
+//!   ([`GIF_GRID`] for GIFs and the viewer, [`DECORATION_GRID`] for emoji, stickers and
+//!   avatars), so animations of any pace share them; none while nothing moves.
 //! - **Settings.** With animated emoji (or stickers) switched off they show their first
 //!   frame, and only the still is fetched ([`MotionPrefs`], kept in `settings.json`).
 //!
-//! The views draw an animation with [`animated`]: it picks the frame from a
-//! [`Playback`] per image, counts it, and asks for a redraw when the next frame is due
-//! (not on every display refresh). Off-screen animations are neither counted nor drawn.
+//! The views draw an animation with [`animated`]. Off-screen animations are neither
+//! counted nor drawn.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -27,7 +34,7 @@ use gpui::{
     canvas, prelude::*, px, AnyElement, App, Bounds, Corners, ImageId, ObjectFit, Pixels,
     RenderImage, Task, Window,
 };
-use inlet_media::{MediaRequest, Playback};
+use inlet_media::MediaRequest;
 use serde::{Deserialize, Serialize};
 
 use crate::backend::platform::prefs;
@@ -40,12 +47,14 @@ pub const MAX_PLAYING: usize = 32;
 /// Animations whose decoded size is remembered, so one over the budget is not loaded
 /// again every frame.
 const MAX_KNOWN_ANIMATIONS: usize = 512;
-/// Shortest wait before a redraw for the next frame (50 frames a second at most, as
-/// browsers clamp GIF delays).
-const MIN_FRAME_GAP: Duration = Duration::from_millis(20);
-/// Frames due this soon are shown now, so animations whose frames change at nearly
-/// the same time share one redraw.
-const LOOKAHEAD: Duration = Duration::from_millis(8);
+/// Redraws for GIFs and the image viewer fall on this grid of the clock (30 a second
+/// at most).
+pub const GIF_GRID: Duration = Duration::from_nanos(33_333_333);
+/// Redraws for emoji, stickers and avatars fall on this grid (20 a second at most).
+pub const DECORATION_GRID: Duration = Duration::from_millis(50);
+/// Animations stop after this long without keyboard or mouse input in the window, and
+/// go on with the next input.
+pub const IDLE_AFTER: Duration = Duration::from_secs(5 * 60);
 /// The key of the media settings in `settings.json`.
 const SETTINGS_KEY: &str = "media";
 
@@ -123,31 +132,109 @@ impl MotionPrefs {
     }
 }
 
+/// What the window is like this frame, for the animations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stage {
+    /// The window has the focus.
+    pub active: bool,
+    /// No input for [`IDLE_AFTER`].
+    pub idle: bool,
+    /// The system asks for reduced motion: every animation shows its first frame.
+    pub reduce_motion: bool,
+    /// A layer (the image viewer, settings, a prompt, the account switcher) lies over
+    /// the chat: only the animation the layer reserved moves.
+    pub layer_open: bool,
+}
+
+impl Stage {
+    /// A focused, used window with nothing over the chat.
+    pub const LIVE: Stage = Stage {
+        active: true,
+        idle: false,
+        reduce_motion: false,
+        layer_open: false,
+    };
+
+    /// Whether the animation clock runs.
+    fn running(self) -> bool {
+        self.active && !self.idle && !self.reduce_motion
+    }
+}
+
 struct Player {
-    playback: Playback,
+    /// Frame lengths (at least 1 ms each) and their sum.
+    delays: Vec<Duration>,
+    total: Duration,
+    /// The frame it showed last.
+    shown: usize,
     /// The frame that last drew it.
     used: u64,
 }
 
-/// The animations of one frame: their bytes against [`ANIMATION_BUDGET_BYTES`], how
-/// many move, and which frame each shows.
+impl Player {
+    fn new(delays: Vec<Duration>, used: u64) -> Self {
+        let delays: Vec<Duration> = delays
+            .into_iter()
+            .map(|d| d.max(Duration::from_millis(1)))
+            .collect();
+        let total = delays.iter().sum();
+        Player {
+            delays,
+            total,
+            shown: 0,
+            used,
+        }
+    }
+
+    /// The frame at `clock` and how long until the next one (`None` for a still).
+    fn at(&self, clock: Duration) -> (usize, Option<Duration>) {
+        if self.delays.len() < 2 || self.total.is_zero() {
+            return (0, None);
+        }
+        let nanos = clock.as_nanos() % self.total.as_nanos();
+        let mut into = Duration::from_nanos(nanos as u64);
+        for (i, d) in self.delays.iter().enumerate() {
+            if into < *d {
+                return (i, Some(*d - into));
+            }
+            into -= *d;
+        }
+        (0, Some(self.delays[0]))
+    }
+}
+
+/// Rounds `t` up to a whole number of `grid`.
+fn round_up(t: Duration, grid: Duration) -> Duration {
+    let g = grid.as_nanos().max(1);
+    let n = t.as_nanos().div_ceil(g) * g;
+    Duration::from_nanos(n as u64)
+}
+
+/// The animations of one frame: their bytes against [`ANIMATION_BUDGET_BYTES`], which
+/// ones may move, how many move, and which frame each shows.
 pub struct AnimationBudget {
     budget: u64,
     used: u64,
     /// Decoded sizes of animations seen, by request.
     known: HashMap<MediaRequest, u64>,
+    /// Images admitted to the byte budget this frame: only these may move. A still that
+    /// happens to decode with several frames shows its first.
+    admitted: HashSet<ImageId>,
+    /// The animation of the open layer (the image viewer): it always moves, and takes
+    /// one of the [`MAX_PLAYING`] places before the chat is drawn.
+    reserved: Option<ImageId>,
     max_playing: usize,
     /// Animations that moved this frame.
     playing: usize,
-    /// The window has the focus.
-    active: bool,
+    stage: Stage,
+    /// The animation clock: it runs only while the window is focused, used and not
+    /// asked to reduce motion, so every animation stops where it is and goes on from
+    /// there, and all of them keep one phase.
+    clock: Duration,
+    /// When the clock was last read.
+    clock_at: Option<Instant>,
     frame: u64,
-    /// Every animation counts its frames from this time (the first frame of the
-    /// session), so animations with the same frame lengths change frames together and
-    /// share their redraws.
-    epoch: Option<Instant>,
-    /// Where each image drawn last frame is in its animation. Images that show the
-    /// same animation share one (they move together).
+    /// The animations drawn last frame. Images that show the same animation share one.
     players: HashMap<ImageId, Player>,
     /// When the earliest next frame of this frame's animations is due.
     wake: Option<Instant>,
@@ -168,11 +255,14 @@ impl AnimationBudget {
             budget,
             used: 0,
             known: HashMap::new(),
+            admitted: HashSet::new(),
+            reserved: None,
             max_playing: MAX_PLAYING,
             playing: 0,
-            active: true,
+            stage: Stage::LIVE,
+            clock: Duration::ZERO,
+            clock_at: None,
             frame: 0,
-            epoch: None,
             players: HashMap::new(),
             wake: None,
             scheduled: None,
@@ -188,24 +278,22 @@ impl AnimationBudget {
         self.prefs = prefs;
     }
 
-    /// A new frame: nothing plays yet. `active` is whether the window has the focus;
-    /// losing it stops every animation where it is, getting it back goes on from there.
-    pub fn next_frame(&mut self, active: bool, now: Instant) {
-        self.used = 0;
-        self.playing = 0;
-        self.wake = None;
-        self.frame += 1;
-        self.epoch.get_or_insert(now);
-        if active != self.active {
-            self.active = active;
-            for p in self.players.values_mut() {
-                if active {
-                    p.playback.resume(now);
-                } else {
-                    p.playback.pause(now);
-                }
+    /// A new frame at `now`: nothing is admitted or plays yet. The clock moves on by
+    /// the time since the last frame if it ran then.
+    pub fn next_frame(&mut self, stage: Stage, now: Instant) {
+        if let Some(at) = self.clock_at {
+            if self.stage.running() {
+                self.clock += now.saturating_duration_since(at);
             }
         }
+        self.clock_at = Some(now);
+        self.stage = stage;
+        self.used = 0;
+        self.playing = 0;
+        self.admitted.clear();
+        self.reserved = None;
+        self.wake = None;
+        self.frame += 1;
         let frame = self.frame;
         self.players
             .retain(|_, p| p.used.saturating_add(1) >= frame);
@@ -225,6 +313,21 @@ impl AnimationBudget {
         true
     }
 
+    /// [`admit`](Self::admit) for the image `id`, which may then move this frame.
+    pub fn admit_image(&mut self, id: ImageId, bytes: u64) -> bool {
+        let fits = self.admit(bytes);
+        if fits {
+            self.admitted.insert(id);
+        }
+        fits
+    }
+
+    /// The open layer's animation (the image viewer): it moves whatever the chat under
+    /// it holds. Call it before the chat is drawn.
+    pub fn reserve(&mut self, id: ImageId) {
+        self.reserved = Some(id);
+    }
+
     /// Bytes of the animations drawn this frame.
     #[cfg(test)]
     pub fn used(&self) -> u64 {
@@ -242,37 +345,61 @@ impl AnimationBudget {
         self.known.insert(req.clone(), bytes);
     }
 
-    /// The frame to draw of the animation `id` (with these frame `delays`) at `now`.
-    /// Counts it as moving; past [`MAX_PLAYING`], or when the settings stop this kind,
-    /// it is the first frame. While the window has no focus it is the frame the
-    /// animation stopped on.
+    /// Whether the last frame found the window idle (no input for a while).
+    pub fn is_idle(&self) -> bool {
+        self.stage.idle
+    }
+
+    /// The frame to draw of the animation `id` (with these frame `delays`). Only an
+    /// image admitted this frame (or the layer's reserved one) moves, at most
+    /// [`MAX_PLAYING`] at once; the others, and kinds the settings stop, show their
+    /// first frame, as does everything when the system asks for reduced motion. Under
+    /// an open layer an animation keeps the frame it showed. Without focus or input the
+    /// clock stands, so every animation keeps its frame.
     pub fn frame_to_draw(
         &mut self,
         id: ImageId,
         motion: Motion,
         delays: impl FnOnce() -> Vec<Duration>,
-        now: Instant,
     ) -> usize {
-        if !self.prefs.allows(motion) || self.playing >= self.max_playing {
+        if self.stage.reduce_motion || !self.prefs.allows(motion) {
             return 0;
         }
-        self.playing += 1;
-        let (frame, active, epoch) = (self.frame, self.active, self.epoch);
-        let player = self.players.entry(id).or_insert_with(|| {
-            let mut playback = Playback::new(delays(), epoch.unwrap_or(now));
-            if !active {
-                playback.pause(now);
+        let frame = self.frame;
+        let reserved = self.reserved == Some(id);
+        if !reserved {
+            if !self.admitted.contains(&id) {
+                return 0;
             }
-            Player {
-                playback,
-                used: frame,
+            if self.stage.layer_open {
+                // Frozen under the layer: not counted, no redraw.
+                return self.players.get_mut(&id).map_or(0, |p| {
+                    p.used = frame;
+                    p.shown
+                });
             }
-        });
+            let places = self.max_playing - usize::from(self.reserved.is_some());
+            if self.playing >= places {
+                return 0;
+            }
+            self.playing += 1;
+        }
+        let player = self
+            .players
+            .entry(id)
+            .or_insert_with(|| Player::new(delays(), frame));
         player.used = frame;
-        let soon = now + LOOKAHEAD;
-        let shown = player.playback.frame_at(soon);
-        if let Some(next) = player.playback.time_to_next_frame(soon) {
-            let at = soon + next.max(MIN_FRAME_GAP);
+        let (shown, next) = player.at(self.clock);
+        player.shown = shown;
+        if let (Some(next), true) = (next, self.stage.running()) {
+            // The next frame, on a shared grid of the clock, so animations of different
+            // paces share their redraws.
+            let grid = match motion {
+                Motion::Gif => GIF_GRID,
+                Motion::Avatar | Motion::Emoji | Motion::Sticker => DECORATION_GRID,
+            };
+            let due = round_up(self.clock + next, grid);
+            let at = self.clock_at.unwrap_or_else(Instant::now) + (due - self.clock);
             self.wake = Some(self.wake.map_or(at, |w| w.min(at)));
         }
         shown
@@ -285,7 +412,7 @@ impl AnimationBudget {
     }
 
     /// When this frame's animations want the next redraw; `None` when nothing moves
-    /// (the window has no focus, or no animation is on screen).
+    /// (no focus, no input, reduced motion, or no animation on screen).
     #[cfg(test)]
     pub fn wake(&self) -> Option<Instant> {
         self.wake
@@ -345,7 +472,7 @@ pub(crate) fn paint_animated(
     } else {
         budget
             .borrow_mut()
-            .frame_to_draw(image.id, motion, || delays(image), Instant::now())
+            .frame_to_draw(image.id, motion, || delays(image))
             .min(count - 1)
     };
     let image_bounds = fit.get_bounds(bounds, image.size(frame));
@@ -375,7 +502,9 @@ fn schedule_wake(budget: &Rc<RefCell<AnimationBudget>>, window: &mut Window, cx:
         return;
     }
     let view = window.current_view();
-    let wait = at.saturating_duration_since(now);
+    // A little late rather than early: a timer that fires before the frame is due
+    // would only draw the same frame again.
+    let wait = at.saturating_duration_since(now) + Duration::from_millis(2);
     let task = window.spawn(cx, async move |cx| {
         cx.background_executor().timer(wait).await;
         let _ = cx.update(move |_, cx| cx.notify(view));
@@ -403,6 +532,25 @@ mod tests {
         vec![ms(100); 3]
     }
 
+    const LIVE: Stage = Stage::LIVE;
+    const UNFOCUSED: Stage = Stage {
+        active: false,
+        ..Stage::LIVE
+    };
+
+    /// A new frame at `t` in which the images `ids` were admitted to the byte budget.
+    fn frame(
+        b: &mut AnimationBudget,
+        stage: Stage,
+        t: Instant,
+        ids: impl IntoIterator<Item = usize>,
+    ) {
+        b.next_frame(stage, t);
+        for n in ids {
+            assert!(b.admit_image(ImageId(n), 1));
+        }
+    }
+
     #[test]
     fn animations_share_one_budget_per_frame() {
         const MIB: u64 = 1024 * 1024;
@@ -421,7 +569,7 @@ mod tests {
         assert_eq!(playing, 10);
         assert!(budget.used() <= ANIMATION_BUDGET_BYTES);
         // A new frame starts empty; sizes seen stay known, bounded.
-        budget.next_frame(true, Instant::now());
+        budget.next_frame(LIVE, Instant::now());
         assert_eq!(budget.used(), 0);
         for n in 0..(MAX_KNOWN_ANIMATIONS as u32 + 10) {
             budget.remember(&req(n), 1);
@@ -435,104 +583,200 @@ mod tests {
         let t0 = Instant::now();
         let id = ImageId(1);
         let mut b = AnimationBudget::default();
-        b.next_frame(true, t0);
-        assert_eq!(b.frame_to_draw(id, Motion::Gif, three, t0), 0);
+        let draw = |b: &mut AnimationBudget, id| b.frame_to_draw(id, Motion::Emoji, three);
+        frame(&mut b, LIVE, t0, [1]);
+        assert_eq!(draw(&mut b, id), 0);
         assert_eq!(b.wake(), Some(t0 + ms(100)));
-        b.next_frame(true, t0 + ms(150));
-        assert_eq!(b.frame_to_draw(id, Motion::Gif, three, t0 + ms(150)), 1);
+        frame(&mut b, LIVE, t0 + ms(150), [1]);
+        assert_eq!(draw(&mut b, id), 1);
+        assert_eq!(b.wake(), Some(t0 + ms(200)));
 
         // The window loses the focus 50 ms into the second frame: it stays there, and
         // no redraw is asked for, however long the window stays in the background.
-        b.next_frame(false, t0 + ms(150));
-        assert_eq!(b.frame_to_draw(id, Motion::Gif, three, t0 + ms(150)), 1);
-        for later in [ms(160), ms(1_000), ms(3_600_000)] {
-            b.next_frame(false, t0 + later);
-            assert_eq!(b.frame_to_draw(id, Motion::Gif, three, t0 + later), 1);
+        frame(&mut b, UNFOCUSED, t0 + ms(150), [1, 2]);
+        assert_eq!(draw(&mut b, id), 1);
+        let fresh_first = draw(&mut b, ImageId(2));
+        for later in [ms(160), ms(1_000), ms(3_600_150)] {
+            frame(&mut b, UNFOCUSED, t0 + later, [1, 2]);
+            assert_eq!(draw(&mut b, id), 1);
+            // One that first shows while unfocused stands still too.
+            assert_eq!(draw(&mut b, ImageId(2)), fresh_first);
             assert_eq!(b.wake(), None, "no redraw while unfocused");
         }
-        // An animation that first shows while unfocused does not move either.
-        let fresh = ImageId(2);
-        assert_eq!(
-            b.frame_to_draw(fresh, Motion::Emoji, three, t0 + ms(3_600_000)),
-            0
-        );
-        b.next_frame(false, t0 + ms(3_600_500));
-        assert_eq!(
-            b.frame_to_draw(fresh, Motion::Emoji, three, t0 + ms(3_600_500)),
-            0
-        );
-        assert_eq!(
-            b.frame_to_draw(id, Motion::Gif, three, t0 + ms(3_600_500)),
-            1
-        );
 
         // Focus back: it goes on from where it stopped, the time away does not count.
         let back = t0 + ms(7_200_000);
-        b.next_frame(true, back);
-        assert_eq!(b.frame_to_draw(id, Motion::Gif, three, back), 1);
-        // It stopped 58 ms into the frame (frames due within 8 ms show early).
-        assert_eq!(b.wake(), Some(back + ms(42)));
-        b.next_frame(true, back + ms(60));
-        assert_eq!(b.frame_to_draw(id, Motion::Gif, three, back + ms(60)), 2);
+        frame(&mut b, LIVE, back, [1]);
+        assert_eq!(draw(&mut b, id), 1);
+        assert_eq!(b.wake(), Some(back + ms(50)));
+        frame(&mut b, LIVE, back + ms(60), [1]);
+        assert_eq!(draw(&mut b, id), 2);
     }
 
     #[test]
     fn at_most_32_animations_run_at_once() {
         let t0 = Instant::now();
         let mut b = AnimationBudget::default();
-        b.next_frame(true, t0);
         // 100 different animations on screen.
+        frame(&mut b, LIVE, t0, 0..100);
         for n in 0..100 {
-            b.frame_to_draw(ImageId(n), Motion::Emoji, three, t0);
+            b.frame_to_draw(ImageId(n), Motion::Emoji, three);
         }
         assert_eq!(b.playing(), MAX_PLAYING);
         assert!(b.players.len() <= MAX_PLAYING);
         // A frame later the first 32 have moved on; the others still show frame one.
         let t1 = t0 + ms(120);
-        b.next_frame(true, t1);
+        frame(&mut b, LIVE, t1, 0..100);
         let frames: Vec<usize> = (0..100)
-            .map(|n| b.frame_to_draw(ImageId(n), Motion::Emoji, three, t1))
+            .map(|n| b.frame_to_draw(ImageId(n), Motion::Emoji, three))
             .collect();
         assert!(frames[..MAX_PLAYING].iter().all(|f| *f == 1), "{frames:?}");
         assert!(frames[MAX_PLAYING..].iter().all(|f| *f == 0), "{frames:?}");
         assert_eq!(b.playing(), MAX_PLAYING);
         // The same emoji 100 times: 32 copies move, the rest show the first frame.
-        b.next_frame(true, t1);
+        frame(&mut b, LIVE, t1, [0]);
         let same: Vec<usize> = (0..100)
-            .map(|_| b.frame_to_draw(ImageId(0), Motion::Emoji, three, t1))
+            .map(|_| b.frame_to_draw(ImageId(0), Motion::Emoji, three))
             .collect();
         assert_eq!(same.iter().filter(|f| **f == 1).count(), MAX_PLAYING);
         assert_eq!(same.iter().filter(|f| **f == 0).count(), 100 - MAX_PLAYING);
         assert_eq!(b.playing(), MAX_PLAYING);
         // Players of animations no longer drawn are let go.
-        b.next_frame(true, t1 + ms(10));
-        b.next_frame(true, t1 + ms(20));
+        b.next_frame(LIVE, t1 + ms(10));
+        b.next_frame(LIVE, t1 + ms(20));
         assert!(b.players.is_empty());
     }
 
     #[test]
-    fn animations_of_the_same_pace_share_their_redraws() {
+    fn the_viewer_moves_over_a_full_chat_and_nothing_under_a_layer_does() {
+        let t0 = Instant::now();
+        let viewer = ImageId(1000);
+        let all = || (0..40).chain([1000]);
+        let mut b = AnimationBudget::default();
+        // Without a layer: the reserved animation takes one place before the chat.
+        frame(&mut b, LIVE, t0, all());
+        b.reserve(viewer);
+        for n in 0..40 {
+            b.frame_to_draw(ImageId(n), Motion::Gif, three);
+        }
+        assert_eq!(b.playing(), MAX_PLAYING - 1);
+        b.frame_to_draw(viewer, Motion::Gif, three);
+        frame(&mut b, LIVE, t0 + ms(110), all());
+        b.reserve(viewer);
+        for n in 0..40 {
+            b.frame_to_draw(ImageId(n), Motion::Gif, three);
+        }
+        assert_eq!(
+            b.frame_to_draw(viewer, Motion::Gif, three),
+            1,
+            "the viewer moves"
+        );
+
+        // The viewer open over 40 animations in the chat (drawn first): they keep their
+        // frame, are not counted and ask for no redraw; the viewer moves on.
+        let open = Stage {
+            layer_open: true,
+            ..LIVE
+        };
+        frame(&mut b, open, t0 + ms(220), all());
+        b.reserve(viewer);
+        let under: Vec<usize> = (0..40)
+            .map(|n| b.frame_to_draw(ImageId(n), Motion::Gif, three))
+            .collect();
+        assert_eq!(b.playing(), 0);
+        assert_eq!(b.wake(), None, "nothing under the layer asks for a redraw");
+        assert_eq!(b.frame_to_draw(viewer, Motion::Gif, three), 2);
+        assert!(b.wake().is_some());
+        frame(&mut b, open, t0 + ms(330), all());
+        b.reserve(viewer);
+        let later: Vec<usize> = (0..40)
+            .map(|n| b.frame_to_draw(ImageId(n), Motion::Gif, three))
+            .collect();
+        assert_eq!(under, later, "frozen under the layer");
+        assert_eq!(b.frame_to_draw(viewer, Motion::Gif, three), 0);
+    }
+
+    #[test]
+    fn an_image_not_admitted_shows_its_first_frame() {
+        // A still asked for without `animated`, that decodes with several frames anyway
+        // (or the still shown when the budget is spent): it never moves.
         let t0 = Instant::now();
         let mut b = AnimationBudget::default();
-        let pace = || vec![ms(90); 8];
-        b.next_frame(true, t0);
-        // Thirty animations that show up at different times over the first second.
-        let mut now = t0;
-        let mut redraws = 0;
-        let end = t0 + ms(3_000);
-        while now < end {
-            b.next_frame(true, now);
-            let shown = ((now - t0).as_millis() / 33).min(30) as usize;
-            for n in 0..shown {
-                b.frame_to_draw(ImageId(n), Motion::Emoji, pace, now);
-            }
-            redraws += 1;
-            // The next redraw: when asked for, else the next one an image load causes.
-            now = b.wake().unwrap_or(now + ms(33)).max(now + ms(1));
+        for t in [0, 150, 250] {
+            b.next_frame(LIVE, t0 + ms(t));
+            assert_eq!(b.frame_to_draw(ImageId(7), Motion::Gif, three), 0);
+            assert_eq!(b.playing(), 0);
+            assert_eq!(b.used(), 0);
+            assert_eq!(b.wake(), None);
         }
-        // After the first second they all change frames together: about one redraw per
-        // 90 ms frame, not one per animation.
-        assert!(redraws <= 30 + 3_000 / 90 + 2, "{redraws} redraws");
+    }
+
+    #[test]
+    fn idle_windows_and_reduced_motion_stand_still() {
+        let t0 = Instant::now();
+        let mut b = AnimationBudget::default();
+        frame(&mut b, LIVE, t0, [1]);
+        b.frame_to_draw(ImageId(1), Motion::Gif, three);
+        // No input for a while: the clock stops where it was, no redraws.
+        let idle = Stage { idle: true, ..LIVE };
+        frame(&mut b, idle, t0 + ms(150), [1]);
+        assert!(b.is_idle());
+        assert_eq!(b.frame_to_draw(ImageId(1), Motion::Gif, three), 1);
+        frame(&mut b, idle, t0 + ms(60_000), [1]);
+        assert_eq!(b.frame_to_draw(ImageId(1), Motion::Gif, three), 1);
+        assert_eq!(b.wake(), None);
+        // Input again: on from there.
+        frame(&mut b, LIVE, t0 + ms(60_010), [1]);
+        assert!(!b.is_idle());
+        assert_eq!(b.frame_to_draw(ImageId(1), Motion::Gif, three), 1);
+        assert!(b.wake().is_some());
+        // The system asks for reduced motion: the first frame, no redraws.
+        let reduced = Stage {
+            reduce_motion: true,
+            ..LIVE
+        };
+        frame(&mut b, reduced, t0 + ms(60_200), [1]);
+        assert_eq!(b.frame_to_draw(ImageId(1), Motion::Gif, three), 0);
+        assert_eq!(b.wake(), None);
+    }
+
+    /// Redraws over `secs` seconds of animations with these frame lengths (all drawn
+    /// every frame), following the redraws they ask for.
+    fn redraws(paces: &[(u64, Motion)], secs: u64) -> usize {
+        let t0 = Instant::now();
+        let mut b = AnimationBudget::default();
+        let mut now = t0;
+        let mut count = 0;
+        while now < t0 + Duration::from_secs(secs) {
+            frame(&mut b, LIVE, now, 0..paces.len());
+            for (n, (pace, motion)) in paces.iter().enumerate() {
+                b.frame_to_draw(ImageId(n), *motion, || vec![ms(*pace); 8]);
+            }
+            count += 1;
+            now = b.wake().expect("they move").max(now + ms(1));
+        }
+        count
+    }
+
+    #[test]
+    fn animations_of_any_pace_share_their_redraws() {
+        // One pace: one redraw per frame of it.
+        let one = redraws(&[(90, Motion::Emoji); 30], 3);
+        assert!(one <= 3_000 / 90 + 2, "{one}");
+        // Mixed paces of emoji and stickers: at most the 50 ms grid, not one per pace.
+        let mixed = redraws(
+            &[
+                (70, Motion::Emoji),
+                (90, Motion::Emoji),
+                (80, Motion::Sticker),
+                (120, Motion::Sticker),
+            ],
+            3,
+        );
+        assert!(mixed <= 3_000 / 50 + 1, "{mixed}");
+        // A GIF of 20 ms frames: at most the 33 ms grid, not 50 a second.
+        let fast = redraws(&[(20, Motion::Gif)], 3);
+        assert!(fast <= 3_000 / 33 + 1, "{fast}");
     }
 
     #[test]
@@ -540,9 +784,9 @@ mod tests {
         let t0 = Instant::now();
         let mut b = AnimationBudget::default();
         b.prefs.animate_stickers = false;
-        b.next_frame(true, t0);
+        frame(&mut b, LIVE, t0, [1]);
         b.remember(&req(1), 5);
-        b.frame_to_draw(ImageId(1), Motion::Gif, three, t0);
+        b.frame_to_draw(ImageId(1), Motion::Gif, three);
         b.reset();
         assert!(b.known.is_empty());
         assert!(b.players.is_empty());
@@ -555,23 +799,17 @@ mod tests {
         let t0 = Instant::now();
         let mut b = AnimationBudget::default();
         b.prefs.animate_emoji = false;
-        b.next_frame(true, t0);
         for later in [0, 150, 250, 1_000] {
-            b.next_frame(true, t0 + ms(later));
-            assert_eq!(
-                b.frame_to_draw(ImageId(1), Motion::Emoji, three, t0 + ms(later)),
-                0
-            );
+            frame(&mut b, LIVE, t0 + ms(later), [1, 2]);
+            assert_eq!(b.frame_to_draw(ImageId(1), Motion::Emoji, three), 0);
             assert_eq!(b.wake(), None);
         }
         assert_eq!(b.playing(), 0);
         // Other kinds still move.
-        b.next_frame(true, t0 + ms(2_000));
-        let before = b.frame_to_draw(ImageId(2), Motion::Gif, three, t0 + ms(2_000));
-        assert_ne!(
-            b.frame_to_draw(ImageId(2), Motion::Gif, three, t0 + ms(2_150)),
-            before
-        );
+        frame(&mut b, LIVE, t0 + ms(2_000), [2]);
+        let before = b.frame_to_draw(ImageId(2), Motion::Gif, three);
+        frame(&mut b, LIVE, t0 + ms(2_150), [2]);
+        assert_ne!(b.frame_to_draw(ImageId(2), Motion::Gif, three), before);
 
         // The setting lives in settings.json next to the other settings.
         let dir = std::env::temp_dir().join(format!("inlet-motion-prefs-{}", std::process::id()));

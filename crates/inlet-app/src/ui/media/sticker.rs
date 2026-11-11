@@ -103,7 +103,7 @@ mod tests {
 
     use super::*;
     use crate::backend::media::png;
-    use crate::ui::media::animation_budget::AnimationBudget;
+    use crate::ui::media::animation_budget::{AnimationBudget, Stage};
 
     /// A stand-in for the media proxy that serves each sticker in its own format.
     struct Stickers {
@@ -174,8 +174,7 @@ mod tests {
         let setup = crate::backend::media::setup(proxy.clone(), fetcher.clone());
         let prefs = MotionPrefs::default();
         let mut budget = AnimationBudget::default();
-        let t0 = Instant::now();
-        budget.next_frame(true, t0);
+        let mut t0 = Instant::now();
         let cases = [
             ("1001", false, "png", 1),
             ("1002", true, "apng", 3),
@@ -205,20 +204,15 @@ mod tests {
                 let delays: Vec<Duration> = (0..image.frame_count())
                     .map(|i| Duration::from(image.delay(i)))
                     .collect();
-                assert_eq!(
-                    budget.frame_to_draw(image.id, Motion::Sticker, || delays.clone(), t0),
-                    0
-                );
-                assert_eq!(
-                    budget.frame_to_draw(
-                        image.id,
-                        Motion::Sticker,
-                        || delays.clone(),
-                        t0 + Duration::from_millis(150)
-                    ),
-                    1,
-                    "{format} moves"
-                );
+                let bytes = crate::ui::media::image::decoded_bytes(&image);
+                budget.next_frame(Stage::LIVE, t0);
+                assert!(budget.admit_image(image.id, bytes));
+                let first = budget.frame_to_draw(image.id, Motion::Sticker, || delays.clone());
+                budget.next_frame(Stage::LIVE, t0 + Duration::from_millis(150));
+                assert!(budget.admit_image(image.id, bytes));
+                let later = budget.frame_to_draw(image.id, Motion::Sticker, || delays.clone());
+                assert_ne!(first, later, "{format} moves");
+                t0 += Duration::from_secs(1);
             }
         }
         // Only the proxy was asked, and only for stickers.

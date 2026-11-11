@@ -1,5 +1,6 @@
 //! Desktop integration for Inlet: tray icon, notifications, taskbar and dock badge,
-//! window flashing, autostart, single instance, `inlet://` deep links and idle time.
+//! window flashing, autostart, single instance, `inlet://` deep links, idle time and
+//! the reduce-motion setting.
 //!
 //! One module per feature, one backend per operating system. What gpui already
 //! provides is reused rather than rebuilt where it works: notifications on macOS
@@ -24,6 +25,7 @@ mod idle;
 pub mod jump_list;
 #[cfg(target_os = "linux")]
 mod linux_bus;
+mod motion;
 mod notify;
 mod single_instance;
 #[cfg(windows)]
@@ -42,6 +44,7 @@ pub use error::{Error, Result};
 pub use events::{events, PlatformEvent};
 pub use icon::Icon;
 pub use idle::idle_time;
+pub use motion::reduce_motion;
 pub use notify::{
     clean_text, dismiss, escape_markup, notify, Notification, Preview, BODY_MAX_GRAPHEMES,
     TITLE_MAX_GRAPHEMES,
