@@ -246,7 +246,7 @@ pub fn from_account_state(
     guild: GuildId,
     channel: ChannelId,
 ) -> (Directory, Vec<Person>) {
-    use inlet_protocol::permissions::{BYPASS_SLOWMODE, MENTION_EVERYONE};
+    use inlet_protocol::permissions::{ATTACH_FILES, BYPASS_SLOWMODE, MENTION_EVERYONE};
     use inlet_state::channels::is_guild_text_based;
     let clean = crate::model::clean_name;
     let id = |s: &str| crate::backend::composer::snowflake_u64(s);
@@ -254,6 +254,7 @@ pub fn from_account_state(
     let rights = Rights {
         mention_everyone: perms.has(MENTION_EVERYONE),
         bypass_slowmode: perms.has(BYPASS_SLOWMODE),
+        attach_files: perms.has(ATTACH_FILES),
     };
     let Some(g) = state.guild(guild) else {
         return (Directory::default(), Vec::new());
@@ -512,7 +513,7 @@ mod tests {
             in_guild: true,
             rights: Rights {
                 mention_everyone: true,
-                bypass_slowmode: false,
+                ..Default::default()
             },
         };
         let (_, rows) = candidates(&Trigger::Mention("ev".into()), &src);

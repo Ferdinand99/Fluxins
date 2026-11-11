@@ -55,8 +55,8 @@ pub fn is_own_copy(m: &p::Message, sent: &Sent<'_>) -> bool {
 }
 
 impl Backend {
-    pub(super) fn resend(&mut self, channel_id: String, nonce: String, text: String) {
-        self.composer_resend(channel_id, nonce, text);
+    pub(super) fn resend(&mut self, channel_id: String, nonce: String, text: String, files: bool) {
+        self.composer_resend(channel_id, nonce, text, files);
     }
 }
 

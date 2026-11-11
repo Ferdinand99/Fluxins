@@ -1002,15 +1002,12 @@ impl Client {
         let too_large = |limit: u64| Error::TooLarge {
             limit: usize::try_from(limit).unwrap_or(usize::MAX),
         };
-        if files
-            .iter()
-            .any(|f| f.data.len() as u64 > limits.max_file_size)
-        {
+        if files.iter().any(|f| f.data.len() > limits.max_file_size) {
             return Err(too_large(limits.max_file_size));
         }
         let total = files
             .iter()
-            .fold(0u64, |sum, f| sum.saturating_add(f.data.len() as u64));
+            .fold(0u64, |sum, f| sum.saturating_add(f.data.len()));
         if total > limits.max_total_size {
             return Err(too_large(limits.max_total_size));
         }

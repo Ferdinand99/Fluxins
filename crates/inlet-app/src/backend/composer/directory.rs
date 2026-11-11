@@ -59,6 +59,8 @@ pub struct Rights {
     pub mention_everyone: bool,
     /// Ignores slowmode.
     pub bypass_slowmode: bool,
+    /// May attach files (`ATTACH_FILES`).
+    pub attach_files: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -109,6 +111,9 @@ struct SentMessage {
     /// Some failure may have reached the server. Once set, it stays: a later clear
     /// refusal does not prove that the first attempt did not arrive.
     ambiguous: bool,
+    /// The message `POST` has gone out once. A message with files is remembered when
+    /// its upload starts; its times move to its first `POST` (see `mark_posting`).
+    posted: bool,
 }
 
 /// How a Retry goes out.
@@ -209,7 +214,24 @@ impl State {
             first: Instant::now(),
             first_ms: unix_ms(),
             ambiguous: false,
+            posted: false,
         });
+    }
+
+    /// The message `POST` of a message with files is about to go out. The first one
+    /// sets the time a late Retry counts from and looks for a copy after: the server
+    /// recognises the nonce from then on, and the message cannot exist before.
+    pub fn mark_posting(&self, gen: u64, nonce: &str) {
+        let Some(mut inner) = self.of(gen) else {
+            return;
+        };
+        if let Some(s) = inner.outbox.iter_mut().find(|s| s.message.nonce == nonce) {
+            if !s.posted {
+                s.posted = true;
+                s.first = Instant::now();
+                s.first_ms = unix_ms();
+            }
+        }
     }
 
     pub fn mark_failed(&self, gen: u64, nonce: &str, ambiguous: bool) {

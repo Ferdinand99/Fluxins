@@ -297,7 +297,6 @@ impl ComposerView {
                 .flex_none()
                 .items_center()
                 .gap(px(2.))
-                .ml(px(8.))
                 .my(px(-5.))
                 .when(buttons.gif, |d| {
                     d.child(button(

@@ -195,6 +195,8 @@ pub struct PendingRow {
     pub nonce: String,
     pub author: String,
     pub blocks: Rc<Vec<Block>>,
+    /// The names of its attachments.
+    pub files: Vec<String>,
     pub failed: Option<String>,
     /// Under an own message or another pending one: no header.
     pub grouped: bool,
@@ -954,6 +956,7 @@ impl MessageView {
                     nonce: o.out.nonce.clone(),
                     author: author.clone(),
                     blocks: o.blocks.clone(),
+                    files: o.out.files.clone(),
                     failed: o.out.failed.clone(),
                     grouped: last_mine,
                 })));
@@ -1102,7 +1105,7 @@ impl MessageView {
                             me,
                             content: &o.out.text,
                             reply_to: o.out.reply_to.as_deref(),
-                            attachments: 0,
+                            attachments: o.out.files.len(),
                             sent_ms: o.queued_ms,
                         },
                     )
@@ -1133,6 +1136,7 @@ impl MessageView {
             channel_id: entry.out.channel_id.clone(),
             nonce: entry.out.nonce.clone(),
             text: entry.out.text.clone(),
+            files: !entry.out.files.is_empty(),
         })
     }
 }
@@ -1167,7 +1171,13 @@ impl Inlet {
                 request,
                 page,
                 rendered,
-            } => self.on_page(channel_id, request, page, rendered, active, cx),
+            } => {
+                let channel = channel_id.clone();
+                self.on_page(channel_id, request, page, rendered, active, cx);
+                // A draft of a message that was sent after all can only be told once
+                // the channel's messages are in.
+                self.composer_messages_arrived(&channel, window, cx);
+            }
             Ev::PageFailed {
                 channel_id,
                 request,
