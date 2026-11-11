@@ -3,7 +3,7 @@
 //!
 //! Which actions a message offers is worked out from the account's permissions in its
 //! channel ([`Perms`], from the one account state: overwrites, `ADMINISTRATOR` and the
-//! guild owner are already in them) and from the message itself ([`Facts`]). Actions
+//! guild's creator are already in them) and from the message itself ([`Facts`]). Actions
 //! the account may not do are not shown, and the rights are checked again when an action
 //! runs, so a menu that stayed open while a role changed cannot do more than it may.
 //! Unknown rights are no rights: until the roles are loaded nothing that needs one is
@@ -249,9 +249,9 @@ pub fn menu_actions(f: &Facts) -> Vec<Action> {
     if f.perms.may_react(false) {
         out.push(Action::AddReaction);
     }
-    // As Fluxer: editing an own message does not need SEND_MESSAGES, but the API
-    // refuses it during a timeout.
-    if f.editable && b.can_view() && !f.perms.timed_out {
+    // SEND_MESSAGES carries the thread rules (no edits in a locked or archived thread);
+    // the API also refuses edits during a timeout.
+    if f.editable && b.can_send() && !f.perms.timed_out {
         out.push(Action::Edit);
     }
     if b.can_send() {
@@ -730,8 +730,9 @@ mod tests {
         assert!(menu.contains(&Action::CopyLink));
         assert!(menu.contains(&Action::Forward));
         assert_eq!(bar_actions(&f), vec![Action::Forward]);
-        // The own message can be edited without the right to send, as in Fluxer.
-        assert!(menu_actions(&facts(&reader, 100, true)).contains(&Action::Edit));
+        // Even the own message: no edit without the right to send (which a locked or
+        // archived thread takes away).
+        assert!(!menu_actions(&facts(&reader, 100, true)).contains(&Action::Edit));
         // Joining an existing reaction needs only the history; a new one needs the right.
         assert!(f.perms.may_react(true));
         assert!(!f.perms.may_react(false));

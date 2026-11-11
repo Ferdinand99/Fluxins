@@ -329,13 +329,6 @@ impl Inlet {
         }
     }
 
-    /// The pointer entered or left message row `id`.
-    pub(crate) fn hover_message(&mut self, id: MessageId, hovered: bool, cx: &mut Context<Self>) {
-        if self.chat.actions.hover_row(id, hovered) {
-            cx.notify();
-        }
-    }
-
     /// "Mark as unread" from message `id`: the account's read mark goes to the message
     /// before it, keeping the mentions after it, here and on the server. The open
     /// channel is then not read again until it is opened again or marked as read (the
