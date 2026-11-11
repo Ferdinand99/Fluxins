@@ -89,3 +89,4 @@ composer-attach-metadata-kept = Sent with its location data.
 composer-attach-send-anyway = Send without removing
 composer-attach-metadata-undo = Undo
 composer-attach-metadata-blocked = The location data could not be removed from { $name }. Remove the file, or choose "Send without removing" on it.
+composer-upload-was-sent = That message was sent after all, so its draft was removed.

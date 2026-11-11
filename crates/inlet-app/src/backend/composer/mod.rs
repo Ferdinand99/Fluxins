@@ -26,7 +26,7 @@ mod send;
 pub mod upload;
 
 pub(super) use directory::{members_chunk, State};
-pub use directory::{ChannelEntry, CustomEmoji, Directory, Person, Rights, RoleEntry};
+pub use directory::{unix_ms, ChannelEntry, CustomEmoji, Directory, Person, Rights, RoleEntry};
 pub use send::{snowflake_u64, Mentions, Outgoing};
 pub use upload::{FileToSend, Limits, Refused, Source, Upload, Uploads};
 
@@ -107,6 +107,9 @@ pub enum Ev {
     },
     /// The upload ended: `sent`, or failed (the message list's row shows Retry).
     UploadDone { nonce: String, sent: bool },
+    /// Nothing was sent: the metadata of photo `name` could not be removed. The message
+    /// goes back to the composer with that file marked; its pending row goes.
+    UploadStuck { nonce: String, name: String },
 }
 
 pub(super) fn handle(backend: &mut Backend, cmd: Cmd) {

@@ -672,18 +672,65 @@ pub(crate) mod tests {
         out
     }
 
-    fn pixels(data: &[u8]) -> Vec<u8> {
+    /// The decoded pixels, or `None` for a file `inlet-media` does not decode.
+    fn try_pixels(data: &[u8]) -> Option<Vec<u8>> {
         let limits = inlet_media::KindLimits::for_kind(inlet_media::MediaKind::Attachment);
         let control = inlet_media::DecodeControl::with_budget(Duration::from_secs(5));
         let fit = inlet_media::Fit::Contain {
             max_width: 4096,
             max_height: 4096,
         };
-        inlet_media::decode(data, fit, &limits, &control)
-            .expect("decodes")
-            .into_gpui_frames()
-            .into_iter()
-            .flat_map(|f| f.buffer().as_raw().clone())
+        Some(
+            inlet_media::decode(data, fit, &limits, &control)
+                .ok()?
+                .into_gpui_frames()
+                .into_iter()
+                .flat_map(|f| f.buffer().as_raw().clone())
+                .collect(),
+        )
+    }
+
+    fn pixels(data: &[u8]) -> Vec<u8> {
+        try_pixels(data).expect("decodes")
+    }
+
+    /// A lossless WebP with an extended header, EXIF (with GPS) and XMP.
+    fn webp_with_metadata() -> Vec<u8> {
+        let (w, h) = (6u32, 4u32);
+        let plain = crate::backend::media::png::encode_webp(w, h, &[90u8; 6 * 4 * 4]);
+        // The VP8L chunk of the simple file.
+        let vp8l = &plain[12..];
+        let mut body = b"WEBP".to_vec();
+        body.extend_from_slice(b"VP8X");
+        body.extend_from_slice(&10u32.to_le_bytes());
+        body.push(VP8X_EXIF | VP8X_XMP | 0x10);
+        body.extend_from_slice(&[0, 0, 0]);
+        body.extend_from_slice(&(w - 1).to_le_bytes()[..3]);
+        body.extend_from_slice(&(h - 1).to_le_bytes()[..3]);
+        body.extend_from_slice(vp8l);
+        let tiff = tiff_with_gps(1);
+        body.extend_from_slice(b"EXIF");
+        body.extend_from_slice(&(tiff.len() as u32).to_le_bytes());
+        body.extend_from_slice(&tiff);
+        if tiff.len() % 2 == 1 {
+            body.push(0);
+        }
+        body.extend_from_slice(b"XMP ");
+        body.extend_from_slice(&4u32.to_le_bytes());
+        body.extend_from_slice(b"GPS!");
+        let mut webp = b"RIFF".to_vec();
+        webp.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        webp.extend_from_slice(&body);
+        webp
+    }
+
+    fn materialize(d: &[u8], pieces: &[Piece]) -> Vec<u8> {
+        pieces
+            .iter()
+            .flat_map(|p| match p {
+                Piece::Keep(r) => d[r.clone()].to_vec(),
+                Piece::New(b) => b.clone(),
+            })
             .collect()
     }
 
@@ -702,8 +749,13 @@ pub(crate) mod tests {
         assert_eq!(pixels(&out), pixels(&jpeg));
         let out = strip(&png_meta).unwrap().unwrap();
         assert_eq!(pixels(&out), pixels(&png));
+        let webp = webp_with_metadata();
+        let out = strip(&webp).unwrap().unwrap();
+        assert!(!contains(&out, b"GPS"));
+        assert_eq!(pixels(&out), pixels(&webp));
 
-        let seeds = [jpeg_meta, png_meta, jpeg_with_exif(6), real_jpeg()];
+        let seeds = [jpeg_meta, png_meta, webp, jpeg_with_exif(6), real_jpeg()];
+        let mut compared = 0;
         let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
         let started = Instant::now();
         for round in 0..4000 {
@@ -737,9 +789,19 @@ pub(crate) mod tests {
                         assert!(r.end <= d.len(), "round {round}");
                     }
                 }
+                // A mutated file that still decodes keeps its pixels once cleaned.
+                if let Some(before) = try_pixels(&d) {
+                    let after = try_pixels(&materialize(&d, &pieces));
+                    assert_eq!(after.as_ref(), Some(&before), "round {round}");
+                    compared += 1;
+                }
             }
             assert!(one.elapsed() < Duration::from_secs(1), "round {round}");
         }
-        assert!(started.elapsed() < Duration::from_secs(60));
+        assert!(
+            compared > 100,
+            "pixels compared for {compared} mutated files"
+        );
+        assert!(started.elapsed() < Duration::from_secs(120));
     }
 }

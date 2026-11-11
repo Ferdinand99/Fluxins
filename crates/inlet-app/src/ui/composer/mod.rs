@@ -198,9 +198,11 @@ impl Inlet {
             slowmode_secs: channel.map_or(0, |c| c.slowmode_secs),
         };
         let account = self.account.as_ref().map(Entity::downgrade);
+        // The account first: opening the channel looks in its messages (a draft of a
+        // message that was sent after all goes).
         self.composer.view.update(cx, |v, cx| {
-            v.set_channel(ctx, window, cx);
             v.set_account(account, cx);
+            v.set_channel(ctx, window, cx);
         });
     }
 
@@ -350,6 +352,12 @@ impl Inlet {
             }),
             Ev::UploadProgress { nonce, sent, total } => {
                 view.update(cx, |v, cx| v.on_upload_progress(&nonce, sent, total, cx))
+            }
+            Ev::UploadStuck { nonce, name } => {
+                if self.chat.view.sent(&nonce) {
+                    self.refresh_rows(cx);
+                }
+                view.update(cx, |v, cx| v.on_upload_stuck(&nonce, &name, window, cx))
             }
             Ev::UploadDone { nonce, sent } => {
                 view.update(cx, |v, cx| v.on_upload_done(&nonce, sent, cx))

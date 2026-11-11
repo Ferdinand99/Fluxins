@@ -632,6 +632,19 @@ impl Inlet {
                 view.update(cx, |v, cx| v.on_upload_progress(&nonce, sent, total, cx));
                 Some(ComposerEv::UploadProgress { nonce, sent, total })
             }
+            ComposerEv::UploadStuck { nonce, name } => {
+                let (n, f) = (nonce.clone(), name.clone());
+                view.update(cx, |v, cx| v.on_upload_stuck(&n, &f, window, cx));
+                if self
+                    .threads
+                    .panel
+                    .as_mut()
+                    .is_some_and(|p| p.view.sent(&nonce))
+                {
+                    self.refresh_panel_rows(cx);
+                }
+                Some(ComposerEv::UploadStuck { nonce, name })
+            }
             ComposerEv::UploadDone { nonce, sent } => {
                 view.update(cx, |v, cx| v.on_upload_done(&nonce, sent, cx));
                 Some(ComposerEv::UploadDone { nonce, sent })
@@ -990,6 +1003,7 @@ mod tests {
                 wire: text.into(),
                 labels: Vec::new(),
                 seq: 0,
+                sent_check: None,
             }),
         );
     }

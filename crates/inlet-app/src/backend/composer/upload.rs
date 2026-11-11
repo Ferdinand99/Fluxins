@@ -422,9 +422,10 @@ pub(super) enum Retry {
 fn metadata_refusal(name: &str, e: exif::Error) -> Option<SendError> {
     match e {
         exif::Error::Cancelled => None,
-        exif::Error::Unreadable | exif::Error::Unsupported => {
-            Some(local(t!("composer-upload-metadata-failed", name = name)))
-        }
+        exif::Error::Unreadable | exif::Error::Unsupported => Some(SendError {
+            stuck: Some(name.to_owned()),
+            ..local(t!("composer-upload-metadata-failed", name = name))
+        }),
     }
 }
 
@@ -621,6 +622,18 @@ impl Uploads {
             Ok(()) => {
                 self.finished(&nonce, true);
                 ctx.sent(nonce.clone());
+            }
+            // A photo could not be cleaned: nothing was sent, and the message goes back
+            // to the composer with the choice for that file (not a failed row).
+            Err(Some(SendError {
+                stuck: Some(name), ..
+            })) => {
+                self.finished(&nonce, true);
+                ctx.state.forget_send(ctx.gen, &nonce);
+                let _ = ctx.events.unbounded_send(Ev::UploadStuck {
+                    nonce: nonce.clone(),
+                    name,
+                });
             }
             Err(Some(e)) => {
                 self.finished(&nonce, false);
@@ -1100,6 +1113,7 @@ fn local(reason: String) -> SendError {
         reason,
         retry_after_secs: None,
         ambiguous: false,
+        stuck: None,
     }
 }
 
@@ -1911,8 +1925,14 @@ mod tests {
             requests(&server, "POST", POSTS).await.is_empty(),
             "not sent"
         );
-        let reason = failure(&events(&mut rx)).expect("the row says why");
-        assert!(reason.contains("notes.txt"), "{reason}");
+        // No failed row: the message goes back to the composer with that file marked.
+        let events = events(&mut rx);
+        assert!(failure(&events).is_none());
+        assert!(events.iter().any(|e| matches!(
+            e,
+            Event::Composer(Ev::UploadStuck { nonce, name }) if nonce == "777" && name == "notes.txt"
+        )));
+        assert!(uploads.retry_of(ctx.gen, "777").is_none(), "nothing kept");
         // The person chose to send this file as it is.
         run(
             &uploads,

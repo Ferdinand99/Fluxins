@@ -44,6 +44,25 @@ pub struct Draft {
     /// Bumped on every change, for dropping the oldest.
     #[serde(default)]
     pub seq: u64,
+    /// A message with files that came back as this draft at an account switch. It may
+    /// have reached the server after all; then the draft goes (see `SentCheck`).
+    #[serde(default)]
+    pub sent_check: Option<SentCheck>,
+}
+
+/// How to tell that a message that came back as a draft was sent after all: its nonce
+/// (in a message the gateway delivered), or an own message with its text and number of
+/// files, created after it was queued (lists carry no nonce).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SentCheck {
+    pub nonce: String,
+    /// The wire text that was sent.
+    pub content: String,
+    pub files: usize,
+    /// When it was queued, in Unix milliseconds.
+    pub queued_ms: u64,
+    /// The draft's first bytes that are this message; the rest was a draft already.
+    pub len: usize,
 }
 
 impl Draft {
@@ -76,6 +95,7 @@ impl Draft {
             wire: buffer.to_wire(),
             labels,
             seq: 0,
+            sent_check: None,
         })
     }
 

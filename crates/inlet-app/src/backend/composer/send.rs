@@ -140,6 +140,9 @@ pub struct SendError {
     /// The request may have reached the server (timeout, broken connection, an answer
     /// that could not be read, a server error): the message may exist.
     pub ambiguous: bool,
+    /// The photo whose metadata could not be removed: the message goes back to the
+    /// composer, so the person can choose for that file.
+    pub stuck: Option<String>,
 }
 
 /// What a failed request means for the UI, or `None` when the session has ended (the
@@ -170,6 +173,7 @@ pub(super) fn failed(
         reason: failure.message,
         retry_after_secs,
         ambiguous,
+        stuck: None,
     })
 }
 
@@ -346,6 +350,7 @@ pub(super) fn not_connected() -> SendError {
         reason: t!("composer-not-connected"),
         retry_after_secs: None,
         ambiguous: false,
+        stuck: None,
     }
 }
 

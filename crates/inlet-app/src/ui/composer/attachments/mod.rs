@@ -30,7 +30,7 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use bytes::Bytes;
 use gpui::{
@@ -76,8 +76,12 @@ const PASTE_MAX_PIXELS: u64 = 36_000_000;
 /// Uploads remembered for a draft when the account is switched.
 const MAX_IN_FLIGHT: usize = 32;
 
-/// One decode at a time for previews and metadata checks, across all composers.
-static PREVIEW_LANE: Mutex<()> = Mutex::new(());
+/// One decode at a time for previews and metadata checks, across all composers. An
+/// async lock: a waiting task holds no thread and no bytes (it waits before reading).
+fn lane() -> &'static futures::lock::Mutex<()> {
+    static LANE: std::sync::OnceLock<futures::lock::Mutex<()>> = std::sync::OnceLock::new();
+    LANE.get_or_init(|| futures::lock::Mutex::new(()))
+}
 
 /// What metadata removal will do with a file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -107,6 +111,11 @@ pub struct InFlight {
     pub channel_id: String,
     pub draft: Option<Draft>,
     pub names: Vec<String>,
+    /// The wire text that was sent, and when it was queued (Unix milliseconds).
+    pub content: String,
+    pub queued_ms: u64,
+    /// The files as attached, to put back if a photo cannot be cleaned when sent.
+    pub files: Vec<FileToSend>,
 }
 
 /// The alt text field of one file.
@@ -220,6 +229,19 @@ pub fn pasted_file(image: &gpui::Image) -> Result<FileToSend, String> {
     })
 }
 
+/// Whether a clipboard image of this format can be attached (as it is, or as PNG).
+fn pasteable(format: gpui::ImageFormat) -> bool {
+    matches!(
+        format,
+        gpui::ImageFormat::Png
+            | gpui::ImageFormat::Jpeg
+            | gpui::ImageFormat::Webp
+            | gpui::ImageFormat::Gif
+            | gpui::ImageFormat::Bmp
+            | gpui::ImageFormat::Tiff
+    )
+}
+
 /// A BMP or TIFF image as PNG, in memory, with limits on its size and on the memory the
 /// decoder may take.
 fn to_png(bytes: &[u8], format: image::ImageFormat) -> Result<Bytes, String> {
@@ -297,7 +319,7 @@ fn head_of(source: &Source) -> Option<Bytes> {
     }
 }
 
-/// What removing metadata would do with a file: one at a time with the previews.
+/// What removing metadata would do with a file. Callers run it in the preview lane.
 pub fn check_metadata(source: &Source, size: u64) -> Metadata {
     let Some(head) = head_of(source) else {
         return Metadata::Stuck;
@@ -309,7 +331,6 @@ pub fn check_metadata(source: &Source, size: u64) -> Metadata {
             Metadata::Removable
         }
         _ => {
-            let _lane = PREVIEW_LANE.lock().unwrap_or_else(|e| e.into_inner());
             let bytes = match source {
                 Source::Memory(b) => Some(b.clone()),
                 Source::Path(path) => read_bounded(path, CHECK_MAX_BYTES as usize),
@@ -324,8 +345,8 @@ pub fn check_metadata(source: &Source, size: u64) -> Metadata {
 }
 
 /// Decodes a preview through `inlet-media`'s checks: the encoded size first, then the
-/// declared size and the memory a decode needs, then a decode with a time budget. One
-/// at a time; a still of the first frame.
+/// declared size and the memory a decode needs, then a decode with a time budget.
+/// Callers run it in the preview lane, one at a time.
 pub fn decode_preview(source: &Source) -> Option<DecodedImage> {
     let mut limits = KindLimits::for_kind(MediaKind::Attachment);
     limits.max_animation_bytes = PREVIEW_ANIMATION_BYTES;
@@ -338,7 +359,6 @@ pub fn decode_preview(source: &Source) -> Option<DecodedImage> {
     if inspected.estimated_peak_bytes() > PREVIEW_MEMORY {
         return None;
     }
-    let _lane = PREVIEW_LANE.lock().unwrap_or_else(|e| e.into_inner());
     let control = DecodeControl::with_budget(limits.decode_budget);
     inspected.decode(PREVIEW_FIT, &limits, &control).ok()
 }
@@ -512,6 +532,14 @@ impl Attachments {
             } else {
                 format!("{}\n{line}", draft.wire)
             };
+            // If it reached the server after all, this part of the draft goes again.
+            draft.sent_check = Some(super::drafts::SentCheck {
+                nonce: f.nonce,
+                content: f.content,
+                files: f.names.len(),
+                queued_ms: f.queued_ms,
+                len: draft.wire.len(),
+            });
             if let Some(now) = drafts.get(&f.channel_id).cloned() {
                 draft.wire = format!("{}\n{}", draft.wire, now.wire);
                 draft.labels.extend(now.labels);
@@ -603,34 +631,60 @@ impl ComposerView {
         };
         let mut images = Vec::new();
         let mut paths = Vec::new();
-        let mut refused = None;
+        let mut unsupported = false;
+        let mut text = false;
         for entry in item.entries() {
             match entry {
-                ClipboardEntry::Image(image) => match pasted_file(image) {
-                    Ok(file) => images.push(file),
-                    Err(reason) => refused = Some(reason),
-                },
+                ClipboardEntry::Image(image) if pasteable(image.format()) => {
+                    images.push(image.clone())
+                }
+                ClipboardEntry::Image(_) => unsupported = true,
                 ClipboardEntry::ExternalPaths(p) => paths.extend(p.paths().iter().cloned()),
-                ClipboardEntry::String(_) => {}
+                ClipboardEntry::String(_) => text = true,
             }
         }
-        if images.is_empty() && paths.is_empty() && refused.is_none() {
-            return;
+        if images.is_empty() && paths.is_empty() {
+            if unsupported {
+                // Never silent; and the clipboard's text, if any, is still pasted.
+                self.error = Some(t!("composer-paste-unsupported"));
+                cx.notify();
+            }
+            if !(unsupported && !text) {
+                return;
+            }
         }
         cx.stop_propagation();
         if self.refuse_attach(cx) {
             return;
         }
-        if let Some(reason) = refused {
-            // Never silent: the picture was not attached, and this says why.
-            self.error = Some(reason);
-            cx.notify();
-        }
         let Some(channel) = self.open_channel_id() else {
             return;
         };
         if !images.is_empty() {
-            self.attach(&channel, self.attachments.epoch, images, cx);
+            // BMP and TIFF are turned into PNG off the UI thread.
+            let epoch = self.attachments.epoch;
+            let made =
+                cx.background_spawn(
+                    async move { images.iter().map(pasted_file).collect::<Vec<_>>() },
+                );
+            let channel = channel.clone();
+            cx.spawn(async move |this, cx| {
+                let made = made.await;
+                let _ = this.update(cx, |this, cx| {
+                    let mut files = Vec::new();
+                    for f in made {
+                        match f {
+                            Ok(file) => files.push(file),
+                            Err(reason) => this.error = Some(reason),
+                        }
+                    }
+                    if !files.is_empty() {
+                        this.attach(&channel, epoch, files, cx);
+                    }
+                    cx.notify();
+                });
+            })
+            .detach();
         }
         if !paths.is_empty() {
             self.attach_paths(channel, paths, cx);
@@ -703,7 +757,10 @@ impl ComposerView {
         size: u64,
         cx: &mut Context<Self>,
     ) {
-        let checked = cx.background_spawn(async move { check_metadata(&source, size) });
+        let checked = cx.background_spawn(async move {
+            let _slot = lane().lock().await;
+            check_metadata(&source, size)
+        });
         cx.spawn(async move |this, cx| {
             let metadata = checked.await;
             let _ = this.update(cx, |this, cx| {
@@ -717,7 +774,10 @@ impl ComposerView {
     }
 
     fn load_preview(&mut self, channel: String, key: u64, source: Source, cx: &mut Context<Self>) {
-        let decoded = cx.background_spawn(async move { decode_preview(&source) });
+        let decoded = cx.background_spawn(async move {
+            let _slot = lane().lock().await;
+            decode_preview(&source)
+        });
         cx.spawn(async move |this, cx| {
             let Some(decoded) = decoded.await else {
                 return;
@@ -762,6 +822,128 @@ impl ComposerView {
         let files = staged.iter().map(|s| s.file.clone()).collect();
         drop_previews(staged, Some(window), cx);
         files
+    }
+
+    /// Another account becomes active: this composer's messages with files that are not
+    /// sent yet become drafts of their channels again. How many.
+    pub fn uploads_to_drafts(&mut self) -> usize {
+        let mut shared = self.shared.borrow_mut();
+        self.attachments.back_to_drafts(&mut shared.drafts)
+    }
+
+    /// A photo of a message could not be cleaned when it was sent: nothing went out.
+    /// The message comes back (its text into the box or the channel's draft, its files
+    /// into the tray), with that photo marked so the person can choose for it.
+    pub fn on_upload_stuck(
+        &mut self,
+        nonce: &str,
+        name: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ix) = self
+            .attachments
+            .in_flight
+            .iter()
+            .position(|f| f.nonce == nonce)
+        else {
+            return;
+        };
+        let back = self.attachments.in_flight.remove(ix);
+        let channel = back.channel_id.clone();
+        let open = self.open_channel_id().as_deref() == Some(channel.as_str());
+        if let Some(draft) = back.draft {
+            if open && self.editor.read(cx).buffer().is_empty() {
+                self.editor
+                    .update(cx, |e, cx| e.set_wire(&draft.wire, &draft, window, cx));
+            } else {
+                let mut shared = self.shared.borrow_mut();
+                let mut merged = draft;
+                if let Some(now) = shared.drafts.get(&channel).cloned() {
+                    merged.wire = format!("{}\n{}", merged.wire, now.wire);
+                    merged.labels.extend(now.labels);
+                }
+                shared.drafts.put(&channel, Some(merged));
+            }
+        }
+        let looks: Vec<(Source, u64, bool, bool)> = back
+            .files
+            .iter()
+            .map(|f| {
+                (
+                    f.source.clone(),
+                    f.size,
+                    previewable(&f.content_type),
+                    f.name == name,
+                )
+            })
+            .collect();
+        match self.attachments.add(&channel, back.files) {
+            Ok(keys) => {
+                for (key, (source, size, wanted, stuck)) in keys.into_iter().zip(looks) {
+                    if stuck {
+                        if let Some(s) = self.attachments.get_mut(&channel, key) {
+                            s.metadata = Metadata::Stuck;
+                        }
+                    } else {
+                        self.check_file(channel.clone(), key, source.clone(), size, cx);
+                    }
+                    if wanted {
+                        self.load_preview(channel.clone(), key, source, cx);
+                    }
+                }
+                self.error = Some(t!("composer-attach-metadata-blocked", name = name));
+            }
+            Err(refused) => self.error = Some(refused.reason()),
+        }
+        cx.notify();
+    }
+
+    /// A message that came back as this channel's draft at an account switch, and
+    /// was sent after all (a copy is in the channel): that part of the draft goes.
+    pub(super) fn drop_sent_draft(&mut self, channel: &str, cx: &mut Context<Self>) -> bool {
+        let Some(draft) = self.shared.borrow().drafts.get(channel).cloned() else {
+            return false;
+        };
+        let Some(check) = draft.sent_check.clone() else {
+            return false;
+        };
+        let Some(account) = self.account_state() else {
+            return false;
+        };
+        let Some(ch) = inlet_state::ChannelId::parse(channel) else {
+            return false;
+        };
+        let state = account.read(cx);
+        let me = state.me_id().to_string();
+        let arrived = state.messages(ch).is_some_and(|window| {
+            window.iter().any(|m| {
+                m.nonce.as_deref() == Some(check.nonce.as_str())
+                    || (m.author.id == me
+                        && m.content == check.content
+                        && m.attachments.len() == check.files
+                        && p::models::snowflake_timestamp_ms(&m.id)
+                            .is_some_and(|t| t + 10_000 >= check.queued_ms))
+            })
+        });
+        if !arrived {
+            return false;
+        }
+        let rest = draft
+            .wire
+            .get(check.len.min(draft.wire.len())..)
+            .unwrap_or_default()
+            .trim_start_matches('\n')
+            .to_owned();
+        let kept = (!rest.trim().is_empty()).then(|| Draft {
+            wire: rest,
+            labels: draft.labels.clone(),
+            seq: 0,
+            sent_check: None,
+        });
+        self.shared.borrow_mut().drafts.put(channel, kept);
+        self.error = Some(t!("composer-upload-was-sent"));
+        true
     }
 
     /// Sign-out: every channel's attachments go, pasted images with them.

@@ -293,6 +293,11 @@ impl ComposerView {
         (Some(channel) == self.channel.as_ref().map(|c| &c.channel_id)).then_some(directory)
     }
 
+    /// The account state, while it lives.
+    pub(super) fn account_state(&self) -> Option<Entity<AccountState>> {
+        self.account.as_ref().and_then(WeakEntity::upgrade)
+    }
+
     /// The account state to read roles, channels, emoji and rights from.
     pub fn set_account(
         &mut self,
@@ -419,6 +424,8 @@ impl ComposerView {
         self.attachments.alt = None;
         self.edit = None;
         self.error = None;
+        // A message that came back as this draft and was sent after all goes again.
+        self.drop_sent_draft(&ctx.channel_id, cx);
         let draft = self.shared.borrow().drafts.get(&ctx.channel_id).cloned();
         self.editor.update(cx, |e, cx| {
             match &draft {
@@ -480,18 +487,15 @@ impl ComposerView {
     /// Messages with files that are not sent yet become drafts of their channels
     /// again, with a line naming their files (the backend stops their uploads at
     /// once). Returns whether there were any, for the notice.
-    pub fn switch_account(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+    pub fn switch_account(&mut self, window: &mut Window, cx: &mut Context<Self>) -> usize {
         self.store_draft(cx);
-        let restored = {
-            let mut shared = self.shared.borrow_mut();
-            self.attachments.back_to_drafts(&mut shared.drafts)
-        };
+        let restored = self.uploads_to_drafts();
         let write = self.shared.borrow_mut().drafts.switch_account();
         if let Some(write) = write {
             cx.background_spawn(async move { write.run() }).detach();
         }
         self.check_generation(window, cx);
-        restored > 0
+        restored
     }
 
     /// Keeps the text of the open channel as its draft.
@@ -843,6 +847,9 @@ impl ComposerView {
                 channel_id: ch.channel_id.clone(),
                 draft: Draft::of(self.editor.read(cx).buffer()),
                 names: files.iter().map(|f| f.name.clone()).collect(),
+                content: outgoing.content.clone(),
+                queued_ms: crate::backend::composer::unix_ms(),
+                files: files.clone(),
             });
             cx.emit(ComposerEvent::Upload(Upload {
                 message: outgoing,
@@ -1610,6 +1617,17 @@ mod tests {
         cx.simulate_keystrokes(PASTE);
         assert!(view.read_with(cx, |v, _| v.error.is_some()));
         assert_eq!(staged(&view, "9", cx).len(), 1);
+        // With text next to it, the text is still pasted.
+        let mut both = gpui::ClipboardItem::new_string("caption".into());
+        both.entries
+            .push(gpui::ClipboardEntry::Image(gpui::Image::from_bytes(
+                gpui::ImageFormat::Svg,
+                b"<svg/>".to_vec(),
+            )));
+        cx.write_to_clipboard(both);
+        cx.simulate_keystrokes(PASTE);
+        let text = view.read_with(cx, |v, cx| v.editor.read(cx).buffer().text().to_owned());
+        assert_eq!(text, "caption");
         // Without the right to attach files in a guild channel, nothing is attached.
         open(&view, "1", cx);
         cx.simulate_keystrokes(PASTE);
@@ -1648,7 +1666,7 @@ mod tests {
         // The account is switched while it uploads: the text and the file's name come
         // back as the old account's draft, and the app says so.
         let stopped = view.update_in(cx, |v, window, cx| v.switch_account(window, cx));
-        assert!(stopped);
+        assert_eq!(stopped, 1);
         cx.run_until_parked();
         let shared = view.read_with(cx, |v, _| v.shared.clone());
         shared.borrow_mut().drafts.attach(file.clone());
@@ -1656,7 +1674,99 @@ mod tests {
         assert!(draft.wire.contains("from the trip"), "{}", draft.wire);
         assert!(draft.wire.contains("beach.png"), "{}", draft.wire);
         // Once a message is sent, a switch has nothing to give back.
-        assert!(!view.update_in(cx, |v, window, cx| v.switch_account(window, cx)));
+        assert_eq!(
+            view.update_in(cx, |v, window, cx| v.switch_account(window, cx)),
+            0
+        );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn photo(name: &str) -> crate::backend::composer::FileToSend {
+        crate::backend::composer::FileToSend {
+            name: name.into(),
+            size: 3,
+            content_type: "image/png".into(),
+            spoiler: false,
+            description: None,
+            keep_metadata: false,
+            source: crate::backend::composer::Source::Memory(bytes::Bytes::from_static(b"abc")),
+        }
+    }
+
+    #[gpui::test]
+    fn an_upload_from_the_thread_panel_is_kept_as_a_draft_too(cx: &mut TestAppContext) {
+        let (_host, view, cx) = host(cx);
+        let dir = std::env::temp_dir().join(format!("inlet-panel-draft-{}", p::new_nonce()));
+        let file = super::super::drafts::path_for(&dir, "fluxer.example", "7").unwrap();
+        view.update_in(cx, |v, window, cx| {
+            v.set_session(2000, Some(file.clone()), window, cx)
+        });
+        // The thread panel's composer shares the chat composer's drafts.
+        let shared = view.read_with(cx, |v, _| v.shared.clone());
+        let panel = cx
+            .update(|window, cx| cx.new(|cx| ComposerView::new(shared.clone(), 2000, window, cx)));
+        open_dm(&panel, "77", cx);
+        panel
+            .update(cx, |v, _| {
+                v.attachments.add("77", vec![photo("plan.png")]).map(|_| ())
+            })
+            .unwrap();
+        type_text(&panel, "for the thread", cx);
+        panel.update_in(cx, |v, window, cx| v.submit(window, cx));
+        // What the account switcher does: the panel first (it goes with the messages),
+        // then the chat's composer, which writes the old account's drafts.
+        let from_panel = panel.update(cx, |v, _| v.uploads_to_drafts());
+        let from_chat = view.update_in(cx, |v, window, cx| v.switch_account(window, cx));
+        assert_eq!(from_panel + from_chat, 1, "the notice counts it");
+        cx.run_until_parked();
+        shared.borrow_mut().drafts.attach(file.clone());
+        let draft = shared.borrow().drafts.get("77").cloned().expect("a draft");
+        assert!(draft.wire.contains("for the thread"), "{}", draft.wire);
+        assert!(draft.wire.contains("plan.png"), "{}", draft.wire);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[gpui::test]
+    fn a_draft_of_a_message_that_was_sent_after_all_goes(cx: &mut TestAppContext) {
+        let (_host, view, cx) = host(cx);
+        let now = crate::backend::composer::unix_ms();
+        // The upload did reach the server: the channel has it (no nonce in a list).
+        let sent = serde_json::json!([{
+            "id": p::models::snowflake_at_ms(now + 1_000), "channel_id": "301", "type": 0,
+            "author": {"id": "10", "username": "me"}, "content": "from the trip",
+            "timestamp": "2026-11-10T10:00:00Z",
+            "attachments": [{"id": "5", "filename": "beach.png", "size": 3}]
+        }]);
+        let (state, _) = super::super::edit_inline::tests::state_with(sent);
+        let account = cx.update(|_, cx| cx.new(|_| state));
+        let restored = "from the trip
+(attach again: beach.png)";
+        let shared = view.read_with(cx, |v, _| v.shared.clone());
+        shared.borrow_mut().drafts.put(
+            "301",
+            Some(Draft {
+                wire: format!(
+                    "{restored}
+my other words"
+                ),
+                labels: Vec::new(),
+                seq: 0,
+                sent_check: Some(super::super::drafts::SentCheck {
+                    nonce: "999".into(),
+                    content: "from the trip".into(),
+                    files: 1,
+                    queued_ms: now,
+                    len: restored.len(),
+                }),
+            }),
+        );
+        view.update(cx, |v, cx| v.set_account(Some(account.downgrade()), cx));
+        open(&view, "301", cx);
+        let text = view.read_with(cx, |v, cx| v.editor.read(cx).buffer().text().to_owned());
+        assert_eq!(text, "my other words", "only the part already sent goes");
+        assert!(
+            view.read_with(cx, |v, _| v.error.is_some()),
+            "and it says so"
+        );
     }
 }
