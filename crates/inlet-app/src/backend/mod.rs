@@ -415,6 +415,8 @@ struct Backend {
     pending_confirm: Option<PendingConfirm>,
     open_guild: Option<AbortHandle>,
     open_channel: Option<AbortHandle>,
+    /// The composer's cache: account ID, message length limit, autocomplete data.
+    composer: composer::State,
     /// The request for older messages of the open channel.
     older: messages::OlderPages,
 }
@@ -446,6 +448,7 @@ impl Backend {
             pending_confirm: None,
             open_guild: None,
             open_channel: None,
+            composer: Default::default(),
             older: Default::default(),
         }
     }

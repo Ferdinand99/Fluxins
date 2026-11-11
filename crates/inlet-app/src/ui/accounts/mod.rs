@@ -195,7 +195,7 @@ impl Inlet {
                 // Back from a sign-in or a start-up screen to the account already shown
                 // (signed in again, or connected after a switch): load its place again.
                 let reopen = self.switcher.is_active(&key) && self.screen != Screen::Main;
-                self.switch_ui_to(key, cx);
+                self.switch_ui_to(key, window, cx);
                 self.switcher.adding = false;
                 self.username = username;
                 self.instance = instance;
@@ -224,12 +224,17 @@ impl Inlet {
                 }
             }
             Ev::SessionEnded(message) => {
+                // The account is gone: its drafts go too.
+                self.composer.sign_out();
                 self.reset_main();
                 self.sign_in.error = Some(message);
             }
-            Ev::SignedOut => self.reset_main(),
-            Ev::Accounts(list) => self.on_account_list(list),
-            Ev::AccountRemoved { key, message } => self.on_account_removed(key, message),
+            Ev::SignedOut => {
+                self.composer.sign_out();
+                self.reset_main();
+            }
+            Ev::Accounts(list) => self.on_account_list(list, cx),
+            Ev::AccountRemoved { key, message } => self.on_account_removed(key, message, cx),
             // The messages domain loads the open channel again on every READY.
             Ev::Reconnected => {}
             Ev::Status(status) => {
@@ -245,6 +250,7 @@ impl Inlet {
     /// From the fatal screen: start a fresh backend that ends the stored session on the
     /// server (best effort, with timeouts) and removes it, all off the UI thread.
     pub(crate) fn fatal_sign_out(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.composer.sign_out();
         self.restart_backend(false, window, cx);
         self.backend.send(Cmd::ForgetStored);
     }
@@ -255,6 +261,8 @@ impl Inlet {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // The account's drafts go now, before another account may take its place.
+        self.composer.sign_out();
         self.backend.send(Cmd::SignOut);
         cx.notify();
     }

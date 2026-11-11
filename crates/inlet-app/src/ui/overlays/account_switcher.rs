@@ -189,7 +189,12 @@ impl Inlet {
     /// Shows `key` as the active account: the old account's state goes to the
     /// background (without its message windows) and its view state is cleared, then the
     /// new account's state, if it ran in the background, comes back with its last place.
-    pub(crate) fn switch_ui_to(&mut self, key: AccountKey, cx: &mut Context<Self>) {
+    pub(crate) fn switch_ui_to(
+        &mut self,
+        key: AccountKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.switcher.is_active(&key) {
             return;
         }
@@ -218,10 +223,15 @@ impl Inlet {
         }
         // Nothing of the old account stays on screen or on its way: the message view
         // with its outbox, the unread gate and settings writes (a new write session, so
-        // late answers are ignored), the composer's draft and any open window.
+        // late answers are ignored), the composer (its text is saved with the old
+        // account's drafts, which are then forgotten here; the account ID is asked for
+        // again, so the next account's drafts file is used) and any open window.
         self.reset_messages();
         self.notifications.clear();
-        self.composer.input.update(cx, |c, cx| c.clear(cx));
+        self.composer
+            .view
+            .update(cx, |v, cx| v.switch_account(window, cx));
+        self.composer.reset_session();
         self.overlays.pending_link = None;
         self.guilds.clear();
         self.channels.clear();
@@ -257,10 +267,15 @@ impl Inlet {
     }
 
     /// The person picked an account in the switcher.
-    pub(crate) fn switch_account(&mut self, key: AccountKey, cx: &mut Context<Self>) {
+    pub(crate) fn switch_account(
+        &mut self,
+        key: AccountKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.switcher.open = false;
         if !self.switcher.is_active(&key) {
-            self.switch_ui_to(key.clone(), cx);
+            self.switch_ui_to(key.clone(), window, cx);
             self.backend.send(Cmd::SwitchAccount(key));
         }
         cx.notify();
@@ -288,7 +303,7 @@ impl Inlet {
     }
 
     /// "Back" on the sign-in screen: to the active account, or to another signed-in one.
-    pub(crate) fn back_from_sign_in(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn back_from_sign_in(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.backend.send(Cmd::CancelSignIn);
         self.switcher.adding = false;
         self.sign_in.busy = false;
@@ -297,14 +312,14 @@ impl Inlet {
         if self.switcher.active.is_some() {
             self.screen = Screen::Main;
         } else if let Some(first) = self.switcher.accounts.first().map(|a| a.key.clone()) {
-            self.switch_ui_to(first.clone(), cx);
+            self.switch_ui_to(first.clone(), window, cx);
             self.backend.send(Cmd::SwitchAccount(first));
         }
         cx.notify();
     }
 
     /// The stored accounts changed.
-    pub(crate) fn on_account_list(&mut self, list: Vec<AccountInfo>) {
+    pub(crate) fn on_account_list(&mut self, list: Vec<AccountInfo>, cx: &mut Context<Self>) {
         let gone: Vec<AccountKey> = self
             .switcher
             .accounts
@@ -313,16 +328,21 @@ impl Inlet {
             .filter(|k| !list.iter().any(|a| &a.key == k) && !self.switcher.is_active(k))
             .collect();
         for k in gone {
-            self.forget_background(&k);
+            self.forget_background(&k, cx);
         }
         self.switcher.accounts = list;
     }
 
     /// An account was signed out or ended by the server.
-    pub(crate) fn on_account_removed(&mut self, key: AccountKey, message: Option<String>) {
+    pub(crate) fn on_account_removed(
+        &mut self,
+        key: AccountKey,
+        message: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         self.switcher.accounts.retain(|a| a.key != key);
         if !self.switcher.is_active(&key) {
-            self.forget_background(&key);
+            self.forget_background(&key, cx);
         }
         if let Some(message) = message {
             let name = self.account_label(&key);
@@ -330,10 +350,23 @@ impl Inlet {
         }
     }
 
-    fn forget_background(&mut self, key: &AccountKey) {
+    /// An account that is not the active one is gone: its passive state, its marks,
+    /// its last place and its drafts file (no draft outlives a sign-out).
+    fn forget_background(&mut self, key: &AccountKey, cx: &mut Context<Self>) {
         self.switcher.background.remove(key);
         self.switcher.summaries.remove(key);
         self.switcher.places.forget(key);
+        let path = dirs::data_local_dir().and_then(|dir| {
+            crate::ui::composer::drafts::path_for(
+                &dir,
+                key.origin.as_str(),
+                &key.user_id.to_string(),
+            )
+        });
+        if let Some(path) = path {
+            let forget = self.composer.shared.borrow().drafts.forget_file(path);
+            cx.background_spawn(async move { forget() }).detach();
+        }
     }
 
     /// The name to show for an account: from its state when it has one, else the list.
@@ -452,85 +485,88 @@ impl Inlet {
         };
         let key = a.key.clone();
         let remove_key = a.key.clone();
-        let main = div()
-            .id(SharedString::from(format!("account-row-{ix}")))
-            .flex_1()
-            .min_w_0()
-            .h(px(52.))
-            .px_2()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_3()
-            .rounded(px(6.))
-            .cursor_pointer()
-            .when(active, |d| d.bg(theme::selected_bg()))
-            .hover(|s| s.bg(theme::hover_bg()))
-            .on_click(cx.listener(move |this, _, _, cx| this.switch_account(key.clone(), cx)))
-            .child(
-                div()
-                    .relative()
-                    .size(px(36.))
-                    .flex_none()
-                    .rounded_full()
-                    .bg(if active {
-                        theme::brand()
-                    } else {
-                        theme::guild_item()
-                    })
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_size(px(13.))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(theme::text_strong())
-                    .child(initials),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .flex_col()
-                    .overflow_hidden()
-                    .whitespace_nowrap()
-                    .child(
+        let main =
+            div()
+                .id(SharedString::from(format!("account-row-{ix}")))
+                .flex_1()
+                .min_w_0()
+                .h(px(52.))
+                .px_2()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_3()
+                .rounded(px(6.))
+                .cursor_pointer()
+                .when(active, |d| d.bg(theme::selected_bg()))
+                .hover(|s| s.bg(theme::hover_bg()))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.switch_account(key.clone(), window, cx)
+                }))
+                .child(
+                    div()
+                        .relative()
+                        .size(px(36.))
+                        .flex_none()
+                        .rounded_full()
+                        .bg(if active {
+                            theme::brand()
+                        } else {
+                            theme::guild_item()
+                        })
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_size(px(13.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme::text_strong())
+                        .child(initials),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .child(
+                            div()
+                                .text_size(px(15.))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(theme::text_strong())
+                                .text_ellipsis()
+                                .child(name),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(theme::text_muted())
+                                .text_ellipsis()
+                                .child(detail),
+                        ),
+                )
+                .when(active, |d| {
+                    d.child(
                         div()
-                            .text_size(px(15.))
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(theme::text_strong())
-                            .text_ellipsis()
-                            .child(name),
-                    )
-                    .child(
-                        div()
+                            .flex_none()
                             .text_size(px(12.))
                             .text_color(theme::text_muted())
-                            .text_ellipsis()
-                            .child(detail),
-                    ),
-            )
-            .when(active, |d| {
-                d.child(
-                    div()
-                        .flex_none()
-                        .text_size(px(12.))
-                        .text_color(theme::text_muted())
-                        .child(t!("accounts-active")),
-                )
-            })
-            .when(!active && marks.mentions > 0, |d| {
-                d.child(mention_badge(marks.mentions))
-            })
-            .when(!active && marks.mentions == 0 && marks.unread, |d| {
-                d.child(
-                    div()
-                        .flex_none()
-                        .size(px(8.))
-                        .rounded_full()
-                        .bg(theme::text_strong()),
-                )
-            });
+                            .child(t!("accounts-active")),
+                    )
+                })
+                .when(!active && marks.mentions > 0, |d| {
+                    d.child(mention_badge(marks.mentions))
+                })
+                .when(!active && marks.mentions == 0 && marks.unread, |d| {
+                    d.child(
+                        div()
+                            .flex_none()
+                            .size(px(8.))
+                            .rounded_full()
+                            .bg(theme::text_strong()),
+                    )
+                });
         div()
             .flex()
             .flex_row()

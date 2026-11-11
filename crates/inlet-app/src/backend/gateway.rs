@@ -14,7 +14,7 @@ use super::accounts::BACKGROUND_IGNORED_EVENTS;
 use super::messages::parse::{
     remember_channels, remember_roles, to_channel, to_message, ChannelCache, SharedNames,
 };
-use super::{accounts, messages, Backend, Internal, RealActive, Ui};
+use super::{accounts, composer, messages, Backend, Internal, RealActive, Ui};
 use crate::model::{self, Channel, Guild};
 use crate::reconnect::{Decision, Stop};
 
@@ -51,6 +51,7 @@ impl Backend {
         let internal = self.internal.clone();
         let (guilds, cache, names) = (guilds.clone(), cache.clone(), names.clone());
         let foreground = foreground.clone();
+        let composer = self.composer.clone();
         let forward = self.spawn_guarded("gateway", Some(gen), async move {
             let on_connected = {
                 let internal = internal.clone();
@@ -58,8 +59,17 @@ impl Backend {
                     let _ = internal.send(Internal::GatewayConnected { gen });
                 }
             };
-            let end =
-                forward_gateway(rx, events, guilds, cache, names, foreground, on_connected).await;
+            let end = forward_gateway(
+                rx,
+                events,
+                guilds,
+                cache,
+                names,
+                foreground,
+                composer,
+                on_connected,
+            )
+            .await;
             let _ = internal.send(Internal::GatewayEnded { gen, end });
         });
         (gateway, forward)
@@ -197,6 +207,7 @@ pub fn close_message(reason: &p::CloseReason) -> Option<String> {
 /// While `foreground` is false (a background account) the caches are still kept, but
 /// messages are not rendered, typing events are dropped, and no channel or guild lists
 /// go to the UI: only the events its account state needs for unread counts.
+#[allow(clippy::too_many_arguments)]
 pub async fn forward_gateway(
     mut rx: tokio::sync::mpsc::Receiver<p::GatewayEvent>,
     events: Ui,
@@ -204,6 +215,7 @@ pub async fn forward_gateway(
     cache: ChannelCache,
     names: SharedNames,
     foreground: Arc<AtomicBool>,
+    composer: composer::State,
     connected: impl Fn(),
 ) -> GatewayEnd {
     macro_rules! send {
@@ -345,6 +357,10 @@ pub async fn forward_gateway(
                                 guild_list = Some(list.clone());
                             }
                         }
+                    }
+                    p::Dispatch::GuildMembersChunk(chunk) => {
+                        // Answers to the composer's member searches.
+                        composer::members_chunk(&composer, &events, chunk);
                     }
                     p::Dispatch::GuildDelete(d) if !d.unavailable => {
                         cache.lock().unwrap().remove(&Some(d.id.clone()));
