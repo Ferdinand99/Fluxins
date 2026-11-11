@@ -74,7 +74,6 @@ pub struct Inlet {
     pub social: ui::social::State,
     #[allow(dead_code)] // filled by the task that builds the domain
     pub search: ui::search::State,
-    #[allow(dead_code)] // filled by the task that builds the domain
     pub inbox: ui::inbox::State,
     pub threads: ui::threads::State,
     #[allow(dead_code)] // filled by the task that builds the domain
@@ -266,6 +265,7 @@ impl Inlet {
         self.selected_guild = None;
         self.selected_channel = None;
         self.reset_messages();
+        self.inbox.clear();
         self.media.reset();
         self.notifications.clear();
         self.switcher.signed_out();

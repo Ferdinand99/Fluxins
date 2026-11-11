@@ -12,7 +12,7 @@
 pub(crate) mod ack;
 pub mod actions;
 mod fetch;
-mod inbox;
+pub mod inbox;
 pub(crate) mod outbox;
 pub mod parse;
 mod pins;
@@ -53,6 +53,8 @@ pub enum Cmd {
     },
     /// A message action: a reaction, delete, pin and the rest (see [`actions`]).
     Action(actions::Cmd),
+    /// The panels over the chat and jumps to a message (see [`inbox`]).
+    Inbox(inbox::Cmd),
     /// Threads and forums (see [`threads`]).
     Thread(threads::Cmd),
 }
@@ -103,6 +105,8 @@ pub enum Ev {
     },
     /// The answer to a message action.
     Action(actions::Ev),
+    /// An answer for the panels over the chat or a jump (see [`inbox`]).
+    Inbox(inbox::Ev),
     /// Thread pages, archived threads and forum posts.
     Thread(threads::Ev),
 }
@@ -125,6 +129,7 @@ pub(super) fn handle(backend: &mut Backend, cmd: Cmd) {
             text,
         } => backend.resend(channel_id, nonce, text),
         Cmd::Action(cmd) => backend.message_action(cmd),
+        Cmd::Inbox(cmd) => backend.inbox(cmd),
         Cmd::Thread(cmd) => threads::handle(backend, cmd),
     }
 }

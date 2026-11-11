@@ -33,6 +33,7 @@ use crate::backend::messages::ack::AckGate;
 use crate::theme;
 use badge::Badge;
 use settings::SettingsBatch;
+pub(crate) use unread::channel_badge;
 use unread::Badges;
 
 actions!(notifications, [MarkChannelRead, MarkGuildRead]);
@@ -178,11 +179,23 @@ impl Inlet {
         self.notifications.badges.guild(guild_id)
     }
 
-    /// Whether the chat is on screen: signed in, and not under the About view or the
-    /// settings view. A view that replaces the chat must be added here, so nothing is
-    /// read or marked as read behind it.
+    /// Whether the chat is on screen: signed in, and not under the About view, the
+    /// settings view or a panel (pins, inbox), and not moving to a message a jump is
+    /// loading. A view that covers the chat must be added here, so nothing is read or
+    /// marked as read behind it.
+    ///
+    /// Deviation: Fluxer keeps reading under its popouts (only modals and the media
+    /// viewer stop it). Inlet's pins and inbox panels cover most of the chat, so the
+    /// messages under them are not taken as seen.
     pub(crate) fn chat_is_visible(&self) -> bool {
-        self.screen == Screen::Main && !self.show_about && self.settings.view.is_none()
+        self.screen == Screen::Main
+            && !self.show_about
+            && self.settings.view.is_none()
+            && self.inbox.open.is_none()
+            && !self
+                .inbox
+                .jump
+                .is_active(chrono::Utc::now().timestamp_millis())
     }
 
     /// Escape (`shift` false) or Shift+Escape.
