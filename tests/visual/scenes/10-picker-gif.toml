@@ -1,0 +1,10 @@
+# The composer's picker on the GIF tab: the trending tile and the featured search terms
+# (the demo's GIF pictures are stills in a scene file).
+name = "picker-gif"
+window = [1280, 860]
+scale = 1.0
+theme = "dark"
+ignore = []
+scene = "picker-gif"
+guild = "g1"
+channel = "c-general"

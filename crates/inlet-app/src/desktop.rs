@@ -936,6 +936,7 @@ impl Inlet {
             switcher: self.switcher_layer_open(),
             panel: self.inbox.open.is_some(),
             settings: self.settings.view.is_some(),
+            picker: self.composer.pickers.is_open(),
             viewer: self.media.viewer.is_some(),
         }
     }
@@ -957,11 +958,18 @@ impl Inlet {
     /// when the window is drawn.
     pub(crate) fn focus_layer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(top) = self.open_layers().topmost() {
-            let handle = self
+            let layer = self
                 .overlays
                 .layer_focus
                 .get_or_insert_with(|| cx.focus_handle())
                 .clone();
+            // Where the keyboard goes when no field of the topmost layer has it: a
+            // picker's search field (it lies inside the layer, so Escape still closes
+            // the layer), else the layer itself.
+            let handle = match top {
+                Layer::Picker => self.composer.pickers.search_focus(cx).unwrap_or(layer),
+                _ => layer,
+            };
             // One rule, from this frame's state only: a text field keeps the keyboard
             // while the layer it belongs to is the topmost one now. A layer that
             // opens over it takes the keyboard in the same frame.
@@ -1021,6 +1029,7 @@ impl Inlet {
             Some(Layer::AccountSwitcher) => self.switcher.open = false,
             Some(Layer::Panel) => self.inbox.open = None,
             Some(Layer::Settings) => self.settings.view = None,
+            Some(Layer::Picker) => self.composer.pickers.close(),
             Some(Layer::Viewer) => self.media.viewer = None,
             None => {}
         }
@@ -1077,9 +1086,18 @@ pub(crate) fn field_keeps_keyboard(top: Layer, field: Option<Layer>) -> bool {
 }
 
 impl Inlet {
-    /// The layer whose text field has the keyboard now, if one has: the status
-    /// picker's custom status, or the note in the profile popout or the full profile.
+    /// The layer whose text field has the keyboard now, if one has: a picker's search,
+    /// the status picker's custom status, or the note in the profile popout or the
+    /// full profile.
     fn focused_layer_field(&self, window: &Window, cx: &App) -> Option<Layer> {
+        if self
+            .composer
+            .pickers
+            .search_focus(cx)
+            .is_some_and(|h| h.is_focused(window))
+        {
+            return Some(Layer::Picker);
+        }
         if self.status_picker_field_focused(window, cx) {
             return Some(Layer::StatusPicker);
         }
@@ -1112,12 +1130,14 @@ pub(crate) enum Layer {
     /// The pinned messages or the inbox, under the channel header.
     Panel,
     Settings,
+    /// The emoji, GIF, sticker and meme picker.
+    Picker,
     Viewer,
 }
 
 /// Which layers are open. They are drawn bottom first (a panel, the image viewer, the
-/// settings view, the notification settings window, the account switcher, the full
-/// profile, the profile popout, the user menu, the status picker, the link
+/// picker, the settings view, the notification settings window, the account switcher,
+/// the full profile, the profile popout, the user menu, the status picker, the link
 /// confirmation, the link prompt, see `ui/overlays`), and the topmost one has the
 /// keyboard: Escape closes it first.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1132,6 +1152,7 @@ pub(crate) struct OpenLayers {
     pub switcher: bool,
     pub panel: bool,
     pub settings: bool,
+    pub picker: bool,
     pub viewer: bool,
 }
 
@@ -1155,6 +1176,8 @@ impl OpenLayers {
             Some(Layer::NotificationSettings)
         } else if self.settings {
             Some(Layer::Settings)
+        } else if self.picker {
+            Some(Layer::Picker)
         } else if self.viewer {
             Some(Layer::Viewer)
         } else if self.panel {
@@ -1178,6 +1201,7 @@ impl OpenLayers {
             Some(Layer::AccountSwitcher) => self.switcher = false,
             Some(Layer::Panel) => self.panel = false,
             Some(Layer::Settings) => self.settings = false,
+            Some(Layer::Picker) => self.picker = false,
             Some(Layer::Viewer) => self.viewer = false,
             None => {}
         }
@@ -1381,6 +1405,19 @@ mod tests {
         };
         let top = picker.topmost().unwrap();
         assert!(field_keeps_keyboard(top, Some(Layer::StatusPicker)));
+        // An emoji or GIF picker keeps its search field's keyboard while it is on top.
+        let emoji = OpenLayers {
+            picker: true,
+            ..OpenLayers::default()
+        };
+        assert!(field_keeps_keyboard(
+            emoji.topmost().unwrap(),
+            Some(Layer::Picker)
+        ));
+        assert!(!field_keeps_keyboard(
+            emoji.topmost().unwrap(),
+            Some(Layer::StatusPicker)
+        ));
         assert!(!field_keeps_keyboard(top, None));
         // A link prompt opens over the picker: its field gives up the keyboard now.
         let prompt = OpenLayers {
@@ -1461,6 +1498,7 @@ mod tests {
             switcher: true,
             panel: true,
             settings: true,
+            picker: true,
             viewer: true,
         };
         let mut order = Vec::new();
@@ -1480,6 +1518,7 @@ mod tests {
                 Layer::AccountSwitcher,
                 Layer::NotificationSettings,
                 Layer::Settings,
+                Layer::Picker,
                 Layer::Viewer,
                 Layer::Panel
             ]

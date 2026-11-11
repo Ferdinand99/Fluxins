@@ -41,6 +41,9 @@
 //! - `composer-attachments`: for `#general`, three files in the composer's tray (a photo
 //!   with alt text, a spoiler, a document), an upload on its way above the box, and its
 //!   message pending in the list.
+//! - `picker-emoji`, `picker-gif`: for `#general`, the composer's picker open on the
+//!   emoji tab (favourites, frequently used, the guild's custom emoji) or the GIF tab
+//!   (the featured search terms; see `pickers.rs`).
 //! - `members`, `profile-popout`: for `#general`, the member list with its groups,
 //!   statuses, custom statuses, the owner's crown and offline members (see
 //!   `members.rs`); or with the profile popout of a moderator open beside it.
@@ -96,6 +99,8 @@ pub enum Scene {
     MediaChannel,
     StatusPicker,
     ComposerAttachments,
+    PickerEmoji,
+    PickerGif,
     Members,
     ProfilePopout,
 }
@@ -132,6 +137,8 @@ impl Scene {
             "media-channel" => Scene::MediaChannel,
             "status-picker" => Scene::StatusPicker,
             "composer-attachments" => Scene::ComposerAttachments,
+            "picker-emoji" => Scene::PickerEmoji,
+            "picker-gif" => Scene::PickerGif,
             "members" => Scene::Members,
             "profile-popout" => Scene::ProfilePopout,
             _ => return None,
@@ -294,6 +301,12 @@ fn ready(
                 })
                 .unwrap_or_default();
             let (icon, banner) = media::guild_art(&g.name);
+            // The first guild's custom emoji and stickers, for the pickers.
+            let (emojis, stickers) = if guilds.first().is_some_and(|f| f.id == g.id) {
+                super::pickers::guild_expressions()
+            } else {
+                (json!([]), json!([]))
+            };
             json!({
                 "id": g.id,
                 "properties": {"id": g.id, "name": g.name, "owner_id": user_id(ME), "icon": icon, "banner": banner},
@@ -309,7 +322,9 @@ fn ready(
                     "roles": [ROLE_MODERATORS],
                     "joined_at": "2026-01-01T00:00:00+00:00"
                 }],
-                "member_count": 5
+                "member_count": 5,
+                "emojis": emojis,
+                "stickers": stickers
             })
         })
         .collect();
@@ -512,6 +527,8 @@ mod tests {
             "media-channel",
             "status-picker",
             "composer-attachments",
+            "picker-emoji",
+            "picker-gif",
             "members",
             "profile-popout",
         ] {
@@ -520,6 +537,10 @@ mod tests {
             assert_eq!(data.guilds.len(), 3);
             assert!(data.channels.contains_key(&None));
             let state = inlet_state::AccountState::from_ready_at(&data.ready, 1);
+            // The pickers' custom emoji and stickers are in the first guild.
+            let first = inlet_state::GuildId::parse(&data.guilds[0].id).expect("a guild");
+            let g = state.guild(first).expect("the first guild");
+            assert!(g.emojis.len() > 30 && g.stickers.len() == 5, "{name}");
             for id in [
                 "c-general",
                 "c-system",
