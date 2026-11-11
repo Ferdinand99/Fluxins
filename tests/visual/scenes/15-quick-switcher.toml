@@ -1,0 +1,10 @@
+# The quick switcher (Ctrl+K) over #general, with the channels visited, with mentions
+# and unread across the demo account and the two accounts in the background.
+name = "quick-switcher"
+window = [1280, 860]
+scale = 1.0
+theme = "dark"
+ignore = []
+scene = "quick-switcher"
+guild = "g1"
+channel = "c-general"

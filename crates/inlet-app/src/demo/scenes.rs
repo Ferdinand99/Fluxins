@@ -50,6 +50,10 @@
 //! - `members`, `profile-popout`: for `#general`, the member list with its groups,
 //!   statuses, custom statuses, the owner's crown and offline members (see
 //!   `members.rs`); or with the profile popout of a moderator open beside it.
+//! - `search-results`: for `#general`, the search panel with the results for `build` in
+//!   the guild (see `search.rs`).
+//! - `quick-switcher`: for `#general`, the quick switcher open over the accounts of
+//!   `accounts` (their channels with mentions and unread messages).
 //!
 //! `INLET_DEMO_SCENE` may also name a scene file of the visual checks
 //! (`tests/visual/scenes/*.toml`, see `scene_file.rs`): it then sets the scene, the guild,
@@ -107,6 +111,8 @@ pub enum Scene {
     MediaErrors,
     Members,
     ProfilePopout,
+    SearchResults,
+    QuickSwitcher,
 }
 
 impl Scene {
@@ -146,6 +152,8 @@ impl Scene {
             "media-errors" => Scene::MediaErrors,
             "members" => Scene::Members,
             "profile-popout" => Scene::ProfilePopout,
+            "search-results" => Scene::SearchResults,
+            "quick-switcher" => Scene::QuickSwitcher,
             _ => return None,
         })
     }
@@ -471,7 +479,11 @@ pub fn data(scene: Scene) -> Data {
     let mut guild_settings = Vec::new();
     let unread_demo = matches!(
         scene,
-        Scene::Default | Scene::Accounts | Scene::AccountsAdd | Scene::InboxUnreads
+        Scene::Default
+            | Scene::Accounts
+            | Scene::AccountsAdd
+            | Scene::InboxUnreads
+            | Scene::QuickSwitcher
     );
     if unread_demo {
         // Unread messages, mentions and mutes in the sidebar and the rail.
@@ -540,6 +552,8 @@ mod tests {
             "media-errors",
             "members",
             "profile-popout",
+            "search-results",
+            "quick-switcher",
         ] {
             let scene = Scene::from_name(name).expect(name);
             let data = data(scene);

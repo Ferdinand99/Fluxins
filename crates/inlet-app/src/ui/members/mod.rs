@@ -225,7 +225,10 @@ impl Inlet {
     pub(crate) fn member_list_shown(&self) -> Option<(GuildId, ChannelId)> {
         let width = self.members.window_width;
         let narrow = width > 0. && width < MIN_WINDOW_WIDTH;
-        if self.members.hidden || self.threads.panel.is_some() || narrow {
+        // The thread panel and the search column (Fluxer's results column) take its
+        // place.
+        if self.members.hidden || self.threads.panel.is_some() || self.search_panel_open() || narrow
+        {
             return None;
         }
         self.member_list_channel()

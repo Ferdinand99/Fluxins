@@ -928,6 +928,7 @@ impl Inlet {
         OpenLayers {
             link_prompt: self.overlays.link_prompt.is_some(),
             link_confirm: self.overlays.pending_link.is_some(),
+            quick_switcher: self.quick_switcher_open(),
             user_menu: self.profile.menu.is_some(),
             profile_popout: self.profile.popout.is_some(),
             profile_modal: self.profile.full.is_some(),
@@ -938,6 +939,7 @@ impl Inlet {
             settings: self.settings.view.is_some(),
             picker: self.composer.pickers.is_open(),
             viewer: self.media.viewer.is_some(),
+            search: self.search_panel_open(),
         }
     }
 
@@ -1001,6 +1003,21 @@ impl Inlet {
         }
     }
 
+    /// Gives the keyboard to a field of a layer that opens now (the search field, the
+    /// quick switcher's), noting where it was so it goes back when the layers close.
+    pub(crate) fn focus_layer_field(
+        &mut self,
+        field: &gpui::FocusHandle,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.overlays.layer_had_focus {
+            self.overlays.focus_before = window.focused(cx);
+            self.overlays.layer_had_focus = true;
+        }
+        field.focus(window, cx);
+    }
+
     /// Adds the layer's focus, key context and Escape to the topmost layer's element.
     pub(crate) fn layer_keys<E: InteractiveElement>(
         &self,
@@ -1021,6 +1038,7 @@ impl Inlet {
         match self.open_layers().topmost() {
             Some(Layer::LinkPrompt) => self.overlays.link_prompt = None,
             Some(Layer::LinkConfirm) => self.overlays.pending_link = None,
+            Some(layer @ (Layer::QuickSwitcher | Layer::Search)) => self.close_search_layer(layer),
             Some(Layer::UserMenu) => self.profile.menu = None,
             Some(Layer::ProfilePopout) => self.profile.popout = None,
             Some(Layer::ProfileModal) => self.profile.full = None,
@@ -1087,8 +1105,8 @@ pub(crate) fn field_keeps_keyboard(top: Layer, field: Option<Layer>) -> bool {
 
 impl Inlet {
     /// The layer whose text field has the keyboard now, if one has: a picker's search,
-    /// the status picker's custom status, or the note in the profile popout or the
-    /// full profile.
+    /// the status picker's custom status, the note in the profile popout or the full
+    /// profile, the quick switcher's field or the search field.
     fn focused_layer_field(&self, window: &Window, cx: &App) -> Option<Layer> {
         if self
             .composer
@@ -1108,6 +1126,12 @@ impl Inlet {
                 Layer::ProfilePopout
             });
         }
+        if self.quick_switcher_field_focused(window, cx) {
+            return Some(Layer::QuickSwitcher);
+        }
+        if self.search_field_focused(window, cx) {
+            return Some(Layer::Search);
+        }
         None
     }
 }
@@ -1117,6 +1141,8 @@ impl Inlet {
 pub(crate) enum Layer {
     LinkPrompt,
     LinkConfirm,
+    /// The quick switcher (Ctrl+K).
+    QuickSwitcher,
     /// The user menu (right click on a member).
     UserMenu,
     /// The profile popout beside the member list.
@@ -1133,17 +1159,20 @@ pub(crate) enum Layer {
     /// The emoji, GIF, sticker and meme picker.
     Picker,
     Viewer,
+    /// The search panel, docked on the right under the channel header.
+    Search,
 }
 
-/// Which layers are open. They are drawn bottom first (a panel, the image viewer, the
-/// picker, the settings view, the notification settings window, the account switcher,
-/// the full profile, the profile popout, the user menu, the status picker, the link
-/// confirmation, the link prompt, see `ui/overlays`), and the topmost one has the
-/// keyboard: Escape closes it first.
+/// Which layers are open. They are drawn bottom first (the search column, a panel, the
+/// image viewer, the picker, the settings view, the notification settings window, the
+/// account switcher, the full profile, the profile popout, the user menu, the status
+/// picker, the quick switcher, the link confirmation, the link prompt, see
+/// `ui/overlays`), and the topmost one has the keyboard: Escape closes it first.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct OpenLayers {
     pub link_prompt: bool,
     pub link_confirm: bool,
+    pub quick_switcher: bool,
     pub user_menu: bool,
     pub profile_popout: bool,
     pub profile_modal: bool,
@@ -1154,6 +1183,7 @@ pub(crate) struct OpenLayers {
     pub settings: bool,
     pub picker: bool,
     pub viewer: bool,
+    pub search: bool,
 }
 
 impl OpenLayers {
@@ -1162,6 +1192,8 @@ impl OpenLayers {
             Some(Layer::LinkPrompt)
         } else if self.link_confirm {
             Some(Layer::LinkConfirm)
+        } else if self.quick_switcher {
+            Some(Layer::QuickSwitcher)
         } else if self.status_picker {
             Some(Layer::StatusPicker)
         } else if self.user_menu {
@@ -1182,6 +1214,8 @@ impl OpenLayers {
             Some(Layer::Viewer)
         } else if self.panel {
             Some(Layer::Panel)
+        } else if self.search {
+            Some(Layer::Search)
         } else {
             None
         }
@@ -1193,6 +1227,8 @@ impl OpenLayers {
         match self.topmost() {
             Some(Layer::LinkPrompt) => self.link_prompt = false,
             Some(Layer::LinkConfirm) => self.link_confirm = false,
+            Some(Layer::QuickSwitcher) => self.quick_switcher = false,
+            Some(Layer::Search) => self.search = false,
             Some(Layer::UserMenu) => self.user_menu = false,
             Some(Layer::ProfilePopout) => self.profile_popout = false,
             Some(Layer::ProfileModal) => self.profile_modal = false,
@@ -1484,12 +1520,61 @@ mod tests {
         assert_eq!(full.after_escape().topmost(), None);
     }
 
+    /// A field keeps the keyboard only while its layer is the topmost one; a layer that
+    /// opens over it (the inbox over the search panel, a link prompt over the quick
+    /// switcher) takes the keyboard at once, in the same frame.
+    #[test]
+    fn a_search_field_keeps_the_keyboard_only_in_the_topmost_layer() {
+        let search = OpenLayers {
+            search: true,
+            ..OpenLayers::default()
+        };
+        assert!(field_keeps_keyboard(
+            search.topmost().unwrap(),
+            Some(Layer::Search)
+        ));
+        let inbox = OpenLayers {
+            panel: true,
+            ..search
+        };
+        assert!(!field_keeps_keyboard(
+            inbox.topmost().unwrap(),
+            Some(Layer::Search)
+        ));
+        let switcher = OpenLayers {
+            quick_switcher: true,
+            ..OpenLayers::default()
+        };
+        assert!(field_keeps_keyboard(
+            switcher.topmost().unwrap(),
+            Some(Layer::QuickSwitcher)
+        ));
+        let prompt = OpenLayers {
+            link_prompt: true,
+            ..switcher
+        };
+        assert!(!field_keeps_keyboard(
+            prompt.topmost().unwrap(),
+            Some(Layer::QuickSwitcher)
+        ));
+        let status = OpenLayers {
+            status_picker: true,
+            ..OpenLayers::default()
+        };
+        assert!(field_keeps_keyboard(
+            status.topmost().unwrap(),
+            Some(Layer::StatusPicker)
+        ));
+        assert!(!field_keeps_keyboard(status.topmost().unwrap(), None));
+    }
+
     /// Every layer closes before the one under it, in the order they are drawn.
     #[test]
     fn layers_close_from_the_top_down() {
         let mut layers = OpenLayers {
             link_prompt: true,
             link_confirm: true,
+            quick_switcher: true,
             user_menu: true,
             profile_popout: true,
             profile_modal: true,
@@ -1500,6 +1585,7 @@ mod tests {
             settings: true,
             picker: true,
             viewer: true,
+            search: true,
         };
         let mut order = Vec::new();
         while let Some(top) = layers.topmost() {
@@ -1511,6 +1597,7 @@ mod tests {
             [
                 Layer::LinkPrompt,
                 Layer::LinkConfirm,
+                Layer::QuickSwitcher,
                 Layer::StatusPicker,
                 Layer::UserMenu,
                 Layer::ProfilePopout,
@@ -1520,7 +1607,8 @@ mod tests {
                 Layer::Settings,
                 Layer::Picker,
                 Layer::Viewer,
-                Layer::Panel
+                Layer::Panel,
+                Layer::Search
             ]
         );
     }

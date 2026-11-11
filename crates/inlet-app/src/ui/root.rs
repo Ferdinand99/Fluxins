@@ -33,6 +33,7 @@ impl Render for Inlet {
             .font_family(assets::ui_font());
         let root = self.notification_keys(root, cx);
         let root = self.picker_keys(root, cx);
+        let root = self.search_keys(root, window, cx);
         if self.show_about {
             return root
                 .child(about::render(self.show_licences, cx))

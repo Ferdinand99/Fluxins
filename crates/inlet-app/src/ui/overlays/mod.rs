@@ -61,6 +61,8 @@ impl Inlet {
         if self.status_picker_open() {
             out.push(self.render_status_picker(cx));
         }
+        // The quick switcher: over the status picker, under the link prompts.
+        out.extend(self.render_quick_switcher(cx));
         if let Some(url) = self.overlays.pending_link.clone() {
             // A layer like the link prompt: it has the keyboard while it is topmost, and
             // Escape closes it.
