@@ -145,24 +145,91 @@ pub fn flash_window(window: &Window) {
     window.request_attention();
 }
 
+/// Hides the main window to the tray.
+///
+/// - Windows: the window and its taskbar button go away. `ShowWindowAsync` only
+///   queues the change, so no window message is handled during the call and it is
+///   safe while gpui's app is borrowed.
+/// - macOS: the app hides, as Command-H does; the dock icon brings it back.
+/// - Linux: the window is minimized. gpui cannot unmap a window, and Wayland has no
+///   hidden state for a toplevel.
+///
+/// Only call this while a tray icon is shown (see [`Tray::has_host`]), or the
+/// window cannot be found again.
+// Deviation: Fluxer hides the window on Linux too; gpui cannot, so it is minimized.
+pub fn hide_window(window: &Window, cx: &App) {
+    #[cfg(windows)]
+    {
+        use windows::Win32::UI::WindowsAndMessaging::{ShowWindowAsync, SW_HIDE};
+        let _ = cx;
+        match hwnd(window) {
+            Some(hwnd) => {
+                // SAFETY: the handle is a live window of this process.
+                let _ = unsafe { ShowWindowAsync(hwnd, SW_HIDE) };
+            }
+            None => window.minimize_window(),
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = window;
+        cx.hide();
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let _ = cx;
+        window.minimize_window();
+    }
+}
+
+/// Shows the main window again (after [`hide_window`], minimized, or opened with
+/// `show: false`) and brings it to the front.
+pub fn show_window(window: &Window, cx: &App) {
+    #[cfg(windows)]
+    {
+        use windows::Win32::UI::WindowsAndMessaging::{IsWindowVisible, ShowWindowAsync, SW_SHOW};
+        let _ = cx;
+        if let Some(hwnd) = hwnd(window) {
+            // SAFETY: the handle is a live window of this process.
+            unsafe {
+                if !IsWindowVisible(hwnd).as_bool() {
+                    let _ = ShowWindowAsync(hwnd, SW_SHOW);
+                }
+            }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    cx.activate(true);
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let _ = cx;
+    window.activate_window();
+}
+
+#[cfg(windows)]
+fn hwnd(window: &Window) -> Option<windows::Win32::Foundation::HWND> {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    // gpui's own `Window::window_handle` returns its handle type; this is the trait's.
+    let handle = HasWindowHandle::window_handle(window).ok()?;
+    let RawWindowHandle::Win32(win32) = handle.as_raw() else {
+        return None;
+    };
+    Some(windows::Win32::Foundation::HWND(
+        win32.hwnd.get() as *mut std::ffi::c_void
+    ))
+}
+
 #[cfg(windows)]
 fn flash_windows(window: &Window) -> bool {
-    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-    use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::{
         FlashWindowEx, FLASHWINFO, FLASHW_TIMERNOFG, FLASHW_TRAY,
     };
 
-    // gpui's own `Window::window_handle` returns its handle type; this is the trait's.
-    let Ok(handle) = HasWindowHandle::window_handle(window) else {
-        return false;
-    };
-    let RawWindowHandle::Win32(win32) = handle.as_raw() else {
+    let Some(hwnd) = hwnd(window) else {
         return false;
     };
     let info = FLASHWINFO {
         cbSize: std::mem::size_of::<FLASHWINFO>() as u32,
-        hwnd: HWND(win32.hwnd.get() as *mut std::ffi::c_void),
+        hwnd,
         dwFlags: FLASHW_TRAY | FLASHW_TIMERNOFG,
         uCount: 0,
         dwTimeout: 0,

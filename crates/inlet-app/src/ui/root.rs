@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! The window's root view: the current screen, the main layout and the overlays.
 
-use gpui::{div, prelude::*, px, Context, Window};
+use gpui::{div, prelude::*, rems, Context, Window};
 
 use crate::app::{Inlet, Screen};
 use crate::text_input::{FocusNext, FocusPrev};
@@ -11,6 +11,7 @@ impl Render for Inlet {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.media_frame(window, cx);
         self.take_channel_jump(window, cx);
+        self.focus_layer(window, cx);
         let root = div()
             .relative()
             .size_full()
@@ -18,7 +19,8 @@ impl Render for Inlet {
             .on_action(|_: &FocusNext, window, cx| window.focus_next(cx))
             .on_action(|_: &FocusPrev, window, cx| window.focus_prev(cx))
             .text_color(theme::text())
-            .text_size(px(16.))
+            // In rems, so the zoom level (the window's rem size) scales the text.
+            .text_size(rems(1.))
             .font_family(assets::ui_font());
         let root = self.notification_keys(root, cx);
         if self.show_about {

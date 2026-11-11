@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! The image viewer: an image at a larger size over the whole window, with zoom, save,
 //! copy link and open original. Escape, a click on the backdrop or the close button
-//! closes it. It takes the keyboard focus while open and gives it back when it closes.
+//! closes it. It is a layer like the settings view (`desktop.rs`): it takes the keyboard
+//! focus while it is the topmost layer, and the focus goes back when the layers close.
 //!
 //! It asks the proxy for at most 2560 pixels on the longest side (an animation for at
 //! most 1024, within the shared animation budget, else its still). A large still can
 //! take most of the image cache, so images of older messages may load again after.
 
-use gpui::{
-    div, prelude::*, px, AnyElement, ClipboardItem, Context, FontWeight, KeyDownEvent, ObjectFit,
-};
+use gpui::{div, prelude::*, px, AnyElement, ClipboardItem, Context, FontWeight, ObjectFit};
 use inlet_media::MediaRequest;
 use url::Url;
 
@@ -104,14 +103,13 @@ impl Viewer {
 }
 
 impl Inlet {
-    /// Opens the viewer; it takes the focus at the next frame.
+    /// Opens the viewer; as the topmost layer it takes the focus when drawn.
     pub(crate) fn open_viewer(&mut self, viewer: Viewer, cx: &mut Context<Self>) {
         self.media.viewer = Some(viewer);
-        self.media.focus_viewer = true;
         cx.notify();
     }
 
-    /// Closes the viewer; the focus goes back at the next frame.
+    /// Closes the viewer; the focus goes back when no layer is left.
     pub(crate) fn close_viewer(&mut self, cx: &mut Context<Self>) {
         self.media.viewer = None;
         cx.notify();
@@ -235,37 +233,34 @@ impl Inlet {
                     .child(alt)
             }));
 
-        Some(
-            div()
-                .id("image-viewer")
-                .when_some(self.media.viewer_focus.clone(), |d, focus| {
-                    d.track_focus(&focus)
-                })
-                .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| {
-                    if ev.keystroke.key == "escape" {
-                        cx.stop_propagation();
-                        this.close_viewer(cx);
-                    }
-                }))
-                .occlude()
-                .absolute()
-                .top_0()
-                .left_0()
-                .size_full()
-                .bg(theme::viewer_backdrop())
-                .flex()
-                .flex_col()
-                .items_center()
-                .justify_center()
-                .gap_3()
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.close_viewer(cx);
-                }))
-                .child(div().absolute().top(px(16.)).right(px(16.)).child(tools))
-                .child(image)
-                .child(caption)
-                .into_any_element(),
-        )
+        let viewer = div()
+            .id("image-viewer")
+            .occlude()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .bg(theme::viewer_backdrop())
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_3()
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.close_viewer(cx);
+            }))
+            .child(div().absolute().top(px(16.)).right(px(16.)).child(tools))
+            .child(image)
+            .child(caption);
+        // The keyboard and Escape go to the topmost layer: the viewer only when no
+        // settings view or link prompt lies over it.
+        let topmost = self.settings.view.is_none() && self.overlays.link_prompt.is_none();
+        let viewer = if topmost {
+            self.layer_keys(viewer, cx)
+        } else {
+            viewer
+        };
+        Some(viewer.into_any_element())
     }
 
     /// Demo screenshots: opens the viewer on the first image of the open channel.

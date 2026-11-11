@@ -58,6 +58,47 @@ pub(crate) fn exec_arg(path: &Path) -> Result<String> {
 /// Writes through a temporary file in the same directory and renames it, so a
 /// crash never leaves half a file behind.
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    write_atomic_with(path, bytes, None)
+}
+
+/// Replaces a file the user may have set up by hand (`mimeapps.list` kept in a
+/// dotfiles folder, say): a symbolic link is followed and stays a link, the file it
+/// points to is replaced atomically, and that file's permissions are kept.
+pub(crate) fn replace_keeping(path: &Path, bytes: &[u8]) -> Result<()> {
+    let target = resolve_links(path)?;
+    let permissions = std::fs::metadata(&target).ok().map(|m| m.permissions());
+    write_atomic_with(&target, bytes, permissions)
+}
+
+/// The file a path ends at after following its symbolic links (at most 16). A
+/// relative link target counts from the link's own folder. A dangling link gives
+/// the path it points to, so the file is created there.
+fn resolve_links(path: &Path) -> Result<PathBuf> {
+    let mut current = path.to_path_buf();
+    for _ in 0..16 {
+        match std::fs::symlink_metadata(&current) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                let target = std::fs::read_link(&current)?;
+                current = if target.is_absolute() {
+                    target
+                } else {
+                    current
+                        .parent()
+                        .ok_or(Error::InvalidInput("path has no parent"))?
+                        .join(target)
+                };
+            }
+            _ => return Ok(current),
+        }
+    }
+    Err(Error::InvalidInput("too many symbolic links"))
+}
+
+fn write_atomic_with(
+    path: &Path,
+    bytes: &[u8],
+    permissions: Option<std::fs::Permissions>,
+) -> Result<()> {
     let dir = path
         .parent()
         .ok_or(Error::InvalidInput("path has no parent"))?;
@@ -68,6 +109,9 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let tmp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
     let result = (|| {
         let mut file = std::fs::File::create(&tmp)?;
+        if let Some(permissions) = permissions {
+            file.set_permissions(permissions)?;
+        }
         file.write_all(bytes)?;
         file.sync_all()?;
         std::fs::rename(&tmp, path)

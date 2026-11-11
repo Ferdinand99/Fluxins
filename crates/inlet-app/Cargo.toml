@@ -28,6 +28,8 @@ inlet-protocol = { path = "../inlet-protocol" }
 inlet-state = { path = "../inlet-state" }
 # Images: fetched from the media proxy, decoded and cached with hard limits.
 inlet-media = { path = "../inlet-media" }
+# Tray, badge, single instance, deep links, autostart (with its gpui glue).
+inlet-platform = { path = "../inlet-platform", features = ["gpui"] }
 
 gpui.workspace = true
 gpui_platform.workspace = true

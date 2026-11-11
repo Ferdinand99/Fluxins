@@ -83,6 +83,10 @@ impl Inlet {
                         ),
                 )
                 .child(
+                    icon_button("settings", Icon::Gear)
+                        .on_click(cx.listener(|this, _, _, cx| this.open_settings(None, cx))),
+                )
+                .child(
                     icon_button("about", Icon::Info).on_click(cx.listener(|this, _, _, cx| {
                         this.show_about = true;
                         cx.notify();
