@@ -918,14 +918,15 @@ impl Inlet {
             link_confirm: self.overlays.pending_link.is_some(),
             notification_settings: self.notifications.settings.is_some(),
             switcher: self.switcher_layer_open(),
+            panel: self.inbox.open.is_some(),
             settings: self.settings.view.is_some(),
             viewer: self.media.viewer.is_some(),
         }
     }
 
     /// Whether a layer covers the chat: the link prompt, the link confirmation, the
-    /// notification settings window, the account switcher, the settings view or the
-    /// image viewer.
+    /// notification settings window, the account switcher, the settings view, the image
+    /// viewer or a panel (pins, inbox).
     pub(crate) fn layer_open(&self) -> bool {
         self.open_layers().topmost().is_some()
     }
@@ -994,6 +995,7 @@ impl Inlet {
             Some(Layer::LinkConfirm) => self.overlays.pending_link = None,
             Some(Layer::NotificationSettings) => self.notifications.settings = None,
             Some(Layer::AccountSwitcher) => self.switcher.open = false,
+            Some(Layer::Panel) => self.inbox.open = None,
             Some(Layer::Settings) => self.settings.view = None,
             Some(Layer::Viewer) => self.media.viewer = None,
             None => {}
@@ -1049,20 +1051,23 @@ pub(crate) enum Layer {
     LinkConfirm,
     NotificationSettings,
     AccountSwitcher,
+    /// The pinned messages or the inbox, under the channel header.
+    Panel,
     Settings,
     Viewer,
 }
 
-/// Which layers are open. They are drawn bottom first (the viewer, the settings view,
-/// the account switcher, the notification settings window, the link confirmation, the
-/// link prompt, see `ui/overlays`), and the topmost one has the keyboard: Escape
-/// closes it first.
+/// Which layers are open. They are drawn bottom first (a panel, the image viewer, the
+/// settings view, the notification settings window, the account switcher, the link
+/// confirmation, the link prompt, see `ui/overlays`), and the topmost one has the
+/// keyboard: Escape closes it first.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct OpenLayers {
     pub link_prompt: bool,
     pub link_confirm: bool,
     pub notification_settings: bool,
     pub switcher: bool,
+    pub panel: bool,
     pub settings: bool,
     pub viewer: bool,
 }
@@ -1073,14 +1078,16 @@ impl OpenLayers {
             Some(Layer::LinkPrompt)
         } else if self.link_confirm {
             Some(Layer::LinkConfirm)
-        } else if self.notification_settings {
-            Some(Layer::NotificationSettings)
         } else if self.switcher {
             Some(Layer::AccountSwitcher)
+        } else if self.notification_settings {
+            Some(Layer::NotificationSettings)
         } else if self.settings {
             Some(Layer::Settings)
         } else if self.viewer {
             Some(Layer::Viewer)
+        } else if self.panel {
+            Some(Layer::Panel)
         } else {
             None
         }
@@ -1094,6 +1101,7 @@ impl OpenLayers {
             Some(Layer::LinkConfirm) => self.link_confirm = false,
             Some(Layer::NotificationSettings) => self.notification_settings = false,
             Some(Layer::AccountSwitcher) => self.switcher = false,
+            Some(Layer::Panel) => self.panel = false,
             Some(Layer::Settings) => self.settings = false,
             Some(Layer::Viewer) => self.viewer = false,
             None => {}
@@ -1295,6 +1303,7 @@ mod tests {
             link_confirm: true,
             notification_settings: true,
             switcher: true,
+            panel: true,
             settings: true,
             viewer: true,
         };
@@ -1308,10 +1317,11 @@ mod tests {
             [
                 Layer::LinkPrompt,
                 Layer::LinkConfirm,
-                Layer::NotificationSettings,
                 Layer::AccountSwitcher,
+                Layer::NotificationSettings,
                 Layer::Settings,
-                Layer::Viewer
+                Layer::Viewer,
+                Layer::Panel
             ]
         );
     }

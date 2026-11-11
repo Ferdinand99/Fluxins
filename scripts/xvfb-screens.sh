@@ -106,6 +106,11 @@ kill $pid; wait $pid 2>/dev/null
 #    on another instance) and the sign-in screen when adding one.
 scene 22-accounts accounts c-general
 scene 23-accounts-add accounts-add c-general
+# The panels under the channel header: pinned messages, and the inbox's three tabs.
+scene 24-chat-pins chat-pins c-general
+scene 25-inbox-unreads inbox-unreads c-general
+scene 26-inbox-saved inbox-saved c-general
+scene 27-inbox-mentions inbox-mentions c-general
 
 # 8. The scene files of the visual checks. Xvfb's pointer cannot be moved and sits in
 #    the middle of the screen; the demo puts a scene's window in the top left corner,

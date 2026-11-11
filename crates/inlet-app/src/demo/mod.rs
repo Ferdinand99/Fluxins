@@ -16,6 +16,7 @@ pub mod accounts;
 pub mod actions;
 pub mod composer;
 mod guilds;
+pub mod inbox;
 mod markdown;
 pub mod media;
 mod messages;
