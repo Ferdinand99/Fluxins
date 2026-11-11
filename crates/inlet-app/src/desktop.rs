@@ -882,12 +882,25 @@ impl Inlet {
         }
     }
 
-    /// Whether a layer covers the chat: the link prompt, the settings view or the image
-    /// viewer.
+    /// The layers over the chat that are open now.
+    pub(crate) fn open_layers(&self) -> OpenLayers {
+        OpenLayers {
+            link_prompt: self.overlays.link_prompt.is_some(),
+            link_confirm: self.overlays.pending_link.is_some(),
+            settings: self.settings.view.is_some(),
+            viewer: self.media.viewer.is_some(),
+        }
+    }
+
+    /// Whether a layer covers the chat: the link prompt, the link confirmation, the
+    /// settings view or the image viewer.
     pub(crate) fn layer_open(&self) -> bool {
-        self.overlays.link_prompt.is_some()
-            || self.settings.view.is_some()
-            || self.media.viewer.is_some()
+        self.open_layers().topmost().is_some()
+    }
+
+    /// Whether `layer` is the topmost open one, so it has the keyboard and Escape.
+    pub(crate) fn is_top_layer(&self, layer: Layer) -> bool {
+        self.open_layers().topmost() == Some(layer)
     }
 
     /// Keeps the keyboard on an open layer, so typing never reaches the composer hidden
@@ -942,15 +955,14 @@ impl Inlet {
         }
     }
 
-    /// Escape on a layer: the link prompt first, then the settings view, then the image
-    /// viewer (the bottom one).
+    /// Escape on a layer: it closes the topmost one (see [`OpenLayers::topmost`]).
     pub(crate) fn close_top_layer(&mut self, cx: &mut Context<Self>) {
-        if self.overlays.link_prompt.is_some() {
-            self.overlays.link_prompt = None;
-        } else if self.settings.view.is_some() {
-            self.settings.view = None;
-        } else if self.media.viewer.is_some() {
-            self.media.viewer = None;
+        match self.open_layers().topmost() {
+            Some(Layer::LinkPrompt) => self.overlays.link_prompt = None,
+            Some(Layer::LinkConfirm) => self.overlays.pending_link = None,
+            Some(Layer::Settings) => self.settings.view = None,
+            Some(Layer::Viewer) => self.media.viewer = None,
+            None => {}
         }
         cx.notify();
     }
@@ -993,6 +1005,55 @@ impl Inlet {
             self.chat.pending_channel_jump = Some(channel);
             self.take_channel_jump(window, cx);
         }
+    }
+}
+
+/// A layer drawn over the chat that takes the keyboard.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Layer {
+    LinkPrompt,
+    LinkConfirm,
+    Settings,
+    Viewer,
+}
+
+/// Which layers are open. They are drawn bottom first (the viewer, the settings view,
+/// the link confirmation, the link prompt, see `ui/overlays`), and the topmost one has
+/// the keyboard: Escape closes it first.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct OpenLayers {
+    pub link_prompt: bool,
+    pub link_confirm: bool,
+    pub settings: bool,
+    pub viewer: bool,
+}
+
+impl OpenLayers {
+    pub fn topmost(self) -> Option<Layer> {
+        if self.link_prompt {
+            Some(Layer::LinkPrompt)
+        } else if self.link_confirm {
+            Some(Layer::LinkConfirm)
+        } else if self.settings {
+            Some(Layer::Settings)
+        } else if self.viewer {
+            Some(Layer::Viewer)
+        } else {
+            None
+        }
+    }
+
+    /// The layers left after Escape.
+    #[cfg(test)]
+    fn after_escape(mut self) -> OpenLayers {
+        match self.topmost() {
+            Some(Layer::LinkPrompt) => self.link_prompt = false,
+            Some(Layer::LinkConfirm) => self.link_confirm = false,
+            Some(Layer::Settings) => self.settings = false,
+            Some(Layer::Viewer) => self.viewer = false,
+            None => {}
+        }
+        self
     }
 }
 
@@ -1138,6 +1199,48 @@ mod tests {
             .unwrap();
         cx.run_until_parked();
         assert_eq!(rem(cx), BASE_REM);
+    }
+
+    /// Escape with a masked-link confirmation over the image viewer closes the
+    /// confirmation first and leaves the viewer open; the next Escape closes the viewer.
+    #[test]
+    fn escape_closes_the_link_confirmation_before_the_viewer_under_it() {
+        let mut layers = OpenLayers {
+            viewer: true,
+            link_confirm: true,
+            ..OpenLayers::default()
+        };
+        assert_eq!(layers.topmost(), Some(Layer::LinkConfirm));
+        layers = layers.after_escape();
+        assert_eq!(layers.topmost(), Some(Layer::Viewer));
+        assert!(layers.viewer && !layers.link_confirm);
+        layers = layers.after_escape();
+        assert_eq!(layers.topmost(), None);
+    }
+
+    /// Every layer closes before the one under it, in the order they are drawn.
+    #[test]
+    fn layers_close_from_the_top_down() {
+        let mut layers = OpenLayers {
+            link_prompt: true,
+            link_confirm: true,
+            settings: true,
+            viewer: true,
+        };
+        let mut order = Vec::new();
+        while let Some(top) = layers.topmost() {
+            order.push(top);
+            layers = layers.after_escape();
+        }
+        assert_eq!(
+            order,
+            [
+                Layer::LinkPrompt,
+                Layer::LinkConfirm,
+                Layer::Settings,
+                Layer::Viewer
+            ]
+        );
     }
 
     fn unread(unread: bool, mentions: u32, muted: bool) -> Unread {
