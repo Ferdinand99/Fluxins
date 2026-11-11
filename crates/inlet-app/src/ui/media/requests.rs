@@ -403,6 +403,7 @@ pub fn embed_icon(
     request(
         proxy
             .external(proxy_url, t)
+            .or_else(|| proxy.attachment(proxy_url, t))
             .or_else(|| own_media(proxy, proxy_url, t)),
         MediaKind::Avatar,
         Fit::square(px),
@@ -521,6 +522,15 @@ mod tests {
         assert!(has(&thumb, "size", "160"), "{}", thumb.url);
         let icon = embed_icon(&proxy, "https://media.example.org/icons/7/def.png", 24., 1.);
         assert!(icon.is_some_and(|r| has(&r, "size", "24")));
+        // An icon that is an attachment keeps its signed query and gets a width.
+        let att_icon = embed_icon(
+            &proxy,
+            "https://media.example.org/attachments/1/2/i.png?ex=1&is=2&hm=3",
+            24.,
+            1.,
+        )
+        .unwrap();
+        assert!(has(&att_icon, "hm", "3") && has(&att_icon, "width", "24"));
         // No proxy URL, but the media's own URL is on the endpoint: used.
         let bare = EmbedMedia {
             proxy_url: None,
