@@ -43,6 +43,20 @@
 	<true/>
 	<key>NSHumanReadableCopyright</key>
 	<string>Inlet is free software under the GNU AGPL 3.0 or later.</string>
+	<!-- inlet:// links open Inlet; the app asks before acting on any of them. -->
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>no.opland.inlet</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>inlet</string>
+			</array>
+		</dict>
+	</array>
 	<!--
 	  Voice and screen sharing (milestones v0.2 and v0.3). Enable these together
 	  with the matching entries in entitlements.plist when the voice code lands;
