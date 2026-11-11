@@ -102,15 +102,17 @@ sleep 6
 shot 15-link-prompt
 kill $pid; wait $pid 2>/dev/null
 
-# 7. The scene files of the visual checks, on a screen larger than their window, so the
-#    pointer can rest outside it (no hover states). The app reads each file itself.
+# 7. The scene files of the visual checks. Xvfb's pointer cannot be moved and sits in
+#    the middle of the screen; the demo puts a scene's window in the top left corner,
+#    and the screen is more than twice its size, so the pointer is never over it (no
+#    hover states). The app reads each file itself.
 mkdir -p "$out/visual"
-Xvfb :98 -screen 0 1600x1000x24 -dpi 96 >/dev/null 2>&1 &
+Xvfb :98 -screen 0 2600x1800x24 -dpi 96 >/dev/null 2>&1 &
 xvfb_scenes=$!
 sleep 2
+echo "scene pointer: $(DISPLAY=:98 xdotool getmouselocation 2>&1)" >&2
 for file in "$scenes_dir"/*.toml; do
   name=$(sed -n 's/^name *= *"\([^"]*\)".*/\1/p' "$file" | head -1)
-  DISPLAY=:98 xdotool mousemove 0 0
   DISPLAY=:98 RUST_LOG=info INLET_DEMO_SCENE="$file" "$bin" >"$out/visual/$name.log" 2>&1 &
   pid=$!
   sleep 8

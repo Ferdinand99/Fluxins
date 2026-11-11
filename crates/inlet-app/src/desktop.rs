@@ -356,13 +356,21 @@ pub fn window_options(start: &Start, cx: &mut App) -> WindowOptions {
             None,
         ),
     };
-    // A scene file of the visual checks fixes the size, whatever was remembered.
+    // A scene file of the visual checks fixes the size, whatever was remembered. Under
+    // Xvfb the pointer cannot be moved and stays in the middle of the screen, so on
+    // Linux the window goes to the top left corner, clear of it (the script makes the
+    // screen more than twice the window's size); elsewhere the scripts park the pointer
+    // beside a centred window. Either way nothing shows a hover state.
     #[cfg(feature = "demo")]
     let (bounds, display_id) = match crate::demo::scenes::window_size() {
-        Some((w, h)) => (
-            WindowBounds::Windowed(Bounds::centered(None, size(px(w), px(h)), cx)),
-            None,
-        ),
+        Some((w, h)) => {
+            let b = if cfg!(any(target_os = "linux", target_os = "freebsd")) {
+                Bounds::new(point(px(0.), px(0.)), size(px(w), px(h)))
+            } else {
+                Bounds::centered(None, size(px(w), px(h)), cx)
+            };
+            (WindowBounds::Windowed(b), None)
+        }
         None => (bounds, display_id),
     };
     let hidden = start.opens_hidden();
