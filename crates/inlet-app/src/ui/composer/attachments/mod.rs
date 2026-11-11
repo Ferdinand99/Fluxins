@@ -611,19 +611,23 @@ impl ComposerView {
                 .border_color(theme::ring())
                 .flex()
                 .flex_col()
-                // The tiles scroll sideways; they never widen the composer.
                 .min_w_0()
-                .overflow_hidden()
                 .child(
-                    div()
-                        .id("composer-attachments")
-                        .w_full()
-                        .min_w_0()
-                        .overflow_x_scroll()
-                        .flex()
-                        .flex_row()
-                        .gap(px(24.))
-                        .children(tiles),
+                    // The tiles scroll sideways. They sit in an absolute layer of a box of
+                    // their height, so they never widen the composer or the chat.
+                    div().relative().w_full().h(px(TILE)).child(
+                        div()
+                            .id("composer-attachments")
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .size_full()
+                            .overflow_x_scroll()
+                            .flex()
+                            .flex_row()
+                            .gap(px(24.))
+                            .children(tiles),
+                    ),
                 )
                 .child(
                     div()
