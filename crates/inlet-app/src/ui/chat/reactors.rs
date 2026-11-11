@@ -24,6 +24,8 @@ pub const KEEP_FOR: Duration = Duration::from_secs(30);
 pub const MIN_GAP: Duration = Duration::from_secs(1);
 /// Lists kept at most.
 const MAX_KEPT: usize = 64;
+/// A request whose answer never came stops blocking new ones after this.
+const ANSWER_WITHIN: Duration = Duration::from_secs(30);
 
 /// The key of a list: the message and the emoji (custom emoji by ID).
 pub fn key(message: MessageId, emoji: &p::Emoji) -> (MessageId, String) {
@@ -56,7 +58,7 @@ pub enum Want {
 #[derive(Debug, Default)]
 pub struct Reactors {
     kept: HashMap<(MessageId, String), (Instant, Names)>,
-    in_flight: Option<(u64, (MessageId, String))>,
+    in_flight: Option<(u64, (MessageId, String), Instant)>,
     last: Option<Instant>,
     next: u64,
     /// The reason the last request failed, for the list it was for.
@@ -71,6 +73,14 @@ impl Reactors {
                 return Want::Ready(names.clone());
             }
         }
+        if self
+            .in_flight
+            .as_ref()
+            .is_some_and(|(_, _, at)| now.saturating_duration_since(*at) >= ANSWER_WITHIN)
+        {
+            // Lost (a task that panicked): it no longer holds the others up.
+            self.in_flight = None;
+        }
         if self.in_flight.is_some() {
             return Want::Wait(now + MIN_GAP);
         }
@@ -80,7 +90,7 @@ impl Reactors {
             }
         }
         self.next += 1;
-        self.in_flight = Some((self.next, key.clone()));
+        self.in_flight = Some((self.next, key.clone(), now));
         self.last = Some(now);
         if self.failed.as_ref().is_some_and(|(k, _)| k == key) {
             self.failed = None;
@@ -90,7 +100,7 @@ impl Reactors {
 
     /// The answer to `request`. An answer to an older request is dropped.
     pub fn answered(&mut self, request: u64, result: Result<Names, String>, now: Instant) {
-        let Some((current, key)) = self.in_flight.take_if(|(r, _)| *r == request) else {
+        let Some((current, key, _)) = self.in_flight.take_if(|(r, _, _)| *r == request) else {
             return;
         };
         debug_assert_eq!(current, request);
@@ -320,5 +330,12 @@ mod tests {
             r.want(&thumbs, t0 + KEEP_FOR + MIN_GAP * 2),
             Want::Fetch(_)
         ));
+        // An answer that never comes stops blocking after a while.
+        let t1 = t0 + KEEP_FOR * 3;
+        let Want::Fetch(_) = r.want(&thumbs, t1) else {
+            panic!("asked");
+        };
+        assert!(matches!(r.want(&blob, t1 + MIN_GAP), Want::Wait(_)));
+        assert!(matches!(r.want(&blob, t1 + ANSWER_WITHIN), Want::Fetch(_)));
     }
 }

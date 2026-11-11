@@ -25,6 +25,8 @@ use crate::backend::accounts::Cmd;
 use crate::theme;
 use crate::ui::widgets::button;
 pub use context_menu::bind_keys;
+#[cfg(test)]
+pub(crate) use context_menu::unread_mark;
 use messages::MessageView;
 
 pub struct ChatState {

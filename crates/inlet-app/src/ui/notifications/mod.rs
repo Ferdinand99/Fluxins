@@ -107,22 +107,31 @@ impl State {
 #[derive(Debug, PartialEq, Eq)]
 enum EscapeAction {
     CloseSettings,
+    /// A message menu or dialog is open (without the focus): it closes.
+    CloseMessageOverlay,
     MarkChannel,
     MarkGuild,
     Nothing,
 }
 
 /// A window over the app takes the key first (the settings window closes, a link
-/// confirmation is left alone); with the chat out of sight nothing is marked as read.
+/// confirmation is left alone, a message menu or dialog closes); with the chat out of
+/// sight nothing is marked as read. Escape and Shift+Escape alike: neither marks
+/// anything read while a layer is open.
 fn escape_action(
     settings_open: bool,
     chat_visible: bool,
     link_confirm_open: bool,
+    message_overlay_open: bool,
     shift: bool,
 ) -> EscapeAction {
     if settings_open {
         EscapeAction::CloseSettings
-    } else if !chat_visible || link_confirm_open {
+    } else if link_confirm_open {
+        EscapeAction::Nothing
+    } else if message_overlay_open {
+        EscapeAction::CloseMessageOverlay
+    } else if !chat_visible {
         EscapeAction::Nothing
     } else if shift {
         EscapeAction::MarkGuild
@@ -172,15 +181,17 @@ impl Inlet {
     }
 
     /// Escape (`shift` false) or Shift+Escape.
-    fn on_escape(&mut self, shift: bool, cx: &mut Context<Self>) {
+    fn on_escape(&mut self, shift: bool, window: &mut gpui::Window, cx: &mut Context<Self>) {
         let action = escape_action(
             self.notifications.settings.is_some(),
             self.chat_is_visible(),
             self.overlays.pending_link.is_some() || self.overlays.link_prompt.is_some(),
+            self.chat.actions.overlay.is_some(),
             shift,
         );
         match action {
             EscapeAction::CloseSettings => self.close_notification_settings(cx),
+            EscapeAction::CloseMessageOverlay => self.close_overlay(window, cx),
             EscapeAction::MarkChannel => self.mark_channel_read(cx),
             EscapeAction::MarkGuild => self.mark_guild_read(cx),
             EscapeAction::Nothing => {}
@@ -193,8 +204,12 @@ impl Inlet {
         el: E,
         cx: &mut Context<Self>,
     ) -> E {
-        el.on_action(cx.listener(|this, _: &MarkChannelRead, _, cx| this.on_escape(false, cx)))
-            .on_action(cx.listener(|this, _: &MarkGuildRead, _, cx| this.on_escape(true, cx)))
+        el.on_action(
+            cx.listener(|this, _: &MarkChannelRead, window, cx| this.on_escape(false, window, cx)),
+        )
+        .on_action(
+            cx.listener(|this, _: &MarkGuildRead, window, cx| this.on_escape(true, window, cx)),
+        )
     }
 
     /// Opens the settings window for the open channel and its server.
@@ -231,15 +246,29 @@ mod tests {
     #[test]
     fn escape_marks_read_only_where_the_chat_is_seen() {
         use EscapeAction::*;
-        assert_eq!(escape_action(false, true, false, false), MarkChannel);
-        assert_eq!(escape_action(false, true, false, true), MarkGuild);
+        assert_eq!(escape_action(false, true, false, false, false), MarkChannel);
+        assert_eq!(escape_action(false, true, false, false, true), MarkGuild);
         // Under the About view: nothing, not the channel behind it.
-        assert_eq!(escape_action(false, false, false, false), Nothing);
-        assert_eq!(escape_action(false, false, false, true), Nothing);
+        assert_eq!(escape_action(false, false, false, false, false), Nothing);
+        assert_eq!(escape_action(false, false, false, false, true), Nothing);
         // A link confirmation keeps the key for itself.
-        assert_eq!(escape_action(false, true, true, false), Nothing);
+        assert_eq!(escape_action(false, true, true, false, false), Nothing);
         // The settings window closes first, with or without Shift.
-        assert_eq!(escape_action(true, true, false, false), CloseSettings);
-        assert_eq!(escape_action(true, true, false, true), CloseSettings);
+        assert_eq!(
+            escape_action(true, true, false, false, false),
+            CloseSettings
+        );
+        assert_eq!(escape_action(true, true, false, false, true), CloseSettings);
+        // A message menu or dialog closes, with or without Shift; nothing is read.
+        assert_eq!(
+            escape_action(false, true, false, true, false),
+            CloseMessageOverlay
+        );
+        assert_eq!(
+            escape_action(false, true, false, true, true),
+            CloseMessageOverlay
+        );
+        // A link prompt over it keeps the key.
+        assert_eq!(escape_action(false, true, true, true, true), Nothing);
     }
 }

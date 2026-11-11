@@ -344,4 +344,41 @@ mod tests {
         assert!(!s.messages(CH).unwrap().has_newest());
         assert!(!should_read_now(&view, &s, CH, SEEN), "detached");
     }
+
+    #[test]
+    fn mark_unread_holds_against_the_tick_and_a_waiting_ack() {
+        use crate::backend::messages::ack::AckGate;
+        use inlet_state::MessageId;
+        use std::time::{Duration, Instant};
+
+        let mut s = state();
+        newest_page(&mut s);
+        let view = MessageView::loaded_for_tests();
+        // The channel was read while watched: an acknowledgement waits in the gate.
+        let t0 = Instant::now();
+        let mut gate = AckGate::default();
+        let _ = s.mark_read(CH, None, AckKind::Automatic);
+        gate.note(CH, MessageId(mid(109)), t0);
+        assert!(!s.unread(CH).unread);
+
+        // "Mark as unread" from mid(106): the mark goes to the message before it, and
+        // the waiting acknowledgement is dropped (what `drop_pending_ack` does).
+        let mark = crate::ui::chat::unread_mark(&s, CH, MessageId(mid(106))).unwrap();
+        assert_eq!(mark.after, MessageId(mid(105)));
+        let _ = s.apply(&mark.ack);
+        gate.clear(CH, t0);
+        assert!(s.unread(CH).unread);
+
+        // The tick: watched, at the bottom, unread, so it tries an automatic read. The
+        // state ignores it while the mark holds, so nothing is acknowledged either.
+        assert!(should_read_now(&view, &s, CH, SEEN));
+        let changes = s.mark_read(CH, None, AckKind::Automatic);
+        assert!(!changes.read_state, "an automatic read does not undo it");
+        assert!(s.unread(CH).unread);
+        assert!(gate.due(t0 + Duration::from_secs(4)).is_empty());
+
+        // Reading on purpose (Escape, the banner, opening the channel again) clears it.
+        let _ = s.mark_read(CH, None, AckKind::Explicit);
+        assert!(!s.unread(CH).unread);
+    }
 }

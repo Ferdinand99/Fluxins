@@ -27,7 +27,7 @@ use crate::theme;
 use crate::ui::markdown::{self, Block, RenderCtx};
 
 /// How long clicks on one message are collected before the net change goes out
-/// (the plan's budget: reaction clicks coalesced over 500 ms per message).
+/// (the request budget: reaction clicks are coalesced over 500 ms per message).
 pub const WINDOW: Duration = Duration::from_millis(500);
 /// Messages with clicks waiting at once; more clicks are ignored until a window ends.
 pub const MAX_MESSAGES: usize = 50;

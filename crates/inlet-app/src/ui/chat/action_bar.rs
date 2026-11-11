@@ -7,7 +7,7 @@
 //! the account may not do are not shown, and the rights are checked again when an action
 //! runs, so a menu that stayed open while a role changed cannot do more than it may.
 //! Unknown rights are no rights: until the roles are loaded nothing that needs one is
-//! offered.
+//! offered (copying the text, link or ID needs none).
 //!
 //! The bar shows the quick reactions, "add reaction", edit (own messages) or reply,
 //! forward and "more" (the context menu); the context menu lists everything.
@@ -19,7 +19,9 @@ use gpui::{
     SharedString, Svg, Window,
 };
 use inlet_protocol as p;
-use inlet_protocol::permissions::{MANAGE_MESSAGES, READ_MESSAGE_HISTORY, VIEW_CHANNEL};
+use inlet_protocol::permissions::{
+    ADMINISTRATOR, MANAGE_MESSAGES, READ_MESSAGE_HISTORY, VIEW_CHANNEL,
+};
 use inlet_state::{AccountState, ChannelId, MessageId, Permissions, UserId};
 
 use super::context_menu::Overlay;
@@ -91,26 +93,37 @@ pub struct Perms {
     pub bits: Permissions,
     /// A direct message or group: every bit is set there, but nobody moderates.
     pub private: bool,
+    /// The account is in a communication timeout in this guild (and is no
+    /// administrator): no reactions and no edits, as the API refuses them.
+    pub timed_out: bool,
 }
 
 impl Perms {
     /// The rights in `ch`. An unknown channel, or a guild whose roles are not loaded
     /// yet, has none.
     pub fn of(state: &AccountState, ch: ChannelId) -> Perms {
+        let bits = state.channel_permissions(ch);
+        let guild = state.channels().guild_of(ch);
+        let timed_out = guild
+            .and_then(|g| state.guild(g))
+            .and_then(|g| g.members.me())
+            .is_some_and(|m| m.is_timed_out_at(state.now_ms()))
+            && !bits.has(ADMINISTRATOR);
         Perms {
-            bits: state.channel_permissions(ch),
-            private: state.channel(ch).is_some() && state.channels().guild_of(ch).is_none(),
+            bits,
+            private: state.channel(ch).is_some() && guild.is_none(),
+            timed_out,
         }
     }
 
-    /// Whether a reaction may be added: a new emoji needs `ADD_REACTIONS`; joining an
-    /// existing reaction needs only to read the history (as Fluxer's API allows).
+    /// Whether a reaction may be added, as Fluxer's API decides: a new emoji needs
+    /// `ADD_REACTIONS`; joining an existing one needs that or the history; never during
+    /// a timeout.
     pub fn may_react(self, exists: bool) -> bool {
-        if exists {
-            self.bits.has(VIEW_CHANNEL | READ_MESSAGE_HISTORY)
-        } else {
-            self.bits.can_react()
+        if self.timed_out {
+            return false;
         }
+        self.bits.can_react() || (exists && self.bits.has(VIEW_CHANNEL | READ_MESSAGE_HISTORY))
     }
 
     /// Whether someone else's message may be deleted or have its embeds hidden.
@@ -150,6 +163,9 @@ pub struct Facts {
     pub has_text: bool,
     pub has_embeds: bool,
     pub embeds_hidden: bool,
+    /// Its kind can be edited by the account ([`p::Message::can_edit`]: an own default
+    /// message or reply, not a forward or a system message).
+    pub editable: bool,
     /// Saved by the account (as far as this session knows).
     pub saved: bool,
 }
@@ -233,7 +249,9 @@ pub fn menu_actions(f: &Facts) -> Vec<Action> {
     if f.perms.may_react(false) {
         out.push(Action::AddReaction);
     }
-    if f.own && b.can_send() {
+    // As Fluxer: editing an own message does not need SEND_MESSAGES, but the API
+    // refuses it during a timeout.
+    if f.editable && b.can_view() && !f.perms.timed_out {
         out.push(Action::Edit);
     }
     if b.can_send() {
@@ -245,7 +263,9 @@ pub fn menu_actions(f: &Facts) -> Vec<Action> {
     if b.can_pin() {
         out.push(if f.pinned { Action::Unpin } else { Action::Pin });
     }
-    out.push(Action::MarkUnread);
+    if b.can_view() {
+        out.push(Action::MarkUnread);
+    }
     if read {
         out.push(if f.saved {
             Action::Unsave
@@ -253,7 +273,9 @@ pub fn menu_actions(f: &Facts) -> Vec<Action> {
             Action::Save
         });
     }
-    if f.has_embeds && (f.own || f.perms.moderates()) {
+    // A message whose embeds are hidden may have none listed (the server stops
+    // fetching them), and must still be able to show them again.
+    if (f.has_embeds || f.embeds_hidden) && (f.own || f.perms.moderates()) {
         out.push(if f.embeds_hidden {
             Action::ShowEmbeds
         } else {
@@ -317,7 +339,9 @@ impl Inlet {
         let state = self.account.as_ref()?.read(cx);
         let m = state.messages(ch)?.get(id)?;
         let meta = RowMeta::of(state.me_id(), m);
+        let me = state.me_id().to_string();
         Some(Facts {
+            editable: m.can_edit(&me),
             perms: Perms::of(state, ch),
             own: meta.own,
             pinned: meta.pinned,
@@ -359,6 +383,8 @@ impl Inlet {
                 spread_radius: px(0.),
                 inset: false,
             }])
+            // The bar sticks out over the row above: only the bar takes the pointer there.
+            .occlude()
             .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                 this.chat.actions.hover_bar(id, *hovered);
                 cx.notify();
@@ -597,6 +623,18 @@ mod tests {
     /// A guild channel `100` where @everyone has `everyone` and the account has role
     /// `30` with `mine`; and a DM `200`.
     fn state(everyone: u64, mine: u64) -> AccountState {
+        state_with(everyone, mine, json!({}))
+    }
+
+    /// [`state`] with more fields on the account's member (a timeout).
+    fn state_with(everyone: u64, mine: u64, member: serde_json::Value) -> AccountState {
+        let mut me =
+            json!({"user": {"id": "10"}, "roles": ["30"], "joined_at": "2026-01-01T00:00:00Z"});
+        if let (Some(obj), Some(more)) = (me.as_object_mut(), member.as_object()) {
+            for (k, v) in more {
+                obj.insert(k.clone(), v.clone());
+            }
+        }
         let ready: p::Ready = serde_json::from_value(json!({
             "session_id": "s",
             "user": {"id": "10", "username": "me"},
@@ -608,7 +646,7 @@ mod tests {
                     {"id": "20", "name": "@everyone", "permissions": everyone.to_string(), "position": 0},
                     {"id": "30", "name": "Mods", "permissions": mine.to_string(), "position": 1}
                 ],
-                "members": [{"user": {"id": "10"}, "roles": ["30"], "joined_at": "2026-01-01T00:00:00Z"}]
+                "members": [me]
             }],
             "private_channels": [{"id": "200", "type": 1, "recipients": [{"id": "7", "username": "ada"}]}],
         }))
@@ -624,6 +662,7 @@ mod tests {
             has_text: true,
             has_embeds: true,
             embeds_hidden: false,
+            editable: own,
             saved: false,
         }
     }
@@ -691,23 +730,23 @@ mod tests {
         assert!(menu.contains(&Action::CopyLink));
         assert!(menu.contains(&Action::Forward));
         assert_eq!(bar_actions(&f), vec![Action::Forward]);
-        // Even the own message: no edit without the right to send.
-        assert!(!menu_actions(&facts(&reader, 100, true)).contains(&Action::Edit));
+        // The own message can be edited without the right to send, as in Fluxer.
+        assert!(menu_actions(&facts(&reader, 100, true)).contains(&Action::Edit));
         // Joining an existing reaction needs only the history; a new one needs the right.
         assert!(f.perms.may_react(true));
         assert!(!f.perms.may_react(false));
+        // With ADD_REACTIONS but no history, both are allowed (the API takes either).
+        let reactor = state(bits::VIEW_CHANNEL | bits::ADD_REACTIONS, 0);
+        let p = Perms::of(&reactor, ChannelId(100));
+        assert!(p.may_react(true) && p.may_react(false));
 
-        // Not even allowed to read (or the roles are not loaded): nothing but copying.
+        // Not even allowed to see the channel (or the roles are not loaded): nothing
+        // but copying.
         let none = state(0, 0);
         let f = facts(&none, 100, false);
         assert_eq!(
             menu_actions(&f),
-            vec![
-                Action::MarkUnread,
-                Action::CopyText,
-                Action::CopyLink,
-                Action::CopyId
-            ]
+            vec![Action::CopyText, Action::CopyLink, Action::CopyId]
         );
         assert!(!f.perms.may_react(true));
         assert!(bar_actions(&f).is_empty());
@@ -733,6 +772,59 @@ mod tests {
         let admin = state(READER, bits::ADMINISTRATOR);
         let menu = menu_actions(&facts(&admin, 100, false));
         assert!(menu.contains(&Action::Delete) && menu.contains(&Action::Pin));
+
+        // A timeout: no reactions (not even joining one) and no edits; reading stays.
+        let timed_out = state_with(
+            MEMBER,
+            0,
+            json!({"communication_disabled_until": "2099-01-01T00:00:00Z"}),
+        );
+        let f = facts(&timed_out, 100, true);
+        assert!(f.perms.timed_out);
+        assert!(!f.perms.may_react(true) && !f.perms.may_react(false));
+        let menu = menu_actions(&f);
+        assert!(!menu.contains(&Action::AddReaction) && !menu.contains(&Action::Edit));
+        assert!(menu.contains(&Action::Forward) && menu.contains(&Action::MarkUnread));
+    }
+
+    #[test]
+    fn only_editable_kinds_offer_edit_and_hidden_embeds_can_be_shown() {
+        let member = state(MEMBER, 0);
+        // An own system message or forward is not editable.
+        let not_editable = Facts {
+            editable: false,
+            ..facts(&member, 100, true)
+        };
+        assert!(!menu_actions(&not_editable).contains(&Action::Edit));
+        // Hidden embeds that the message no longer lists can be shown again.
+        let hidden = Facts {
+            has_embeds: false,
+            embeds_hidden: true,
+            ..facts(&member, 100, true)
+        };
+        assert!(menu_actions(&hidden).contains(&Action::ShowEmbeds));
+        let none = Facts {
+            has_embeds: false,
+            ..facts(&member, 100, true)
+        };
+        assert!(!menu_actions(&none).contains(&Action::HideEmbeds));
+
+        let me = "10";
+        let own = |extra: serde_json::Value| -> p::Message {
+            let mut v = json!({"id": "5", "channel_id": "100", "author": {"id": me, "username": "me"},
+                               "type": 0, "content": "x", "timestamp": "2026-10-01T12:00:00Z"});
+            for (k, val) in extra.as_object().unwrap() {
+                v[k] = val.clone();
+            }
+            serde_json::from_value(v).unwrap()
+        };
+        assert!(own(json!({})).can_edit(me));
+        assert!(!own(json!({"type": 6})).can_edit(me), "a pin notice");
+        assert!(
+            !own(json!({"message_reference": {"type": 1, "message_id": "1", "channel_id": "2"}}))
+                .can_edit(me),
+            "a forward"
+        );
     }
 
     #[test]

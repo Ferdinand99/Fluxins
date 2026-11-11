@@ -50,24 +50,25 @@ fn reply_notified_author(m: &p::Message) -> Option<bool> {
     Some(m.mentions.iter().any(|u| u.id == author))
 }
 
-/// The newest message of the account in the channel's window, never someone else's.
+/// The newest message of the account in the channel's window that it can edit (a
+/// default message or reply, not a forward or a system message), never someone else's.
 pub fn last_own(state: &AccountState, channel: ChannelId) -> Option<EditTarget> {
     let me = state.me_id();
     let m = state
         .messages(channel)?
         .iter()
         .rev()
-        .find(|m| UserId::parse(&m.author.id) == Some(me))?;
+        .find(|m| UserId::parse(&m.author.id) == Some(me) && m.can_edit(&me.to_string()))?;
     Some(target_of(channel, m))
 }
 
-/// One message of the account in the channel's window, never someone else's.
+/// One message of the account in the channel's window, if its kind can be edited.
 pub fn own(state: &AccountState, channel: ChannelId, id: MessageId) -> Option<EditTarget> {
     let me = state.me_id();
     let m = state
         .messages(channel)?
         .get(id)
-        .filter(|m| UserId::parse(&m.author.id) == Some(me))?;
+        .filter(|m| UserId::parse(&m.author.id) == Some(me) && m.can_edit(&me.to_string()))?;
     Some(target_of(channel, m))
 }
 

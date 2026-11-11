@@ -3,17 +3,20 @@
 //! in the bar), the emoji list of "add reaction", who reacted, the delete confirmation
 //! and the forward picker. One is open at a time.
 //!
-//! An open overlay takes the keyboard focus, so Escape closes it before it can reach
-//! the app's "mark as read" (the composer, when it has focus, cancels its own reply or
-//! edit first). Closing gives the focus back to where it was. A click outside a menu
-//! closes it. Enter confirms a delete.
+//! An open overlay takes the keyboard focus, so Escape and Shift+Escape close it before
+//! they can reach the app's "mark as read" (the composer, when it has focus, cancels
+//! its own reply or edit first). The focus is taken back after a layer over it (the
+//! link prompt) closes, and the app's own Escape handling also closes an open overlay
+//! instead of marking anything read. Closing gives the focus back to where it was, or to
+//! the composer. A click outside a menu closes it. Enter confirms a delete.
 
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use gpui::{
     actions, anchored, deferred, div, point, prelude::*, px, AnyElement, App, ClickEvent, Context,
-    FocusHandle, FontWeight, KeyBinding, MouseDownEvent, Pixels, Point, SharedString, Window,
+    FocusHandle, Focusable, FontWeight, KeyBinding, MouseDownEvent, Pixels, Point, SharedString,
+    Window,
 };
 use inlet_protocol as p;
 use inlet_protocol::models::channel_type;
@@ -46,6 +49,9 @@ const MAX_SAVED: usize = 500;
 const IN_FLIGHT_FOR: Duration = Duration::from_secs(30);
 /// Destinations the forward picker lists.
 const MAX_DESTINATIONS: usize = 40;
+/// Of those, at most this many channels of the open server, so direct messages always
+/// get a place.
+const MAX_GUILD_DESTINATIONS: usize = 30;
 /// Width of the context menu.
 const MENU_WIDTH: f32 = 220.;
 
@@ -54,6 +60,7 @@ const MENU_WIDTH: f32 = 220.;
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("escape", CloseMessageOverlay, Some(KEY_CONTEXT)),
+        KeyBinding::new("shift-escape", CloseMessageOverlay, Some(KEY_CONTEXT)),
         KeyBinding::new("enter", ConfirmMessageOverlay, Some(KEY_CONTEXT)),
     ]);
 }
@@ -115,6 +122,8 @@ pub struct ActionsState {
     hovered_bar: Option<MessageId>,
     focus: Option<FocusHandle>,
     restore_focus: Option<FocusHandle>,
+    /// An overlay has the focus (and gives it back when it closes).
+    holds_focus: bool,
     /// Demo scenes: a bar shown without the pointer.
     pub shown_bar: Option<MessageId>,
     #[cfg(feature = "demo")]
@@ -198,6 +207,49 @@ impl ActionsState {
     }
 }
 
+/// What "mark as unread" from a message sets: the read mark (the message before it in
+/// the window, or the ID just below), the mentions of the account after it, and the
+/// manual acknowledgement for the state. As Fluxer's `markAsUnread`. `None` without a
+/// window. A channel without a read state ignores the acknowledgement locally; the
+/// server still gets it.
+pub(crate) struct UnreadMark {
+    pub after: MessageId,
+    pub mentions: u64,
+    pub ack: p::Dispatch,
+}
+
+pub(crate) fn unread_mark(
+    state: &inlet_state::AccountState,
+    ch: ChannelId,
+    id: MessageId,
+) -> Option<UnreadMark> {
+    let w = state.messages(ch)?;
+    let after = w
+        .iter()
+        .filter_map(|m| MessageId::parse(&m.id))
+        .filter(|m| *m < id)
+        .max()
+        .unwrap_or(MessageId(id.0.saturating_sub(1)));
+    let me = state.me_id().to_string();
+    let mentions = w
+        .iter()
+        .filter(|m| MessageId::parse(&m.id).is_some_and(|m| m > after))
+        .filter(|m| m.author.id != me && mentions_me(state, ch, m))
+        .count() as u64;
+    let ack = serde_json::from_value::<p::models::MessageAck>(json!({
+        "channel_id": ch.to_string(),
+        "message_id": after.to_string(),
+        "mention_count": mentions,
+        "manual": true,
+    }))
+    .ok()?;
+    Some(UnreadMark {
+        after,
+        mentions,
+        ack: p::Dispatch::MessageAck(Box::new(ack)),
+    })
+}
+
 /// The frame every overlay is drawn in: it holds the focus and the keys.
 fn key_frame(focus: &FocusHandle) -> gpui::Div {
     div().key_context(KEY_CONTEXT).track_focus(focus)
@@ -231,6 +283,7 @@ impl Inlet {
             a.restore_focus = window.focused(cx).filter(|f| *f != focus);
         }
         a.overlay = Some(overlay);
+        a.holds_focus = true;
         window.focus(&focus, cx);
         cx.notify();
     }
@@ -241,12 +294,39 @@ impl Inlet {
         if a.overlay.take().is_none() {
             return;
         }
-        if let Some(back) = a.restore_focus.take() {
-            window.focus(&back, cx);
-        } else {
-            window.focus(&self.focus, cx);
-        }
+        a.holds_focus = false;
+        let back = a
+            .restore_focus
+            .take()
+            .unwrap_or_else(|| self.composer.view.focus_handle(cx));
+        window.focus(&back, cx);
         cx.notify();
+    }
+
+    /// Called when the window is drawn: an open overlay keeps the keyboard (it takes it
+    /// back after a layer over it, such as the link prompt, closed), and one that closed
+    /// by itself (its message went, another channel opened) gives it back. Layers over
+    /// the chat (`desktop::layer_open`) own the keyboard while they are open.
+    pub(crate) fn focus_message_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.layer_open() {
+            return;
+        }
+        let composer = self.composer.view.focus_handle(cx);
+        let a = &mut self.chat.actions;
+        if a.overlay.is_some() {
+            let handle = a.focus.get_or_insert_with(|| cx.focus_handle()).clone();
+            if !handle.is_focused(window) {
+                if !a.holds_focus {
+                    a.restore_focus = window.focused(cx).filter(|f| *f != handle);
+                    a.holds_focus = true;
+                }
+                cx.defer_in(window, move |_, window, cx| handle.focus(window, cx));
+            }
+        } else if a.holds_focus {
+            a.holds_focus = false;
+            let back = a.restore_focus.take().unwrap_or(composer);
+            cx.defer_in(window, move |_, window, cx| back.focus(window, cx));
+        }
     }
 
     /// The pointer entered or left message row `id`.
@@ -269,35 +349,15 @@ impl Inlet {
         let Some(account) = self.account.clone() else {
             return;
         };
-        let (after, mentions) = {
-            let state = account.read(cx);
-            let Some(w) = state.messages(ch) else {
-                return;
-            };
-            let after = w
-                .iter()
-                .filter_map(|m| MessageId::parse(&m.id))
-                .filter(|m| *m < id)
-                .max()
-                .unwrap_or(MessageId(id.0.saturating_sub(1)));
-            let me = state.me_id().to_string();
-            let mentions = w
-                .iter()
-                .filter(|m| MessageId::parse(&m.id).is_some_and(|m| m > after))
-                .filter(|m| m.author.id != me && mentions_me(state, ch, m))
-                .count() as u64;
-            (after, mentions)
-        };
-        let ack = serde_json::from_value::<p::models::MessageAck>(json!({
-            "channel_id": ch.to_string(),
-            "message_id": after.to_string(),
-            "mention_count": mentions,
-            "manual": true,
-        }));
-        let Ok(ack) = ack else {
+        let Some(UnreadMark {
+            after,
+            mentions,
+            ack,
+        }) = unread_mark(account.read(cx), ch, id)
+        else {
             return;
         };
-        let changes = account.update(cx, |s, _| s.apply(&p::Dispatch::MessageAck(Box::new(ack))));
+        let changes = account.update(cx, |s, _| s.apply(&ack));
         // An acknowledgement still waiting would move the mark forward again.
         self.notifications.drop_pending_ack(ch);
         self.chat.view.mark_unread_after(ch, after);
@@ -405,7 +465,9 @@ impl Inlet {
         let (ch, id) = overlay.target();
         // The message went away, or another channel is open: nothing to act on.
         if self.open_channel_id() != Some(ch) || self.action_facts(ch, id, cx).is_none() {
+            // The focus goes back on the next frame (`focus_message_overlay`).
             self.chat.actions.overlay = None;
+            cx.notify();
             return Vec::new();
         }
         let focus = self
@@ -703,6 +765,7 @@ impl Inlet {
                 }
             }
         }
+        out.truncate(MAX_GUILD_DESTINATIONS);
         for c in state.private_channels() {
             let Some(id) = ChannelId::parse(&c.id) else {
                 continue;
@@ -729,6 +792,9 @@ impl Inlet {
     }
 
     /// "Forward message": one click on a destination sends it there.
+    // Deviation: Fluxer's forward dialog searches every destination, takes several at
+    // once and a comment; Inlet lists the open server's channels and the direct
+    // messages, and forwards to one per click.
     fn render_forward(
         &mut self,
         focus: &FocusHandle,
@@ -984,6 +1050,11 @@ mod tests {
                         h.marked_read += 1
                     }),
                 )
+                .on_action(
+                    cx.listener(|h, _: &crate::ui::notifications::MarkGuildRead, _, _| {
+                        h.marked_read += 1
+                    }),
+                )
                 .child(
                     key_frame(&self.focus)
                         .size(px(100.))
@@ -993,7 +1064,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn escape_closes_the_menu_before_it_marks_the_channel_read(cx: &mut TestAppContext) {
+    fn escape_and_shift_escape_close_the_menu_and_mark_nothing_read(cx: &mut TestAppContext) {
         // The app's bindings in the app's order: the global Escape first, then the
         // overlay's.
         cx.update(crate::ui::notifications::bind_keys);
@@ -1006,5 +1077,8 @@ mod tests {
         host.update_in(cx, |h, window, cx| window.focus(&h.focus, cx));
         cx.simulate_keystrokes("escape");
         assert_eq!(host.read_with(cx, |h, _| (h.closed, h.marked_read)), (1, 0));
+        // Shift+Escape (mark the whole server read) closes it too, and reads nothing.
+        cx.simulate_keystrokes("shift-escape");
+        assert_eq!(host.read_with(cx, |h, _| (h.closed, h.marked_read)), (2, 0));
     }
 }
