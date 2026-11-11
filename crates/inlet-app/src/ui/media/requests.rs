@@ -108,8 +108,11 @@ fn embed_url(proxy: &p::Media, m: &EmbedMedia, t: Transform) -> Option<String> {
         })
 }
 
-/// Media of the instance itself (emoji, stickers, avatars) at a URL on the media
-/// endpoint, with the transform. `None` for any URL elsewhere.
+/// Media of the instance itself (emoji, stickers, avatars, icons) at a URL on the media
+/// endpoint, with the transform. `None` for any URL elsewhere. Those are the proxy's
+/// asset routes: they take one `size` (the larger side, on the size ladder), not a
+/// width and height, and `animated` is said either way, since without it an `a_` asset
+/// comes animated.
 fn own_media(proxy: &p::Media, u: &str, t: Transform) -> Option<String> {
     let base = Url::parse(proxy.base()).ok()?;
     let mut url = Url::parse(u.trim()).ok()?;
@@ -119,7 +122,12 @@ fn own_media(proxy: &p::Media, u: &str, t: Transform) -> Option<String> {
     url.set_fragment(None);
     let keep: Vec<(String, String)> = url
         .query_pairs()
-        .filter(|(k, _)| !matches!(k.as_ref(), "width" | "height" | "format" | "animated"))
+        .filter(|(k, _)| {
+            !matches!(
+                k.as_ref(),
+                "width" | "height" | "size" | "format" | "animated"
+            )
+        })
         .map(|(k, v)| (k.into_owned(), v.into_owned()))
         .collect();
     url.set_query(None);
@@ -128,18 +136,13 @@ fn own_media(proxy: &p::Media, u: &str, t: Transform) -> Option<String> {
         for (k, v) in &keep {
             q.append_pair(k, v);
         }
-        if let Some(w) = t.width {
-            q.append_pair("width", &w.clamp(1, 16_384).to_string());
-        }
-        if let Some(h) = t.height {
-            q.append_pair("height", &h.clamp(1, 16_384).to_string());
+        if let Some(side) = t.width.max(t.height) {
+            q.append_pair("size", &snap_proxy_size(side.clamp(1, 16_384)).to_string());
         }
         if let Some(f) = t.format {
             q.append_pair("format", image_format_name(f));
         }
-        if t.animated {
-            q.append_pair("animated", "true");
-        }
+        q.append_pair("animated", if t.animated { "true" } else { "false" });
     }
     let mut s: String = url.into();
     if s.ends_with('?') {
@@ -257,7 +260,8 @@ pub fn attachment_preview(
 /// `animate` the animation of an animated one (smaller, see
 /// [`VIEWER_ANIMATED_MAX_PIXELS`]).
 pub fn attachment_full(proxy: &p::Media, a: &Attachment, animate: bool) -> Option<MediaRequest> {
-    if animate && !a.animated {
+    let video = a.kind == crate::model::AttachmentKind::Video;
+    if animate && (!a.animated || video) {
         return None;
     }
     let max = if animate {
@@ -397,7 +401,9 @@ pub fn embed_icon(
         ..Default::default()
     };
     request(
-        proxy.external(proxy_url, t),
+        proxy
+            .external(proxy_url, t)
+            .or_else(|| own_media(proxy, proxy_url, t)),
         MediaKind::Avatar,
         Fit::square(px),
         px,
@@ -494,7 +500,27 @@ mod tests {
         let req = embed_image(&proxy, &own, PREVIEW_MAX, 1., false).unwrap();
         assert_eq!(req.url.host_str(), Some("media.example.org"));
         assert_eq!(req.url.path(), "/emojis/123.gif");
+        // The asset route takes one size, and the still says it is not animated.
         assert!(has(&req, "size", "96") && has(&req, "format", "webp"));
+        assert!(has(&req, "animated", "false"));
+        assert!(!query(&req)
+            .iter()
+            .any(|(k, _)| k == "width" || k == "height"));
+        assert_eq!(query(&req).iter().filter(|(k, _)| k == "size").count(), 1);
+        let moving = embed_image(&proxy, &own, PREVIEW_MAX, 1., true).unwrap();
+        assert!(has(&moving, "animated", "true"));
+        // A bot's avatar link asks for 1024: the request asks for the size shown.
+        let avatar = EmbedMedia {
+            url: "https://media.example.org/avatars/5/abc.png?size=1024".into(),
+            proxy_url: Some("https://media.example.org/avatars/5/abc.png?size=1024".into()),
+            width: Some(1024),
+            height: Some(1024),
+            ..Default::default()
+        };
+        let thumb = embed_image(&proxy, &avatar, EMBED_THUMBNAIL_MAX, 2., false).unwrap();
+        assert!(has(&thumb, "size", "160"), "{}", thumb.url);
+        let icon = embed_icon(&proxy, "https://media.example.org/icons/7/def.png", 24., 1.);
+        assert!(icon.is_some_and(|r| has(&r, "size", "24")));
         // No proxy URL, but the media's own URL is on the endpoint: used.
         let bare = EmbedMedia {
             proxy_url: None,
@@ -519,6 +545,34 @@ mod tests {
             );
             assert!(embed_original(&proxy, &m).is_none(), "{bad}");
         }
+        // An endpoint with a path: only URLs under that path are its own.
+        let under = p::Media::new("https://x.example/media").unwrap();
+        for (url, ok) in [
+            ("https://x.example/media/emojis/1.gif", true),
+            ("https://x.example/other/emojis/1.gif", false),
+            ("https://x.example/mediaxyz/emojis/1.gif", false),
+            ("https://x.example/media/../api/v1/users/@me", false),
+        ] {
+            let m = EmbedMedia {
+                url: url.into(),
+                proxy_url: Some(url.into()),
+                ..Default::default()
+            };
+            assert_eq!(
+                embed_image(&under, &m, PREVIEW_MAX, 1., false).is_some(),
+                ok,
+                "{url}"
+            );
+        }
+        // A video attachment is never asked for as an animation, in the viewer either.
+        let clip = Attachment {
+            proxy_url: Some("https://media.example.org/attachments/1/2/c.gif".into()),
+            kind: crate::model::AttachmentKind::Video,
+            animated: true,
+            ..Default::default()
+        };
+        assert!(attachment_full(&proxy, &clip, true).is_none());
+        assert!(attachment_preview(&proxy, &clip, 1., true).is_none());
     }
 
     #[test]

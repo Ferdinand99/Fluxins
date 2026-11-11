@@ -65,6 +65,22 @@ fn field_rows(fields: &[EmbedField], with_thumbnail: bool) -> Vec<Vec<&EmbedFiel
     rows
 }
 
+/// The "GIF" mark in the corner of a GIF page shown as a still.
+fn gif_badge() -> AnyElement {
+    div()
+        .absolute()
+        .bottom(px(6.))
+        .left(px(6.))
+        .px(px(6.))
+        .rounded(px(4.))
+        .bg(theme::media_overlay())
+        .text_size(px(12.))
+        .font_weight(FontWeight::BOLD)
+        .text_color(theme::text_strong())
+        .child(t!("media-gif-badge"))
+        .into_any_element()
+}
+
 /// Whether an embed belongs to a link hidden in a spoiler: its page or one of its media
 /// is one of `hidden`.
 pub(super) fn embed_spoilered(e: &model::Embed, hidden: &[String]) -> bool {
@@ -130,18 +146,22 @@ pub(super) fn render_embed(
             .or(e.thumbnail.as_ref())
             .or(e.video.as_ref())
         {
+            let picture = this.embed_image(
+                id,
+                m,
+                requests::PREVIEW_MAX,
+                0.,
+                e.nsfw,
+                t!("embed-image"),
+                &origin,
+                cx,
+            );
+            // A GIF page that only has its video shows the first frame: the badge says
+            // it is a GIF, which plays on the site (no video player here).
+            let badge = (e.kind == EmbedKind::Gifv && m.video).then(gif_badge);
             return div()
                 .pt_1()
-                .child(this.embed_image(
-                    id,
-                    m,
-                    requests::PREVIEW_MAX,
-                    0.,
-                    e.nsfw,
-                    t!("embed-image"),
-                    &origin,
-                    cx,
-                ))
+                .child(div().relative().child(picture).children(badge))
                 .into_any_element();
         }
     }

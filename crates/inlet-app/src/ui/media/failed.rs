@@ -142,6 +142,11 @@ impl Inlet {
         retry: Vec<MediaRequest>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        // Only what can work the next time: an animation that was too large stays out.
+        let retry: Vec<MediaRequest> = retry
+            .into_iter()
+            .filter(|r| !self.failed_for_good(r))
+            .collect();
         let retry = (trouble.can_retry() && !retry.is_empty()).then_some(retry);
         let link = origin.link.clone();
         let layout = TileLayout::of((w, h));

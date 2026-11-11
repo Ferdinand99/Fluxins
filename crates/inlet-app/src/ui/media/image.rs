@@ -236,6 +236,29 @@ impl Inlet {
         still: Option<&MediaRequest>,
         cx: &mut Context<Self>,
     ) -> Shown {
+        self.moving_with(moving, still, false, cx)
+    }
+
+    /// [`Inlet::moving`] for the previews of attachments and embeds: while the
+    /// animation loads, the still loads too and shows first, so a slow or failing GIF
+    /// never leaves an empty box. Emoji, stickers, avatars, the pickers and the viewer
+    /// use [`Inlet::moving`], which only borrows a still that is already at hand.
+    pub(crate) fn moving_preview(
+        &self,
+        moving: Option<&MediaRequest>,
+        still: Option<&MediaRequest>,
+        cx: &mut Context<Self>,
+    ) -> Shown {
+        self.moving_with(moving, still, true, cx)
+    }
+
+    fn moving_with(
+        &self,
+        moving: Option<&MediaRequest>,
+        still: Option<&MediaRequest>,
+        load_still: bool,
+        cx: &mut Context<Self>,
+    ) -> Shown {
         // While the picker is the layer on top, only its own images may take a place in
         // the budget: the frozen chat under it shows stills and leaves the room to it.
         let may_move = self.media.images.animations.borrow().may_admit();
@@ -257,12 +280,17 @@ impl Inlet {
                         images.remove(anim);
                     }
                     Shown::Loading => {
-                        // The still loads alongside: it shows first, and it is what
-                        // stays if the animation fails or times out.
-                        return match still.map(|s| self.image(s, cx)) {
-                            Some(Shown::Ready(image)) => Shown::Ready(image),
-                            _ => Shown::Loading,
+                        // A preview's still loads alongside: it shows first, and it is
+                        // what stays if the animation fails or times out.
+                        let at_hand = match still {
+                            Some(s) if load_still => match self.image(s, cx) {
+                                Shown::Ready(image) => Some(image),
+                                _ => None,
+                            },
+                            Some(s) => self.cached_only(s),
+                            None => None,
                         };
+                        return at_hand.map_or(Shown::Loading, Shown::Ready);
                     }
                     // Too large, too many frames, or any other failure: the still.
                     Shown::Failed(_) | Shown::Unavailable => {}
@@ -273,6 +301,27 @@ impl Inlet {
             Some(req) => self.image(req, cx),
             None => Shown::Unavailable,
         }
+    }
+
+    /// An image the views or the cache already hold, without starting a load.
+    fn cached_only(&self, req: &MediaRequest) -> Option<Arc<RenderImage>> {
+        let images = &self.media.images;
+        if let Some(entry) = images.entries.borrow_mut().get_mut(req) {
+            if let Slot::Ready(image) = &entry.slot {
+                entry.used = images.frame.get();
+                return Some(image.clone());
+            }
+        }
+        self.media.setup.as_ref()?.client.cached(req)
+    }
+
+    /// Whether `req` failed in a way asking again cannot help (too large, not an
+    /// image); a retry leaves it out.
+    pub(crate) fn failed_for_good(&self, req: &MediaRequest) -> bool {
+        matches!(
+            self.media.images.entries.borrow().get(req).map(|e| &e.slot),
+            Some(Slot::Failed(err)) if err.is_permanent()
+        )
     }
 
     /// Loads `requests` again from the start: what the views hold of them goes, and

@@ -66,7 +66,7 @@ impl Inlet {
                 let scale = self.media.scale;
                 let still = requests::embed_image(&setup.proxy, m, max, scale, false);
                 let moving = requests::embed_image(&setup.proxy, m, max, scale, true);
-                let shown = self.moving(moving.as_ref(), still.as_ref(), cx);
+                let shown = self.moving_preview(moving.as_ref(), still.as_ref(), cx);
                 (shown, still.into_iter().chain(moving).collect())
             }
             None => (Shown::Unavailable, Vec::new()),

@@ -31,8 +31,9 @@ const MAX_TRACKED: usize = 500;
 /// At most this many refreshes start in [`REFRESH_WINDOW`]; the rest wait.
 const REFRESHES_PER_WINDOW: usize = 4;
 const REFRESH_WINDOW: Duration = Duration::from_secs(10);
-/// How long a preview waits for fresh URLs before it loads what it has: the answer
-/// redraws it sooner, this only bounds a refresh that never answers.
+/// Longest time a preview keeps its placeholder while the refresh of its message is on
+/// its way. The answer (fresh URLs, or a failure) ends the wait sooner; past this the
+/// refresh counts as failed and the old URL decides what shows.
 const REFRESH_WAIT: Duration = Duration::from_secs(15);
 /// Width of a file card.
 pub const FILE_CARD_WIDTH: f32 = 432.;
@@ -49,9 +50,27 @@ pub struct Refresh {
 struct RefreshInner {
     asked: HashSet<String>,
     asked_order: VecDeque<String>,
+    /// Messages whose refresh is on its way, since when.
+    pending: HashMap<String, Instant>,
     fresh: HashMap<String, Attachment>,
     fresh_order: VecDeque<String>,
     recent: VecDeque<Instant>,
+    /// When the one redraw for refreshes held back by the rate limit is due.
+    wake: Option<Instant>,
+}
+
+/// What a preview does about its URLs this frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RefreshState {
+    /// Nothing to refresh (or no second try): load what the attachment has.
+    NotNeeded,
+    /// Ask for fresh URLs now, and wait.
+    Ask,
+    /// The refresh of the message is on its way: keep the placeholder.
+    Waiting,
+    /// The URL has expired, but the rate limit holds the refresh back until then: keep
+    /// the placeholder and draw again at that time.
+    Throttled(Instant),
 }
 
 /// Whether a failed load looks like an expired signed URL.
@@ -82,27 +101,38 @@ impl Refresh {
             .unwrap_or_else(|| a.clone())
     }
 
-    /// Whether to ask for fresh URLs of message `message_id` now: `a` (as drawn) has
-    /// expired by its time, or failed with `failure` the way an expired URL does. Only
-    /// once per message, never for an attachment that was already refreshed, and at most
-    /// a few per ten seconds (a later frame asks again).
-    pub fn want(
+    /// What to do about the URLs of `a` (as drawn) of message `message_id`: ask for
+    /// fresh ones when it has expired by its time, or failed with `failure` the way an
+    /// expired URL does. Only once per message, never for an attachment that was already
+    /// refreshed, and at most a few per ten seconds. While the answer is on its way (up
+    /// to [`REFRESH_WAIT`]) or the rate limit holds the refresh back, the preview waits.
+    pub fn check(
         &self,
         message_id: &str,
         a: &Attachment,
         failure: Option<&MediaError>,
         now_ms: i64,
         now: Instant,
-    ) -> bool {
+    ) -> RefreshState {
         let mut s = self.inner.borrow_mut();
-        if s.fresh.contains_key(&a.id) || s.asked.contains(message_id) {
-            return false;
+        if s.fresh.contains_key(&a.id) {
+            return RefreshState::NotNeeded;
+        }
+        if let Some(since) = s.pending.get(message_id) {
+            if now.saturating_duration_since(*since) < REFRESH_WAIT {
+                return RefreshState::Waiting;
+            }
+            // No answer in time: as good as failed.
+            s.pending.remove(message_id);
+        }
+        if s.asked.contains(message_id) {
+            return RefreshState::NotNeeded;
         }
         let expired = a.expired
             || a.expires_at_ms.is_some_and(|t| t <= now_ms)
             || failure.is_some_and(looks_expired);
         if !expired {
-            return false;
+            return RefreshState::NotNeeded;
         }
         while s
             .recent
@@ -112,14 +142,43 @@ impl Refresh {
             s.recent.pop_front();
         }
         if s.recent.len() >= REFRESHES_PER_WINDOW {
-            return false;
+            let free = s.recent.front().map_or(now, |t| *t + REFRESH_WINDOW);
+            return RefreshState::Throttled(free);
         }
         s.recent.push_back(now);
         s.asked.insert(message_id.to_string());
+        s.pending.insert(message_id.to_string(), now);
         if let Some(old) = remember(&mut s.asked_order, message_id.to_string()) {
             s.asked.remove(&old);
+            s.pending.remove(&old);
         }
-        true
+        RefreshState::Ask
+    }
+
+    /// Whether to ask for fresh URLs now ([`Refresh::check`] says [`RefreshState::Ask`]).
+    #[cfg(test)]
+    pub fn want(
+        &self,
+        message_id: &str,
+        a: &Attachment,
+        failure: Option<&MediaError>,
+        now_ms: i64,
+        now: Instant,
+    ) -> bool {
+        self.check(message_id, a, failure, now_ms, now) == RefreshState::Ask
+    }
+
+    /// Takes the one redraw for refreshes the rate limit holds back: `true` when none
+    /// is due by `at` yet (the caller then schedules it), `false` when one already is.
+    pub fn take_wake(&self, at: Instant, now: Instant) -> bool {
+        let mut s = self.inner.borrow_mut();
+        match s.wake {
+            Some(due) if due > now && due <= at => false,
+            _ => {
+                s.wake = Some(at);
+                true
+            }
+        }
     }
 
     /// Whether the message was asked about.
@@ -129,8 +188,9 @@ impl Refresh {
     }
 
     /// The server's answer: the attachments with fresh URLs.
-    pub fn refreshed(&self, _message_id: &str, attachments: Vec<Attachment>) {
+    pub fn refreshed(&self, message_id: &str, attachments: Vec<Attachment>) {
         let mut s = self.inner.borrow_mut();
+        s.pending.remove(message_id);
         for a in attachments {
             let id = a.id.clone();
             if s.fresh.insert(id.clone(), a).is_none() {
@@ -142,30 +202,45 @@ impl Refresh {
     }
 
     /// The refresh failed. The message stays asked: there is no second try.
-    pub fn failed(&self, _message_id: &str) {}
+    pub fn failed(&self, message_id: &str) {
+        self.inner.borrow_mut().pending.remove(message_id);
+    }
 }
 
 impl Inlet {
-    /// Asks for fresh URLs of a message's attachments when [`Refresh::want`] says so.
+    /// Asks for fresh URLs of a message's attachments when [`Refresh::check`] says so,
+    /// and makes sure a waiting preview is drawn again: once when the answer can be
+    /// given up on, and once (shared by all rows) when the rate limit lets go. Returns
+    /// whether the preview waits.
     fn maybe_refresh(
         &self,
         channel_id: &str,
         message_id: &str,
         a: &Attachment,
         failure: Option<&MediaError>,
+        cx: &mut Context<Self>,
     ) -> bool {
         let now_ms = chrono::Utc::now().timestamp_millis();
-        let ask = self
-            .media
-            .refresh
-            .want(message_id, a, failure, now_ms, Instant::now());
-        if ask {
-            self.backend.send(Cmd::Refresh {
-                channel_id: channel_id.to_string(),
-                message_id: message_id.to_string(),
-            });
+        let now = Instant::now();
+        let refresh = &self.media.refresh;
+        match refresh.check(message_id, a, failure, now_ms, now) {
+            RefreshState::NotNeeded => false,
+            RefreshState::Waiting => true,
+            RefreshState::Ask => {
+                self.backend.send(Cmd::Refresh {
+                    channel_id: channel_id.to_string(),
+                    message_id: message_id.to_string(),
+                });
+                self.redraw_after(REFRESH_WAIT, cx);
+                true
+            }
+            RefreshState::Throttled(at) => {
+                if refresh.take_wake(at, now) {
+                    self.redraw_after(at.saturating_duration_since(now), cx);
+                }
+                true
+            }
         }
-        ask
     }
 
     /// Draws again after `wait`, so a placeholder that waits for an answer never waits
@@ -274,18 +349,17 @@ impl Inlet {
         let Some(setup) = &self.media.setup else {
             return tile(Trouble::Unavailable, cx);
         };
-        // Expired by its time: ask for fresh URLs before loading the old one.
-        if self.maybe_refresh(channel_id, message_id, a, None) {
-            self.redraw_after(REFRESH_WAIT, cx);
+        // Expired by its time, or its refresh is on its way: wait for fresh URLs
+        // before loading the old one.
+        if self.maybe_refresh(channel_id, message_id, a, None, cx) {
             return (placeholder(size, 4., false), false);
         }
         let scale = self.media.scale;
         let still = requests::attachment_preview(&setup.proxy, a, scale, false);
         let moving = requests::attachment_preview(&setup.proxy, a, scale, true);
-        let shown = self.moving(moving.as_ref(), still.as_ref(), cx);
+        let shown = self.moving_preview(moving.as_ref(), still.as_ref(), cx);
         if let Shown::Failed(err) = &shown {
-            if self.maybe_refresh(channel_id, message_id, a, Some(err)) {
-                self.redraw_after(REFRESH_WAIT, cx);
+            if self.maybe_refresh(channel_id, message_id, a, Some(err), cx) {
                 return (placeholder(size, 4., false), false);
             }
         }
@@ -315,10 +389,16 @@ impl Inlet {
         if let Some(cover) = self.cover(key, a.spoiler, a.explicit, size, cx) {
             return cover;
         }
-        let (frame, _) = self.attachment_frame(channel_id, message_id, key, a, size, cx);
+        let (frame, failed) = self.attachment_frame(channel_id, message_id, key, a, size, cx);
         let viewer = super::Viewer::for_attachment(self, a);
         let group = SharedString::from(format!("att-{key}"));
-        let save = self.save_button(&group, key, a, cx);
+        // No save button over a tile: there is nothing to save, and it would cover the
+        // tile's own buttons.
+        let save = if failed {
+            None
+        } else {
+            self.save_button(&group, key, a, cx)
+        };
         div()
             .id(SharedString::from(format!("att-img-{key}")))
             .group(group)
@@ -647,6 +727,74 @@ mod tests {
             now_ms,
             now + REFRESH_WINDOW
         ));
+    }
+
+    #[test]
+    fn an_expired_link_waits_for_its_refresh_then_shows_the_image() {
+        let r = Refresh::default();
+        let now = Instant::now();
+        let now_ms = 1_000_000;
+        let old = att("a1", Some(now_ms - 1));
+        let gone = MediaError::Fetch(FetchError::Status(404));
+
+        // Expired by its time: ask, then wait in every frame until the answer, even
+        // when the old URL has failed meanwhile (no "no longer available" tile).
+        assert_eq!(r.check("m1", &old, None, now_ms, now), RefreshState::Ask);
+        for later in [Duration::ZERO, Duration::from_secs(1), REFRESH_WAIT / 2] {
+            assert_eq!(
+                r.check("m1", &old, Some(&gone), now_ms, now + later),
+                RefreshState::Waiting
+            );
+        }
+        // The answer: the fresh attachment loads, nothing waits any more.
+        let mut fresh = att("a1", Some(now_ms + 86_400_000));
+        fresh.url = Some("https://media.example.org/attachments/1/a1/a.png?ex=2".into());
+        r.refreshed("m1", vec![fresh.clone()]);
+        let shown = r.current(&old);
+        assert_eq!(shown, fresh);
+        assert_eq!(
+            r.check("m1", &shown, None, now_ms, now),
+            RefreshState::NotNeeded
+        );
+
+        // A failed refresh ends the wait: then the old URL decides (the tile).
+        let other = att("b1", Some(now_ms - 1));
+        assert_eq!(r.check("m2", &other, None, now_ms, now), RefreshState::Ask);
+        r.failed("m2");
+        assert_eq!(
+            r.check("m2", &other, Some(&gone), now_ms, now),
+            RefreshState::NotNeeded
+        );
+        // No answer at all: the wait ends after REFRESH_WAIT.
+        let third = att("c1", Some(now_ms - 1));
+        assert_eq!(r.check("m3", &third, None, now_ms, now), RefreshState::Ask);
+        assert_eq!(
+            r.check("m3", &third, Some(&gone), now_ms, now + REFRESH_WAIT),
+            RefreshState::NotNeeded
+        );
+
+        // Rate limited: the fifth message waits too, and all rows share one redraw.
+        assert_eq!(
+            r.check("m4", &att("d1", Some(0)), None, now_ms, now),
+            RefreshState::Ask
+        );
+        let held = r.check("m5", &att("e1", Some(0)), Some(&gone), now_ms, now);
+        let RefreshState::Throttled(at) = held else {
+            panic!("{held:?}");
+        };
+        assert_eq!(at, now + REFRESH_WINDOW);
+        assert!(r.take_wake(at, now));
+        assert!(!r.take_wake(at, now));
+        assert_eq!(
+            r.check("m6", &att("f1", Some(0)), None, now_ms, now),
+            RefreshState::Throttled(at)
+        );
+        // When the window has passed, it asks.
+        assert_eq!(
+            r.check("m5", &att("e1", Some(0)), Some(&gone), now_ms, at),
+            RefreshState::Ask
+        );
+        assert!(r.take_wake(at + REFRESH_WINDOW, at));
     }
 
     #[test]
