@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! The image viewer: an image at a larger size over the whole window, with zoom, save,
-//! copy link and open original. A click on the backdrop or the close button closes it.
+//! copy link and open original. Escape, a click on the backdrop or the close button
+//! closes it. It takes the keyboard focus while open and gives it back when it closes.
 //!
-//! It asks the proxy for at most 2560 pixels on the longest side. That is larger than
-//! the image cache keeps, so the image lives only while the viewer shows it.
+//! It asks the proxy for at most 2560 pixels on the longest side (an animation for at
+//! most 1024, within the shared animation budget, else its still). A large still can
+//! take most of the image cache, so images of older messages may load again after.
 
-use gpui::{div, prelude::*, px, AnyElement, ClipboardItem, Context, FontWeight, ObjectFit};
+use gpui::{
+    div, prelude::*, px, AnyElement, ClipboardItem, Context, FontWeight, KeyDownEvent, ObjectFit,
+};
 use inlet_media::MediaRequest;
 use url::Url;
 
 use super::attachment::icon_button;
+use super::image::picture_of;
 use super::{requests, MediaIcon};
 use crate::app::Inlet;
 use crate::model::{Attachment, EmbedMedia};
@@ -23,7 +28,10 @@ const MARGIN: f32 = 72.;
 /// What the viewer shows.
 #[derive(Clone)]
 pub struct Viewer {
+    /// The still.
     request: Option<MediaRequest>,
+    /// The animation of an animated image.
+    moving: Option<MediaRequest>,
     /// Natural size in logical pixels (at most the requested size).
     size: (f32, f32),
     name: String,
@@ -44,7 +52,8 @@ impl Viewer {
         let size = requests::fit_inside(a.width, a.height, (max, max));
         let original = requests::attachment_original(&setup.proxy, a);
         Some(Viewer {
-            request: requests::attachment_full(&setup.proxy, a),
+            request: requests::attachment_full(&setup.proxy, a, false),
+            moving: requests::attachment_full(&setup.proxy, a, true),
             size,
             name: a.filename.clone(),
             alt: a.alt.clone(),
@@ -60,7 +69,8 @@ impl Viewer {
         let max = requests::VIEWER_MAX_PIXELS as f32;
         let size = requests::fit_inside(m.width, m.height, (max, max));
         Some(Viewer {
-            request: requests::embed_full(&setup.proxy, m),
+            request: requests::embed_full(&setup.proxy, m, false),
+            moving: requests::embed_full(&setup.proxy, m, true),
             size,
             name,
             alt: None,
@@ -94,6 +104,19 @@ impl Viewer {
 }
 
 impl Inlet {
+    /// Opens the viewer; it takes the focus at the next frame.
+    pub(crate) fn open_viewer(&mut self, viewer: Viewer, cx: &mut Context<Self>) {
+        self.media.viewer = Some(viewer);
+        self.media.focus_viewer = true;
+        cx.notify();
+    }
+
+    /// Closes the viewer; the focus goes back at the next frame.
+    pub(crate) fn close_viewer(&mut self, cx: &mut Context<Self>) {
+        self.media.viewer = None;
+        cx.notify();
+    }
+
     /// The viewer over the window, if it is open.
     pub(crate) fn render_image_viewer(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let viewer = self.media.viewer.clone()?;
@@ -103,7 +126,8 @@ impl Inlet {
         );
         let zoom = viewer.zoom.unwrap_or_else(|| viewer.fit_zoom(viewport));
         let shown = (viewer.size.0 * zoom, viewer.size.1 * zoom);
-        let picture = self.picture(viewer.request.as_ref(), shown, 0., ObjectFit::Contain, cx);
+        let image = self.moving(viewer.moving.as_ref(), viewer.request.as_ref(), cx);
+        let picture = picture_of(image, shown, 0., ObjectFit::Contain);
         let image = div()
             .id("viewer-image")
             .max_w(px((viewport.0 - 2. * MARGIN).max(64.)))
@@ -163,6 +187,8 @@ impl Inlet {
             tools = tools.child(icon_button("viewer-copy".into(), MediaIcon::Copy).on_click(
                 cx.listener(move |this, _, _, cx| {
                     cx.stop_propagation();
+                    // Deviation: Fluxer copies the image; this copies its link (an
+                    // image on the clipboard is not wired up yet).
                     cx.write_to_clipboard(ClipboardItem::new_string(link.clone()));
                     this.chat.notice = Some(t!("media-link-copied"));
                     cx.notify();
@@ -183,8 +209,7 @@ impl Inlet {
             icon_button("viewer-close".into(), MediaIcon::Close).on_click(cx.listener(
                 |this, _, _, cx| {
                     cx.stop_propagation();
-                    this.media.viewer = None;
-                    cx.notify();
+                    this.close_viewer(cx);
                 },
             )),
         );
@@ -213,6 +238,15 @@ impl Inlet {
         Some(
             div()
                 .id("image-viewer")
+                .when_some(self.media.viewer_focus.clone(), |d, focus| {
+                    d.track_focus(&focus)
+                })
+                .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| {
+                    if ev.keystroke.key == "escape" {
+                        cx.stop_propagation();
+                        this.close_viewer(cx);
+                    }
+                }))
                 .occlude()
                 .absolute()
                 .top_0()
@@ -225,8 +259,7 @@ impl Inlet {
                 .justify_center()
                 .gap_3()
                 .on_click(cx.listener(|this, _, _, cx| {
-                    this.media.viewer = None;
-                    cx.notify();
+                    this.close_viewer(cx);
                 }))
                 .child(div().absolute().top(px(16.)).right(px(16.)).child(tools))
                 .child(image)
@@ -258,7 +291,9 @@ impl Inlet {
             _ => None,
         });
         if let Some(a) = first {
-            self.media.viewer = Viewer::for_attachment(self, &a);
+            if let Some(v) = Viewer::for_attachment(self, &a) {
+                self.open_viewer(v, cx);
+            }
             self.media.demo_viewer_done = true;
             cx.notify();
         }

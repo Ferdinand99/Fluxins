@@ -21,13 +21,16 @@ use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 
 use futures::StreamExt;
-use gpui::{Context, Pixels, RenderImage, Size, Task, Window};
+use gpui::{Context, FocusHandle, Pixels, RenderImage, Size, Task, Window};
 
 use crate::app::Inlet;
 use crate::backend::media::{Ev, Setup};
 
+pub(crate) use attachment::cover_box;
 pub use attachment::Refresh;
 pub(crate) use image::Images;
+#[cfg(test)]
+pub(crate) use video_thumb::video_explicit;
 pub use viewer::Viewer;
 
 /// Spoilers and explicit media shown on request, remembered for this many items.
@@ -79,6 +82,12 @@ pub struct State {
     pub refresh: Refresh,
     /// The open image viewer.
     pub viewer: Option<Viewer>,
+    /// The viewer's focus, made the first time it opens.
+    pub viewer_focus: Option<FocusHandle>,
+    /// The viewer just opened: it takes the focus at the next frame.
+    focus_viewer: bool,
+    /// What had the focus before the viewer took it.
+    focus_back: Option<FocusHandle>,
     /// Demo screenshots: the viewer was opened once for the `image-viewer` scene.
     #[cfg(feature = "demo")]
     pub demo_viewer_done: bool,
@@ -100,6 +109,9 @@ impl Default for State {
             cover_explicit: true,
             refresh: Refresh::default(),
             viewer: None,
+            viewer_focus: None,
+            focus_viewer: false,
+            focus_back: None,
             #[cfg(feature = "demo")]
             demo_viewer_done: false,
         }
@@ -147,11 +159,35 @@ impl Inlet {
         self.media.scale = window.scale_factor();
         self.media.viewport = window.viewport_size();
         // Here, not while rows are drawn: the list holds its state borrowed then.
-        self.media.column_width = self.chat.message_list.viewport_bounds().size.width.as_f32();
+        let width = self.chat.message_list.viewport_bounds().size.width.as_f32();
+        if width != self.media.column_width {
+            // The bounds are from the last layout: draw once more so media fit the
+            // new width without waiting for something else to redraw.
+            self.media.column_width = width;
+            window.request_animation_frame();
+        }
         self.media.images.next_frame();
         self.release_evicted(Some(window), cx);
+        self.viewer_focus(window, cx);
         #[cfg(feature = "demo")]
         self.demo_open_viewer(cx);
+    }
+
+    /// The viewer takes the focus when it opens and gives it back when it closes.
+    fn viewer_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.media.viewer.is_some() {
+            let focus = self
+                .media
+                .viewer_focus
+                .get_or_insert_with(|| cx.focus_handle())
+                .clone();
+            if std::mem::take(&mut self.media.focus_viewer) {
+                self.media.focus_back = window.focused(cx);
+                window.focus(&focus, cx);
+            }
+        } else if let Some(back) = self.media.focus_back.take() {
+            window.focus(&back, cx);
+        }
     }
 
     /// Takes the images the cache let go of and frees the texture of every one that

@@ -33,6 +33,12 @@ function Run-Demo([string]$Name, [hashtable]$Env, [int]$Seconds) {
         $script:Failed += $Name
     }
     Save-Screen $Name
+    # A panic on another thread can leave the window up: the log tells.
+    if (-not ($script:Failed -contains $Name) -and (Select-String -Path $log -Pattern 'panicked' -Quiet)) {
+        Write-Host "$($Name): a panic in the log"
+        Get-Content $log | Select-String -Pattern 'panicked' -Context 0,3
+        $script:Failed += $Name
+    }
     if (-not $p.HasExited) {
         $p.Refresh()
         Write-Host ("memory {0}: working set {1} MB, private {2} MB" -f $Name, [math]::Round($p.WorkingSet64 / 1MB), [math]::Round($p.PrivateMemorySize64 / 1MB))

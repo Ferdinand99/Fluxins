@@ -5,6 +5,12 @@
 //! A view asks for an image while it draws ([`Inlet::image`]). The first time, the
 //! image comes from the client's memory cache or starts loading in a task; the task is
 //! dropped (and the load cancelled) when a frame passes without the image being drawn.
+//!
+//! **Animations** keep every frame decoded, so they are counted. Each is capped by
+//! the client (`ANIMATION_MAX_BYTES`, see `backend::media`), and the animations one
+//! frame draws share [`ANIMATION_BUDGET_BYTES`]. One that is too large, failed, or
+//! does not fit the budget shows its still (the first frame) instead ([`Inlet::moving`]).
+//! Only animations on screen are drawn, so only they play.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -16,6 +22,74 @@ use inlet_media::{MediaError, MediaRequest};
 use super::MediaIcon;
 use crate::app::Inlet;
 use crate::theme;
+
+/// Decoded bytes the animations drawn in one frame may hold together (the GPU copies
+/// of the frames they have shown come on top).
+pub const ANIMATION_BUDGET_BYTES: u64 = 32 * 1024 * 1024;
+/// Animations whose decoded size is remembered, so one over the budget is not loaded
+/// again every frame.
+const MAX_KNOWN_ANIMATIONS: usize = 512;
+
+/// The decoded bytes of a gpui image (all its frames).
+pub(crate) fn decoded_bytes(image: &RenderImage) -> u64 {
+    (0..image.frame_count())
+        .map(|i| image.as_bytes(i).map_or(0, |b| b.len() as u64))
+        .sum()
+}
+
+/// The animations of one frame against [`ANIMATION_BUDGET_BYTES`].
+#[derive(Default)]
+pub struct AnimationBudget {
+    budget: u64,
+    used: u64,
+    /// Decoded sizes of animations seen, by request.
+    known: HashMap<MediaRequest, u64>,
+}
+
+impl AnimationBudget {
+    pub fn new(budget: u64) -> Self {
+        Self {
+            budget,
+            ..Self::default()
+        }
+    }
+
+    /// A new frame: nothing plays yet.
+    pub fn next_frame(&mut self) {
+        self.used = 0;
+    }
+
+    /// Whether an animation of `bytes` still fits this frame.
+    pub fn fits(&self, bytes: u64) -> bool {
+        self.used.saturating_add(bytes) <= self.budget
+    }
+
+    /// Counts a playing animation of `bytes` if it fits; `false` when it does not.
+    pub fn admit(&mut self, bytes: u64) -> bool {
+        if !self.fits(bytes) {
+            return false;
+        }
+        self.used = self.used.saturating_add(bytes);
+        true
+    }
+
+    /// Bytes of the animations playing this frame.
+    #[cfg(test)]
+    pub fn used(&self) -> u64 {
+        self.used
+    }
+
+    fn known(&self, req: &MediaRequest) -> Option<u64> {
+        self.known.get(req).copied()
+    }
+
+    fn remember(&mut self, req: &MediaRequest, bytes: u64) {
+        if self.known.len() >= MAX_KNOWN_ANIMATIONS && !self.known.contains_key(req) {
+            self.known.clear();
+        }
+        self.known.insert(req.clone(), bytes);
+    }
+}
 
 /// What a view can draw for an image this frame.
 pub(crate) enum Shown {
@@ -39,10 +113,20 @@ struct Entry {
 }
 
 /// The images the views hold, by request. Only the ones drawn in the last frame stay.
-#[derive(Default)]
 pub struct Images {
     entries: RefCell<HashMap<MediaRequest, Entry>>,
     frame: Cell<u64>,
+    animations: RefCell<AnimationBudget>,
+}
+
+impl Default for Images {
+    fn default() -> Self {
+        Self {
+            entries: RefCell::default(),
+            frame: Cell::default(),
+            animations: RefCell::new(AnimationBudget::new(ANIMATION_BUDGET_BYTES)),
+        }
+    }
 }
 
 impl Images {
@@ -50,6 +134,7 @@ impl Images {
     pub fn next_frame(&self) {
         let frame = self.frame.get() + 1;
         self.frame.set(frame);
+        self.animations.borrow_mut().next_frame();
         self.entries
             .borrow_mut()
             .retain(|_, e| e.used.saturating_add(1) >= frame);
@@ -57,6 +142,11 @@ impl Images {
 
     pub fn clear(&self) {
         self.entries.borrow_mut().clear();
+    }
+
+    /// Lets go of one image now.
+    fn remove(&self, req: &MediaRequest) {
+        self.entries.borrow_mut().remove(req);
     }
 
     /// Images held (loaded, loading or failed).
@@ -145,21 +235,59 @@ impl Inlet {
         Shown::Loading
     }
 
-    /// An image of `w` x `h` logical pixels, or a placeholder of the same size while it
-    /// loads or when it cannot be shown.
-    pub(crate) fn picture(
+    /// An image that may be animated: `moving` (the animation, if there is one) while
+    /// it fits the frame's animation budget and loads, otherwise `still`. An animation
+    /// that is too large, failed, or does not fit shows the still, never a broken
+    /// image; while it loads, the still shows if it is at hand.
+    pub(crate) fn moving(
         &self,
-        req: Option<&MediaRequest>,
-        (w, h): (f32, f32),
-        radius: f32,
-        fit: ObjectFit,
+        moving: Option<&MediaRequest>,
+        still: Option<&MediaRequest>,
         cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let shown = match req {
+    ) -> Shown {
+        if let Some(anim) = moving {
+            let images = &self.media.images;
+            let known = images.animations.borrow().known(anim);
+            if known.is_none_or(|bytes| images.animations.borrow().fits(bytes)) {
+                match self.image(anim, cx) {
+                    Shown::Ready(image) => {
+                        let bytes = decoded_bytes(&image);
+                        let mut budget = images.animations.borrow_mut();
+                        budget.remember(anim, bytes);
+                        if budget.admit(bytes) {
+                            return Shown::Ready(image);
+                        }
+                        drop(budget);
+                        // Over the budget: let it go now, the still shows.
+                        images.remove(anim);
+                    }
+                    Shown::Loading => {
+                        return match still.map(|s| self.cached_only(s)) {
+                            Some(Some(image)) => Shown::Ready(image),
+                            _ => Shown::Loading,
+                        };
+                    }
+                    // Too large, too many frames, or any other failure: the still.
+                    Shown::Failed(_) | Shown::Unavailable => {}
+                }
+            }
+        }
+        match still {
             Some(req) => self.image(req, cx),
             None => Shown::Unavailable,
-        };
-        picture_of(shown, (w, h), radius, fit)
+        }
+    }
+
+    /// An image the views or the cache already hold, without starting a load.
+    fn cached_only(&self, req: &MediaRequest) -> Option<Arc<RenderImage>> {
+        let images = &self.media.images;
+        if let Some(entry) = images.entries.borrow_mut().get_mut(req) {
+            if let Slot::Ready(image) = &entry.slot {
+                entry.used = images.frame.get();
+                return Some(image.clone());
+            }
+        }
+        self.media.setup.as_ref()?.client.cached(req)
     }
 }
 
@@ -209,6 +337,33 @@ mod tests {
         let url =
             url::Url::parse(&format!("https://media.example.org/avatars/1/{n}.webp")).unwrap();
         MediaRequest::new(url, MediaKind::Avatar, Fit::square(40))
+    }
+
+    #[test]
+    fn animations_share_one_budget_per_frame() {
+        const MIB: u64 = 1024 * 1024;
+        let mut budget = AnimationBudget::new(ANIMATION_BUDGET_BYTES);
+        // A capped animation (24 MiB) plays; a second one that does not fit shows its
+        // still; small ones fill what is left.
+        assert!(budget.admit(24 * MIB));
+        assert!(!budget.admit(24 * MIB));
+        assert!(budget.admit(6 * MIB));
+        assert!(budget.admit(2 * MIB));
+        assert!(!budget.admit(1));
+        assert!(budget.used() <= ANIMATION_BUDGET_BYTES);
+        // Many on screen: never more than the budget plays.
+        let mut budget = AnimationBudget::new(ANIMATION_BUDGET_BYTES);
+        let playing = (0..100).filter(|_| budget.admit(3 * MIB)).count();
+        assert_eq!(playing, 10);
+        assert!(budget.used() <= ANIMATION_BUDGET_BYTES);
+        // A new frame starts empty; sizes seen stay known, bounded.
+        budget.next_frame();
+        assert_eq!(budget.used(), 0);
+        for n in 0..(MAX_KNOWN_ANIMATIONS as u32 + 10) {
+            budget.remember(&req(n), 1);
+        }
+        assert!(budget.known.len() <= MAX_KNOWN_ANIMATIONS);
+        assert_eq!(budget.known(&req(MAX_KNOWN_ANIMATIONS as u32 + 9)), Some(1));
     }
 
     #[test]

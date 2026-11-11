@@ -10,7 +10,7 @@ use std::rc::Rc;
 
 use gpui::{div, prelude::*, px, AnyElement, Context, FontWeight, Hsla, SharedString};
 
-use super::embed::render_embed;
+use super::embed::{render_embed, spoiler_urls};
 use super::messages::{MessageRow, PendingRow, Row, Tag};
 use super::{divider, reply_preview, system_message, welcome};
 use crate::app::Inlet;
@@ -81,8 +81,18 @@ impl Inlet {
                     .on_click(cx.listener(move |this, _, _, cx| this.expand(id, cx))),
             );
         }
+        // Links the text hides in spoilers hide their embeds too, until shown. A cut
+        // text is read whole for this, so a spoiler past the cut still counts.
+        let hidden = if row.revealed || m.embeds.is_empty() {
+            Vec::new()
+        } else if m.truncated {
+            spoiler_urls(&markdown::parse(&m.content))
+        } else {
+            spoiler_urls(&m.blocks)
+        };
         for (i, e) in m.embeds.iter().enumerate() {
-            body = body.child(render_embed(self, &format!("m{}-e{i}", m.id), e, &ctx, cx));
+            let id = format!("m{}-e{i}", m.id);
+            body = body.child(render_embed(self, &id, e, &hidden, &ctx, cx));
         }
         if m.is_empty() {
             body = body.child(
@@ -283,7 +293,13 @@ impl Inlet {
                     }))
                     .when(animated_avatar, |d| {
                         d.on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                            this.media.hovered_message = hovered.then(|| hover_id.clone());
+                            if *hovered {
+                                this.media.hovered_message = Some(hover_id.clone());
+                            } else if this.media.hovered_message.as_ref() == Some(&hover_id) {
+                                // Only this row's own leave: another row may have
+                                // taken over already (hover changes come in paint order).
+                                this.media.hovered_message = None;
+                            }
                             cx.notify();
                         }))
                     })

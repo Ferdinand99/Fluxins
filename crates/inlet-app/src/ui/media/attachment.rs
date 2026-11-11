@@ -32,6 +32,8 @@ const REFRESHES_PER_WINDOW: usize = 4;
 const REFRESH_WINDOW: Duration = Duration::from_secs(10);
 /// Width of a file card.
 pub const FILE_CARD_WIDTH: f32 = 432.;
+/// Height of a file card (32 px icon, 12 px padding, borders).
+const FILE_CARD_HEIGHT: f32 = 66.;
 
 /// Fresh signed URLs for expired attachments, asked for at most once per message.
 #[derive(Default)]
@@ -231,10 +233,10 @@ impl Inlet {
         if self.maybe_refresh(channel_id, message_id, a, None) {
             return placeholder(size, 4., false);
         }
-        let shown = match requests::attachment_preview(&setup.proxy, a, self.media.scale) {
-            Some(req) => self.image(&req, cx),
-            None => Shown::Unavailable,
-        };
+        let scale = self.media.scale;
+        let still = requests::attachment_preview(&setup.proxy, a, scale, false);
+        let moving = requests::attachment_preview(&setup.proxy, a, scale, true);
+        let shown = self.moving(moving.as_ref(), still.as_ref(), cx);
         if let Shown::Failed(err) = &shown {
             if self.maybe_refresh(channel_id, message_id, a, Some(err)) {
                 return placeholder(size, 4., false);
@@ -272,8 +274,7 @@ impl Inlet {
             .children(save)
             .on_click(cx.listener(move |this, _, _, cx| {
                 if let Some(v) = viewer.clone() {
-                    this.media.viewer = Some(v);
-                    cx.notify();
+                    this.open_viewer(v, cx);
                 }
             }))
             .into_any_element()
@@ -281,6 +282,8 @@ impl Inlet {
 
     /// The cover over a spoiler or explicit image, `None` when it shows (revealed, or
     /// neither). A click reveals it.
+    // Deviation: Fluxer blurs the image under the cover; gpui has no blur filter, so the
+    // cover is solid (nothing shows through, and nothing loads until revealed).
     pub(super) fn cover(
         &self,
         key: &str,
@@ -301,28 +304,7 @@ impl Inlet {
         };
         let key = key.to_string();
         Some(
-            div()
-                .id(SharedString::from(format!("cover-{key}")))
-                .w(px(size.0))
-                .h(px(size.1))
-                .flex_none()
-                .rounded(px(4.))
-                .bg(theme::media_cover())
-                .flex()
-                .items_center()
-                .justify_center()
-                .cursor_pointer()
-                .child(
-                    div()
-                        .px_2()
-                        .py_1()
-                        .rounded(px(12.))
-                        .bg(theme::media_overlay())
-                        .text_size(px(13.))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(theme::text_strong())
-                        .child(label),
-                )
+            cover_box(format!("cover-{key}"), label, size)
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.media.reveal(key.clone());
                     cx.notify();
@@ -363,7 +345,22 @@ impl Inlet {
 
     /// A file that is not an image, video or audio: icon, name, size and save.
     fn file_card(&self, key: &str, a: &Attachment, cx: &mut Context<Self>) -> AnyElement {
+        if let Some(cover) = self.file_cover(key, a, cx) {
+            return cover;
+        }
         self.file_row(key, a, MediaIcon::File, file_size(a.size), None, cx)
+    }
+
+    /// The cover over a spoiler file or audio card, the card's size: the name, size and
+    /// length stay hidden until it is clicked.
+    pub(super) fn file_cover(
+        &self,
+        key: &str,
+        a: &Attachment,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let width = self.fit_column((FILE_CARD_WIDTH, FILE_CARD_HEIGHT), 0.).0;
+        self.cover(key, a.spoiler, false, (width, FILE_CARD_HEIGHT), cx)
     }
 
     /// The card of a file: icon, name (click saves), a second line, an optional play
@@ -478,6 +475,33 @@ impl Inlet {
         })
         .detach();
     }
+}
+
+/// A solid box of `size` with `label` in the middle: what covers spoilers and explicit
+/// media. The caller adds what a click does.
+pub(crate) fn cover_box(id: String, label: String, size: (f32, f32)) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(SharedString::from(id))
+        .w(px(size.0))
+        .h(px(size.1))
+        .flex_none()
+        .rounded(px(4.))
+        .bg(theme::media_cover())
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .child(
+            div()
+                .px_2()
+                .py_1()
+                .rounded(px(12.))
+                .bg(theme::media_overlay())
+                .text_size(px(13.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(theme::text_strong())
+                .child(label),
+        )
 }
 
 /// A 32 px round button with an icon, for actions over media.

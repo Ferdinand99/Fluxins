@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Audio attachments: a file card with the length and a play button that opens the file
 //! in the browser (Inlet has no player of its own yet), and the save button.
+//!
+//! Deviation: the plan opens audio in the system's player; until that is decided it
+//! opens in the browser.
 
 use gpui::{prelude::*, AnyElement, Context};
 
@@ -16,6 +19,9 @@ impl Inlet {
         a: &Attachment,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        if let Some(cover) = self.file_cover(key, a, cx) {
+            return cover;
+        }
         let detail = match a.duration_secs {
             Some(secs) => t!(
                 "media-audio-detail",

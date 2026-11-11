@@ -37,10 +37,15 @@ use crate::model::{self, Attachment, AttachmentKind, Embed, EmbedKind, EmbedMedi
 
 /// Attachments of one message that are converted (Fluxer allows 10).
 pub const MAX_ATTACHMENTS: usize = 10;
-/// Decoded images the cache keeps, in bytes, counting gpui's copy and its atlas tile.
-/// Images on screen are a few MiB; the rest is scroll-back. An image larger than this
-/// (a big one in the viewer) is never kept: it lives while it is shown.
-pub const MEMORY_CACHE_BYTES: u64 = 64 * 1024 * 1024;
+/// Decoded images the cache keeps, in bytes, counting gpui's copy and its atlas tile
+/// (twice the pixels). Images on screen are a few MiB; the rest is scroll-back. An
+/// image larger than this (a long animation) is never kept: it lives while it is
+/// shown. A large still in the viewer (2560 x 1440 counts 29 MiB) does fit, and
+/// pushes most older images out.
+pub const MEMORY_CACHE_BYTES: u64 = 32 * 1024 * 1024;
+/// Most decoded bytes one animation may take (all its frames, at the size shown). A
+/// longer one shows its still.
+pub const ANIMATION_MAX_BYTES: u64 = 24 * 1024 * 1024;
 /// Longest URL kept from a message; longer ones are dropped.
 const MAX_URL_LEN: usize = 4096;
 
@@ -84,8 +89,8 @@ pub struct Setup {
     pub evicted: Evictions,
 }
 
-/// Most bytes (counted like the cache: twice the pixels) that may wait in the eviction
-/// queue. A whole cache cleared at once fits.
+/// Counted bytes (like the cache: twice the pixels) the eviction queue is expected to
+/// hold at most: a whole cache cleared at once fits. More is logged, never dropped.
 pub const EVICTION_QUEUE_BYTES: u64 = 2 * MEMORY_CACHE_BYTES;
 
 /// The decoded bytes of a gpui image, counted like the cache (CPU copy and atlas tile).
@@ -96,9 +101,10 @@ fn counted_bytes(image: &RenderImage) -> u64 {
     pixels.saturating_mul(2)
 }
 
-/// The sending half of the eviction queue, inside the image sink. Bounded in bytes, it
-/// never blocks (the sink runs on the client's threads) and wakes the UI, which frees
-/// the textures right away instead of waiting for the next frame.
+/// The sending half of the eviction queue, inside the image sink. It never blocks (the
+/// sink runs on the client's threads) and wakes the UI, which frees the textures right
+/// away instead of waiting for the next frame. It never drops an image either: a view
+/// may still draw it, and its texture must be freed once it does not.
 pub struct EvictionQueue {
     tx: Mutex<mpsc::Sender<(Arc<RenderImage>, u64)>>,
     wake: Mutex<futures::channel::mpsc::Sender<()>>,
@@ -114,7 +120,7 @@ pub struct Evictions {
     pub wake: Option<futures::channel::mpsc::Receiver<()>>,
 }
 
-/// A new eviction queue holding at most `cap` counted bytes (one image always fits).
+/// A new eviction queue that warns when it holds more than `cap` counted bytes.
 pub fn eviction_queue(cap: u64) -> (EvictionQueue, Evictions) {
     let (tx, rx) = mpsc::channel();
     // One pending wake is enough: the UI drains everything when it wakes.
@@ -136,36 +142,24 @@ pub fn eviction_queue(cap: u64) -> (EvictionQueue, Evictions) {
 }
 
 impl EvictionQueue {
-    /// Queues an image the cache let go of. Returns `false` when the queue is full: the
-    /// image is dropped here (its texture, if it was ever drawn, stays in the atlas
-    /// until the window closes, which the bound makes the rare case).
+    /// Queues an image the cache let go of. Over `cap` the UI is behind: that is
+    /// logged once, and the image still waits for it (releasing it here could leave its
+    /// texture in the atlas while a view draws it). Returns `false` only when the UI is
+    /// gone, and then nothing needs freeing.
     pub fn push(&self, image: Arc<RenderImage>) -> bool {
         let bytes = counted_bytes(&image);
-        let mut now = self.queued.load(Ordering::Acquire);
-        let reserved = loop {
-            if now != 0 && now.saturating_add(bytes) > self.cap {
-                break false;
-            }
-            match self.queued.compare_exchange_weak(
-                now,
-                now.saturating_add(bytes),
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => break true,
-                Err(actual) => now = actual,
-            }
-        };
-        if !reserved {
-            log::warn!("image eviction queue full; dropping an evicted image");
-            return false;
+        let before = self.queued.fetch_add(bytes, Ordering::AcqRel);
+        if before <= self.cap && before.saturating_add(bytes) > self.cap {
+            log::warn!(
+                "image eviction queue over {} bytes; the UI is behind",
+                self.cap
+            );
         }
         let sent = self
             .tx
             .lock()
             .is_ok_and(|tx| tx.send((image, bytes)).is_ok());
         if !sent {
-            // The UI is gone; nothing will free it, nothing needs to.
             self.queued.fetch_sub(bytes, Ordering::AcqRel);
             return false;
         }
@@ -211,7 +205,7 @@ impl ImageSink for GpuiImages {
     }
 
     fn evicted(&self, handle: Self::Handle) {
-        // Bounded and never blocks.
+        // Never blocks, never drops.
         self.evicted.push(handle);
     }
 }
@@ -221,7 +215,13 @@ pub fn config(proxy: &p::Media) -> MediaConfig {
     let host = Url::parse(proxy.base())
         .ok()
         .and_then(|u| u.host_str().map(str::to_owned));
+    let mut limits = inlet_media::Limits::default();
+    // Every frame of an animation stays decoded: cap each one (the views show the
+    // still of a longer one).
+    limits.attachment.max_animation_bytes = ANIMATION_MAX_BYTES;
+    limits.avatar.max_animation_bytes = ANIMATION_MAX_BYTES;
     MediaConfig {
+        limits,
         // Only the media endpoint. Embeds' third-party URLs never get here, and if one
         // did, the client would refuse it.
         allowed_hosts: host.into_iter().collect(),
@@ -321,15 +321,18 @@ pub struct ProxyFetcher {
 impl ProxyFetcher {
     pub fn new(proxy: &p::Media) -> Option<Self> {
         let base = Url::parse(proxy.base()).ok()?;
-        let http = reqwest::Client::builder()
+        let builder = reqwest::Client::builder()
             .user_agent(concat!("Inlet/", env!("CARGO_PKG_VERSION")))
             .connect_timeout(Duration::from_secs(10))
             .read_timeout(Duration::from_secs(30))
             // A redirect could lead anywhere; the media proxy answers directly.
             .redirect(reqwest::redirect::Policy::none())
-            .use_rustls_tls()
-            .build()
-            .ok()?;
+            .use_rustls_tls();
+        // The private test instance's CA, as for the REST client. The feature is
+        // refused in release builds (inlet-protocol).
+        #[cfg(feature = "test-extra-ca")]
+        let builder = p::test_ca::add_to_http(builder);
+        let http = builder.build().ok()?;
         Some(Self { http, base })
     }
 }
@@ -439,6 +442,10 @@ pub async fn save_to(
         Ok(())
     }
     .await;
+    let ours = match file.metadata().await {
+        Ok(meta) => file_identity(&meta),
+        Err(_) => None,
+    };
     drop(file);
     if let Err(err) = result {
         let _ = tokio::fs::remove_file(&part).await;
@@ -448,26 +455,48 @@ pub async fn save_to(
         let _ = tokio::fs::remove_file(&part).await;
         return Err(SaveError::Write(err));
     }
+    // Someone who can write to the folder could have swapped the temporary file for a
+    // link before the rename. Then what landed at `path` is not what we wrote.
+    if let Some(ours) = ours {
+        let landed = tokio::fs::symlink_metadata(&path).await;
+        let same = landed.is_ok_and(|m| m.is_file() && file_identity(&m) == Some(ours));
+        if !same {
+            let _ = tokio::fs::remove_file(&path).await;
+            return Err(SaveError::Write(std::io::Error::other(
+                "the file was replaced while it was saved",
+            )));
+        }
+    }
     Ok(written)
+}
+
+/// The device and inode of a file, where the platform has them.
+#[cfg(unix)]
+fn file_identity(meta: &std::fs::Metadata) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    Some((meta.dev(), meta.ino()))
+}
+
+#[cfg(not(unix))]
+fn file_identity(_meta: &std::fs::Metadata) -> Option<(u64, u64)> {
+    None
 }
 
 /// Names tried for the temporary file of one save.
 const PART_ATTEMPTS: usize = 16;
 
-/// `dir/.name.<seed>.part`: a temporary file a save writes before it is complete.
+/// `dir/.inlet-<seed>.part`: a temporary file a save writes before it is complete. Short,
+/// so a chosen name near the length limit still works.
 fn part_path(path: &Path, seed: u64) -> PathBuf {
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "download".into());
-    path.with_file_name(format!(".{name}.{seed:016x}.part"))
+    path.with_file_name(format!(".inlet-{seed:016x}.part"))
 }
 
 /// Seeds for temporary names nobody can guess ahead: the time, the process and a counter.
 fn part_seeds() -> impl Iterator<Item = u64> {
     use std::hash::{BuildHasher, Hasher};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
-    // A fresh random key per call (std seeds it from the system's randomness).
+    // Keys from the system's randomness, once per thread, then stepped per call; with
+    // the counter, the process and the time the name cannot be guessed ahead.
     let keys = std::collections::hash_map::RandomState::new();
     (0..PART_ATTEMPTS as u64).map(move |attempt| {
         let mut h = keys.build_hasher();
@@ -767,45 +796,151 @@ mod tests {
     }
 
     #[test]
-    fn evicted_images_are_bounded_and_released() {
+    fn evicted_images_are_never_dropped_and_are_released_once_drained() {
         let a = render_image(16);
         let bytes = counted_bytes(&a);
         assert_eq!(bytes, 16 * 16 * 4 * 2);
-        // Room for two such images.
+        // Expected to hold two such images.
         let (queue, mut evicted) = eviction_queue(bytes * 2);
         let mut wake = evicted.wake.take().unwrap();
 
         assert!(queue.push(a.clone()));
         assert!(queue.push(render_image(16)));
-        // Full: the third is refused and let go at once, not kept.
+        // Over the bound: still queued, not dropped (a view may draw it).
         let c = render_image(16);
-        assert!(!queue.push(c.clone()));
-        assert_eq!(Arc::strong_count(&c), 1);
-        assert_eq!(evicted.queued_bytes(), bytes * 2);
+        assert!(queue.push(c.clone()));
+        assert_eq!(Arc::strong_count(&c), 2);
+        assert_eq!(evicted.queued_bytes(), bytes * 3);
         // The UI was woken (once is enough).
         use futures::FutureExt;
         assert_eq!(wake.next().now_or_never(), Some(Some(())));
 
-        // Draining hands the images over and empties the queue.
+        // Draining hands every image over and empties the queue.
         let drained = evicted.drain();
-        assert_eq!(drained.len(), 2);
+        assert_eq!(drained.len(), 3);
         assert_eq!(evicted.queued_bytes(), 0);
         assert_eq!(Arc::strong_count(&a), 2);
         drop(drained);
         assert_eq!(Arc::strong_count(&a), 1);
-
-        // One image larger than the whole bound still fits an empty queue (the viewer's
-        // big image), and nothing else fits beside it.
-        let big = render_image(64);
-        assert!(queue.push(big));
-        assert!(!queue.push(render_image(16)));
-        assert_eq!(evicted.drain().len(), 1);
+        assert_eq!(Arc::strong_count(&c), 1);
 
         // The UI gone: nothing is kept for it.
         drop(evicted);
         let d = render_image(16);
         assert!(!queue.push(d.clone()));
         assert_eq!(Arc::strong_count(&d), 1);
+    }
+
+    /// Serves long GIFs when the animation is asked for, a small still otherwise.
+    struct Animations {
+        seen: Mutex<Vec<String>>,
+    }
+
+    impl Fetcher for Animations {
+        fn fetch<'a>(&'a self, url: &'a Url) -> BoxFuture<'a, Result<FetchResponse, FetchError>> {
+            self.seen.lock().unwrap().push(url.to_string());
+            let animated = url.query().is_some_and(|q| q.contains("animated=true"));
+            let body = match (animated, url.path().contains("screen")) {
+                // A 1920 x 1080 screen recording, 20 frames.
+                (true, true) => png::long_gif(1920, 1080, 20),
+                // A 550 px GIF of 200 frames.
+                (true, false) => png::long_gif(550, 309, 200),
+                (false, _) => png::solid(64, 36, [90, 90, 200, 255]),
+            };
+            Box::pin(async move { Ok(FetchResponse::from_bytes(Bytes::from(body))) })
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn long_animations_show_their_still_within_the_budget() {
+        let fetcher = Arc::new(Animations {
+            seen: Mutex::default(),
+        });
+        let proxy = proxy();
+        let client = MediaClient::new(
+            tokio::runtime::Handle::current(),
+            fetcher.clone(),
+            Counting::default(),
+            config(&proxy),
+        );
+        let gif = |name: &str, w, h| Attachment {
+            id: name.into(),
+            proxy_url: Some(format!(
+                "https://media.example.org/media/attachments/1/2/{name}.gif"
+            )),
+            kind: AttachmentKind::Image,
+            width: Some(w),
+            height: Some(h),
+            animated: true,
+            ..Default::default()
+        };
+
+        // The 550 px GIF in a message: the animation is asked for at the size shown,
+        // not times the display scale, and is refused once its frames pass the cap.
+        let long = gif("long", 550, 309);
+        let moving = requests::attachment_preview(&proxy, &long, 2.0, true).unwrap();
+        let q: Vec<(String, String)> = moving.url.query_pairs().into_owned().collect();
+        assert!(q.contains(&("width".into(), "550".into())), "{q:?}");
+        assert!(q.contains(&("animated".into(), "true".into())), "{q:?}");
+        let err = client.load(moving).await.expect_err("too long");
+        assert!(
+            matches!(
+                err,
+                MediaError::AnimationTooLarge | MediaError::TooManyFrames { .. }
+            ),
+            "{err:?}"
+        );
+        // Its still shows instead: something, never a broken image.
+        let still = requests::attachment_preview(&proxy, &long, 2.0, false).unwrap();
+        assert!(!still.url.as_str().contains("animated=true"));
+        client.load(still).await.expect("the still loads");
+
+        // The 1920 x 1080 GIF in the viewer: a smaller animation is asked for, it is
+        // still too long, and the viewer's still shows.
+        let screen = gif("screen", 1920, 1080);
+        let moving = requests::attachment_full(&proxy, &screen, true).unwrap();
+        assert_eq!(
+            moving.proxy_size,
+            Some(requests::VIEWER_ANIMATED_MAX_PIXELS)
+        );
+        // (A debug build may run out of decode time first; any failure shows the still.)
+        let err = client.load(moving).await.expect_err("too long");
+        assert!(
+            matches!(
+                err,
+                MediaError::AnimationTooLarge
+                    | MediaError::TooManyFrames { .. }
+                    | MediaError::DecodeTimeout
+            ),
+            "{err:?}"
+        );
+        let still = requests::attachment_full(&proxy, &screen, false).unwrap();
+        client.load(still).await.expect("the still loads");
+
+        // Nothing over the cap was kept: only the two stills are in memory.
+        let stats = client.stats();
+        assert_eq!(stats.memory_entries, 2);
+        assert!(stats.memory_bytes <= MEMORY_CACHE_BYTES);
+
+        // A short animation plays, within the cap.
+        let short = Attachment {
+            proxy_url: Some("https://media.example.org/media/attachments/1/2/short.gif".into()),
+            ..gif("short", 40, 30)
+        };
+        let req = requests::attachment_preview(&proxy, &short, 1.0, true).unwrap();
+        let fetch = Arc::new(Recording {
+            seen: Mutex::default(),
+            body: Bytes::from(png::long_gif(40, 30, 12)),
+        });
+        let small = MediaClient::new(
+            tokio::runtime::Handle::current(),
+            fetch,
+            Counting::default(),
+            config(&proxy),
+        );
+        let image = small.load(req).await.expect("plays");
+        assert_eq!(image.frames.len(), 12);
+        assert!(image.byte_size() <= ANIMATION_MAX_BYTES);
     }
 
     fn proxy() -> p::Media {
@@ -833,7 +968,7 @@ mod tests {
             proxy_url: Some("https://tracker.example.net/media/external/x.png".into()),
             ..Default::default()
         };
-        assert!(requests::embed_image(&proxy, &evil, (400., 300.), 1.0).is_none());
+        assert!(requests::embed_image(&proxy, &evil, (400., 300.), 1.0, false).is_none());
         // A raw URL from a message never becomes a request either.
         let att = Attachment {
             url: Some("https://cdn.elsewhere.example/attachments/1/2/a.png".into()),
@@ -843,7 +978,7 @@ mod tests {
             height: Some(10),
             ..Default::default()
         };
-        assert!(requests::attachment_preview(&proxy, &att, 1.0).is_none());
+        assert!(requests::attachment_preview(&proxy, &att, 1.0, false).is_none());
 
         // The client refuses other hosts even if a request were made by hand.
         for bad in [
@@ -874,7 +1009,7 @@ mod tests {
             height: Some(8),
             ..Default::default()
         };
-        let req = requests::embed_image(&proxy, &good, (400., 300.), 1.0).unwrap();
+        let req = requests::embed_image(&proxy, &good, (400., 300.), 1.0, false).unwrap();
         client.load(req).await.expect("a proxy URL loads");
         let avatar = UserAvatar {
             user_id: "5".into(),
@@ -933,7 +1068,7 @@ mod tests {
             height: Some(100_000),
             ..Default::default()
         };
-        let req = requests::attachment_preview(&proxy, &att, 1.0).unwrap();
+        let req = requests::attachment_preview(&proxy, &att, 1.0, false).unwrap();
         let q: Vec<(String, String)> = req.url.query_pairs().into_owned().collect();
         assert!(q.contains(&("width".into(), "350".into())), "{q:?}");
         assert!(q.contains(&("height".into(), "350".into())), "{q:?}");

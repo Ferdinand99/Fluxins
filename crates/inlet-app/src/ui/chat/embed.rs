@@ -6,13 +6,16 @@
 //!
 //! Sizes from Fluxer: 516 px wide without media, 432 px with media, media at most
 //! 400 x 300 (400 x 450 when tall), thumbnail at most 80 x 80 with 16 px to its left.
+//!
+//! An embed of a link the text hides in a spoiler is covered as a whole (image, title
+//! and description) until the message's spoilers are shown; nothing of it loads.
 
 use gpui::{div, prelude::*, px, rgb, AnyElement, Context, FontWeight, Hsla, SharedString};
 
 use crate::app::Inlet;
 use crate::model::{self, EmbedField, EmbedKind};
 use crate::theme;
-use crate::ui::markdown::{self, RenderCtx};
+use crate::ui::markdown::{self, Block, Inline, RenderCtx, Style};
 use crate::ui::media::requests;
 
 /// Card width without media (`EMBED_TEXT_OUTER_WIDTH`).
@@ -61,14 +64,85 @@ fn field_rows(fields: &[EmbedField], with_thumbnail: bool) -> Vec<Vec<&EmbedFiel
     rows
 }
 
-/// Draws an embed.
+/// The URLs of the links a message's text hides in spoilers.
+pub(super) fn spoiler_urls(blocks: &[Block]) -> Vec<String> {
+    fn inline(i: &Inline, out: &mut Vec<String>) {
+        for link in &i.links {
+            let hidden = i.highlights.iter().any(|(r, style)| {
+                *style == Style::Spoiler && r.start <= link.range.start && link.range.end <= r.end
+            });
+            if hidden {
+                out.push(link.url.clone());
+            }
+        }
+    }
+    fn walk(blocks: &[Block], out: &mut Vec<String>) {
+        for b in blocks {
+            match b {
+                Block::Text(i) | Block::Heading(_, i) | Block::Subtext(i) => inline(i, out),
+                Block::Quote(inner) | Block::Alert(_, inner) => walk(inner, out),
+                Block::List(items) => items.iter().for_each(|(_, inner)| walk(inner, out)),
+                Block::Code { .. } => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(blocks, &mut out);
+    out
+}
+
+/// Whether an embed belongs to a link hidden in a spoiler: its page or one of its media
+/// is one of `hidden`.
+pub(super) fn embed_spoilered(e: &model::Embed, hidden: &[String]) -> bool {
+    if hidden.is_empty() {
+        return false;
+    }
+    let same = |u: &str| {
+        let u = u.trim_end_matches('/');
+        !u.is_empty() && hidden.iter().any(|h| h.trim_end_matches('/') == u)
+    };
+    e.url.as_deref().is_some_and(same)
+        || [&e.image, &e.thumbnail, &e.video]
+            .into_iter()
+            .flatten()
+            .any(|m| same(&m.url))
+}
+
+/// The cover over a whole embed of a spoilered link; a click shows the message's
+/// spoilers (text and embeds).
+fn spoiler_card(this: &Inlet, id: &str, e: &model::Embed, ctx: &RenderCtx) -> AnyElement {
+    // About the card's size: its large media, if any (a thumbnail sits beside text).
+    let media = e.image.as_ref().or(e.video.as_ref());
+    let width = if media.is_some() {
+        EMBED_MEDIA_WIDTH
+    } else {
+        EMBED_MAX_WIDTH
+    };
+    let height = media.map_or(80., |m| requests::embed_media_box(m).1 + 24.);
+    let size = this.fit_column((width, height), 0.);
+    let reveal = ctx.on_reveal.clone();
+    div()
+        .mt_1()
+        .child(
+            crate::ui::media::cover_box(format!("{id}-spoiler"), t!("media-spoiler"), size)
+                .on_click(move |_, window, cx| reveal(window, cx)),
+        )
+        .into_any_element()
+}
+
+/// Draws an embed. `hidden` are the URLs the text hides in spoilers (empty once the
+/// message's spoilers are shown).
 pub(super) fn render_embed(
     this: &Inlet,
     id: &str,
     e: &model::Embed,
+    hidden: &[String],
     ctx: &RenderCtx,
     cx: &mut Context<Inlet>,
 ) -> AnyElement {
+    if embed_spoilered(e, hidden) {
+        return spoiler_card(this, id, e, ctx);
+    }
     let has_text = e.title.is_some()
         || e.author.is_some()
         || !e.description.is_empty()
@@ -234,6 +308,7 @@ pub(super) fn render_embed(
             v,
             still,
             e.url.clone().filter(|u| markdown::openable(u).is_some()),
+            e.nsfw,
             cx,
         ));
     } else if let Some(i) = image {
@@ -298,6 +373,48 @@ mod tests {
     use crate::backend::messages::parse::to_embed;
     use crate::model::Names;
     use serde_json::json;
+
+    #[test]
+    fn embeds_of_spoilered_links_are_covered() {
+        let blocks = markdown::parse("look ||https://x.example/a.png|| and https://open.example/");
+        let hidden = spoiler_urls(&blocks);
+        assert_eq!(hidden, vec!["https://x.example/a.png".to_string()]);
+        let image = model::Embed {
+            kind: EmbedKind::Image,
+            url: Some("https://x.example/a.png".into()),
+            image: Some(model::EmbedMedia {
+                url: "https://x.example/a.png".into(),
+                proxy_url: Some("https://media.example.org/external/x/a.png".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(embed_spoilered(&image, &hidden));
+        // The open link's embed shows; nothing is hidden once the spoilers are shown.
+        let open = model::Embed {
+            url: Some("https://open.example".into()),
+            ..Default::default()
+        };
+        assert!(!embed_spoilered(&open, &hidden));
+        assert!(!embed_spoilered(&image, &[]));
+        // Inside a quote too.
+        let quoted = markdown::parse("> ||https://x.example/a.png||");
+        assert_eq!(spoiler_urls(&quoted), hidden);
+    }
+
+    #[test]
+    fn explicit_video_embeds_are_covered() {
+        use crate::ui::media::video_explicit;
+        let plain = model::EmbedMedia::default();
+        let marked = model::EmbedMedia {
+            explicit: true,
+            ..Default::default()
+        };
+        assert!(!video_explicit(false, &plain, Some(&plain)));
+        assert!(video_explicit(true, &plain, None));
+        assert!(video_explicit(false, &marked, None));
+        assert!(video_explicit(false, &plain, Some(&marked)));
+    }
 
     #[test]
     fn embed_without_colour_uses_brand_foreground() {

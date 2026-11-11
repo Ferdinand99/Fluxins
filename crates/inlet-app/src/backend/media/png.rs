@@ -145,6 +145,65 @@ pub fn claiming(w: u32, h: u32) -> Vec<u8> {
     out
 }
 
+/// A GIF of `frames` frames on a `w` x `h` canvas: the first frame fills it, the others
+/// change one pixel. Small to send, large once every frame is decoded at full size.
+/// LZW without compression: 7-bit codes in bytes, a clear code every 64 pixels so the
+/// code width never grows.
+#[cfg(test)]
+pub fn long_gif(w: u16, h: u16, frames: usize) -> Vec<u8> {
+    fn image_data(out: &mut Vec<u8>, pixels: impl Iterator<Item = u8>) {
+        const CLEAR: u8 = 128;
+        const END: u8 = 129;
+        let mut codes = Vec::new();
+        let mut run = 0;
+        codes.push(CLEAR);
+        for p in pixels {
+            if run == 64 {
+                codes.push(CLEAR);
+                run = 0;
+            }
+            codes.push(p & 0x7f);
+            run += 1;
+        }
+        codes.push(END);
+        out.push(7); // LZW minimum code size: 128 colours.
+        for block in codes.chunks(255) {
+            out.push(block.len() as u8);
+            out.extend(block);
+        }
+        out.push(0);
+    }
+    fn descriptor(out: &mut Vec<u8>, w: u16, h: u16) {
+        // Graphic control: 100 ms, no transparency.
+        out.extend([0x21, 0xF9, 4, 0, 10, 0, 0, 0]);
+        out.push(0x2C);
+        out.extend(0u16.to_le_bytes());
+        out.extend(0u16.to_le_bytes());
+        out.extend(w.to_le_bytes());
+        out.extend(h.to_le_bytes());
+        out.push(0);
+    }
+    let mut out = b"GIF89a".to_vec();
+    out.extend(w.to_le_bytes());
+    out.extend(h.to_le_bytes());
+    // Global colour table of 128 entries, 8-bit colour resolution.
+    out.extend([0xF6, 0, 0]);
+    for i in 0..128u8 {
+        out.extend([i * 2, 255 - i * 2, 90]);
+    }
+    descriptor(&mut out, w, h);
+    image_data(
+        &mut out,
+        (0..usize::from(w) * usize::from(h)).map(|i| (i / 97) as u8),
+    );
+    for i in 1..frames {
+        descriptor(&mut out, 1, 1);
+        image_data(&mut out, std::iter::once((i % 128) as u8));
+    }
+    out.push(0x3B);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,5 +216,22 @@ mod tests {
         assert_eq!((inspected.width(), inspected.height()), (3, 2));
         assert_eq!(adler32(b"Wikipedia"), 0x11E6_0398);
         assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+    }
+
+    #[test]
+    fn written_gifs_decode_with_every_frame() {
+        let fit = inlet_media::Fit::Contain {
+            max_width: 40,
+            max_height: 30,
+        };
+        let limits = inlet_media::KindLimits::for_kind(inlet_media::MediaKind::Attachment);
+        let decoded = inlet_media::decode(
+            &long_gif(40, 30, 5),
+            fit,
+            &limits,
+            &inlet_media::DecodeControl::with_budget(std::time::Duration::from_secs(5)),
+        )
+        .unwrap();
+        assert_eq!(decoded.frames.len(), 5);
     }
 }

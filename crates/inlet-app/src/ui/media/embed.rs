@@ -31,10 +31,12 @@ impl Inlet {
             return cover;
         }
         let shown = match &self.media.setup {
-            Some(setup) => match requests::embed_image(&setup.proxy, m, max, self.media.scale) {
-                Some(req) => self.image(&req, cx),
-                None => Shown::Unavailable,
-            },
+            Some(setup) => {
+                let scale = self.media.scale;
+                let still = requests::embed_image(&setup.proxy, m, max, scale, false);
+                let moving = requests::embed_image(&setup.proxy, m, max, scale, true);
+                self.moving(moving.as_ref(), still.as_ref(), cx)
+            }
             None => Shown::Unavailable,
         };
         let viewer = Viewer::for_embed(self, m, name);
@@ -45,8 +47,7 @@ impl Inlet {
             .child(picture_of(shown, size, 4., ObjectFit::Contain))
             .on_click(cx.listener(move |this, _, _, cx| {
                 if let Some(v) = viewer.clone() {
-                    this.media.viewer = Some(v);
-                    cx.notify();
+                    this.open_viewer(v, cx);
                 }
             }))
             .into_any_element()

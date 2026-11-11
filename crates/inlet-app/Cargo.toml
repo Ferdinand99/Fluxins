@@ -12,6 +12,9 @@ publish = false
 # Built-in sample data, started with INLET_DEMO=1. Only for screenshots and UI checks;
 # off in normal builds.
 demo = []
+# Trust the private test instance's CA (REST, gateway and media). Debug builds only:
+# inlet-protocol refuses it in a release build.
+test-extra-ca = ["inlet-protocol/test-extra-ca"]
 
 [[bin]]
 name = "inlet"

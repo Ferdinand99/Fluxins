@@ -194,7 +194,9 @@ fn serve(path: &str, query: &str) -> Option<Vec<u8>> {
             match stem {
                 "weekend" => png_of(1280, 720, landscape(1280, 720, 0.)),
                 "lighthouse" => png_of(600, 900, bands(600, 900, [40, 60, 120], [250, 200, 120])),
-                "cat" => png::encode_apng(160, 160, &bouncing(160, 12), 80),
+                // The proxy gives the first frame unless asked for the animation.
+                "cat" if animated => png::encode_apng(160, 160, &bouncing(160, 12), 80),
+                "cat" => png_of(160, 160, bouncing(160, 1).remove(0)),
                 "clip" => png_of(960, 540, landscape(960, 540, 2.4)),
                 "finale" => png_of(800, 450, bands(800, 450, [120, 30, 60], [250, 120, 80])),
                 "beach" => png_of(800, 450, landscape(800, 450, 4.)),
@@ -212,7 +214,8 @@ fn serve(path: &str, query: &str) -> Option<Vec<u8>> {
             "thumb" => png_of(160, 160, bands(160, 160, [241, 196, 15], [180, 90, 20])),
             "article" => png_of(800, 420, landscape(800, 420, 3.)),
             "picture" => png_of(900, 600, landscape(900, 600, 5.)),
-            "gif" => png::encode_apng(240, 240, &bouncing(240, 12), 80),
+            "gif" if animated => png::encode_apng(240, 240, &bouncing(240, 12), 80),
+            "gif" => png_of(240, 240, bouncing(240, 1).remove(0)),
             "video" => png_of(1280, 720, landscape(1280, 720, 0.7)),
             "sky" => png_of(800, 450, bands(800, 450, [60, 120, 230], [220, 240, 255])),
             _ => return None,
@@ -352,8 +355,8 @@ fn attachments_channel() -> Vec<p::Message> {
         with(
             43,
             "ada",
-            "10:05",
-            "Spoiler for the finale, and one marked sensitive.",
+            "10:08",
+            "Spoiler for the finale, one marked sensitive, and the script.",
             vec![
                 attachment(
                     ch,
@@ -369,12 +372,35 @@ fn attachments_channel() -> Vec<p::Message> {
                     "image/png",
                     json!({"width": 330, "height": 186, "size": 300_000, "flags": 16}),
                 ),
+                attachment(
+                    ch,
+                    8011,
+                    "finale-script.pdf",
+                    "application/pdf",
+                    json!({"size": 120_000, "flags": 8}),
+                ),
             ],
+        ),
+        // A link in a spoiler: its embed is covered with the text.
+        message_at(
+            46,
+            ch,
+            "grace",
+            at("10:10"),
+            "How it ends: ||https://blog.example/finale||",
+            json!({ "embeds": [{
+                "type": "link",
+                "url": "https://blog.example/finale",
+                "provider": {"name": "Example Blog"},
+                "title": "The finale, explained",
+                "description": "Everything that happens in the last episode.",
+                "thumbnail": media_json("thumb", 160, 160)
+            }] }),
         ),
         with(
             44,
             "linus",
-            "10:07",
+            "10:04",
             "The cat, and a clip of it.",
             vec![
                 attachment(
@@ -396,7 +422,7 @@ fn attachments_channel() -> Vec<p::Message> {
         with(
             42,
             "grace",
-            "10:09",
+            "10:06",
             "Release notes and the recording of the talk.",
             vec![
                 attachment(
@@ -434,7 +460,7 @@ fn embeds_channel() -> Vec<p::Message> {
         with(
             50,
             "ada",
-            "11:00",
+            "11:06",
             "",
             json!({
                 "type": "bluesky",
@@ -450,7 +476,7 @@ fn embeds_channel() -> Vec<p::Message> {
         with(
             51,
             "linus",
-            "11:02",
+            "11:10",
             "",
             json!({"type": "gifv", "url": "https://gifs.example/cat", "provider": {"name": "Gifs"},
                    "thumbnail": {"url": "https://gifs.example/cat.gif", "proxy_url": external("gif"), "width": 240, "height": 240, "flags": 32},
@@ -459,7 +485,7 @@ fn embeds_channel() -> Vec<p::Message> {
         with(
             52,
             "grace",
-            "11:03",
+            "11:09",
             "",
             json!({"type": "image", "url": "https://images.example/hills.png",
                    "thumbnail": media_json("picture", 900, 600)}),
@@ -481,7 +507,7 @@ fn embeds_channel() -> Vec<p::Message> {
         with(
             54,
             "grace",
-            "11:07",
+            "11:08",
             "",
             json!({
                 "type": "video",
@@ -497,7 +523,7 @@ fn embeds_channel() -> Vec<p::Message> {
         with(
             55,
             "linus",
-            "11:09",
+            "11:02",
             "https://blog.example/rust-gpui",
             json!({
                 "type": "link",
@@ -511,14 +537,14 @@ fn embeds_channel() -> Vec<p::Message> {
         with(
             56,
             "Inlet",
-            "11:10",
+            "11:01",
             "",
             json!({"title": "No colour", "description": "An embed without a colour gets the brand bar."}),
         ),
         with(
             57,
             "Sylo",
-            "11:12",
+            "11:00",
             "",
             json!({
                 "type": "rich",
@@ -536,6 +562,21 @@ fn embeds_channel() -> Vec<p::Message> {
                 "thumbnail": media_json("thumb", 160, 160),
                 "footer": {"text": "Sylo", "proxy_icon_url": external("footer")},
                 "timestamp": "2026-11-10T11:00:00+00:00"
+            }),
+        ),
+        with(
+            58,
+            "linus",
+            "11:11",
+            "",
+            json!({
+                "type": "video",
+                "url": "https://video.example/watch?v=sensitive",
+                "provider": {"name": "VideoSite"},
+                "title": "Marked sensitive",
+                "nsfw": true,
+                "thumbnail": media_json("video", 1280, 720),
+                "video": {"url": "https://video.example/embed/sensitive", "width": 1280, "height": 720}
             }),
         ),
     ]

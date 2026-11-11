@@ -9,6 +9,13 @@
 //! tall), embed thumbnails 80 x 80, avatars 40 px. The proxy is asked for the pixels
 //! shown (logical size times the display scale), so it does the scaling and the decode
 //! limits shrink to match (`MediaRequest::with_proxy_size`).
+//!
+//! Animations come in two requests: the animated one and its still (the first frame,
+//! `animated` off). Animated requests ask for the logical size only, never times the
+//! display scale, and the viewer's for at most [`VIEWER_ANIMATED_MAX_PIXELS`]: every
+//! frame is kept decoded, so their size is what an animation costs. The views fall
+//! back to the still when an animation is too large or the budget is spent (see
+//! `image.rs`).
 
 use inlet_media::{snap_proxy_size, Fit, MediaKind, MediaRequest};
 use inlet_protocol::{self as p, ImageFormat, ImageOptions, Transform};
@@ -26,6 +33,8 @@ pub const EMBED_MEDIA_TALL_MAX: (f32, f32) = (400., 450.);
 pub const EMBED_THUMBNAIL_MAX: (f32, f32) = (80., 80.);
 /// Longest side, in pixels, the image viewer asks for.
 pub const VIEWER_MAX_PIXELS: u32 = 2560;
+/// Longest side, in pixels, of an animation in the viewer.
+pub const VIEWER_ANIMATED_MAX_PIXELS: u32 = 1024;
 
 /// The logical size an image of `w` x `h` shows at inside `max`, never enlarged. An
 /// unknown size takes the whole box.
@@ -145,17 +154,28 @@ pub fn guild_banner(
 }
 
 /// The preview of an image attachment (or a video's first frame), at its size inside
-/// 550 x 350.
-pub fn attachment_preview(proxy: &p::Media, a: &Attachment, scale: f32) -> Option<MediaRequest> {
-    let (w, h) = fit_inside(a.width, a.height, PREVIEW_MAX);
-    let (pw, ph) = (pixels(w, scale), pixels(h, scale));
+/// 550 x 350. With `animate`, the animated version of an animated image (`None` for
+/// anything else); without, always a still.
+pub fn attachment_preview(
+    proxy: &p::Media,
+    a: &Attachment,
+    scale: f32,
+    animate: bool,
+) -> Option<MediaRequest> {
     let video = a.kind == crate::model::AttachmentKind::Video;
+    let animated = animate && a.animated && !video;
+    if animate && !animated {
+        return None;
+    }
+    let (w, h) = fit_inside(a.width, a.height, PREVIEW_MAX);
+    let scale = if animated { 1. } else { scale };
+    let (pw, ph) = (pixels(w, scale), pixels(h, scale));
     let t = Transform {
         width: Some(pw),
         height: Some(ph),
         // An image format makes the proxy return a video's first frame.
         format: video.then_some(ImageFormat::Webp),
-        animated: a.animated && !video,
+        animated,
     };
     request(
         attachment_url(proxy, a, t),
@@ -168,16 +188,25 @@ pub fn attachment_preview(proxy: &p::Media, a: &Attachment, scale: f32) -> Optio
     )
 }
 
-/// The large version of an image attachment for the viewer.
-pub fn attachment_full(proxy: &p::Media, a: &Attachment) -> Option<MediaRequest> {
-    let max = VIEWER_MAX_PIXELS as f32;
+/// The large version of an image attachment for the viewer: the still, or with
+/// `animate` the animation of an animated one (smaller, see
+/// [`VIEWER_ANIMATED_MAX_PIXELS`]).
+pub fn attachment_full(proxy: &p::Media, a: &Attachment, animate: bool) -> Option<MediaRequest> {
+    if animate && !a.animated {
+        return None;
+    }
+    let max = if animate {
+        VIEWER_ANIMATED_MAX_PIXELS
+    } else {
+        VIEWER_MAX_PIXELS
+    } as f32;
     let (w, h) = fit_inside(a.width, a.height, (max, max));
     let (pw, ph) = (w as u32, h as u32);
     let t = Transform {
         width: Some(pw),
         height: Some(ph),
         format: None,
-        animated: a.animated,
+        animated: animate,
     };
     request(
         attachment_url(proxy, a, t),
@@ -195,20 +224,26 @@ pub fn attachment_original(proxy: &p::Media, a: &Attachment) -> Option<Url> {
     Url::parse(&attachment_url(proxy, a, Transform::default())?).ok()
 }
 
-/// An embed image, thumbnail or video frame for a box of `max` logical pixels.
+/// An embed image or thumbnail for a box of `max` logical pixels: the still, or with
+/// `animate` the animation of an animated one (`None` otherwise).
 pub fn embed_image(
     proxy: &p::Media,
     m: &EmbedMedia,
     max: (f32, f32),
     scale: f32,
+    animate: bool,
 ) -> Option<MediaRequest> {
+    if animate && !m.animated {
+        return None;
+    }
     let (w, h) = fit_inside(m.width, m.height, max);
+    let scale = if animate { 1. } else { scale };
     let (pw, ph) = (pixels(w, scale), pixels(h, scale));
     let t = Transform {
         width: Some(pw),
         height: Some(ph),
         format: None,
-        animated: m.animated,
+        animated: animate,
     };
     request(
         embed_url(proxy, m.proxy_url.as_deref(), t),
@@ -247,16 +282,24 @@ pub fn embed_video_frame(
     )
 }
 
-/// The large version of an embed image for the viewer.
-pub fn embed_full(proxy: &p::Media, m: &EmbedMedia) -> Option<MediaRequest> {
-    let max = VIEWER_MAX_PIXELS as f32;
+/// The large version of an embed image for the viewer: the still, or with `animate`
+/// the animation of an animated one (smaller, see [`VIEWER_ANIMATED_MAX_PIXELS`]).
+pub fn embed_full(proxy: &p::Media, m: &EmbedMedia, animate: bool) -> Option<MediaRequest> {
+    if animate && !m.animated {
+        return None;
+    }
+    let max = if animate {
+        VIEWER_ANIMATED_MAX_PIXELS
+    } else {
+        VIEWER_MAX_PIXELS
+    } as f32;
     let (w, h) = fit_inside(m.width, m.height, (max, max));
     let (pw, ph) = (w as u32, h as u32);
     let t = Transform {
         width: Some(pw),
         height: Some(ph),
         format: None,
-        animated: m.animated,
+        animated: animate,
     };
     request(
         embed_url(proxy, m.proxy_url.as_deref(), t),
@@ -327,7 +370,8 @@ mod tests {
             height: Some(1080),
             ..Default::default()
         };
-        let req = attachment_preview(&proxy, &a, 2.0).unwrap();
+        let req = attachment_preview(&proxy, &a, 2.0, false).unwrap();
+        assert!(attachment_preview(&proxy, &a, 2.0, true).is_none());
         assert_eq!(
             req.url.as_str(),
             "https://media.example.org/attachments/1/2/v.mp4?ex=1&is=2&hm=3&width=1100&height=618&format=webp"

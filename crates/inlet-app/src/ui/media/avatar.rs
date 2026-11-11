@@ -12,6 +12,8 @@ use crate::model::{Guild, UserAvatar};
 use crate::theme;
 
 /// Height of the guild banner above the channel list.
+// Deviation: Fluxer's banner is 16:9 (at most 30 % of the window) with the name over it
+// on a gradient; here it is a fixed 120 px strip with the name below.
 pub const BANNER_HEIGHT: f32 = 120.;
 
 impl Inlet {

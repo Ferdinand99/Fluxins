@@ -2,6 +2,9 @@
 //! Videos as a still: the first frame from the media proxy with a play button. Inlet has
 //! no video player; the play button opens the video in the browser, through the link
 //! check. Video sites in embeds (YouTube and the like) always open in the browser.
+//!
+//! Deviation: the plan opens attachment videos in the system's player. Until that is
+//! decided they open in the browser, which needs no new code path for local files.
 
 use gpui::{div, prelude::*, px, AnyElement, Context, FontWeight, ObjectFit, SharedString};
 
@@ -10,6 +13,12 @@ use super::{duration, requests, MediaIcon};
 use crate::app::Inlet;
 use crate::model::{Attachment, EmbedMedia};
 use crate::theme;
+
+/// Whether an embed's video is covered as explicit: the embed is marked, or its video
+/// or its still is.
+pub(crate) fn video_explicit(nsfw: bool, video: &EmbedMedia, still: Option<&EmbedMedia>) -> bool {
+    nsfw || video.explicit || still.is_some_and(|s| s.explicit)
+}
 
 /// The round play button in the middle of a video still.
 fn play_button() -> gpui::Div {
@@ -103,6 +112,7 @@ impl Inlet {
         video: &EmbedMedia,
         thumbnail: Option<&EmbedMedia>,
         link: Option<String>,
+        nsfw: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let shape = thumbnail.unwrap_or(video);
@@ -111,10 +121,18 @@ impl Inlet {
             height: video.height.or(shape.height),
             ..Default::default()
         });
+        let shown_size = self.fit_column(size, super::EMBED_CHROME);
+        // Covered before anything loads.
+        let explicit = video_explicit(nsfw, video, thumbnail);
+        if let Some(cover) = self.cover(&format!("evid-{key}"), false, explicit, shown_size, cx) {
+            return cover;
+        }
         let shown = match &self.media.setup {
             Some(setup) => {
                 let req = match thumbnail {
-                    Some(t) => requests::embed_image(&setup.proxy, t, size, self.media.scale),
+                    Some(t) => {
+                        requests::embed_image(&setup.proxy, t, size, self.media.scale, false)
+                    }
                     None => {
                         requests::embed_video_frame(&setup.proxy, video, size, self.media.scale)
                     }
@@ -126,7 +144,6 @@ impl Inlet {
             }
             None => Shown::Unavailable,
         };
-        let shown_size = self.fit_column(size, super::EMBED_CHROME);
         let still = picture_of(shown, shown_size, 4., ObjectFit::Cover);
         let link = link.or_else(|| (!video.url.is_empty()).then(|| video.url.clone()));
         with_play(format!("evid-{key}"), still, None)

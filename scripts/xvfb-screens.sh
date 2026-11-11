@@ -9,7 +9,13 @@ Xvfb :99 -screen 0 1280x860x24 >/dev/null 2>&1 &
 export DISPLAY=:99 XDG_CONFIG_HOME="$out/config"
 sleep 2
 
-shot() { import -window root "$out/$1.png" 2>/dev/null; }
+# A run whose app quit before its screenshot crashed: noted here, and the script fails
+# at the end (after handing back the pictures).
+failed=""
+shot() {
+  kill -0 "$pid" 2>/dev/null || { echo "$1: the app exited early" >&2; failed="$failed $1"; }
+  import -window root "$out/$1.png" 2>/dev/null
+}
 win() { xdotool search --name '^Inlet' | head -1; }
 # Press and release with a pause: gpui's inline text (links, spoilers) registers its
 # mouse-up handler on the frame after the mouse-down, so an instant click is lost.
@@ -74,3 +80,7 @@ tail -n 20 "$out/signin.log" "$out/demo.log" >&2
 cat "$out/memory.txt" >&2
 rm -rf "$out/config"
 tar -C "$out" -cf - .
+if [ -n "$failed" ]; then
+  echo "exited early:$failed" >&2
+  exit 1
+fi

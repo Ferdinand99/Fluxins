@@ -19,6 +19,8 @@ impl Inlet {
                 .map(|g| g.name.clone())
                 .unwrap_or_default(),
         };
+        // Deviation: a 120 px banner with the name below it, not Fluxer's 16:9 banner
+        // with the name over it (see `ui/media/avatar.rs`).
         let banner = self.guild_banner(super::SIDEBAR_WIDTH, cx);
         let name = div()
             .h(px(HEADER_HEIGHT))
