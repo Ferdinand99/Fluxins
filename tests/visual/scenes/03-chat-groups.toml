@@ -1,0 +1,10 @@
+# Messages in groups (cozy): avatars, names, grouped follow-ups, the unread line, a
+# message on its way and one that failed.
+name = "chat-groups"
+window = [1280, 860]
+scale = 1.0
+theme = "dark"
+ignore = []
+scene = "chat-cozy"
+guild = "g1"
+channel = "c-general"

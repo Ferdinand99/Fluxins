@@ -1,0 +1,10 @@
+# Guild rail with unread and mention marks, and the channel list of the first guild
+# (categories, a voice channel, long and non-Latin names).
+name = "rail-channels"
+window = [1280, 860]
+scale = 1.0
+theme = "dark"
+ignore = []
+scene = "default"
+guild = "g1"
+channel = "c-welcome"

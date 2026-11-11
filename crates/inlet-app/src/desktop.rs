@@ -356,6 +356,15 @@ pub fn window_options(start: &Start, cx: &mut App) -> WindowOptions {
             None,
         ),
     };
+    // A scene file of the visual checks fixes the size, whatever was remembered.
+    #[cfg(feature = "demo")]
+    let (bounds, display_id) = match crate::demo::scenes::window_size() {
+        Some((w, h)) => (
+            WindowBounds::Windowed(Bounds::centered(None, size(px(w), px(h)), cx)),
+            None,
+        ),
+        None => (bounds, display_id),
+    };
     let hidden = start.opens_hidden();
     WindowOptions {
         window_bounds: Some(bounds),

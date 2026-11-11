@@ -17,8 +17,12 @@ use crate::app::Inlet;
 use crate::theme;
 use crate::ui::markdown::{self, RenderCtx};
 
+/// Space left of the avatar column, and right of the text (16 | 40 | 12 | text).
+pub const ROW_INSET: f32 = 16.;
 /// Avatar column of the message grid (16 | 40 | 12 | text).
 pub const AVATAR_COLUMN: f32 = 40.;
+/// Space between the avatar column and the text (16 | 40 | 12 | text).
+pub const AVATAR_GAP: f32 = 12.;
 /// Space above the first message of a group (`--message-group-spacing`, cozy only).
 pub const GROUP_SPACING: f32 = 16.;
 /// Width of the time column in compact mode.
@@ -230,10 +234,17 @@ impl Inlet {
             div()
                 .flex()
                 .flex_row()
-                .gap_3()
-                .child(div().w(px(AVATAR_COLUMN)).flex_none().child(side))
+                .gap(px(AVATAR_GAP))
                 .child(
                     div()
+                        .debug_selector(|| "message-avatar-column".into())
+                        .w(px(AVATAR_COLUMN))
+                        .flex_none()
+                        .child(side),
+                )
+                .child(
+                    div()
+                        .debug_selector(|| "message-content".into())
                         .flex_1()
                         .min_w_0()
                         .flex()
@@ -272,11 +283,12 @@ impl Inlet {
             .child(
                 div()
                     .id(SharedString::from(format!("row-{}", m.id)))
+                    .debug_selector(|| "message-row".into())
                     .group(ROW_GROUP)
                     .relative()
                     .w_full()
-                    .pl_4()
-                    .pr_4()
+                    .pl(px(ROW_INSET))
+                    .pr(px(ROW_INSET))
                     .py(px(2.))
                     .flex()
                     .flex_col()

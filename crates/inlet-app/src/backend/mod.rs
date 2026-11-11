@@ -198,6 +198,14 @@ impl BackendHandle {
     pub fn send(&self, command: impl Into<Command>) {
         let _ = self.tx.send(command.into());
     }
+
+    /// A handle with no backend behind it: commands go nowhere. For the layout tests,
+    /// which feed the view its events themselves.
+    #[cfg(feature = "demo")]
+    pub fn detached() -> Self {
+        let (tx, _rx) = unbounded_channel();
+        Self { tx }
+    }
 }
 
 /// Starts the backend thread. Events arrive on `events`. When the thread ends (a panic in

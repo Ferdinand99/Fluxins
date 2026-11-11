@@ -10,6 +10,8 @@ use crate::ui::notifications::badge::{rail_badge, RailMarks};
 
 /// Guild rail width.
 pub const RAIL_WIDTH: f32 = 72.;
+/// Height of one rail entry (`--guild-list-item-box-size`).
+pub const ITEM_BOX: f32 = 48.;
 
 impl Inlet {
     pub(crate) fn render_guild_rail(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -20,11 +22,18 @@ impl Inlet {
         let item = |id: SharedString, content: AnyElement, active: bool, marks: RailMarks| {
             let group = SharedString::from(format!("{id}-g"));
             div()
-                .id(id)
+                .id(id.clone())
+                .debug_selector(move || {
+                    if id.as_ref() == "home" {
+                        "rail-home".into()
+                    } else {
+                        "rail-guild".into()
+                    }
+                })
                 .group(group.clone())
                 .relative()
                 .w(px(RAIL_WIDTH))
-                .h(px(48.))
+                .h(px(ITEM_BOX))
                 .flex_none()
                 .flex()
                 .items_center()
@@ -71,6 +80,7 @@ impl Inlet {
         };
         div()
             .id("guild-rail")
+            .debug_selector(|| "guild-rail".into())
             .w(px(RAIL_WIDTH))
             .h_full()
             .flex_none()

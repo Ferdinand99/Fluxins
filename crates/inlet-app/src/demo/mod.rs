@@ -9,13 +9,14 @@
 //! ([`snowflake`]), and message IDs are made from the message's time.
 //!
 //! One file per domain (`guilds`, `media`, `messages`, `markdown`, `social`); `scenes`
-//! picks what to show.
+//! picks what to show, also from the scene files of the visual checks (`scene_file`).
 
 pub mod composer;
 mod guilds;
 mod markdown;
 pub mod media;
 mod messages;
+pub mod scene_file;
 pub mod scenes;
 mod social;
 mod unread;
@@ -278,6 +279,21 @@ fn page_of(list: &[p::Message], before: Option<MessageId>) -> Vec<p::Message> {
         .collect()
 }
 
+/// A page of `list` as the API would answer, with its messages converted.
+pub(crate) fn rendered_page(
+    list: &[p::Message],
+    before: Option<MessageId>,
+    names: &SharedNames,
+) -> (MessagesPage, Vec<Message>) {
+    let list = page_of(list, before);
+    let rendered = list.iter().map(|m| parse::to_message(m, names)).collect();
+    let page = match before {
+        Some(b) => MessagesPage::before(b, list, PAGE_SIZE),
+        None => MessagesPage::latest(list, PAGE_SIZE),
+    };
+    (page, rendered)
+}
+
 impl MockSession {
     pub fn start(events: Ui) -> Self {
         let scene = scenes::current();
@@ -366,7 +382,7 @@ impl MockSession {
     }
 
     fn page(&self, channel_id: &str, before: Option<MessageId>) -> (MessagesPage, Vec<Message>) {
-        let list = page_of(
+        rendered_page(
             self.messages
                 .lock()
                 .unwrap()
@@ -374,16 +390,8 @@ impl MockSession {
                 .map(Vec::as_slice)
                 .unwrap_or_default(),
             before,
-        );
-        let rendered = list
-            .iter()
-            .map(|m| parse::to_message(m, &self.names))
-            .collect();
-        let page = match before {
-            Some(b) => MessagesPage::before(b, list, PAGE_SIZE),
-            None => MessagesPage::latest(list, PAGE_SIZE),
-        };
-        (page, rendered)
+            &self.names,
+        )
     }
 
     /// The newest page of a channel, which also becomes the one the demo gateway

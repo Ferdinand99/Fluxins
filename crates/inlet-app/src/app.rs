@@ -98,6 +98,18 @@ impl gpui::Global for CurrentBackend {}
 
 impl Inlet {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::build(None, window, cx)
+    }
+
+    /// The view without a backend thread: commands go nowhere. The layout tests feed
+    /// it its events themselves.
+    #[cfg(feature = "demo")]
+    pub(crate) fn detached(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::build(Some(BackendHandle::detached()), window, cx)
+    }
+
+    /// `backend`: `None` starts the backend thread and restores the saved session.
+    fn build(backend: Option<BackendHandle>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let mut subscriptions = Vec::new();
         let sign_in = ui::accounts::SignInState::new(window, cx, &mut subscriptions);
         let composer = ui::composer::ComposerState::new(window, cx, &mut subscriptions);
@@ -112,7 +124,10 @@ impl Inlet {
             }
         }));
 
-        let (backend, _) = Self::spawn_backend(0, true, window, cx);
+        let backend = match backend {
+            Some(backend) => backend,
+            None => Self::spawn_backend(0, true, window, cx).0,
+        };
         let notifications = ui::notifications::State::new(window.is_window_active());
         Self {
             backend,
@@ -196,7 +211,12 @@ impl Inlet {
     }
 
     /// Hands a backend event to the domain it belongs to.
-    fn handle_event(&mut self, event: Event, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn handle_event(
+        &mut self,
+        event: Event,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         match event {
             Event::Accounts(ev) => self.on_accounts_event(ev, window, cx),
             Event::Messages(ev) => self.on_messages_event(ev, window, cx),

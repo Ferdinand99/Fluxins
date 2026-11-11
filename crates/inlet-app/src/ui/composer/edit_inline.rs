@@ -229,10 +229,11 @@ impl ComposerView {
                 .flex_col()
                 .gap_1()
                 .child(
+                    // As the composer's box: the border takes 1 px of Fluxer's padding.
                     div()
-                        .min_h(px(58.))
+                        .min_h(px(super::editor::BOX_MIN_HEIGHT))
                         .px_4()
-                        .py(px(18.))
+                        .py(px(17.))
                         .flex()
                         .items_center()
                         .rounded(px(8.))
