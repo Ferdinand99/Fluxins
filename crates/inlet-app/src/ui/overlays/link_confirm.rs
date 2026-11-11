@@ -2,7 +2,7 @@
 //! Opening links from messages: http(s) only, and a confirmation when the link text
 //! does not show where it goes.
 
-use gpui::{div, prelude::*, px, AnyElement, Context, FontWeight};
+use gpui::{div, prelude::*, px, Context, Div, FontWeight, Stateful};
 
 use super::modal::modal;
 use crate::app::Inlet;
@@ -32,7 +32,7 @@ impl Inlet {
         cx.notify();
     }
 
-    pub(super) fn render_link_confirm(&self, url: &str, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_link_confirm(&self, url: &str, cx: &mut Context<Self>) -> Stateful<Div> {
         let host = markdown::link_target_label(url);
         // Open exactly what was parsed and shown, never the raw text.
         let parsed = markdown::openable(url);
@@ -93,7 +93,6 @@ impl Inlet {
                     .into_any_element(),
             ],
         )
-        .into_any_element()
     }
 }
 

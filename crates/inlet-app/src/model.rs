@@ -241,6 +241,10 @@ pub struct Message {
     pub blocks: Vec<Block>,
     /// `content` is longer than what `blocks` shows.
     pub truncated: bool,
+    /// The URLs the whole text hides in spoilers (see `markdown::spoilered_links`);
+    /// the embeds of these links are covered until the spoilers are shown. Only worked
+    /// out for a message with embeds, on the backend thread, so drawing never parses.
+    pub spoiler_links: Vec<String>,
     pub attachments: Vec<Attachment>,
     pub embeds: Vec<Embed>,
     pub reply: Option<Reply>,
@@ -280,6 +284,15 @@ impl Message {
         if self.edited {
             crate::ui::markdown::mark_edited(&mut self.blocks);
         }
+        // A cut text is read whole for this, so a spoiler past the cut still counts.
+        self.spoiler_links = if self.embeds.is_empty() {
+            Vec::new()
+        } else if self.truncated {
+            let whole = crate::ui::markdown::parse_with(&self.content, names);
+            crate::ui::markdown::spoilered_links(&whole)
+        } else {
+            crate::ui::markdown::spoilered_links(&self.blocks)
+        };
     }
 }
 
@@ -404,6 +417,7 @@ mod tests {
             content: String::new(),
             blocks: vec![],
             truncated: false,
+            spoiler_links: vec![],
             attachments: vec![],
             embeds: vec![],
             reply: None,
@@ -471,5 +485,31 @@ mod tests {
         big.content = "x".repeat(MAX_CONTENT_BYTES * 2);
         big.parse();
         assert_eq!(big.content.len(), MAX_CONTENT_BYTES);
+    }
+
+    #[test]
+    fn spoiler_links_of_a_cut_text_are_worked_out_when_it_is_parsed() {
+        let hidden = "https://x.example/a.png";
+        let mut m = msg("3", "a", 0);
+        m.embeds.push(Embed::default());
+        m.content = format!("{}\n\n||{hidden}||", "ø".repeat(DISPLAY_CHARS + 10));
+        m.parse();
+        assert!(m.truncated);
+        // The spoiler lies past the cut: `blocks` does not have it, the list does.
+        assert_eq!(m.spoiler_links, vec![hidden.to_string()]);
+
+        // A message that is not cut reads its own blocks.
+        let mut short = msg("4", "a", 0);
+        short.embeds.push(Embed::default());
+        short.content = format!("see ||{hidden}|| and https://open.example/");
+        short.parse();
+        assert!(!short.truncated);
+        assert_eq!(short.spoiler_links, vec![hidden.to_string()]);
+
+        // Without embeds there is nothing to cover, so nothing is worked out.
+        let mut plain = msg("5", "a", 0);
+        plain.content = format!("||{hidden}||");
+        plain.parse();
+        assert!(plain.spoiler_links.is_empty());
     }
 }
