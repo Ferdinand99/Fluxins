@@ -112,6 +112,8 @@ impl Inlet {
             }
         }
         children.push(buttons.into_any_element());
-        modal("link-prompt", 480., children).into_any_element()
+        // The prompt is the topmost layer: it has the keyboard, and Escape closes it.
+        self.layer_keys(modal("link-prompt", 480., children), cx)
+            .into_any_element()
     }
 }

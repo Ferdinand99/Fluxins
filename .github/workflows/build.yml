@@ -151,6 +151,19 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+      # COM used on a thread that never initialised it (as gpui's own jump list did),
+      # or a shell call made while gpui's app is borrowed, shows only in these logs.
+      - name: No COM or borrow errors in the demo logs
+        shell: pwsh
+        run: |
+          $patterns = @('CoInitialize has not been called', '0x800401F0', 'RefCell already borrowed', 'jump list')
+          $bad = Select-String -Path screenshots/*.log -Pattern $patterns -SimpleMatch
+          if ($bad) {
+            $bad | ForEach-Object { Write-Host "::error::$($_.Filename): $($_.Line)" }
+            exit 1
+          }
+          Write-Host "no COM or borrow errors in $((Get-ChildItem screenshots/*.log).Count) logs"
+
   macos:
     name: macOS (aarch64)
     runs-on: macos-latest

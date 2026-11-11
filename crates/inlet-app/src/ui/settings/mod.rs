@@ -145,8 +145,14 @@ impl Inlet {
         let Some(view) = self.settings.view.clone() else {
             return div().into_any_element();
         };
-        div()
-            .id("settings-overlay")
+        let overlay = div().id("settings-overlay");
+        // Under an open link prompt, the prompt has the keyboard.
+        let overlay = if self.overlays.link_prompt.is_none() {
+            self.layer_keys(overlay, cx)
+        } else {
+            overlay
+        };
+        overlay
             .occlude()
             .absolute()
             .top_0()

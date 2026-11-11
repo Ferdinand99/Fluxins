@@ -171,6 +171,69 @@ impl LinkGate {
     }
 }
 
+/// Where the signed-in session is, as far as links care.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Session {
+    /// Signed in and the account state is loaded: a link can be looked up.
+    Ready,
+    /// A saved session is connecting, reconnecting or finishing sign-in.
+    Connecting,
+    /// Nobody is signed in.
+    SignedOut,
+}
+
+/// How long a link waits for the session before it is dropped.
+pub const MAX_WAIT: Duration = Duration::from_secs(120);
+
+/// What to show for a link now.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Next {
+    /// Look it up and ask about it.
+    Ask(Incoming),
+    /// Nobody is signed in: say so.
+    SignInFirst,
+}
+
+/// A link that came before the session was ready (Inlet started by the link, or a
+/// reconnect): kept until the account is loaded, then shown. Only the newest link is
+/// kept, and only for [`MAX_WAIT`].
+#[derive(Debug, Default)]
+pub struct LinkQueue {
+    waiting: Option<(Incoming, Instant)>,
+}
+
+impl LinkQueue {
+    /// A new link (already through the [`LinkGate`]). It replaces one that waits.
+    pub fn offer(&mut self, link: Incoming, session: Session, now: Instant) -> Option<Next> {
+        self.waiting = Some((link, now));
+        self.poll(session, now)
+    }
+
+    /// The waiting link, once the session allows it.
+    pub fn poll(&mut self, session: Session, now: Instant) -> Option<Next> {
+        let (_, at) = self.waiting.as_ref()?;
+        if now.saturating_duration_since(*at) > MAX_WAIT {
+            log::info!("a link waited too long for the session; dropped");
+            self.waiting = None;
+            return None;
+        }
+        match session {
+            Session::Ready => self.waiting.take().map(|(link, _)| Next::Ask(link)),
+            Session::SignedOut => {
+                self.waiting = None;
+                Some(Next::SignInFirst)
+            }
+            Session::Connecting => None,
+        }
+    }
+
+    /// Whether a link waits.
+    #[cfg(test)]
+    pub fn is_waiting(&self) -> bool {
+        self.waiting.is_some()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,6 +348,52 @@ mod tests {
         ] {
             assert_eq!(web_invite(bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn a_link_waits_for_the_session_and_is_then_asked_about() {
+        let mut queue = LinkQueue::default();
+        let t = Instant::now();
+        let link = deep("inlet://channels/1/2");
+        // Started by the link, still connecting: nothing yet, and no "sign in first".
+        assert_eq!(queue.offer(link.clone(), Session::Connecting, t), None);
+        assert!(queue.is_waiting());
+        assert_eq!(
+            queue.poll(Session::Connecting, t + Duration::from_secs(5)),
+            None
+        );
+        // The account is in: asked once.
+        assert_eq!(
+            queue.poll(Session::Ready, t + Duration::from_secs(6)),
+            Some(Next::Ask(link.clone()))
+        );
+        assert_eq!(queue.poll(Session::Ready, t + Duration::from_secs(7)), None);
+        // A newer link replaces a waiting one; only one is ever kept.
+        queue.offer(deep("inlet://channels/1/3"), Session::Connecting, t);
+        queue.offer(link.clone(), Session::Connecting, t);
+        assert_eq!(
+            queue.poll(Session::Ready, t + Duration::from_secs(1)),
+            Some(Next::Ask(link.clone()))
+        );
+        // Ready at once: asked at once.
+        assert_eq!(
+            queue.offer(link.clone(), Session::Ready, t),
+            Some(Next::Ask(link.clone()))
+        );
+        // The saved session could not be restored: sign in first.
+        queue.offer(link.clone(), Session::Connecting, t);
+        assert_eq!(
+            queue.poll(Session::SignedOut, t + Duration::from_secs(1)),
+            Some(Next::SignInFirst)
+        );
+        assert!(!queue.is_waiting());
+        // A link does not wait forever.
+        queue.offer(link, Session::Connecting, t);
+        assert_eq!(
+            queue.poll(Session::Ready, t + MAX_WAIT + Duration::from_secs(1)),
+            None
+        );
+        assert!(!queue.is_waiting());
     }
 
     #[test]

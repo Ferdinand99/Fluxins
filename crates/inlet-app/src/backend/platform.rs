@@ -56,12 +56,17 @@ pub struct SecondLaunch {
     /// The `inlet://` link, already validated. Only what follows `--` counts when
     /// there is a `--` (the registered handlers pass the link that way).
     pub link: Option<DeepLink>,
-    /// A Windows jump list entry (`--dock-action <n>`, written by gpui). Only an index
-    /// into the entries Inlet set itself; anything else is ignored.
+    /// A Windows jump list entry (`--dock-action <n>`, see `inlet_platform::jump_list`).
+    /// Only an index into the entries Inlet set itself; anything else is ignored.
     pub dock_action: Option<usize>,
 }
 
-/// How many dock and jump list entries there are; a larger index is ignored.
+/// Jump list entry: show the window.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub const DOCK_OPEN: usize = 0;
+/// Jump list entry: quit Inlet.
+pub const DOCK_QUIT: usize = 1;
+/// How many jump list entries there are; a larger index is ignored.
 pub const DOCK_ENTRIES: usize = 2;
 
 impl SecondLaunch {

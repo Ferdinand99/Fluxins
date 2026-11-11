@@ -48,6 +48,10 @@ fn main() {
         Err(err) => desktop::run_start_error(err),
     };
     let start = desktop::Start::from_env();
+    if start.quit_at_once {
+        // The jump list's "Quit Inlet" while Inlet was not running.
+        return;
+    }
     let app = gpui_platform::application();
     inlet_platform::gpui_glue::install_on_application(&app);
     app.on_reopen(desktop::show_main_window);

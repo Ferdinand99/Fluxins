@@ -22,8 +22,9 @@ use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use gpui::{
-    actions, div, point, prelude::*, px, size, App, Bounds, Context, FontWeight, Global,
-    KeyBinding, MenuItem, TitlebarOptions, Window, WindowBounds, WindowHandle, WindowOptions,
+    actions, div, point, prelude::*, px, size, AnyWindowHandle, App, Bounds, Context, Focusable,
+    FontWeight, Global, KeyBinding, TitlebarOptions, Window, WindowBounds, WindowHandle,
+    WindowOptions,
 };
 use inlet_platform::{
     autostart, deep_link, gpui_glue, Badge, DeepLink, Icon, Instance, PlatformEvent, Tray,
@@ -33,15 +34,22 @@ use inlet_state::{AccountState, ChannelId, GuildId, Unread};
 
 use crate::app::{CurrentBackend, Inlet, Screen};
 use crate::backend::accounts;
-use crate::backend::platform::links::{self, Incoming, LinkGate, Lookup};
+use crate::backend::platform::links::{
+    self, Incoming, LinkGate, LinkQueue, Lookup, Next, Prompt, Session,
+};
 use crate::backend::platform::prefs::{self, DesktopPrefs};
 use crate::backend::platform::window_state::{self, Monitor, Placement, Rect};
-use crate::backend::platform::{self as platform, Ev, SecondLaunch, TRAY_OPEN, TRAY_QUIT};
+use crate::backend::platform::{
+    self as platform, Ev, SecondLaunch, DOCK_QUIT, TRAY_OPEN, TRAY_QUIT,
+};
 use crate::model::clean_name;
 use crate::ui::widgets::button;
 use crate::{assets, theme};
 
-actions!(desktop, [ShowInlet, QuitInlet, ZoomIn, ZoomOut, ZoomReset]);
+actions!(desktop, [ShowInlet, ZoomIn, ZoomOut, ZoomReset, CloseLayer]);
+
+/// The key context of a layer over the chat (link prompt, settings view).
+pub const LAYER_CONTEXT: &str = "InletLayer";
 
 /// The rem size at zoom 100 %.
 const BASE_REM: f32 = 16.0;
@@ -65,20 +73,35 @@ fn demo_mode() -> bool {
 }
 
 /// How this process was started.
+#[derive(Debug, PartialEq, Eq)]
 pub struct Start {
     /// The login item asked for a start hidden in the tray.
     pub hidden: bool,
+    /// The `inlet://` link Inlet was started with (the registered handler passes it
+    /// after `--`). It is asked about once the account is ready, like any other link.
+    pub link: Option<DeepLink>,
+    /// The jump list's "Quit Inlet" started Inlet, which was not running: nothing to
+    /// quit, so this start ends at once.
+    pub quit_at_once: bool,
 }
 
 impl Start {
-    /// Reads Inlet's own command line. Only options before any `--` count.
+    /// Reads Inlet's own command line.
     pub fn from_env() -> Self {
         let args: Vec<String> = std::env::args_os()
             .skip(1)
             .filter_map(|a| a.into_string().ok())
             .collect();
+        Self::from_args(&args)
+    }
+
+    /// Only options before any `--` count; the link is taken with `deep_link::extract`.
+    pub fn from_args(args: &[String]) -> Self {
+        let launch = SecondLaunch::from_args(args);
         Start {
-            hidden: autostart::start_minimized(&args),
+            hidden: autostart::start_minimized(args),
+            link: launch.link,
+            quit_at_once: launch.dock_action == Some(DOCK_QUIT),
         }
     }
 
@@ -129,7 +152,8 @@ pub fn run_start_error(err: inlet_platform::Error) -> ! {
             cx.quit();
             return;
         }
-        cx.on_window_closed(|cx, _| cx.quit()).detach();
+        // Exit here with 1: on macOS `run` never returns and `quit` would exit with 0.
+        cx.on_window_closed(|_, _| std::process::exit(1)).detach();
         cx.activate(true);
     });
     std::process::exit(1)
@@ -160,7 +184,7 @@ impl Render for StartError {
             .child(
                 div().flex().flex_row().child(
                     button("start-error-close", t!("desktop-start-error-close"), true)
-                        .on_click(cx.listener(|_, _, _, cx| cx.quit())),
+                        .on_click(cx.listener(|_, _, _, _| std::process::exit(1))),
                 ),
             )
     }
@@ -176,8 +200,10 @@ pub struct Desktop {
     pub autostart: Option<bool>,
     /// The last error from changing the login item, for the settings tab.
     pub autostart_error: Option<String>,
-    window: Option<WindowHandle<Inlet>>,
+    window: Option<AnyWindowHandle>,
     gate: LinkGate,
+    /// A link waiting for the account to be ready.
+    links: LinkQueue,
     last_unread: Option<DesktopUnread>,
     /// When the window last moved, while that is not written yet.
     moved_at: Option<Instant>,
@@ -186,6 +212,21 @@ pub struct Desktop {
 impl Global for Desktop {}
 
 impl Desktop {
+    fn new(prefs: DesktopPrefs, path: Option<PathBuf>) -> Self {
+        Desktop {
+            prefs,
+            path,
+            tray: None,
+            autostart: None,
+            autostart_error: None,
+            window: None,
+            gate: LinkGate::default(),
+            links: LinkQueue::default(),
+            last_unread: None,
+            moved_at: None,
+        }
+    }
+
     /// Whether a tray icon is shown right now.
     pub fn tray_shown(&self) -> bool {
         self.tray.as_ref().is_some_and(|t| t.has_host())
@@ -209,37 +250,30 @@ pub fn init(cx: &mut App) {
         prefs::settings_path()
     };
     let prefs = path.as_deref().map(prefs::load).unwrap_or_default();
-    cx.set_global(Desktop {
-        prefs,
-        path,
-        tray: None,
-        autostart: None,
-        autostart_error: None,
-        window: None,
-        gate: LinkGate::default(),
-        last_unread: None,
-        moved_at: None,
-    });
+    cx.set_global(Desktop::new(prefs, path));
     gpui_glue::install(cx);
-
-    let [zoom_in, zoom_in_plus, zoom_out, zoom_reset] = ZOOM_KEYS;
-    cx.bind_keys([
-        KeyBinding::new(zoom_in, ZoomIn, None),
-        KeyBinding::new(zoom_in_plus, ZoomIn, None),
-        KeyBinding::new(zoom_out, ZoomOut, None),
-        KeyBinding::new(zoom_reset, ZoomReset, None),
-    ]);
-    cx.on_action(|_: &ShowInlet, cx| show_main_window(cx));
-    cx.on_action(|_: &QuitInlet, cx| quit(cx));
-    cx.on_action(|_: &ZoomIn, cx| zoom_by(1, cx));
-    cx.on_action(|_: &ZoomOut, cx| zoom_by(-1, cx));
-    cx.on_action(|_: &ZoomReset, cx| set_zoom(1.0, cx));
-    // The macOS dock menu, and the Windows jump list (whose entries start Inlet with
-    // `--dock-action <n>`, see `SecondLaunch`). Same order as `platform::DOCK_ENTRIES`.
-    cx.set_dock_menu(vec![
-        MenuItem::action(t!("desktop-tray-open"), ShowInlet),
-        MenuItem::action(t!("desktop-tray-quit"), QuitInlet),
-    ]);
+    install_actions(cx);
+    // The dock menu on macOS (Quit is already in it), and the jump list on Windows:
+    // gpui builds its jump list on a thread without COM, so Inlet builds its own.
+    // Its entries start Inlet with `--dock-action <n>`, see `SecondLaunch`.
+    #[cfg(target_os = "macos")]
+    cx.set_dock_menu(vec![gpui::MenuItem::action(
+        t!("desktop-tray-open"),
+        ShowInlet,
+    )]);
+    #[cfg(windows)]
+    if let Err(err) = inlet_platform::jump_list::set_tasks(vec![
+        inlet_platform::jump_list::JumpTask {
+            title: t!("desktop-tray-open"),
+            args: format!("--dock-action {}", platform::DOCK_OPEN),
+        },
+        inlet_platform::jump_list::JumpTask {
+            title: t!("desktop-tray-quit"),
+            args: format!("--dock-action {DOCK_QUIT}"),
+        },
+    ]) {
+        log::warn!("jump list: {err}");
+    }
 
     if !demo_mode() {
         // Release builds make this executable the handler of inlet:// links (Windows:
@@ -265,6 +299,24 @@ pub fn init(cx: &mut App) {
     }
 }
 
+/// The keys and the app-wide handlers of this file's actions.
+fn install_actions(cx: &mut App) {
+    let [zoom_in, zoom_in_plus, zoom_out, zoom_reset] = ZOOM_KEYS;
+    cx.bind_keys([
+        KeyBinding::new(zoom_in, ZoomIn, None),
+        KeyBinding::new(zoom_in_plus, ZoomIn, None),
+        KeyBinding::new(zoom_out, ZoomOut, None),
+        KeyBinding::new(zoom_reset, ZoomReset, None),
+        // A layer over the chat (link prompt, settings) closes with Escape; this
+        // binding is in the layer's own context, so it wins over the chat's Escape.
+        KeyBinding::new("escape", CloseLayer, Some(LAYER_CONTEXT)),
+    ]);
+    cx.on_action(|_: &ShowInlet, cx| show_main_window(cx));
+    cx.on_action(|_: &ZoomIn, cx| zoom_by(1, cx));
+    cx.on_action(|_: &ZoomOut, cx| zoom_by(-1, cx));
+    cx.on_action(|_: &ZoomReset, cx| set_zoom(1.0, cx));
+}
+
 /// The main window's options: back where it was on its monitor, or centred.
 pub fn window_options(start: &Start, cx: &mut App) -> WindowOptions {
     let memory = cx.global::<Desktop>().prefs.window.clone();
@@ -274,12 +326,12 @@ pub fn window_options(start: &Start, cx: &mut App) -> WindowOptions {
         .filter_map(|d| {
             Some(Monitor {
                 id: d.uuid().ok()?.to_string(),
-                area: window_space(d.bounds()),
+                area: window_space(d.visible_bounds()),
             })
         })
         .collect();
     let main = cx.primary_display().map(|d| {
-        let s = d.bounds().size;
+        let s = d.visible_bounds().size;
         (s.width.as_f32(), s.height.as_f32())
     });
     let (bounds, display_id) = match window_state::place(&memory, &monitors, main, DEFAULT_SIZE) {
@@ -322,8 +374,9 @@ pub fn window_options(start: &Start, cx: &mut App) -> WindowOptions {
     }
 }
 
-/// A monitor's area in the coordinates gpui uses for window bounds: global on Windows
-/// and Linux, relative to the monitor on macOS.
+/// A monitor's usable area (without task bar or dock) in the coordinates gpui uses for
+/// window bounds: global on Windows and Linux, relative to the monitor on macOS. On X11
+/// gpui reports the whole X screen as one monitor, so all monitors share one entry.
 fn window_space(bounds: Bounds<gpui::Pixels>) -> Rect {
     let (x, y) = if cfg!(target_os = "macos") {
         (0.0, 0.0)
@@ -346,7 +399,7 @@ pub fn attach(
     start: &Start,
     cx: &mut App,
 ) {
-    cx.global_mut::<Desktop>().window = Some(handle);
+    cx.global_mut::<Desktop>().window = Some(handle.into());
     let zoom = cx.global::<Desktop>().prefs.zoom;
     let _ = handle.update(cx, |_, window, cx| {
         window.set_rem_size(px(BASE_REM * zoom));
@@ -385,19 +438,24 @@ pub fn attach(
     })
     .detach();
 
-    create_tray(start.hidden, cx);
+    create_tray(
+        start.opens_hidden(),
+        start.hidden && cfg!(target_os = "linux"),
+        cx,
+    );
+    // The link Inlet was started with waits for the account like any other.
+    if let Some(link) = start.link.clone() {
+        let _ = handle.update(cx, |this, _, cx| this.offer_deep_link(link, cx));
+    }
 
     // Once a second: the unread state for the tray and the badge, and the window's
     // place once it has stayed put.
     cx.spawn(async move |cx| loop {
         cx.background_executor().timer(Duration::from_secs(1)).await;
         let alive = handle.update(cx, |this, _, cx| {
-            let unread = this
-                .account
-                .as_ref()
-                .map(|a| account_unread(a.read(cx)))
-                .unwrap_or_default();
+            let unread = this.desktop_unread(cx);
             sync_unread(unread, cx);
+            this.release_waiting_link(cx);
             let d = cx.global_mut::<Desktop>();
             if d.moved_at.is_some_and(|t| t.elapsed() >= SAVE_AFTER) {
                 d.save();
@@ -418,29 +476,15 @@ pub fn attach(
         .ok()
         .and_then(|l| deep_link::parse(&l))
     {
-        // Once the demo account is in, as a real link would find it.
-        cx.spawn(async move |cx| {
-            for _ in 0..80 {
-                cx.background_executor()
-                    .timer(Duration::from_millis(250))
-                    .await;
-                let shown = handle.update(cx, |this, _, cx| {
-                    let ready = this.screen == Screen::Main && this.account.is_some();
-                    if ready {
-                        this.ask_about_link(Incoming::Deep(link.clone()), cx);
-                    }
-                    ready
-                });
-                if shown.unwrap_or(true) {
-                    return;
-                }
-            }
-        })
-        .detach();
+        // Waits for the demo account, as a link Inlet was started with does.
+        let _ = handle.update(cx, |this, _, cx| this.offer_deep_link(link, cx));
     }
 }
 
-fn create_tray(start_hidden: bool, cx: &mut App) {
+/// `opened_hidden`: the window was opened hidden for a login start (Windows, macOS).
+/// `hide_when_shown`: a login start on Linux, where the window is hidden only once a
+/// tray icon is there.
+fn create_tray(opened_hidden: bool, hide_when_shown: bool, cx: &mut App) {
     let icon = match Icon::from_png(TRAY_PNG) {
         Ok(icon) => icon,
         Err(err) => {
@@ -463,30 +507,52 @@ fn create_tray(start_hidden: bool, cx: &mut App) {
                 d.tray = Some(tray);
                 // Draw the current state on the new icon at the next tick.
                 d.last_unread = None;
-                // Linux opens the window and hides it once the icon is there.
-                if start_hidden && shown && cfg!(target_os = "linux") {
+                if hide_when_shown && shown {
                     hide_main_window(cx);
                 }
             }
-            Err(err) => log::info!("no tray icon: {err}"),
+            Err(err) => {
+                log::info!("no tray icon: {err}");
+                // Without a tray icon a hidden window could not be found again.
+                if opened_hidden {
+                    show_main_window(cx);
+                }
+            }
         });
     })
     .detach();
 }
 
-/// Brings the main window to the front.
-pub fn show_main_window(cx: &mut App) {
+/// Runs `f` on the main window once the current update is done. Actions, keys and
+/// clicks are handled inside an update of that very window, during which gpui has
+/// taken the window out of the app; updating it there fails. Deferred, the window is
+/// back. A failure is logged, never swallowed.
+fn with_main_window(
+    cx: &mut App,
+    what: &'static str,
+    f: impl FnOnce(&mut Window, &mut App) + 'static,
+) {
     let Some(handle) = cx.try_global::<Desktop>().and_then(|d| d.window) else {
         return;
     };
-    let _ = handle.update(cx, |_, window, cx| gpui_glue::show_window(window, cx));
+    cx.defer(move |cx| {
+        if let Err(err) = handle.update(cx, |_, window, cx| f(window, cx)) {
+            log::warn!("could not {what}: {err}");
+        }
+    });
+}
+
+/// Brings the main window to the front.
+pub fn show_main_window(cx: &mut App) {
+    with_main_window(cx, "show the window", |window, cx| {
+        gpui_glue::show_window(window, cx)
+    });
 }
 
 fn hide_main_window(cx: &mut App) {
-    let Some(handle) = cx.try_global::<Desktop>().and_then(|d| d.window) else {
-        return;
-    };
-    let _ = handle.update(cx, |_, window, cx| gpui_glue::hide_window(window, cx));
+    with_main_window(cx, "hide the window", |window, cx| {
+        gpui_glue::hide_window(window, cx)
+    });
 }
 
 /// Writes the window's place, ends the session (bounded wait) and quits.
@@ -559,11 +625,9 @@ pub fn set_zoom(zoom: f32, cx: &mut App) {
     }
     d.prefs.zoom = zoom;
     d.save();
-    let Some(handle) = d.window else { return };
-    let _ = handle.update(cx, |_, window, cx| {
+    with_main_window(cx, "apply the zoom", move |window, _| {
         window.set_rem_size(px(BASE_REM * zoom));
         window.refresh();
-        cx.notify();
     });
 }
 
@@ -653,6 +717,7 @@ impl DesktopUnread {
     }
 }
 
+/// One account's part of what the tray and the badge show.
 fn account_unread(state: &AccountState) -> DesktopUnread {
     DesktopUnread::of(
         state
@@ -730,8 +795,10 @@ impl Inlet {
         }
         match event {
             Ev::SecondLaunch(SecondLaunch { link, dock_action }) => {
-                if let Some(n) = dock_action {
-                    cx.perform_dock_menu_action(n);
+                // "Open Inlet" in the jump list only shows the window (done above).
+                if dock_action == Some(DOCK_QUIT) {
+                    quit(cx);
+                    return;
                 }
                 if let Some(link) = link {
                     self.offer_deep_link(link, cx);
@@ -743,16 +810,114 @@ impl Inlet {
         }
     }
 
-    /// An `inlet://` link from outside: through the gate, then a prompt. While a prompt
-    /// is open, further links are dropped, so the prompt cannot change under the cursor.
-    fn offer_deep_link(&mut self, link: DeepLink, cx: &mut Context<Self>) {
+    /// What the tray and the badge show. Every signed-in account adds its part here:
+    /// with several accounts, this is the one place that sums them.
+    fn desktop_unread(&self, cx: &App) -> DesktopUnread {
+        self.account
+            .as_ref()
+            .map(|a| account_unread(a.read(cx)))
+            .unwrap_or_default()
+    }
+
+    /// Where the session is, for links.
+    fn link_session(&self) -> Session {
+        session_of(&self.screen, self.account.is_some())
+    }
+
+    /// An `inlet://` link from outside: through the gate, then a prompt, or held until
+    /// the account is ready (Inlet was started by the link, or is reconnecting). While
+    /// a prompt is open, further links are dropped, so the prompt cannot change under
+    /// the cursor.
+    pub(crate) fn offer_deep_link(&mut self, link: DeepLink, cx: &mut Context<Self>) {
         if self.overlays.link_prompt.is_some() {
             log::info!("a link prompt is open; another link was dropped");
             return;
         }
-        if cx.global_mut::<Desktop>().gate.admit(&link, Instant::now()) {
-            self.ask_about_link(Incoming::Deep(link), cx);
+        let now = Instant::now();
+        let session = self.link_session();
+        let d = cx.global_mut::<Desktop>();
+        if !d.gate.admit(&link, now) {
+            return;
         }
+        if let Some(next) = d.links.offer(Incoming::Deep(link), session, now) {
+            self.show_next_link(next, cx);
+        }
+    }
+
+    /// Shows a held link once the account is ready (called once a second).
+    fn release_waiting_link(&mut self, cx: &mut Context<Self>) {
+        if self.overlays.link_prompt.is_some() {
+            return;
+        }
+        let session = self.link_session();
+        if let Some(next) = cx
+            .global_mut::<Desktop>()
+            .links
+            .poll(session, Instant::now())
+        {
+            self.show_next_link(next, cx);
+        }
+    }
+
+    fn show_next_link(&mut self, next: Next, cx: &mut Context<Self>) {
+        match next {
+            Next::Ask(link) => self.ask_about_link(link, cx),
+            Next::SignInFirst => {
+                self.overlays.link_prompt = Some(Prompt::SignInFirst);
+                cx.notify();
+            }
+        }
+    }
+
+    /// Whether a layer covers the chat: the link prompt or the settings view.
+    pub(crate) fn layer_open(&self) -> bool {
+        self.overlays.link_prompt.is_some() || self.settings.view.is_some()
+    }
+
+    /// Keeps the keyboard on an open layer, so typing never reaches the composer hidden
+    /// behind it, and gives it back to the composer when the last layer closes. Called
+    /// when the window is drawn.
+    pub(crate) fn focus_layer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.layer_open() {
+            let handle = self
+                .overlays
+                .layer_focus
+                .get_or_insert_with(|| cx.focus_handle())
+                .clone();
+            if !handle.is_focused(window) {
+                self.overlays.layer_had_focus = true;
+                cx.defer_in(window, move |_, window, cx| handle.focus(window, cx));
+            }
+        } else if self.overlays.layer_had_focus {
+            self.overlays.layer_had_focus = false;
+            let composer = self.composer.view.focus_handle(cx);
+            cx.defer_in(window, move |_, window, cx| composer.focus(window, cx));
+        }
+    }
+
+    /// Adds the layer's focus, key context and Escape to the topmost layer's element.
+    pub(crate) fn layer_keys<E: InteractiveElement>(
+        &self,
+        element: E,
+        cx: &mut Context<Self>,
+    ) -> E {
+        let element = element
+            .key_context(LAYER_CONTEXT)
+            .on_action(cx.listener(|this, _: &CloseLayer, _, cx| this.close_top_layer(cx)));
+        match &self.overlays.layer_focus {
+            Some(handle) => element.track_focus(handle),
+            None => element,
+        }
+    }
+
+    /// Escape on a layer: the link prompt first, then the settings view.
+    pub(crate) fn close_top_layer(&mut self, cx: &mut Context<Self>) {
+        if self.overlays.link_prompt.is_some() {
+            self.overlays.link_prompt = None;
+        } else if self.settings.view.is_some() {
+            self.settings.view = None;
+        }
+        cx.notify();
     }
 
     /// Shows the prompt for a link. Nothing happens until the person clicks in it.
@@ -796,9 +961,136 @@ impl Inlet {
     }
 }
 
+/// The session as links see it, from the screen and whether the account state is in.
+fn session_of(screen: &Screen, has_account: bool) -> Session {
+    match screen {
+        Screen::Main if has_account => Session::Ready,
+        Screen::Main
+        | Screen::Starting { .. }
+        | Screen::Finishing
+        | Screen::Offline { .. }
+        | Screen::Fatal => Session::Connecting,
+        Screen::SignIn | Screen::Confirm { .. } => Session::SignedOut,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn strings(args: &[&str]) -> Vec<String> {
+        args.iter().map(|a| a.to_string()).collect()
+    }
+
+    #[test]
+    fn a_link_that_starts_inlet_is_kept_for_the_account() {
+        let start = Start::from_args(&strings(&["--url", "--", "inlet://channels/1/2"]));
+        assert_eq!(
+            start.link,
+            Some(DeepLink::Channel {
+                guild: Some(1),
+                channel: 2,
+                message: None
+            })
+        );
+        assert!(!start.hidden && !start.quit_at_once);
+        // Flags after `--` do not count; a link that breaks out of its quotes is none.
+        let start = Start::from_args(&strings(&[
+            "--url",
+            "--",
+            "inlet://x\"",
+            "--autostart",
+            "--start-minimized",
+        ]));
+        assert_eq!(
+            start,
+            Start {
+                hidden: false,
+                link: None,
+                quit_at_once: false
+            }
+        );
+        assert!(Start::from_args(&strings(&["--autostart", "--start-minimized"])).hidden);
+        assert!(Start::from_args(&strings(&["--dock-action", "1"])).quit_at_once);
+        assert!(!Start::from_args(&strings(&["--dock-action", "0"])).quit_at_once);
+
+        // The link waits while the saved session connects, then is asked about; a
+        // signed-in person never sees "sign in first".
+        let mut queue = LinkQueue::default();
+        let now = Instant::now();
+        let link = Incoming::Deep(start_link());
+        let starting = Screen::Starting { instance: None };
+        assert_eq!(
+            queue.offer(link.clone(), session_of(&starting, false), now),
+            None
+        );
+        let offline = Screen::Offline {
+            instance: "https://chat.example".into(),
+            message: String::new(),
+            retry_in_secs: 5,
+        };
+        assert_eq!(queue.poll(session_of(&offline, false), now), None);
+        assert_eq!(queue.poll(session_of(&Screen::Main, false), now), None);
+        assert_eq!(
+            queue.poll(session_of(&Screen::Main, true), now),
+            Some(Next::Ask(link))
+        );
+        assert_eq!(session_of(&Screen::SignIn, false), Session::SignedOut);
+    }
+
+    fn start_link() -> DeepLink {
+        deep_link::parse("inlet://channels/1/2").unwrap()
+    }
+
+    /// A view for the zoom test: just a window to zoom.
+    struct Probe;
+
+    impl Render for Probe {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
+
+    /// Zoom applies at once, from inside the window's own dispatch (as a key press or a
+    /// click in the settings tab is handled), not only after a restart.
+    #[gpui::test]
+    fn zoom_changes_the_rem_size_at_once(cx: &mut gpui::TestAppContext) {
+        let window = cx.add_window(|_, _| Probe);
+        cx.update(|cx| {
+            cx.set_global(Desktop::new(DesktopPrefs::default(), None));
+            cx.global_mut::<Desktop>().window = Some(window.into());
+            install_actions(cx);
+        });
+        let rem = |cx: &mut gpui::TestAppContext| {
+            window
+                .update(cx, |_, window, _| window.rem_size().as_f32())
+                .unwrap()
+        };
+        assert_eq!(rem(cx), BASE_REM);
+
+        // The action, dispatched in the window like a key press.
+        window
+            .update(cx, |_, window, cx| {
+                window.dispatch_action(Box::new(ZoomIn), cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert!((rem(cx) - BASE_REM * 1.1).abs() < 0.01, "{}", rem(cx));
+
+        // A button in the settings tab: a handler inside an update of that window.
+        window.update(cx, |_, _, cx| zoom_by(1, cx)).unwrap();
+        cx.run_until_parked();
+        assert!((rem(cx) - BASE_REM * 1.25).abs() < 0.01, "{}", rem(cx));
+        cx.update(|cx| assert_eq!(cx.global::<Desktop>().prefs.zoom, 1.25));
+
+        window
+            .update(cx, |_, window, cx| {
+                window.dispatch_action(Box::new(ZoomReset), cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(rem(cx), BASE_REM);
+    }
 
     fn unread(unread: bool, mentions: u32, muted: bool) -> Unread {
         Unread {

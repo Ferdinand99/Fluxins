@@ -8,7 +8,7 @@ pub mod modal;
 mod notification_settings;
 mod tooltip;
 
-use gpui::{AnyElement, Context};
+use gpui::{AnyElement, Context, FocusHandle};
 
 use crate::app::Inlet;
 use crate::backend::platform::links::Prompt;
@@ -21,6 +21,10 @@ pub struct OverlayState {
     pub link_prompt: Option<Prompt>,
     /// The channel a confirmed link opens once its guild's channel list is in.
     pub link_channel: Option<String>,
+    /// The keyboard focus of the topmost layer over the chat (link prompt, settings).
+    pub layer_focus: Option<FocusHandle>,
+    /// Whether a layer took the focus, so it goes back to the composer on close.
+    pub layer_had_focus: bool,
 }
 
 impl Inlet {
