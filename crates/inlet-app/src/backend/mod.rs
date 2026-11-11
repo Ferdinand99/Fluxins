@@ -479,6 +479,8 @@ struct Backend {
     pending_confirm: Option<PendingConfirm>,
     open_guild: Option<AbortHandle>,
     open_channel: Option<AbortHandle>,
+    /// Messages with files on their way, and failed ones kept for Retry (all accounts).
+    uploads: composer::Uploads,
     /// The request for older messages of the open channel.
     older: messages::OlderPages,
     /// Requests of the thread panel, thread lists and forums.
@@ -510,6 +512,7 @@ impl Backend {
             pending_confirm: None,
             open_guild: None,
             open_channel: None,
+            uploads: Default::default(),
             older: Default::default(),
             threads: Default::default(),
             social: Default::default(),

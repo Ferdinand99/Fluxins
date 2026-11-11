@@ -30,7 +30,9 @@ use crate::backend::messages::{self, threads as backend};
 use crate::model::{self, Message};
 use crate::theme;
 use crate::ui::chat::messages::{splice_range, JumpAction, MessageView};
-use crate::ui::composer::{begin_send, edit_last, ChannelContext, ComposerEvent, ComposerView};
+use crate::ui::composer::{
+    begin_send, begin_upload, edit_last, ChannelContext, ComposerEvent, ComposerView,
+};
 use crate::ui::HEADER_HEIGHT;
 
 /// The message length limit until the instance's own is known (as the chat's composer).
@@ -211,6 +213,9 @@ impl Inlet {
                 this.on_panel_composer_event(event.clone(), window, cx)
             },
         ));
+        // The account's upload limits, as the chat's composer has them.
+        let limits = self.composer.upload_limits;
+        view.update(cx, |v, _| v.set_upload_limits(limits));
         self.threads.composer = Some(view.clone());
         view
     }
@@ -606,6 +611,44 @@ impl Inlet {
                 let shown = view.update(cx, |v, cx| v.on_edit_failed(&message_id, &reason, cx));
                 (!shown).then_some(ComposerEv::EditFailed { message_id, reason })
             }
+            // Uploads: both composers hear of them; each shows only its own channel's
+            // rows, and only the one that sent a message keeps its text.
+            ComposerEv::UploadStarted {
+                nonce,
+                channel_id,
+                names,
+                total,
+            } => {
+                let (n, c, f) = (nonce.clone(), channel_id.clone(), names.clone());
+                view.update(cx, |v, cx| v.on_upload_started(n, c, f, total, cx));
+                Some(ComposerEv::UploadStarted {
+                    nonce,
+                    channel_id,
+                    names,
+                    total,
+                })
+            }
+            ComposerEv::UploadProgress { nonce, sent, total } => {
+                view.update(cx, |v, cx| v.on_upload_progress(&nonce, sent, total, cx));
+                Some(ComposerEv::UploadProgress { nonce, sent, total })
+            }
+            ComposerEv::UploadStuck { nonce, name } => {
+                let (n, f) = (nonce.clone(), name.clone());
+                view.update(cx, |v, cx| v.on_upload_stuck(&n, &f, window, cx));
+                if self
+                    .threads
+                    .panel
+                    .as_mut()
+                    .is_some_and(|p| p.view.sent(&nonce))
+                {
+                    self.refresh_panel_rows(cx);
+                }
+                Some(ComposerEv::UploadStuck { nonce, name })
+            }
+            ComposerEv::UploadDone { nonce, sent } => {
+                view.update(cx, |v, cx| v.on_upload_done(&nonce, sent, cx));
+                Some(ComposerEv::UploadDone { nonce, sent })
+            }
             ComposerEv::DirectMessageFailed { nonce, reason } => {
                 if let Some(ix) = self.threads.dm_nonces.iter().position(|n| *n == nonce) {
                     self.threads.dm_nonces.remove(ix);
@@ -636,6 +679,31 @@ impl Inlet {
                 if let Some(cmd) = send_from_panel(panel, message) {
                     self.refresh_panel_rows(cx);
                     self.backend.send(cmd);
+                }
+            }
+            ComposerEvent::Upload(upload) => {
+                // The pending row goes into the panel's list, like a send from it.
+                let Some(panel) = self.threads.panel.as_mut() else {
+                    return;
+                };
+                if upload.message.channel_id != panel.thread.to_string() {
+                    return;
+                }
+                let cmd = begin_upload(&mut panel.view, upload);
+                self.refresh_panel_rows(cx);
+                self.backend.send(cmd);
+            }
+            ComposerEvent::CancelUpload { nonce } => {
+                self.backend.send(ComposerCmd::CancelUpload {
+                    nonce: nonce.clone(),
+                });
+                let gone = self
+                    .threads
+                    .panel
+                    .as_mut()
+                    .is_some_and(|p| p.view.sent(&nonce));
+                if gone {
+                    self.refresh_panel_rows(cx);
                 }
             }
             ComposerEvent::Edit {
@@ -935,6 +1003,7 @@ mod tests {
                 wire: text.into(),
                 labels: Vec::new(),
                 seq: 0,
+                sent_check: None,
             }),
         );
     }
@@ -1060,6 +1129,51 @@ mod tests {
     /// thread's row in the account's outbox, and the thread opened again shows it with
     /// Retry and the same nonce.
     #[test]
+    fn an_upload_from_the_panel_shows_its_row_with_its_files_in_the_panel() {
+        use crate::backend::composer::{Cmd, FileToSend, Mentions, Source, Upload};
+        let state = state();
+        let thread = ChannelId::parse(THREAD).unwrap();
+        let (guild, parent) = can_open(&state, thread).unwrap();
+        let chat = MessageView::new();
+        let mut panel = Panel::new(thread, guild, parent, &chat, 0);
+        let upload = Upload {
+            message: Outgoing {
+                channel_id: THREAD.into(),
+                nonce: "4343".into(),
+                content: String::new(),
+                mentions: Mentions::default(),
+                reply_to: None,
+                silent: false,
+            },
+            files: vec![FileToSend {
+                name: "plan.pdf".into(),
+                size: 3,
+                content_type: "application/pdf".into(),
+                spoiler: false,
+                description: None,
+                keep_metadata: false,
+                source: Source::Memory(bytes::Bytes::from_static(b"pdf")),
+            }],
+            strip_exif: true,
+        };
+        // What the app does with the panel composer's `Upload`.
+        let Cmd::Upload(sent) = begin_upload(&mut panel.view, upload) else {
+            panic!("an upload command");
+        };
+        assert_eq!(sent.message.nonce, "4343");
+        let files: Vec<Vec<String>> = panel
+            .view
+            .build_rows(&state, thread)
+            .into_iter()
+            .filter_map(|r| match r {
+                Row::Pending(p) => Some(p.files.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(files, [vec!["plan.pdf".to_owned()]]);
+    }
+
+    #[test]
     fn a_failed_thread_send_keeps_its_row_after_the_panel_closes() {
         use crate::backend::composer::Mentions;
         let state = state();
@@ -1105,6 +1219,7 @@ mod tests {
                 channel_id,
                 nonce,
                 text,
+                files: false,
             }) => {
                 assert_eq!(channel_id, THREAD);
                 assert_eq!(nonce, "4242");

@@ -143,6 +143,9 @@ scene 33-media-channel media-channel c-gallery
 # Presence: the status picker open over the user panel, two people typing in #general.
 scene 35-status-picker status-picker c-general
 
+# The composer with files attached and an upload on its way.
+scene 36-composer-attachments composer-attachments c-general
+
 # 10. The Notifications settings tab.
 INLET_DEMO=1 INLET_DEMO_LIVE_SECS=3600 INLET_DEMO_GUILD=g1 INLET_DEMO_CHANNEL=c-general INLET_DEMO_SETTINGS=notifications "$bin" >>"$out/demo.log" 2>&1 &
 pid=$!
@@ -151,8 +154,8 @@ shot 34-settings-notifications
 kill $pid; wait $pid 2>/dev/null
 
 # 11. The member list beside the chat, and the profile popout of a member.
-scene 36-members members c-general
-scene 37-profile-popout profile-popout c-general
+scene 37-members members c-general
+scene 38-profile-popout profile-popout c-general
 
 # 12. The scene files of the visual checks. Xvfb's pointer cannot be moved and sits in
 #     the middle of the screen; the demo puts a scene's window in the top left corner,

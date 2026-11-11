@@ -84,7 +84,8 @@
 //! # Chat features
 //!
 //! - Messages: [`Client::send`] (replies, stickers, flags), [`Client::edit_message`],
-//!   [`Client::delete_message`], [`Client::send_with_files`] (uploads with progress).
+//!   [`Client::delete_message`], [`Client::send_with_files`] (uploads with progress),
+//!   and the pre-signed uploads of [`presigned`].
 //! - Reactions: [`Client::add_reaction`], [`Client::remove_reaction`],
 //!   [`Client::reaction_users`]; pins: [`Client::pins`], [`Client::pin_message`].
 //! - Typing and read state: [`Client::trigger_typing`] is debounced (one request
@@ -152,6 +153,7 @@ pub mod limits;
 pub mod media;
 pub mod models;
 pub mod permissions;
+pub mod presigned;
 pub mod proto;
 pub mod ratelimit;
 pub mod rest;
@@ -202,8 +204,9 @@ pub use models::{
     UserSettingsUpdate, VoiceState,
 };
 pub use permissions::PermissionContext;
+pub use presigned::{PresignFile, UploadMode, UploadPlan, UploadUrl, UploadedFile};
 pub use ratelimit::{RateLimitConfig, RateLimiter};
 pub use reqwest::Method;
 pub use rest::{new_nonce, Client};
 pub use token::Token;
-pub use upload::{ProgressFn, UploadFile, UploadLimits};
+pub use upload::{safe_filename, ProgressFn, Segment, UploadData, UploadFile, UploadLimits};

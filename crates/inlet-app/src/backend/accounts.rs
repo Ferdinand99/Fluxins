@@ -1104,6 +1104,8 @@ impl Backend {
                     t.abort();
                 }
                 self.stop_screen_tasks();
+                // Uploads never go on behind another account.
+                self.stop_uploads(&r);
                 self.background.push(r);
             }
             #[cfg(feature = "demo")]
@@ -1299,6 +1301,7 @@ impl Backend {
     pub(super) fn teardown(&mut self, r: &RealActive) {
         Self::close_engine(r);
         self.stop_screen_tasks();
+        self.uploads.forget_gen(r.gen);
     }
 
     /// Stops an account wherever it runs or waits (active, background, waiting start).
@@ -1312,6 +1315,7 @@ impl Backend {
         if let Some(ix) = self.background.iter().position(|r| &r.key == key) {
             let r = self.background.remove(ix);
             Self::close_engine(&r);
+            self.uploads.forget_gen(r.gen);
         }
         if let Some(start) = self.starts.remove(key) {
             start.task.abort();
