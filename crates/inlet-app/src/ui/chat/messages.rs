@@ -1091,11 +1091,12 @@ impl Inlet {
                 // A message in the open channel while it shows the newest messages and
                 // has focus: read.
                 let at_bottom = self.chat.message_list.is_following_tail();
-                if self
-                    .chat
-                    .view
-                    .may_mark_read(account.read(cx), ch, at_bottom, window_active)
-                {
+                if self.chat.view.may_mark_read(
+                    account.read(cx),
+                    ch,
+                    at_bottom,
+                    window_active && self.chat_is_visible(),
+                ) {
                     changes.merge(self.read_channel(ch, AckKind::Automatic, false, cx));
                 }
             }
@@ -1148,11 +1149,12 @@ impl Inlet {
                 self.chat.view.newest_retries = 0;
                 // Opened and shown at the bottom with focus: the channel is read.
                 let at_bottom = self.chat.message_list.is_following_tail();
-                if self
-                    .chat
-                    .view
-                    .may_mark_read(account.read(cx), ch, at_bottom, window_active)
-                {
+                if self.chat.view.may_mark_read(
+                    account.read(cx),
+                    ch,
+                    at_bottom,
+                    window_active && self.chat_is_visible(),
+                ) {
                     changes.merge(self.read_channel(ch, AckKind::Explicit, false, cx));
                 }
             } else if is_detached(account.read(cx), ch)
@@ -1445,6 +1447,9 @@ impl Inlet {
         }
         if !changes.is_empty() || jump_over {
             self.after_changes(changes, false, cx);
+            cx.notify();
+        } else if markdown::refresh_due(now_ms()) {
+            // A relative timestamp on screen shows a new label.
             cx.notify();
         }
     }

@@ -112,10 +112,16 @@ impl Switcher {
 
     /// Mentions waiting in the accounts that are not active.
     pub fn background_mentions(&self) -> u32 {
+        self.background_marks()
+            .fold(0u32, |n, s| n.saturating_add(s.mentions))
+    }
+
+    /// The unread marks of the accounts that are not active.
+    pub fn background_marks(&self) -> impl Iterator<Item = Summary> + '_ {
         self.summaries
             .iter()
             .filter(|(k, _)| !self.is_active(k))
-            .fold(0u32, |n, (_, s)| n.saturating_add(s.mentions))
+            .map(|(_, s)| *s)
     }
 
     fn summary_of(&self, k: &AccountKey) -> Summary {
@@ -232,7 +238,15 @@ impl Inlet {
             .view
             .update(cx, |v, cx| v.switch_account(window, cx));
         self.composer.reset_session();
+        // Links: the prompt, a link waiting for the session and a channel a link wants to
+        // open were all for the account before (as at sign-out).
         self.overlays.pending_link = None;
+        self.overlays.link_prompt = None;
+        self.overlays.link_channel = None;
+        if cx.has_global::<crate::desktop::Desktop>() {
+            cx.global_mut::<crate::desktop::Desktop>()
+                .forget_waiting_link();
+        }
         self.guilds.clear();
         self.channels.clear();
         self.selected_guild = None;

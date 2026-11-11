@@ -304,7 +304,7 @@ mod imp {
             name = crate::APP_NAME,
         );
         xdg::write_atomic(&apps.join(entry_name(scheme)), entry.as_bytes())?;
-        set_default(config_home, scheme, Some(&entry_name(scheme)))
+        set_default(config_home, scheme, &entry_name(scheme), true)
     }
 
     pub(super) fn unregister_in(data_home: &Path, config_home: &Path, scheme: &str) -> Result<()> {
@@ -312,53 +312,80 @@ mod imp {
             Err(err) if err.kind() != std::io::ErrorKind::NotFound => return Err(err.into()),
             _ => {}
         }
-        set_default(config_home, scheme, None)
+        set_default(config_home, scheme, &entry_name(scheme), false)
     }
 
     fn mimeapps(config_home: &Path) -> PathBuf {
         config_home.join("mimeapps.list")
     }
 
-    /// Sets or removes `x-scheme-handler/<scheme>` under `[Default Applications]`,
-    /// keeping every other line of the file as it was.
-    fn set_default(config_home: &Path, scheme: &str, entry: Option<&str>) -> Result<()> {
+    /// Makes our entry the default for `x-scheme-handler/<scheme>` under
+    /// `[Default Applications]` (`set`), or takes only our entry out of that line
+    /// (`!set`): a handler the user picked for the scheme stays. Every other line of
+    /// the file stays as it was. The file may be a symbolic link into a dotfiles
+    /// folder: the link stays, the file it points to is replaced atomically and
+    /// keeps its permissions. Nothing is written when nothing changes.
+    fn set_default(config_home: &Path, scheme: &str, ours: &str, set: bool) -> Result<()> {
         let path = mimeapps(config_home);
         let old = match std::fs::read_to_string(&path) {
             Ok(text) => text,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
             Err(err) => return Err(err.into()),
         };
+        let text = edit_defaults(&old, scheme, ours, set);
+        if text == old {
+            return Ok(());
+        }
+        std::fs::create_dir_all(config_home)?;
+        xdg::replace_keeping(&path, text.as_bytes())
+    }
+
+    /// The new text of `mimeapps.list`; see [`set_default`].
+    pub(super) fn edit_defaults(old: &str, scheme: &str, ours: &str, set: bool) -> String {
+        const DEFAULTS: &str = "[Default Applications]";
         let key = format!("x-scheme-handler/{scheme}=");
+        let ours_line = format!("{key}{ours};");
         let mut out = Vec::new();
         let mut section = String::new();
         let mut written = false;
         for line in old.lines() {
             let trimmed = line.trim();
             if trimmed.starts_with('[') {
-                if section == "[Default Applications]" && !written {
-                    if let Some(entry) = entry {
-                        out.push(format!("{key}{entry};"));
-                    }
+                if section == DEFAULTS && !written && set {
+                    out.push(ours_line.clone());
                     written = true;
                 }
                 section = trimmed.to_string();
-            } else if section == "[Default Applications]" && trimmed.starts_with(&key) {
-                continue;
+            } else if section == DEFAULTS {
+                if let Some(value) = trimmed.strip_prefix(&key) {
+                    if set {
+                        continue;
+                    }
+                    let others: Vec<&str> = value
+                        .split(';')
+                        .map(str::trim)
+                        .filter(|v| !v.is_empty() && *v != ours)
+                        .collect();
+                    if !others.is_empty() {
+                        out.push(format!("{key}{};", others.join(";")));
+                    }
+                    continue;
+                }
             }
             out.push(line.to_string());
         }
-        if !written {
-            if let Some(entry) = entry {
-                if section != "[Default Applications]" {
-                    out.push("[Default Applications]".to_string());
-                }
-                out.push(format!("{key}{entry};"));
+        if set && !written {
+            if section != DEFAULTS {
+                out.push(DEFAULTS.to_string());
             }
+            out.push(ours_line);
+        }
+        if old.is_empty() && !set {
+            return String::new();
         }
         let mut text = out.join("\n");
         text.push('\n');
-        std::fs::create_dir_all(config_home)?;
-        xdg::write_atomic(&path, text.as_bytes())
+        text
     }
 
     #[cfg(test)]
@@ -643,5 +670,65 @@ mod tests {
             .exists());
         let list = std::fs::read_to_string(config.join("mimeapps.list")).unwrap();
         assert!(list.contains("text/html=firefox.desktop"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mimeapps_list_keeps_its_symlink_and_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (data, config, dotfiles) = (
+            dir.path().join("data"),
+            dir.path().join("config"),
+            dir.path().join("dotfiles"),
+        );
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::create_dir_all(&dotfiles).unwrap();
+        let real = dotfiles.join("mimeapps.list");
+        std::fs::write(&real, "[Added Associations]\nimage/png=eog.desktop;\n").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o640)).unwrap();
+        // A relative link, as stow makes them.
+        std::os::unix::fs::symlink("../dotfiles/mimeapps.list", config.join("mimeapps.list"))
+            .unwrap();
+
+        let exe = std::path::Path::new("/opt/inlet/inlet");
+        imp::register_in(&data, &config, "inlet", exe).unwrap();
+        let link = std::fs::symlink_metadata(config.join("mimeapps.list")).unwrap();
+        assert!(link.file_type().is_symlink(), "the link was replaced");
+        let text = std::fs::read_to_string(&real).unwrap();
+        assert!(text.contains("image/png=eog.desktop;"), "{text}");
+        assert!(text.contains("x-scheme-handler/inlet=no.opland.inlet-inlet-handler.desktop;"));
+        let mode = std::fs::metadata(&real).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o640);
+        // No temporary file is left next to the real file or the link.
+        let left: Vec<_> = std::fs::read_dir(&dotfiles)
+            .unwrap()
+            .chain(std::fs::read_dir(&config).unwrap())
+            .map(|e| e.unwrap().file_name())
+            .filter(|n| n.to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unregistering_leaves_a_handler_the_user_picked() {
+        let ours = "no.opland.inlet-inlet-handler.desktop";
+        let other = "[Default Applications]\nx-scheme-handler/inlet=other.desktop;\n";
+        assert_eq!(imp::edit_defaults(other, "inlet", ours, false), other);
+        let mixed =
+            format!("[Default Applications]\nx-scheme-handler/inlet={ours};other.desktop;\n");
+        assert_eq!(imp::edit_defaults(&mixed, "inlet", ours, false), other);
+        let only_ours = format!("[Default Applications]\nx-scheme-handler/inlet={ours};\n");
+        assert_eq!(
+            imp::edit_defaults(&only_ours, "inlet", ours, false),
+            "[Default Applications]\n"
+        );
+        // Removing from no file writes no file.
+        assert_eq!(imp::edit_defaults("", "inlet", ours, false), "");
+        let dir = tempfile::tempdir().unwrap();
+        imp::unregister_in(&dir.path().join("d"), &dir.path().join("c"), "inlet").unwrap();
+        assert!(!dir.path().join("c").join("mimeapps.list").exists());
     }
 }

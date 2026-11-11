@@ -68,6 +68,8 @@ impl Inlet {
                     self.select_channel(wanted, window, cx);
                 }
             }
+            // A channel a confirmed link asked for (see `desktop`).
+            self.take_link_channel(window, cx);
             if self.selected_channel.is_none() {
                 match self.channels.iter().find(|c| c.is_messageable()).cloned() {
                     Some(first) => self.select_channel(first.id, window, cx),
