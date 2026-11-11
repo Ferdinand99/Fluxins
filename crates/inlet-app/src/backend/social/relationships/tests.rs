@@ -135,3 +135,47 @@ async fn group_dm_create_handles_captcha_result() {
     ))
     .is_ok());
 }
+
+#[test]
+fn a_call_that_never_answers_frees_its_target_and_fails() {
+    let (tx, mut rx) = futures::channel::mpsc::unbounded();
+    let ui = crate::backend::Ui::new(tx);
+    let account = key("3");
+    assert!(with_gate(&account, |g| g.admit(
+        "user:9",
+        Budget::Write,
+        Instant::now()
+    ))
+    .is_ok());
+    // The task panics or is aborted before it answers.
+    drop(Call {
+        account: account.clone(),
+        key: "user:9".into(),
+        events: ui,
+        answered: false,
+    });
+    assert!(with_gate(&account, |g| g.admit(
+        "user:9",
+        Budget::Write,
+        Instant::now()
+    ))
+    .is_ok());
+    match rx.try_recv() {
+        Ok(crate::backend::Event::Social(super::super::Ev::Relationships(Ev::Failed {
+            key,
+            ..
+        }))) => assert_eq!(key, "user:9"),
+        _ => panic!("the UI is answered"),
+    }
+}
+
+#[test]
+fn a_huge_server_wait_is_capped() {
+    let mut g = Gate::default();
+    let now = Instant::now();
+    g.group_rate_limited(now, Duration::MAX);
+    match g.admit("group-dm", Budget::GroupCreate, now) {
+        Err(Refusal::GroupLimit { wait }) => assert_eq!(wait, MAX_GROUP_WAIT),
+        other => panic!("{other:?}"),
+    }
+}

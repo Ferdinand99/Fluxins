@@ -95,6 +95,7 @@ social-blocked-messages-hide = { $count } blocked { $count ->
 ## Failures and waits
 
 social-busy = That is already on its way.
+social-action-failed = That did not work. Try again.
 social-too-fast = Slow down a little, then try again.
 social-not-connected = Not connected.
 social-not-a-dm = That is not a direct message.

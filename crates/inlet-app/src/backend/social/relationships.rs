@@ -36,6 +36,8 @@ pub const WRITE_WINDOW: Duration = Duration::from_secs(10);
 pub const GROUP_CALLS_PER_HOUR: usize = 3;
 /// The window of [`GROUP_CALLS_PER_HOUR`].
 pub const GROUP_WINDOW: Duration = Duration::from_secs(3600);
+/// Longest server wait taken for group DM calls (the protocol reports at most 6 h).
+pub const MAX_GROUP_WAIT: Duration = Duration::from_secs(6 * 3600);
 /// Largest group DM icon read from disk (Fluxer takes up to 10 MiB).
 pub const MAX_ICON_BYTES: u64 = 10 * 1024 * 1024;
 
@@ -242,7 +244,9 @@ impl Gate {
 
     /// The server said to wait `wait` before the next group DM call.
     fn group_rate_limited(&mut self, now: Instant, wait: Duration) {
-        let until = now + wait;
+        let Some(until) = now.checked_add(wait.min(MAX_GROUP_WAIT)) else {
+            return;
+        };
         self.group_wait_until = Some(self.group_wait_until.map_or(until, |u| u.max(until)));
     }
 }
@@ -389,10 +393,45 @@ pub(in crate::backend) fn handle(backend: &mut Backend, cmd: Cmd) {
     }
     let internal = backend.internal.clone();
     backend.spawn_guarded("social action", None, async move {
-        let ev = run(&client, &internal, gen, &account, &key, cmd).await;
-        with_gate(&account, |g| g.finish(&key));
-        let _ = events.unbounded_send(super::Ev::Relationships(ev));
+        // Frees the target and answers the UI even when the call panics or is aborted.
+        let mut call = Call {
+            account,
+            key,
+            events,
+            answered: false,
+        };
+        let ev = run(&client, &internal, gen, &call.account, &call.key, cmd).await;
+        call.answer(ev);
     });
+}
+
+/// One admitted call: its gate slot is freed and the UI answered exactly once, also
+/// when the task panics or is aborted (then with a failure).
+struct Call {
+    account: AccountKey,
+    key: String,
+    events: super::super::Ui,
+    answered: bool,
+}
+
+impl Call {
+    fn answer(&mut self, ev: Ev) {
+        self.answered = true;
+        with_gate(&self.account, |g| g.finish(&self.key));
+        let _ = self.events.unbounded_send(super::Ev::Relationships(ev));
+    }
+}
+
+impl Drop for Call {
+    fn drop(&mut self) {
+        if !self.answered {
+            let ev = Ev::Failed {
+                key: self.key.clone(),
+                reason: t!("social-action-failed"),
+            };
+            self.answer(ev);
+        }
+    }
 }
 
 /// Runs one admitted call and says how it ended.
@@ -525,10 +564,13 @@ fn group_answer(account: &AccountKey, key: String, result: GroupDm) -> Ev {
 }
 
 fn group_failed(internal: &TokioSender<Internal>, gen: u64, key: String, err: p::Error) -> Ev {
-    let reason = failure(internal, gen, err).unwrap_or_default();
-    Ev::GroupDm {
-        key,
-        result: GroupDm::Failed(reason),
+    match failure(internal, gen, err) {
+        Some(reason) => Ev::GroupDm {
+            key,
+            result: GroupDm::Failed(reason),
+        },
+        // The session ended: the sign-in screen says why; the call just ends.
+        None => Ev::Done { key },
     }
 }
 
