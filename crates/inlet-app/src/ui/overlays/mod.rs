@@ -8,10 +8,11 @@ pub mod modal;
 mod notification_settings;
 mod tooltip;
 
-use gpui::{AnyElement, Context, FocusHandle};
+use gpui::{AnyElement, Context, FocusHandle, IntoElement};
 
 use crate::app::Inlet;
 use crate::backend::platform::links::Prompt;
+use crate::desktop::Layer;
 
 #[derive(Default)]
 pub struct OverlayState {
@@ -40,7 +41,14 @@ impl Inlet {
             out.push(self.render_settings_overlay(cx));
         }
         if let Some(url) = self.overlays.pending_link.clone() {
-            out.push(self.render_link_confirm(&url, cx));
+            // A layer like the link prompt: it has the keyboard while it is topmost, and
+            // Escape closes it.
+            let card = self.render_link_confirm(&url, cx);
+            out.push(if self.is_top_layer(Layer::LinkConfirm) {
+                self.layer_keys(card, cx).into_any_element()
+            } else {
+                card.into_any_element()
+            });
         }
         if self.notifications.settings.is_some() {
             out.push(self.render_notification_settings(cx));

@@ -16,6 +16,7 @@ use super::attachment::icon_button;
 use super::image::picture_of;
 use super::{requests, MediaIcon};
 use crate::app::Inlet;
+use crate::desktop::Layer;
 use crate::model::{Attachment, EmbedMedia};
 use crate::theme;
 
@@ -253,9 +254,8 @@ impl Inlet {
             .child(image)
             .child(caption);
         // The keyboard and Escape go to the topmost layer: the viewer only when no
-        // settings view or link prompt lies over it.
-        let topmost = self.settings.view.is_none() && self.overlays.link_prompt.is_none();
-        let viewer = if topmost {
+        // settings view, link confirmation or link prompt lies over it.
+        let viewer = if self.is_top_layer(Layer::Viewer) {
             self.layer_keys(viewer, cx)
         } else {
             viewer

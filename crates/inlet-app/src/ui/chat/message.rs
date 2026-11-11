@@ -88,22 +88,19 @@ impl Inlet {
                     .on_click(cx.listener(move |this, _, _, cx| this.expand(id, cx))),
             );
         }
-        // Links the text hides in spoilers hide their embeds too, until shown. A cut
-        // text is read whole for this, so a spoiler past the cut still counts. Embeds
-        // hidden with "Suppress Embeds" are not drawn at all.
-        let hidden = if row.revealed || m.embeds.is_empty() || row.meta.embeds_hidden {
-            Vec::new()
-        } else if m.truncated {
-            markdown::spoilered_links(&markdown::parse(&m.content))
+        // Links the text hides in spoilers hide their embeds too, until shown. The links
+        // are worked out when the message is converted, not here. Embeds hidden with
+        // "Suppress Embeds" are not drawn at all.
+        let hidden: &[String] = if row.revealed || row.meta.embeds_hidden {
+            &[]
         } else {
-            markdown::spoilered_links(&m.blocks)
+            &m.spoiler_links
         };
-        for (i, e) in m.embeds.iter().enumerate() {
-            if row.meta.embeds_hidden {
-                break;
+        if !row.meta.embeds_hidden {
+            for (i, e) in m.embeds.iter().enumerate() {
+                let id = format!("m{}-e{i}", m.id);
+                body = body.child(render_embed(self, &id, e, hidden, &ctx, cx));
             }
-            let id = format!("m{}-e{i}", m.id);
-            body = body.child(render_embed(self, &id, e, &hidden, &ctx, cx));
         }
         if m.is_empty() {
             body = body.child(

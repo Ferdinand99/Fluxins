@@ -129,6 +129,7 @@ fn convert_message(m: &p::Message, names: &SharedNames) -> Message {
         content: m.content.clone(),
         blocks: Vec::new(),
         truncated: false,
+        spoiler_links: Vec::new(),
         attachments: m
             .attachments
             .iter()
