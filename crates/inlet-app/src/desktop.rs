@@ -894,9 +894,12 @@ impl Inlet {
         }
     }
 
-    /// Whether a layer covers the chat: the link prompt or the settings view.
+    /// Whether a layer covers the chat: the link prompt, the settings view or the image
+    /// viewer.
     pub(crate) fn layer_open(&self) -> bool {
-        self.overlays.link_prompt.is_some() || self.settings.view.is_some()
+        self.overlays.link_prompt.is_some()
+            || self.settings.view.is_some()
+            || self.media.viewer.is_some()
     }
 
     /// Keeps the keyboard on an open layer, so typing never reaches the composer hidden
@@ -951,12 +954,15 @@ impl Inlet {
         }
     }
 
-    /// Escape on a layer: the link prompt first, then the settings view.
+    /// Escape on a layer: the link prompt first, then the settings view, then the image
+    /// viewer (the bottom one).
     pub(crate) fn close_top_layer(&mut self, cx: &mut Context<Self>) {
         if self.overlays.link_prompt.is_some() {
             self.overlays.link_prompt = None;
         } else if self.settings.view.is_some() {
             self.settings.view = None;
+        } else if self.media.viewer.is_some() {
+            self.media.viewer = None;
         }
         cx.notify();
     }

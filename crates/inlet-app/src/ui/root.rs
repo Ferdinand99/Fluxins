@@ -9,6 +9,7 @@ use crate::{about, assets, theme};
 
 impl Render for Inlet {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.media_frame(window, cx);
         self.take_channel_jump(window, cx);
         self.focus_layer(window, cx);
         let root = div()

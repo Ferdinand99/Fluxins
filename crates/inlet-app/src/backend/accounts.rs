@@ -323,6 +323,7 @@ impl Backend {
             self.active = Some(Active::Demo(crate::demo::MockSession::start(
                 self.global.clone(),
             )));
+            super::media::demo_started(self);
             return;
         }
         let store = self.store.clone();
@@ -863,6 +864,7 @@ impl Backend {
         }
 
         self.events = events.clone();
+        self.session_activated(&session);
         self.active = Some(Active::Real(RealActive {
             gen,
             key: key.clone(),
@@ -1034,6 +1036,7 @@ impl Backend {
         let gen = r.gen;
         let guilds = r.guilds.lock().unwrap().clone();
         self.events = r.events.clone();
+        self.session_activated(&r.session);
         self.active = Some(Active::Real(r));
         if restart {
             self.restart_gateway(gen);
@@ -1049,12 +1052,21 @@ impl Backend {
         true
     }
 
+    /// What every account needs when it becomes the active one, however it got there
+    /// (sign-in, start-up, switch): the image client for its own media endpoint, sent
+    /// with its tag so the UI never keeps the previous account's.
+    fn session_activated(&self, session: &p::Session) {
+        super::media::session_started(self, session);
+    }
+
     /// Makes `key` the active account: a connected one at once, a stored one that is not
     /// connected yet by connecting it now (start-up screens as for the first account).
     pub(super) fn switch_account(&mut self, key: AccountKey) {
         #[cfg(feature = "demo")]
         if let Some(Active::Demo(m)) = &mut self.active {
             m.switch(&key);
+            // The UI let go of its image client at the switch.
+            super::media::demo_started(self);
             return;
         }
         if let Some(Active::Real(r)) = &self.active {

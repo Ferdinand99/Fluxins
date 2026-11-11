@@ -5,6 +5,5 @@ channel-unnamed = channel { $id }
 reply-no-text = (attachment or embed)
 embed-image = Image
 embed-thumbnail = Thumbnail
-embed-video = Video
 error-load-channels = Could not load channels: { $error }
 error-load-messages = Could not load messages: { $error }

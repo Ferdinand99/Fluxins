@@ -11,6 +11,11 @@
 //! - `chat-compact`: `chat-cozy` in compact mode.
 //! - `chat-system`: for `#system-messages`, every system message type.
 //! - `chat-replies`: for `#replies`, replies with loaded, deleted and missing originals.
+//! - `attachments`: for `#attachments`, images, a GIF, a video, a file, audio, a spoiler,
+//!   explicit media, an expired link that is refreshed and an image too large to decode.
+//! - `embed-all-types`: for `#embeds`, every embed type (rich, link, article, image, gifv,
+//!   video, bluesky) and an embed without a colour.
+//! - `image-viewer`: `attachments` with the image viewer open on the newest photo.
 //! - `markdown-inline`, `markdown-blocks`, `markdown-alerts`, `markdown-code`: for
 //!   `#development`, every kind of markdown node (see `markdown.rs`).
 //! - `accounts`: as `default`, with two more accounts in the background (one on the same
@@ -23,8 +28,8 @@ use inlet_protocol as p;
 use serde_json::{json, Value};
 
 use super::{
-    guilds, markdown, messages, snowflake, social, unread, user, user_id, ME, ROLE_CONTRIBUTORS,
-    ROLE_MODERATORS,
+    guilds, markdown, media, messages, snowflake, social, unread, user, user_id, ME,
+    ROLE_CONTRIBUTORS, ROLE_MODERATORS,
 };
 use crate::backend::messages::Pending;
 use crate::model::{Channel, ChannelKind, Guild};
@@ -37,6 +42,9 @@ pub enum Scene {
     ChatCompact,
     ChatSystem,
     ChatReplies,
+    Attachments,
+    EmbedAllTypes,
+    ImageViewer,
     MarkdownInline,
     MarkdownBlocks,
     MarkdownAlerts,
@@ -53,6 +61,9 @@ impl Scene {
             "chat-compact" => Scene::ChatCompact,
             "chat-system" => Scene::ChatSystem,
             "chat-replies" => Scene::ChatReplies,
+            "attachments" => Scene::Attachments,
+            "embed-all-types" => Scene::EmbedAllTypes,
+            "image-viewer" => Scene::ImageViewer,
             "markdown-inline" => Scene::MarkdownInline,
             "markdown-blocks" => Scene::MarkdownBlocks,
             "markdown-alerts" => Scene::MarkdownAlerts,
@@ -151,9 +162,10 @@ fn ready(
                         .collect()
                 })
                 .unwrap_or_default();
+            let (icon, banner) = media::guild_art(&g.name);
             json!({
                 "id": g.id,
-                "properties": {"id": g.id, "name": g.name, "owner_id": user_id(ME)},
+                "properties": {"id": g.id, "name": g.name, "owner_id": user_id(ME), "icon": icon, "banner": banner},
                 "channels": list,
                 "roles": [
                     {"id": g.id, "name": "@everyone", "permissions": "2251799813685247", "position": 0},
@@ -195,6 +207,7 @@ pub fn data(scene: Scene) -> Data {
     social::dm_channels(&mut channels);
     let mut by_name = HashMap::new();
     messages::messages(&mut by_name);
+    media::messages(&mut by_name);
     social::dm_messages(&mut by_name);
     match scene {
         Scene::MarkdownInline => {
@@ -307,6 +320,9 @@ mod tests {
             "chat-compact",
             "chat-system",
             "chat-replies",
+            "attachments",
+            "embed-all-types",
+            "image-viewer",
             "markdown-inline",
             "markdown-blocks",
             "markdown-alerts",
@@ -319,7 +335,15 @@ mod tests {
             assert_eq!(data.guilds.len(), 3);
             assert!(data.channels.contains_key(&None));
             let state = inlet_state::AccountState::from_ready_at(&data.ready, 1);
-            for id in ["c-general", "c-system", "c-replies", "c-joins", "dm-ada"] {
+            for id in [
+                "c-general",
+                "c-system",
+                "c-replies",
+                "c-joins",
+                "dm-ada",
+                "c-attachments",
+                "c-embeds",
+            ] {
                 let ch = inlet_state::ChannelId::parse(&snowflake(id)).expect(id);
                 assert!(state.channel(ch).is_some(), "{name}: {id}");
                 assert!(data.messages.contains_key(&snowflake(id)), "{name}: {id}");
@@ -330,5 +354,32 @@ mod tests {
             );
         }
         assert_eq!(Scene::from_name("nope"), None);
+
+        // The media scenes have what they promise.
+        let data = data(Scene::EmbedAllTypes);
+        let embeds = &data.messages[&snowflake("c-embeds")];
+        let kinds: Vec<String> = embeds
+            .iter()
+            .flat_map(|m| m.parsed_embeds())
+            .map(|e| e.kind)
+            .collect();
+        for kind in [
+            "rich", "link", "article", "image", "gifv", "video", "bluesky",
+        ] {
+            assert!(kinds.iter().any(|k| k == kind), "{kind} in {kinds:?}");
+        }
+        assert!(embeds
+            .iter()
+            .flat_map(|m| m.parsed_embeds())
+            .any(|e| e.color.is_none()));
+        let atts: Vec<p::Attachment> = data.messages[&snowflake("c-attachments")]
+            .iter()
+            .flat_map(|m| m.attachments.clone())
+            .collect();
+        assert!(atts.iter().any(|a| a.is_spoiler()));
+        assert!(atts.iter().any(|a| a.is_explicit()));
+        assert!(atts.iter().any(|a| a.is_video()));
+        assert!(atts.iter().any(|a| a.is_audio()));
+        assert!(atts.iter().any(|a| a.expires_at().is_some()));
     }
 }

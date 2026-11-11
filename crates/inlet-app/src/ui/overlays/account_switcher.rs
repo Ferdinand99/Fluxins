@@ -238,6 +238,9 @@ impl Inlet {
             .view
             .update(cx, |v, cx| v.switch_account(window, cx));
         self.composer.reset_session();
+        // The old account's image client is not used for the next one; the backend
+        // sends the next account's own (its media endpoint) right after the switch.
+        self.media.reset();
         // Links: the prompt, a link waiting for the session and a channel a link wants to
         // open were all for the account before (as at sign-out).
         self.overlays.pending_link = None;

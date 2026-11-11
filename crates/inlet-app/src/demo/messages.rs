@@ -95,13 +95,8 @@ fn general() -> Vec<p::Message> {
             "c-general",
             "ada",
             "09:21",
-            "Attachments show as links in v0.",
-            json!({"attachments": [{
-                "id": "7001",
-                "filename": "screenshot.png",
-                "size": 1024,
-                "url": "https://example.invalid/attachments/screenshot.png"
-            }]}),
+            "Attachments show as images.",
+            json!({"attachments": [super::media::screenshot()]}),
         ),
         // Same display name, other account: its own header, and @username shows.
         msg_with(

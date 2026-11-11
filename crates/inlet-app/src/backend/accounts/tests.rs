@@ -526,6 +526,28 @@ async fn background_account_sends_no_op14_and_no_rest() {
     // Made active, it starts again with typing events, and opening a guild sends the
     // Lazy Request (the check above could see one).
     switch_and_open(&mut b, &key);
+    // The UI is told which account is active, then gets that account's own image client
+    // (its media endpoint), tagged with it, so the previous account's is not kept.
+    let mut signed_in = false;
+    let mut media_for_it = false;
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            Event::Accounts(Ev::SignedIn { key: k, .. }) => signed_in = k == key,
+            Event::Tagged { account, event } => {
+                if let Event::Media(crate::backend::media::Ev::Ready(setup)) = *event {
+                    assert!(signed_in, "the image client comes after the switch");
+                    assert_eq!(account, key);
+                    assert_eq!(setup.proxy.base(), instance.media().unwrap().base());
+                    media_for_it = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        media_for_it,
+        "a switch sets up media for the new active account"
+    );
     let mut conn = Conn::accept(&listener).await;
     let identify = conn.identify("9").await;
     assert!(!ignores_typing(&identify));
