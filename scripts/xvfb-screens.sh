@@ -65,17 +65,21 @@ scene 06-chat-cozy chat-cozy c-general
 scene 07-chat-compact chat-compact c-general
 scene 08-chat-system chat-system c-system
 scene 09-chat-replies chat-replies c-replies
+scene 10-markdown-inline markdown-inline c-dev
+scene 11-markdown-blocks markdown-blocks c-dev
+scene 12-markdown-alerts markdown-alerts c-dev
+scene 13-markdown-code markdown-code c-dev
 
 # 6. The Desktop settings tab, and the prompt a link from outside opens.
 INLET_DEMO=1 INLET_DEMO_LIVE_SECS=3600 INLET_DEMO_GUILD=g1 INLET_DEMO_CHANNEL=c-general INLET_DEMO_SETTINGS=desktop "$bin" >>"$out/demo.log" 2>&1 &
 pid=$!
 sleep 6
-shot 10-settings-desktop
+shot 14-settings-desktop
 kill $pid; wait $pid 2>/dev/null
 INLET_DEMO=1 INLET_DEMO_LIVE_SECS=3600 INLET_DEMO_GUILD=g1 INLET_DEMO_CHANNEL=c-general INLET_DEMO_DEEP_LINK=inlet://invite/abc123 "$bin" >>"$out/demo.log" 2>&1 &
 pid=$!
 sleep 6
-shot 11-link-prompt
+shot 15-link-prompt
 kill $pid; wait $pid 2>/dev/null
 
 tail -n 20 "$out/signin.log" "$out/demo.log" >&2
