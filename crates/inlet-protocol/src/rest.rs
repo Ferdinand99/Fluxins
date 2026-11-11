@@ -31,6 +31,10 @@ pub const FLUXER_CAPABILITIES: &str = "guild_visits";
 
 /// A 429 longer than this is returned as [`Error::RateLimited`] instead of waited out.
 const MAX_AUTO_WAIT: Duration = Duration::from_secs(10);
+/// Longest `retry_after` reported in [`Error::RateLimited`]. The limiter
+/// itself never blocks longer than [`MAX_SERVER_WAIT`], but some buckets are
+/// longer (group DM creation: 10 per hour), and the UI should show the real wait.
+pub const MAX_REPORTED_WAIT: Duration = Duration::from_secs(6 * 3600);
 /// Retries after a route 429.
 const MAX_429_RETRIES: u32 = 3;
 /// Most pages `guilds()` fetches (200 guilds each).
@@ -174,6 +178,13 @@ pub(crate) async fn send(
                     == Some("true");
             let wait =
                 clamp_server_secs(retry_after, MAX_SERVER_WAIT).max(Duration::from_millis(1));
+            // What the caller is told: the server's wait up to MAX_REPORTED_WAIT
+            // (a nonsense value falls back to the clamped wait).
+            let reported = if retry_after.is_finite() && retry_after > 0.0 {
+                clamp_server_secs(retry_after, MAX_REPORTED_WAIT).max(wait)
+            } else {
+                wait
+            };
             limiter.record_429(&route, wait, global);
             tracing::warn!(route = %route, ?wait, global, "rate limited by the instance");
             if global && token.is_some() {
@@ -181,11 +192,15 @@ pub(crate) async fn send(
             }
             if req.upload.is_some() {
                 // An upload body is never sent twice; the caller decides.
-                return Err(Error::RateLimited { retry_after: wait });
+                return Err(Error::RateLimited {
+                    retry_after: reported,
+                });
             }
             attempts += 1;
             if attempts > MAX_429_RETRIES || wait > MAX_AUTO_WAIT {
-                return Err(Error::RateLimited { retry_after: wait });
+                return Err(Error::RateLimited {
+                    retry_after: reported,
+                });
             }
             continue;
         }

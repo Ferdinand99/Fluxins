@@ -125,6 +125,11 @@ Run-Demo "16-image-viewer" @{ INLET_DEMO = "1"; INLET_DEMO_LIVE_SECS = "3600"; I
 # A prompt over a chat full of Twemoji: the dimmed backdrop must cover the emoji too.
 Run-Demo "17-overlay-over-emoji" @{ INLET_DEMO = "1"; INLET_DEMO_LIVE_SECS = "3600"; INLET_DEMO_SCENE = "markdown-inline"; INLET_DEMO_GUILD = "g1"; INLET_DEMO_CHANNEL = "c-dev"; INLET_DEMO_DEEP_LINK = "inlet://invite/abc123" } 10
 
+# Message actions: reactions and the hover bar, the context menu, the delete confirmation.
+Run-Demo "18-chat-reactions" @{ INLET_DEMO = "1"; INLET_DEMO_LIVE_SECS = "3600"; INLET_DEMO_SCENE = "chat-reactions"; INLET_DEMO_GUILD = "g1"; INLET_DEMO_CHANNEL = "c-general" } 10
+Run-Demo "19-chat-menu" @{ INLET_DEMO = "1"; INLET_DEMO_LIVE_SECS = "3600"; INLET_DEMO_SCENE = "chat-menu"; INLET_DEMO_GUILD = "g1"; INLET_DEMO_CHANNEL = "c-general" } 10
+Run-Demo "20-chat-delete" @{ INLET_DEMO = "1"; INLET_DEMO_LIVE_SECS = "3600"; INLET_DEMO_SCENE = "chat-delete"; INLET_DEMO_GUILD = "g1"; INLET_DEMO_CHANNEL = "c-general" } 10
+
 # One scene file: the app opens in the state the file names, at its window size, and
 # the inside of the window is saved as visual/<name>.png.
 function Run-Scene([System.IO.FileInfo]$File) {

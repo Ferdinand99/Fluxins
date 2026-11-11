@@ -20,7 +20,6 @@ pub struct Reply {
 
 impl ComposerView {
     /// Starts a reply to a message in the open channel and puts the caret in the box.
-    #[allow(dead_code)] // called by the message actions
     pub fn start_reply(
         &mut self,
         message_id: String,

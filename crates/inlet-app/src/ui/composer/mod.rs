@@ -115,10 +115,37 @@ pub(crate) fn edit_last(
     window: &mut Window,
     cx: &mut App,
 ) {
-    let state = account.read(cx);
-    let Some(target) = edit_inline::last_own(state, channel) else {
+    let Some(target) = edit_inline::last_own(account.read(cx), channel) else {
         return;
     };
+    start_edit_of(view, account, channel, target, window, cx);
+}
+
+/// "Edit" in a message's actions: opens that message for editing, if it is one of the
+/// account's own in `channel`'s window.
+pub(crate) fn edit_message(
+    view: &Entity<ComposerView>,
+    account: &Entity<AccountState>,
+    channel: ChannelId,
+    message: inlet_state::MessageId,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some(target) = edit_inline::own(account.read(cx), channel, message) else {
+        return;
+    };
+    start_edit_of(view, account, channel, target, window, cx);
+}
+
+fn start_edit_of(
+    view: &Entity<ComposerView>,
+    account: &Entity<AccountState>,
+    channel: ChannelId,
+    target: edit_inline::EditTarget,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let state = account.read(cx);
     let guild = state.channels().guild_of(channel);
     // The labels are worked out now; the edit box keeps them.
     let draft = {

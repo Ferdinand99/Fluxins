@@ -11,6 +11,7 @@
 //! One file per domain (`guilds`, `media`, `messages`, `markdown`, `social`); `scenes`
 //! picks what to show, also from the scene files of the visual checks (`scene_file`).
 
+pub mod actions;
 pub mod composer;
 mod guilds;
 mod markdown;

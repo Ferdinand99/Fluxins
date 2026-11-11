@@ -70,9 +70,7 @@ pub fn run() {
     inlet_platform::gpui_glue::install_on_application(&app);
     app.on_reopen(desktop::show_main_window);
     app.run(move |cx: &mut App| {
-        text_input::bind_keys(cx);
-        ui::notifications::bind_keys(cx);
-        ui::composer::bind_keys(cx);
+        bind_keys(cx);
         assets::load_fonts(cx);
         desktop::init(cx);
         let options = desktop::window_options(&start, cx);
@@ -90,4 +88,83 @@ pub fn run() {
             cx.activate(true);
         }
     });
+}
+
+/// The key bindings of every domain that has some, in this order.
+fn bind_keys(cx: &mut App) {
+    text_input::bind_keys(cx);
+    ui::notifications::bind_keys(cx);
+    ui::composer::bind_keys(cx);
+    ui::chat::bind_keys(cx);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+    use std::path::Path;
+
+    use gpui::{App, TestAppContext};
+
+    /// A domain's `bind_keys`.
+    type Bind = fn(&mut App);
+
+    /// The domains with key bindings. A new `fn bind_keys` must be added here and to
+    /// [`super::bind_keys`].
+    const DOMAINS: [(&str, Bind); 4] = [
+        ("text_input", crate::text_input::bind_keys),
+        ("ui::notifications", crate::ui::notifications::bind_keys),
+        ("ui::composer", crate::ui::composer::bind_keys),
+        ("ui::chat", crate::ui::chat::bind_keys),
+    ];
+
+    fn bound(cx: &mut TestAppContext, bind: Bind) -> BTreeSet<String> {
+        cx.update(|cx| {
+            cx.clear_key_bindings();
+            bind(cx);
+            let keymap = cx.key_bindings();
+            let names = keymap
+                .borrow()
+                .bindings()
+                .map(|b| b.action().name().to_string())
+                .collect();
+            names
+        })
+    }
+
+    fn count_bind_keys_fns(dir: &Path) -> usize {
+        let mut n = 0;
+        for entry in std::fs::read_dir(dir).expect("read src/") {
+            let path = entry.expect("an entry").path();
+            if path.is_dir() {
+                n += count_bind_keys_fns(&path);
+            } else if path.extension().is_some_and(|e| e == "rs") && !path.ends_with("lib.rs") {
+                let text = std::fs::read_to_string(&path).expect("read a source file");
+                n += text.matches("pub fn bind_keys(cx: &mut App)").count();
+            }
+        }
+        n
+    }
+
+    /// Start-up registers the bindings of every domain. A merge that drops a call from
+    /// `bind_keys` (as happened when `main.rs` became `lib.rs`) fails here, and so does a
+    /// new domain with bindings that is not listed.
+    #[gpui::test]
+    fn start_up_binds_the_keys_of_every_domain(cx: &mut TestAppContext) {
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        assert_eq!(
+            count_bind_keys_fns(&src),
+            DOMAINS.len(),
+            "a domain's bind_keys is missing from DOMAINS and from lib.rs's bind_keys"
+        );
+        let all = bound(cx, super::bind_keys);
+        for (domain, bind) in DOMAINS {
+            let own = bound(cx, bind);
+            assert!(!own.is_empty(), "{domain} binds no keys");
+            let missing: Vec<_> = own.difference(&all).collect();
+            assert!(
+                missing.is_empty(),
+                "start-up does not bind {domain}'s keys: {missing:?}"
+            );
+        }
+    }
 }
