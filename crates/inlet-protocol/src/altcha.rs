@@ -163,8 +163,42 @@ fn solve_cancellable(challenge: &Value, timeout: Duration, cancel: &AtomicBool) 
     Ok(base64::engine::general_purpose::STANDARD.encode(token.to_string()))
 }
 
-/// Async wrapper around [`solve_blocking`]. Dropping the future stops the work.
+/// One solve at a time in the whole process (sign-in and group DMs share
+/// it), so many clicks or accounts cannot take every core.
+fn solver_slot() -> Arc<tokio::sync::Semaphore> {
+    static SLOT: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    SLOT.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)))
+        .clone()
+}
+
+/// Async wrapper around [`solve_blocking`], with a hard deadline.
+///
+/// - Only one solve runs at a time in the process; waiting for it counts
+///   against `timeout`.
+/// - The answer (or an error) comes back within `timeout`, whatever happens.
+///   The workers stop at their next attempt after the deadline or when this
+///   future is dropped, and the slot is only freed once they have stopped
+///   (one attempt at the highest accepted cost can take a few seconds).
 pub async fn solve(challenge: Value, timeout: Duration) -> Result<String> {
+    let started = tokio::time::Instant::now();
+    let permit = tokio::time::timeout(timeout, solver_slot().acquire_owned())
+        .await
+        .map_err(|_| Error::Captcha("another CAPTCHA is being solved".into()))?
+        .map_err(|_| Error::Captcha("solver closed".into()))?;
+    let left = timeout.saturating_sub(started.elapsed());
+    tokio::time::timeout(left, solve_holding(challenge, left, permit))
+        .await
+        .unwrap_or_else(|_| Err(Error::Captcha("CAPTCHA timed out".into())))
+}
+
+/// Like [`solve`], and keeps `guard` alive until the blocking work has really
+/// stopped (also when this future is dropped early), for example a permit
+/// that limits how many solves run at once.
+pub(crate) async fn solve_holding<G: Send + 'static>(
+    challenge: Value,
+    timeout: Duration,
+    guard: G,
+) -> Result<String> {
     struct CancelOnDrop(Arc<AtomicBool>);
     impl Drop for CancelOnDrop {
         fn drop(&mut self) {
@@ -173,9 +207,13 @@ pub async fn solve(challenge: Value, timeout: Duration) -> Result<String> {
     }
     let cancel = Arc::new(AtomicBool::new(false));
     let _guard = CancelOnDrop(cancel.clone());
-    tokio::task::spawn_blocking(move || solve_cancellable(&challenge, timeout, &cancel))
-        .await
-        .map_err(|e| Error::Captcha(e.to_string()))?
+    tokio::task::spawn_blocking(move || {
+        let result = solve_cancellable(&challenge, timeout, &cancel);
+        drop(guard);
+        result
+    })
+    .await
+    .map_err(|e| Error::Captcha(e.to_string()))?
 }
 
 /// Reads the challenge from a 400 `CAPTCHA_REQUIRED`/`INVALID_CAPTCHA` body.

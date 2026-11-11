@@ -118,6 +118,25 @@
 //!   silent messages ([`OutgoingMessage::silent`]) and `allowed_mentions`
 //!   ([`models::AllowedMentions`]).
 //!
+//! # Social, profiles and settings
+//!
+//! - Friends, requests, blocks and notes ([`api::relationships`]):
+//!   [`Client::relationships`], [`Client::send_friend_request_by_tag`],
+//!   [`Client::accept_friend_request`], [`Client::block_user`],
+//!   [`Client::set_note`]; RELATIONSHIP_* and USER_NOTE_UPDATE arrive typed.
+//! - DMs and group DMs ([`api::dms`]): [`Client::open_dm`],
+//!   [`Client::create_group_dm`] (solves the ALTCHA CAPTCHA off the async
+//!   threads, or returns [`api::dms::GroupDmOutcome::Captcha`]),
+//!   [`Client::add_group_dm_recipient`], [`Client::pin_dm`].
+//! - Profiles ([`api::profiles`]): [`Client::edit_profile`],
+//!   [`Client::edit_member_profile`].
+//! - Guild folders ([`api::folders`]) and `SyncedPreferences`
+//!   ([`api::preferences`], generated from Fluxer's `.proto` in [`proto`]):
+//!   writes keep every field this crate does not know.
+//! - Emoji and sticker lookups and memes ([`api::expressions`]), GIF search
+//!   through the instance only ([`api::gifs`]), invites with checked codes
+//!   ([`api::invites`]).
+//!
 //! # Not covered yet
 //!
 //! Voice, pre-signed uploads, forum posts with files, WebAuthn.
@@ -133,6 +152,7 @@ pub mod limits;
 pub mod media;
 pub mod models;
 pub mod permissions;
+pub mod proto;
 pub mod ratelimit;
 pub mod rest;
 #[cfg(feature = "test-extra-ca")]
@@ -146,8 +166,15 @@ compile_error!(
     "the `test-extra-ca` feature is for tests against a private instance and must not be in a release build"
 );
 
+pub use api::dms::{GroupDmEdit, GroupDmOutcome};
+pub use api::expressions::Meme;
+pub use api::gifs::Gif;
 pub use api::inbox::MentionsQuery;
+pub use api::invites::{Invite, InviteLink};
 pub use api::messages::ForwardSource;
+pub use api::preferences::{PreferencesSave, SyncedPreferences};
+pub use api::profiles::{ImageData, MemberProfileEdit, ProfileEdit};
+pub use api::relationships::Relationship;
 pub use api::saved::SavedMessage;
 pub use api::search::{MessageSearch, MessageSearchResults};
 pub use api::threads::{

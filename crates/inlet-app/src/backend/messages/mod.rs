@@ -10,7 +10,7 @@
 //! parsed on the UI thread.
 
 pub(crate) mod ack;
-mod actions;
+pub mod actions;
 mod fetch;
 mod inbox;
 pub(crate) mod outbox;
@@ -51,6 +51,8 @@ pub enum Cmd {
         nonce: String,
         text: String,
     },
+    /// A message action: a reaction, delete, pin and the rest (see [`actions`]).
+    Action(actions::Cmd),
 }
 
 /// A message being sent, or one that could not be sent (a row with "Retry").
@@ -97,6 +99,8 @@ pub enum Ev {
     Sent {
         nonce: String,
     },
+    /// The answer to a message action.
+    Action(actions::Ev),
 }
 
 pub(super) fn handle(backend: &mut Backend, cmd: Cmd) {
@@ -116,5 +120,6 @@ pub(super) fn handle(backend: &mut Backend, cmd: Cmd) {
             nonce,
             text,
         } => backend.resend(channel_id, nonce, text),
+        Cmd::Action(cmd) => backend.message_action(cmd),
     }
 }

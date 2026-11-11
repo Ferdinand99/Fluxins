@@ -899,6 +899,7 @@ impl Inlet {
         OpenLayers {
             link_prompt: self.overlays.link_prompt.is_some(),
             link_confirm: self.overlays.pending_link.is_some(),
+            notification_settings: self.notifications.settings.is_some(),
             switcher: self.switcher_layer_open(),
             settings: self.settings.view.is_some(),
             viewer: self.media.viewer.is_some(),
@@ -906,7 +907,8 @@ impl Inlet {
     }
 
     /// Whether a layer covers the chat: the link prompt, the link confirmation, the
-    /// account switcher, the settings view or the image viewer.
+    /// notification settings window, the account switcher, the settings view or the
+    /// image viewer.
     pub(crate) fn layer_open(&self) -> bool {
         self.open_layers().topmost().is_some()
     }
@@ -973,6 +975,7 @@ impl Inlet {
         match self.open_layers().topmost() {
             Some(Layer::LinkPrompt) => self.overlays.link_prompt = None,
             Some(Layer::LinkConfirm) => self.overlays.pending_link = None,
+            Some(Layer::NotificationSettings) => self.notifications.settings = None,
             Some(Layer::AccountSwitcher) => self.switcher.open = false,
             Some(Layer::Settings) => self.settings.view = None,
             Some(Layer::Viewer) => self.media.viewer = None,
@@ -1027,18 +1030,21 @@ impl Inlet {
 pub(crate) enum Layer {
     LinkPrompt,
     LinkConfirm,
+    NotificationSettings,
     AccountSwitcher,
     Settings,
     Viewer,
 }
 
 /// Which layers are open. They are drawn bottom first (the viewer, the settings view,
-/// the account switcher, the link confirmation, the link prompt, see `ui/overlays`),
-/// and the topmost one has the keyboard: Escape closes it first.
+/// the account switcher, the notification settings window, the link confirmation, the
+/// link prompt, see `ui/overlays`), and the topmost one has the keyboard: Escape
+/// closes it first.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct OpenLayers {
     pub link_prompt: bool,
     pub link_confirm: bool,
+    pub notification_settings: bool,
     pub switcher: bool,
     pub settings: bool,
     pub viewer: bool,
@@ -1050,6 +1056,8 @@ impl OpenLayers {
             Some(Layer::LinkPrompt)
         } else if self.link_confirm {
             Some(Layer::LinkConfirm)
+        } else if self.notification_settings {
+            Some(Layer::NotificationSettings)
         } else if self.switcher {
             Some(Layer::AccountSwitcher)
         } else if self.settings {
@@ -1067,6 +1075,7 @@ impl OpenLayers {
         match self.topmost() {
             Some(Layer::LinkPrompt) => self.link_prompt = false,
             Some(Layer::LinkConfirm) => self.link_confirm = false,
+            Some(Layer::NotificationSettings) => self.notification_settings = false,
             Some(Layer::AccountSwitcher) => self.switcher = false,
             Some(Layer::Settings) => self.settings = false,
             Some(Layer::Viewer) => self.viewer = false,
@@ -1237,12 +1246,37 @@ mod tests {
         assert_eq!(layers.topmost(), None);
     }
 
+    /// The notification settings window is a layer: it has the keyboard (so typing
+    /// never reaches the composer behind it) and Escape closes it, before the settings
+    /// view under it and after a link confirmation over it.
+    #[test]
+    fn the_notification_settings_window_is_a_layer() {
+        let alone = OpenLayers {
+            notification_settings: true,
+            ..OpenLayers::default()
+        };
+        assert_eq!(alone.topmost(), Some(Layer::NotificationSettings));
+        assert_eq!(alone.after_escape().topmost(), None);
+        let mut layers = OpenLayers {
+            link_confirm: true,
+            notification_settings: true,
+            settings: true,
+            ..OpenLayers::default()
+        };
+        assert_eq!(layers.topmost(), Some(Layer::LinkConfirm));
+        layers = layers.after_escape();
+        assert_eq!(layers.topmost(), Some(Layer::NotificationSettings));
+        layers = layers.after_escape();
+        assert_eq!(layers.topmost(), Some(Layer::Settings));
+    }
+
     /// Every layer closes before the one under it, in the order they are drawn.
     #[test]
     fn layers_close_from_the_top_down() {
         let mut layers = OpenLayers {
             link_prompt: true,
             link_confirm: true,
+            notification_settings: true,
             switcher: true,
             settings: true,
             viewer: true,
@@ -1257,6 +1291,7 @@ mod tests {
             [
                 Layer::LinkPrompt,
                 Layer::LinkConfirm,
+                Layer::NotificationSettings,
                 Layer::AccountSwitcher,
                 Layer::Settings,
                 Layer::Viewer

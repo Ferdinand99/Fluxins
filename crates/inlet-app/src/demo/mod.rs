@@ -12,6 +12,7 @@
 //! `scenes` picks what to show.
 
 pub mod accounts;
+pub mod actions;
 pub mod composer;
 mod guilds;
 mod markdown;
