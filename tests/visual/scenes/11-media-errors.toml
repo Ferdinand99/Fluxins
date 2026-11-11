@@ -1,0 +1,11 @@
+# Media that cannot be shown, in the DM with Ada: a GIF page whose only media is a video
+# (its first frame shows), one whose media is on a host the app does not load from, and
+# two GIF attachments that fail (the proxy does not answer, the file does not decode).
+# Each failure is a tile with its reason, the file or site name and its buttons; none
+# of it moves, and the demo proxy answers at once.
+name = "media-errors"
+window = [1280, 860]
+scale = 1.0
+theme = "dark"
+ignore = []
+scene = "media-errors"

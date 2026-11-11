@@ -44,6 +44,9 @@
 //! - `picker-emoji`, `picker-gif`: for `#general`, the composer's picker open on the
 //!   emoji tab (favourites, frequently used, the guild's custom emoji) or the GIF tab
 //!   (the featured search terms; see `pickers.rs`).
+//! - `media-errors`: the DM with Ada holds GIFs that cannot be shown (a proxy that does
+//!   not answer, a file that does not decode, a host Inlet does not load from), each as
+//!   a tile with its reason, and a GIF page that only has a video (see `media.rs`).
 //! - `members`, `profile-popout`: for `#general`, the member list with its groups,
 //!   statuses, custom statuses, the owner's crown and offline members (see
 //!   `members.rs`); or with the profile popout of a moderator open beside it.
@@ -101,6 +104,7 @@ pub enum Scene {
     ComposerAttachments,
     PickerEmoji,
     PickerGif,
+    MediaErrors,
     Members,
     ProfilePopout,
 }
@@ -139,6 +143,7 @@ impl Scene {
             "composer-attachments" => Scene::ComposerAttachments,
             "picker-emoji" => Scene::PickerEmoji,
             "picker-gif" => Scene::PickerGif,
+            "media-errors" => Scene::MediaErrors,
             "members" => Scene::Members,
             "profile-popout" => Scene::ProfilePopout,
             _ => return None,
@@ -380,6 +385,9 @@ pub fn data(scene: Scene) -> Data {
         Scene::Emoji100 => {
             by_name.insert(markdown::SCENE_CHANNEL.into(), emoji::hundred());
         }
+        Scene::MediaErrors => {
+            by_name.insert("dm-ada".into(), media::dm_errors());
+        }
         _ => {}
     }
     super::inbox::add(&mut by_name);
@@ -529,6 +537,7 @@ mod tests {
             "composer-attachments",
             "picker-emoji",
             "picker-gif",
+            "media-errors",
             "members",
             "profile-popout",
         ] {

@@ -4,8 +4,9 @@
 //! still go through `inlet-media` with all its checks, like real ones.
 //!
 //! Also the messages of `#attachments` (every kind of attachment, a spoiler, explicit
-//! media, an expired link that is refreshed, an image too large to decode) and `#embeds`
-//! (every embed type).
+//! media, an expired link that is refreshed, an image too large to decode), `#embeds`
+//! (every embed type), and the DM of the `media-errors` scene (GIFs that cannot be shown,
+//! and a GIF page that only has a video).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -204,6 +205,8 @@ fn serve(path: &str, query: &str) -> Option<Vec<u8>> {
                     png_of(480, 270, bands(480, 270, [20, 90, 90], [140, 230, 200]))
                 }
                 "huge" => png::claiming(100_000, 50_000),
+                // Cut off after its header: does not decode.
+                "broken" => b"GIF89a\x40\x01\xb4\x00".to_vec(),
                 "screenshot" => png_of(640, 360, bands(640, 360, [30, 30, 40], [90, 80, 160])),
                 _ => return None,
             }
@@ -238,6 +241,12 @@ fn serve(path: &str, query: &str) -> Option<Vec<u8>> {
                     png_of(192, 120, bands(192, 120, hue(0), hue(3)))
                 }
             }
+            // A GIF page's video: like the real proxy, its first frame only when an image
+            // format is asked for; otherwise the video itself, which is no image.
+            "loop" if query.contains("format=webp") => {
+                png_of(480, 270, bands(480, 270, [90, 40, 140], [240, 180, 90]))
+            }
+            "loop" => b"\0\0\0\x18ftypmp42 (the whole video)".to_vec(),
             _ => return None,
         },
         "emojis" => super::emoji::emoji_picture(stem, animated)?,
@@ -251,12 +260,15 @@ struct DemoFetcher;
 
 impl Fetcher for DemoFetcher {
     fn fetch<'a>(&'a self, url: &'a Url) -> BoxFuture<'a, Result<FetchResponse, FetchError>> {
+        // A file the proxy cannot reach answers 503 (the `media-errors` scene).
+        let down = url.path().contains("/unreachable");
         let found = url
             .as_str()
             .strip_prefix(MEDIA_BASE)
             .and_then(|_| serve(url.path(), url.query().unwrap_or_default()));
         Box::pin(async move {
             match found {
+                _ if down => Err(FetchError::Status(503)),
                 Some(bytes) => Ok(FetchResponse::from_bytes(Bytes::from(bytes))),
                 None => Err(FetchError::Status(404)),
             }
@@ -605,6 +617,72 @@ fn embeds_channel() -> Vec<p::Message> {
     ]
 }
 
+/// The DM with Ada in the `media-errors` scene: a GIF page that only has a video (its
+/// first frame shows), one whose media is on a host Inlet does not load from, and two
+/// GIFs that cannot be shown (the proxy does not answer, the file does not decode).
+/// Every one ends as a picture or as a tile that says why, never as an empty box.
+pub fn dm_errors() -> Vec<p::Message> {
+    let ch = "dm-ada";
+    let ext =
+        |name: &str| format!("{MEDIA_BASE}/external/demo-signature/https/gifs.example/{name}");
+    vec![
+        message_at(
+            20,
+            ch,
+            "ada",
+            at("10:01"),
+            "Hi! This is a direct message.",
+            json!({}),
+        ),
+        message_at(
+            21,
+            ch,
+            "ada",
+            at("10:02"),
+            "",
+            json!({"embeds": [{
+                "type": "gifv",
+                "url": "https://gifs.example/view/loop-21",
+                "provider": {"name": "Gifs"},
+                "video": {"url": "https://gifs.example/loop.mp4", "proxy_url": ext("loop.mp4"),
+                          "content_type": "video/mp4", "width": 480, "height": 270}
+            }]}),
+        ),
+        message_at(
+            22,
+            ch,
+            "ada",
+            at("10:03"),
+            "",
+            json!({"embeds": [{
+                "type": "gifv",
+                "url": "https://tenor.example/view/dance-22",
+                "provider": {"name": "Tenor"},
+                // An instance without external media signing leaves the provider's URL.
+                "thumbnail": {"url": "https://media.tenor.example/dance.gif",
+                              "proxy_url": "https://media.tenor.example/dance.gif",
+                              "content_type": "image/gif", "width": 480, "height": 270},
+                "video": {"url": "https://media.tenor.example/dance.mp4",
+                          "proxy_url": "https://media.tenor.example/dance.mp4",
+                          "content_type": "video/mp4", "width": 480, "height": 270}
+            }]}),
+        ),
+        message_at(
+            23,
+            ch,
+            super::ME,
+            at("10:04"),
+            "",
+            json!({"attachments": [
+                attachment(ch, 8301, "unreachable.gif", "image/gif",
+                           json!({"width": 240, "height": 180, "size": 812_004, "flags": 32})),
+                attachment(ch, 8302, "broken.gif", "image/gif",
+                           json!({"width": 240, "height": 180, "size": 1_204})),
+            ]}),
+        ),
+    ]
+}
+
 /// Adds `#attachments` and `#embeds`.
 pub fn messages(messages: &mut HashMap<String, Vec<p::Message>>) {
     messages.insert("c-attachments".into(), attachments_channel());
@@ -677,6 +755,14 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{path}: {e}"));
         }
         assert!(serve("/attachments/1/2/expired.png", "hm=expired").is_none());
+        // A video gives its first frame only when an image format is asked for.
+        let video = "/external/s/https/gifs.example/loop.mp4";
+        let frame = Bytes::from(serve(video, "width=480&height=270&format=webp").unwrap());
+        inlet_media::inspect(frame, &limits).expect("the first frame decodes");
+        let whole = Bytes::from(serve(video, "width=480&height=270").unwrap());
+        assert!(inlet_media::inspect(whole, &limits).is_err());
+        let broken = Bytes::from(serve("/attachments/1/2/broken.gif", "").unwrap());
+        assert!(inlet_media::inspect(broken, &limits).is_err());
         let huge = Bytes::from(serve("/attachments/1/2/huge.png", "").unwrap());
         assert!(matches!(
             inlet_media::inspect(huge, &limits),

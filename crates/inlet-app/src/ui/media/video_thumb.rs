@@ -8,8 +8,8 @@
 
 use gpui::{div, prelude::*, px, AnyElement, Context, FontWeight, ObjectFit, SharedString};
 
-use super::animation_budget::Motion;
-use super::image::{picture_of, Shown};
+use super::failed::Origin;
+use super::image::Shown;
 use super::{duration, requests, MediaIcon};
 use crate::app::Inlet;
 use crate::model::{Attachment, EmbedMedia};
@@ -85,7 +85,11 @@ impl Inlet {
         if let Some(cover) = self.cover(key, a.spoiler, a.explicit, size, cx) {
             return cover;
         }
-        let still = self.attachment_frame(channel_id, message_id, a, size, cx);
+        let (still, failed) = self.attachment_frame(channel_id, message_id, key, a, size, cx);
+        if failed {
+            // The tile says why and opens the video itself; no play button over it.
+            return still;
+        }
         let group = SharedString::from(format!("vid-{key}"));
         let save = self.save_button(&group, key, a, cx);
         let url = self
@@ -106,7 +110,9 @@ impl Inlet {
     }
 
     /// The video of an embed: the thumbnail (or the video's first frame) with the play
-    /// button. A click opens `link` (the page of the video) in the browser.
+    /// button. A click opens `link` (the page of the video) in the browser. A still
+    /// that cannot be shown is a tile named after `origin`, without the play button.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn embed_video(
         &self,
         key: &str,
@@ -114,6 +120,7 @@ impl Inlet {
         thumbnail: Option<&EmbedMedia>,
         link: Option<String>,
         nsfw: bool,
+        origin: &Origin,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let shape = thumbnail.unwrap_or(video);
@@ -128,7 +135,7 @@ impl Inlet {
         if let Some(cover) = self.cover(&format!("evid-{key}"), false, explicit, shown_size, cx) {
             return cover;
         }
-        let shown = match &self.media.setup {
+        let (shown, req) = match &self.media.setup {
             Some(setup) => {
                 let req = match thumbnail {
                     Some(t) => {
@@ -139,20 +146,34 @@ impl Inlet {
                     }
                 };
                 match req {
-                    Some(req) => self.image(&req, cx),
-                    None => Shown::Unavailable,
+                    Some(req) => (self.image(&req, cx), Some(req)),
+                    None => (Shown::Unavailable, None),
                 }
             }
-            None => Shown::Unavailable,
+            None => (Shown::Unavailable, None),
         };
-        let still = picture_of(
+        let failed = matches!(shown, Shown::Failed(_) | Shown::Unavailable);
+        let link = link.or_else(|| (!video.url.is_empty()).then(|| video.url.clone()));
+        let origin = Origin {
+            name: origin.name.clone(),
+            link: origin
+                .link
+                .clone()
+                .or_else(|| link.clone().map(|l| (l, true))),
+        };
+        let still = self.media_or_tile(
+            &format!("evid-{key}"),
             shown,
             shown_size,
             4.,
             ObjectFit::Cover,
-            &self.media.images.animator(Motion::Gif),
+            &origin,
+            req.into_iter().collect(),
+            cx,
         );
-        let link = link.or_else(|| (!video.url.is_empty()).then(|| video.url.clone()));
+        if failed {
+            return still;
+        }
         with_play(format!("evid-{key}"), still, None)
             .on_click(cx.listener(move |this, _, _, cx| {
                 if let Some(url) = &link {
