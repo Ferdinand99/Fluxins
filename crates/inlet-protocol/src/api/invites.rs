@@ -8,10 +8,10 @@
 //!
 //! [`parse_invite`] takes a bare code or an invite link of this instance
 //! (`{endpoints.invite}/{code}` or `{webapp}/invite/{code}`). A link to another
-//! host is not an invite of this instance: it comes back as
-//! [`InviteLink::OtherInstance`] with the host, so the UI can hand it to the
-//! account of that instance or open it in the browser, and its code is never
-//! sent to this one.
+//! origin that has the shape of a Fluxer invite is not an invite of this
+//! instance: it comes back as [`InviteLink::OtherInstance`] with the origin,
+//! so the UI can hand it to the account of that instance or open it in the
+//! browser, and its code is never sent to this one.
 
 use reqwest::Method;
 use serde::{Deserialize, Serialize};
@@ -22,6 +22,10 @@ use crate::error::{Error, Result};
 use crate::instance::require_scheme;
 use crate::models::{lenient_bool, opt_u64, sf, u64_or_zero, Snowflake, User};
 use crate::{Client, Instance};
+
+/// The public short-link host of Fluxer, where `/{code}` is an invite. On other
+/// hosts only `/invite/{code}` counts, so `https://github.com/foo` is not one.
+pub const SHORT_INVITE_HOST: &str = "fluxer.gg";
 
 /// Longest invite code Fluxer accepts in a path.
 pub const MAX_INVITE_CODE_LEN: usize = 256;
@@ -54,14 +58,21 @@ pub fn invite_code(code: &str) -> Result<&str> {
 pub enum InviteLink {
     /// An invite of this instance: the checked code.
     Code(String),
-    /// An `https` link to another host. It is not this instance's invite and
-    /// its code must not be sent here: let the account of that instance
-    /// handle it, or open it in the browser.
+    /// An `https` link to another origin whose path has the shape of an
+    /// invite (`/invite/{code}`, or `/{code}` on [`SHORT_INVITE_HOST`]). It
+    /// is not this instance's invite and its code must not be sent here.
+    ///
+    /// The shape is all that is known: any site can use such a path. The UI
+    /// must match `origin` to one of the accounts' instances before it
+    /// treats the link as an invite, and otherwise open the link in the
+    /// browser (after its usual confirmation) or ignore it.
     OtherInstance {
-        /// The host of the link (lowercase, without port).
-        host: String,
-        /// The code, when the path looks like `/invite/{code}` or `/{code}`.
-        code: Option<String>,
+        /// Scheme, host (lowercase) and port of the link, for example
+        /// `https://other.example` or `https://chat.example:8443`. The port
+        /// is left out when it is the default of the scheme.
+        origin: String,
+        /// The checked code.
+        code: String,
     },
     /// Neither a code nor an invite link.
     NotAnInvite,
@@ -70,7 +81,8 @@ pub enum InviteLink {
 /// What `input` is: a bare code or an invite link of this instance
 /// (`{endpoints.invite}/{code}`, `{endpoints.invite}/invite/{code}` or
 /// `{webapp}/invite/{code}`) gives [`InviteLink::Code`]; an `https` link
-/// elsewhere gives [`InviteLink::OtherInstance`] with its host.
+/// elsewhere with the path of an invite gives [`InviteLink::OtherInstance`]
+/// with its origin. Any other link is [`InviteLink::NotAnInvite`].
 pub fn parse_invite(input: &str, instance: &Instance) -> InviteLink {
     let input = input.trim();
     if invite_code(input).is_ok() {
@@ -109,20 +121,23 @@ pub fn parse_invite(input: &str, instance: &Instance) -> InviteLink {
     let ours = invite_host || same_origin(instance.webapp());
     let code = match segments.as_slice() {
         // {endpoints.invite}/{code}, when the invite base has no path of its own.
-        [code] if invite_root || !ours => Some(*code),
+        // On another host only the short-link host has this form.
+        [code] if invite_root || (!ours && url.host_str() == Some(SHORT_INVITE_HOST)) => {
+            Some(*code)
+        }
         // {endpoints.invite}/invite/{code} or {webapp}/invite/{code}.
         ["invite", code] => Some(*code),
         _ => None,
     }
     .and_then(|c| invite_code(c).ok())
     .map(str::to_owned);
-    if ours {
-        code.map_or(InviteLink::NotAnInvite, InviteLink::Code)
-    } else {
-        InviteLink::OtherInstance {
-            host: url.host_str().unwrap_or_default().to_ascii_lowercase(),
+    match code {
+        Some(code) if ours => InviteLink::Code(code),
+        Some(code) => InviteLink::OtherInstance {
+            origin: url.origin().ascii_serialization(),
             code,
-        }
+        },
+        None => InviteLink::NotAnInvite,
     }
 }
 
