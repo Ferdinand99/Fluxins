@@ -12,7 +12,7 @@ publish = false
 # Built-in sample data, started with INLET_DEMO=1. Only for screenshots and UI checks;
 # off in normal builds. Also builds `inlet-visual`, the screenshot comparison tool, and
 # the layout tests.
-demo = ["dep:toml"]
+demo = ["dep:toml", "dep:image-webp"]
 # Trust the private test instance's CA (REST, gateway and media). Debug builds only:
 # inlet-protocol refuses it in a release build.
 test-extra-ca = ["inlet-protocol/test-extra-ca"]
@@ -80,6 +80,9 @@ unic-langid = "0.9"
 unicode-segmentation = "1"
 url = "2"
 zeroize = "1"
+# Writes the WebP pictures of the demo stickers (demo builds only; already used by
+# inlet-media to read WebP).
+image-webp = { version = "0.2", optional = true }
 
 [dev-dependencies]
 # gpui's test platform, for the composer's key handling tests.
@@ -92,6 +95,8 @@ tokio = { version = "1", features = ["net", "test-util"] }
 tokio-tungstenite = { version = "0.26", default-features = false, features = ["handshake"] }
 # Reads the catalogue files in the i18n tests (same version fluent-bundle uses).
 fluent-syntax = "0.12"
+# Writes WebP test pictures (stickers).
+image-webp = "0.2"
 
 # Embeds the app icon and version info in inlet.exe.
 [target.'cfg(windows)'.build-dependencies]

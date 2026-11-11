@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Inline nodes: text, styles, links, mentions, timestamps and emoji. Parsing turns
 //! them into an [`Inline`]; drawing composes the current labels of its [`Live`] pieces
-//! into it ([`compose`]) and draws the result as one styled text, with Twemoji painted
-//! over their placeholders.
+//! into it ([`compose`]) and draws the result as one styled text, with Twemoji and
+//! custom emoji painted over their placeholders.
 
 use std::ops::Range;
 
@@ -352,7 +352,7 @@ pub(super) fn highlight(paint: Paint, revealed: bool) -> HighlightStyle {
             background_color: Some(theme::hover_bg()),
             ..Default::default()
         },
-        Style::Edited | Style::LinkTarget | Style::Muted => HighlightStyle {
+        Style::Edited | Style::LinkTarget => HighlightStyle {
             color: Some(theme::text_muted()),
             ..Default::default()
         },
@@ -538,7 +538,7 @@ pub(super) fn element(id: SharedString, inline: &Inline, d: &Draw, look: Look) -
         .with_highlights(composed.flatten(revealed))
         .with_font_family_overrides(composed.code_ranges());
     let layout = text.layout().clone();
-    let overlay = emoji::overlay(layout, &emoji, size);
+    let overlay = emoji::overlay(layout, &emoji, size, d.ctx.emoji.clone());
     let clicks = clickables(&composed, revealed);
     let text = if clicks.is_empty() {
         text.into_any_element()

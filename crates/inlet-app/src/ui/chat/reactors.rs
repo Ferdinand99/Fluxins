@@ -13,7 +13,7 @@ use gpui::{div, prelude::*, px, AnyElement, Context, FontWeight, SharedString};
 use inlet_protocol as p;
 use inlet_state::{ChannelId, MessageId};
 
-use super::reactions::{emoji_el, ReactionChip};
+use super::reactions::ReactionChip;
 use crate::app::Inlet;
 use crate::backend::messages::{actions, Cmd};
 use crate::theme;
@@ -220,7 +220,12 @@ impl Inlet {
                     .cursor_pointer()
                     .when(selected, |d| d.bg(theme::floating_hover()))
                     .hover(|s| s.bg(theme::floating_hover()))
-                    .child(emoji_el(&format!("reactors-e-{id}-{i}"), &chip.emoji, 11.))
+                    .child(self.reaction_emoji(
+                        &format!("reactors-e-{id}-{i}"),
+                        &chip.emoji,
+                        11.,
+                        cx,
+                    ))
                     .child(
                         div()
                             .text_size(px(12.))

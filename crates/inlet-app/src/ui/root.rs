@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! The window's root view: the current screen, the main layout and the overlays.
 
-use gpui::{div, prelude::*, rems, Context, Window};
+use gpui::{div, prelude::*, rems, Context, MouseMoveEvent, ScrollEvent, Window};
 
 use crate::app::{Inlet, Screen};
 use crate::text_input::{FocusNext, FocusPrev};
@@ -19,6 +19,11 @@ impl Render for Inlet {
             .track_focus(&self.focus)
             .on_action(|_: &FocusNext, window, cx| window.focus_next(cx))
             .on_action(|_: &FocusPrev, window, cx| window.focus_prev(cx))
+            // Any input keeps animations going (they stop when the window is idle).
+            .on_mouse_move(cx.listener(|this, _: &MouseMoveEvent, _, cx| this.note_input(cx)))
+            .capture_any_mouse_down(cx.listener(|this, _, _, cx| this.note_input(cx)))
+            .on_scroll(cx.listener(|this, _: &ScrollEvent, _, cx| this.note_input(cx)))
+            .capture_key_down(cx.listener(|this, _, _, cx| this.note_input(cx)))
             .text_color(theme::text())
             // In rems, so the zoom level (the window's rem size) scales the text.
             .text_size(rems(1.))

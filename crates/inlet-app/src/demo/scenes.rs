@@ -27,6 +27,10 @@
 //! - `chat-pins`: for `#general`, the pinned messages panel open.
 //! - `inbox-unreads`, `inbox-saved`, `inbox-mentions`: for `#general`, the inbox open on
 //!   that tab (with the unread state of `default`; see `inbox.rs`).
+//! - `custom-emoji`: for `#development`, still and animated custom emoji (inline, in a
+//!   quote, large) and stickers in PNG, APNG, GIF, WebP and animated WebP.
+//! - `emoji-100`: for `#development`, 100 different animated custom emoji at once (see
+//!   `emoji.rs`).
 //!
 //! `INLET_DEMO_SCENE` may also name a scene file of the visual checks
 //! (`tests/visual/scenes/*.toml`, see `scene_file.rs`): it then sets the scene, the guild,
@@ -41,7 +45,7 @@ use serde_json::{json, Value};
 
 use super::scene_file::SceneFile;
 use super::{
-    guilds, markdown, media, messages, snowflake, social, unread, user, user_id, ME,
+    emoji, guilds, markdown, media, messages, snowflake, social, unread, user, user_id, ME,
     ROLE_CONTRIBUTORS, ROLE_MODERATORS,
 };
 use crate::backend::messages::Pending;
@@ -71,6 +75,8 @@ pub enum Scene {
     InboxUnreads,
     InboxSaved,
     InboxMentions,
+    CustomEmoji,
+    Emoji100,
 }
 
 impl Scene {
@@ -97,6 +103,8 @@ impl Scene {
             "inbox-unreads" => Scene::InboxUnreads,
             "inbox-saved" => Scene::InboxSaved,
             "inbox-mentions" => Scene::InboxMentions,
+            "custom-emoji" => Scene::CustomEmoji,
+            "emoji-100" => Scene::Emoji100,
             _ => return None,
         })
     }
@@ -151,8 +159,10 @@ pub fn load_scene_file() {
     set("INLET_DEMO_SETTINGS", file.settings.as_deref());
     set("INLET_DEMO_DEEP_LINK", file.deep_link.as_deref());
     set("INLET_DEMO_ACCENT", file.accent.as_deref());
-    // No live demo messages while the screenshot is taken.
+    // No live demo messages while the screenshot is taken, and animated emoji hold
+    // their first frame: a scene must look the same whenever it is taken.
     set("INLET_DEMO_LIVE_SECS", Some("86400"));
+    set("INLET_DEMO_ANIMATE_EMOJI", Some("0"));
     let _ = WINDOW.set(file.window);
     log::info!("demo scene file {path}: {}", file.name);
 }
@@ -301,6 +311,12 @@ pub fn data(scene: Scene) -> Data {
         Scene::ChatReactions | Scene::ChatMenu | Scene::ChatDelete => {
             super::actions::add(&mut by_name);
         }
+        Scene::CustomEmoji => {
+            by_name.insert(markdown::SCENE_CHANNEL.into(), emoji::custom());
+        }
+        Scene::Emoji100 => {
+            by_name.insert(markdown::SCENE_CHANNEL.into(), emoji::hundred());
+        }
         _ => {}
     }
     super::inbox::add(&mut by_name);
@@ -419,6 +435,8 @@ mod tests {
             "inbox-unreads",
             "inbox-saved",
             "inbox-mentions",
+            "custom-emoji",
+            "emoji-100",
         ] {
             let scene = Scene::from_name(name).expect(name);
             let data = data(scene);

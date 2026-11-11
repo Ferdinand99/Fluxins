@@ -32,7 +32,11 @@ There are two kinds of screenshots:
   demo scene in `crates/inlet-app/src/demo/scenes.rs` and a line at the end of each
   list, numbered after the last one.
 - **Scene files** (`scenes/*.toml`): compared with the baselines on every pull request.
-  Add one only for a state that should never change by accident.
+  Add one only for a state that should never change by accident. A scene file turns
+  live demo messages off and holds animated emoji on their first frame
+  (`INLET_DEMO_ANIMATE_EMOJI=0`), so a picture does not depend on when it was taken.
+  Anything else that moves (a playing GIF or video, a running timer) cannot be gated
+  yet: keep it in the numbered demo runs, or freeze it with a demo switch first.
 
 When your change alters how a gated scene looks (for example a new header button),
 the screenshot jobs go red; that is expected:
