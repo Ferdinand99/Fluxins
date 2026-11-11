@@ -14,11 +14,17 @@ use crate::theme;
 /// What a tag shows: its Unicode emoji, then its name.
 pub fn label(tag: &ForumTag) -> String {
     let name = model::clean_name(&tag.name);
-    match tag.emoji_name.as_deref().map(str::trim) {
-        Some(e) if !e.is_empty() && tag.emoji_id.is_none() => {
-            format!("{} {name}", e.chars().take(8).collect::<String>())
-        }
-        _ => name,
+    // Cleaned like a name; nothing left of it shows no emoji.
+    let emoji = tag
+        .emoji_name
+        .as_deref()
+        .filter(|_| tag.emoji_id.is_none())
+        .map(model::clean_name)
+        .filter(|e| *e != model::clean_name(""))
+        .map(|e| e.chars().take(8).collect::<String>());
+    match emoji {
+        Some(e) => format!("{e} {name}"),
+        None => name,
     }
 }
 
@@ -88,4 +94,32 @@ pub fn filter_bar(
                 .into_any_element()
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tag(name: &str, emoji: Option<&str>, emoji_id: Option<&str>) -> ForumTag {
+        ForumTag {
+            id: "1".into(),
+            name: name.into(),
+            moderated: false,
+            emoji_id: emoji_id.map(Into::into),
+            emoji_name: emoji.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn tag_labels_are_cleaned_like_names() {
+        // Bidi overrides and controls from the server never reach the screen.
+        assert_eq!(label(&tag("Bug\u{202E}gub", None, None)), "Buggub");
+        assert_eq!(
+            label(&tag("Idea", Some("\u{1F4A1}"), None)),
+            "\u{1F4A1} Idea"
+        );
+        // A custom emoji is not drawn; neither is an emoji made only of hidden marks.
+        assert_eq!(label(&tag("Help", Some("help"), Some("55"))), "Help");
+        assert_eq!(label(&tag("Help", Some("\u{200B}\u{202E}"), None)), "Help");
+    }
 }
