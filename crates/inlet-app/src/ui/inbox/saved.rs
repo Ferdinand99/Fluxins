@@ -73,6 +73,15 @@ impl Saved {
 }
 
 impl Inlet {
+    /// Removing a saved message failed: the list (which hid the row) loads again.
+    pub(crate) fn inbox_unsave_failed(&mut self, cx: &mut Context<Self>) {
+        let list = &mut self.inbox.saved.list;
+        if list.loaded {
+            list.stale = true;
+            self.pump_panels(cx);
+        }
+    }
+
     /// "Remove from saved": the row goes at once, and the message actions send the
     /// request (one at a time per message) and keep what they know as saved.
     fn unsave(&mut self, channel_id: String, message_id: String, cx: &mut Context<Self>) {

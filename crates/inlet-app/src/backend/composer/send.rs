@@ -343,7 +343,7 @@ impl Backend {
                 events: self.events.clone(),
                 internal: self.internal.clone(),
                 gen: r.gen,
-                state: self.composer.clone(),
+                state: r.composer.clone(),
             }),
             _ => None,
         }
@@ -360,7 +360,7 @@ impl Backend {
                 max_message_length: 2000,
             }),
             Some(Active::Real(r)) => {
-                if let Some((user_id, max)) = self.composer.session(r.gen) {
+                if let Some((user_id, max)) = r.composer.session(r.gen) {
                     self.emit(Ev::Session {
                         token,
                         user_id,
@@ -374,7 +374,7 @@ impl Backend {
                     self.internal.clone(),
                     r.gen,
                 );
-                let state = self.composer.clone();
+                let state = r.composer.clone();
                 self.spawn_guarded("composer session", None, async move {
                     match session.client().me().await {
                         Ok(me) => {

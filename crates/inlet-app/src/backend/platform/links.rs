@@ -237,6 +237,12 @@ impl LinkQueue {
         }
     }
 
+    /// Drops a waiting link (another account became active: it was meant for the one
+    /// before).
+    pub fn clear(&mut self) {
+        self.waiting = None;
+    }
+
     /// Whether a link waits.
     #[cfg(test)]
     pub fn is_waiting(&self) -> bool {

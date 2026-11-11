@@ -83,6 +83,8 @@ pub struct Inlet {
     pub notifications: ui::notifications::State,
     #[allow(dead_code)] // filled by the task that builds the domain
     pub settings: ui::settings::State,
+    /// The signed-in accounts and the account switcher.
+    pub switcher: ui::overlays::account_switcher::Switcher,
 
     /// Demo screenshots: the channel to open once the guild's channels arrive.
     #[cfg(feature = "demo")]
@@ -97,6 +99,16 @@ impl gpui::Global for CurrentBackend {}
 
 impl Inlet {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::new_with(window, cx, backend::start)
+    }
+
+    /// [`Inlet::new`] with the backend `start` gives (the system's in the app, one with
+    /// test accounts in tests).
+    pub(crate) fn new_with(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        start: impl FnOnce(futures::channel::mpsc::UnboundedSender<Event>) -> BackendHandle,
+    ) -> Self {
         let mut subscriptions = Vec::new();
         let sign_in = ui::accounts::SignInState::new(window, cx, &mut subscriptions);
         let composer = ui::composer::ComposerState::new(window, cx, &mut subscriptions);
@@ -111,7 +123,7 @@ impl Inlet {
             }
         }));
 
-        let (backend, _) = Self::spawn_backend(0, true, window, cx);
+        let (backend, _) = Self::spawn_backend_with(0, true, window, cx, start);
         let notifications = ui::notifications::State::new(window.is_window_active());
         Self {
             backend,
@@ -142,6 +154,7 @@ impl Inlet {
             voice: Default::default(),
             notifications,
             settings: Default::default(),
+            switcher: Default::default(),
             #[cfg(feature = "demo")]
             demo_channel: None,
             _subscriptions: subscriptions,
@@ -155,8 +168,18 @@ impl Inlet {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> (BackendHandle, u64) {
+        Self::spawn_backend_with(epoch, restore, window, cx, backend::start)
+    }
+
+    fn spawn_backend_with(
+        epoch: u64,
+        restore: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        start: impl FnOnce(futures::channel::mpsc::UnboundedSender<Event>) -> BackendHandle,
+    ) -> (BackendHandle, u64) {
         let (events_tx, mut events_rx) = futures::channel::mpsc::unbounded();
-        let backend = backend::start(events_tx);
+        let backend = start(events_tx);
         cx.set_global(CurrentBackend(backend.clone()));
         cx.spawn_in(window, async move |this, cx| {
             while let Some(event) = events_rx.next().await {
@@ -195,7 +218,12 @@ impl Inlet {
     }
 
     /// Hands a backend event to the domain it belongs to.
-    fn handle_event(&mut self, event: Event, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn handle_event(
+        &mut self,
+        event: Event,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         match event {
             Event::Accounts(ev) => self.on_accounts_event(ev, window, cx),
             Event::Messages(ev) => self.on_messages_event(ev, window, cx),
@@ -207,6 +235,7 @@ impl Inlet {
             Event::Notifications(ev) => self.on_notifications_event(ev, window, cx),
             Event::Voice(ev) => self.on_voice_event(ev, window, cx),
             Event::Platform(ev) => self.on_platform_event(ev, window, cx),
+            Event::Tagged { account, event } => self.on_tagged_event(account, *event, window, cx),
         }
         cx.notify();
     }
@@ -240,6 +269,8 @@ impl Inlet {
         self.inbox.clear();
         self.media.reset();
         self.notifications.clear();
+        self.switcher.signed_out();
+        self.backend.set_account(None);
         self.chat.status.clear();
         self.chat.error = None;
         self.chat.notice = None;

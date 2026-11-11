@@ -364,6 +364,17 @@ impl MessageWindow {
         let page_newest = page.keys().next_back().copied();
         let mut old = std::mem::take(&mut self.messages);
         let mut merged = page;
+        // A message the window already had and that changed live meanwhile (an edit, a
+        // reaction) keeps that change, as in `merge_latest`.
+        if fresh {
+            for (id, m) in merged.iter_mut() {
+                if let Some(live) = old.get(id) {
+                    if edited_ms(live) >= edited_ms(m) {
+                        *m = live.clone();
+                    }
+                }
+            }
+        }
         // The page carries the server's reactions; buffered ones are in it or
         // belong to messages it does not have.
         self.pending_reactions.clear();

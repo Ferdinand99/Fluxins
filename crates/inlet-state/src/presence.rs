@@ -52,6 +52,11 @@ impl Presences {
         true
     }
 
+    /// A new cap (lower for an account in the background).
+    pub(crate) fn set_cap(&mut self, cap: usize) {
+        self.by_user.set_cap(cap);
+    }
+
     /// A user's presence, or `None` when offline or unknown.
     pub fn get(&self, id: UserId) -> Option<&Presence> {
         self.by_user.get(&id)

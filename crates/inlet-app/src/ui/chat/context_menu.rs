@@ -416,6 +416,10 @@ impl Inlet {
                 if let Some(id) = MessageId::parse(&message_id) {
                     self.chat.actions.end(kind, id);
                 }
+                // The inbox's saved list hid the row already: it loads again.
+                if kind == Kind::Unsave {
+                    self.inbox_unsave_failed(cx);
+                }
                 self.chat.error = Some(match kind {
                     Kind::Delete => t!("action-delete-failed", reason = reason),
                     Kind::Pin | Kind::Unpin => t!("action-pin-failed", reason = reason),

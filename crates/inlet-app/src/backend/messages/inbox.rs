@@ -8,7 +8,9 @@
 //!
 //! - A list (pins of a channel, mentions, saved messages) loads its first page when its
 //!   panel opens and nothing fresh is cached; one request per list at a time and at most
-//!   one a second, also for "load more" and for reloads after gateway events.
+//!   one a second, also for "load more", reloads after gateway events, other filters
+//!   and another channel. A failed load is tried again when the panel or tab is shown
+//!   again, or on "Try again".
 //! - A jump loads one page around the message when it is not in the open window; one
 //!   jump request at a time.
 //! - Removing a mention: one request per click, none while the same one is on its way.
@@ -255,8 +257,9 @@ impl Backend {
                 }
                 Cmd::AckPins { channel_id } => {
                     if let Err(err) = client.ack_pins(&channel_id).await {
-                        // Only the end of the session matters: a lost ack is sent again
-                        // the next time the pins are looked at.
+                        // Only the end of the session matters. The pins are already seen
+                        // locally, so a lost ack is not sent again until the pins change
+                        // (as in Fluxer).
                         let _ = fail(err);
                     }
                 }

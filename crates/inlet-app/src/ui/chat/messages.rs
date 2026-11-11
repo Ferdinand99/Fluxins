@@ -38,9 +38,11 @@ use crate::backend::messages::{Cmd, Ev, Pending};
 use crate::model::{self, Message, Names};
 use crate::ui::markdown::{self, Block};
 
-/// How long a message that was jumped to stays highlighted (Fluxer's highlight
-/// transition, `--message-transition-highlight`).
-pub const JUMP_HIGHLIGHT_MS: i64 = 320;
+/// How long a message that was jumped to stays highlighted: Fluxer holds it for 2 s
+/// (`handleJumpHighlight` in `ChannelMessages.tsx`) and fades it in and out over
+/// 320 ms (`--message-transition-highlight`). Deviation: no fade; gpui rows have no
+/// colour transition here, so the highlight switches on and off.
+pub const JUMP_HIGHLIGHT_MS: i64 = 2_000;
 /// Shortest time between two requests for older messages from the UI.
 pub const OLDER_PAGE_INTERVAL_MS: i64 = 1_000;
 /// Shortest time between two reloads of the newest page that the person asks for
@@ -449,6 +451,12 @@ fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
+/// Builds an account's state from its READY: the one place that does, for the active
+/// account here and for the accounts in the background (one state per account).
+pub(crate) fn account_state_from(ready: &p::Ready) -> AccountState {
+    AccountState::from_ready_at(ready, now_ms())
+}
+
 /// Default and reply messages; everything else is a system line.
 fn is_regular(kind: i64) -> bool {
     kind == message_type::DEFAULT || kind == message_type::REPLY
@@ -798,6 +806,12 @@ impl MessageView {
         self.jumped = Some((id, now_ms + JUMP_HIGHLIGHT_MS));
     }
 
+    /// Whether message `id` is highlighted at `now_ms`.
+    pub fn is_highlighted(&self, id: MessageId, now_ms: i64) -> bool {
+        self.jumped
+            .is_some_and(|(j, until)| j == id && now_ms < until)
+    }
+
     /// Keeps the converted messages of a page applied outside this view (the page
     /// around a message that a jump loads), so the rows need no conversion here.
     pub fn remember_page(
@@ -838,7 +852,8 @@ impl MessageView {
         let mut rows = Vec::new();
         self.unread_count = 0;
         let mut unread_since_ms = 0;
-        if self.jumped.is_some_and(|(_, until)| until <= now_ms()) {
+        let now = now_ms();
+        if self.jumped.is_some_and(|(_, until)| until <= now) {
             self.jumped = None;
         }
         self.detached = is_detached(state, ch);
@@ -894,7 +909,7 @@ impl MessageView {
                     id,
                     grouped,
                     mention: mentions_me(state, ch, m),
-                    jumped: self.jumped.is_some_and(|(j, _)| j == id),
+                    jumped: self.is_highlighted(id, now),
                     revealed: self.revealed.contains(&id),
                     name_color: name_color(state, guild, m),
                     tag: tag(channel, m, &c.shown),
@@ -1074,7 +1089,7 @@ impl Inlet {
         if let p::Dispatch::Ready(ready) = &dispatch {
             let mut changes = match self.account.clone() {
                 None => {
-                    let state = AccountState::from_ready_at(ready, now_ms());
+                    let state = account_state_from(ready);
                     self.account = Some(cx.new(|_| state));
                     self.start_ticker(cx);
                     let mut c = Changes::default();
@@ -1229,6 +1244,8 @@ impl Inlet {
             account.update(cx, |s, _| s.cancel_load(ch));
             if self.open_channel_id() == Some(ch) {
                 self.refresh_rows(cx);
+                // A jump waiting for this page is given up.
+                self.inbox.jump.give_up_in(ch);
             }
         }
     }
@@ -1246,6 +1263,7 @@ impl Inlet {
         // The sidebar and the rail read their badges from the same state.
         self.notifications
             .refresh_badges(account.read(cx), &changes);
+        self.inbox.state_changed(&changes);
         self.chat.view.conversions.prune(account.read(cx), &changes);
         let Some(ch) = self.open_channel_id() else {
             return;
@@ -1287,6 +1305,8 @@ impl Inlet {
 
     /// Empties the list (another guild or channel is about to show).
     pub(crate) fn clear_messages(&mut self) {
+        // The pins panel belongs to the channel that is closing.
+        self.inbox.channel_changed(self.open_channel_id());
         let view = &mut self.chat.view;
         view.rows.clear();
         view.unread_after = None;
@@ -1444,6 +1464,9 @@ impl Inlet {
                         if at_top {
                             this.load_older(cx);
                         } else if this.chat.view.detached {
+                            // Deviation: Fluxer loads `?after=` pages below a window
+                            // that lost its newest messages (after a jump); Inlet loads
+                            // the newest page, which replaces the window.
                             this.reload_newest(cx);
                         }
                         // Back at the bottom with focus: the channel is read. The tick
@@ -1460,7 +1483,7 @@ impl Inlet {
     }
 
     /// Ticks the account state about once a second (typing, timeouts, load timeouts).
-    fn start_ticker(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn start_ticker(&mut self, cx: &mut Context<Self>) {
         self.chat.view.ticker = Some(cx.spawn(async move |this, cx| loop {
             cx.background_executor().timer(Duration::from_secs(1)).await;
             let alive = this.update(cx, |this, cx| this.tick_account(cx));
@@ -1534,6 +1557,8 @@ impl Inlet {
         if action == JumpAction::LoadNewest {
             self.reload_newest(cx);
         }
+        // A jump still loading its page would pull the list back.
+        self.inbox.jump.cancel();
         self.chat.view.scrolled_away = false;
         self.chat.message_list.scroll_to_end();
         self.chat.message_list.set_follow_mode(FollowMode::Tail);

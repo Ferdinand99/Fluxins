@@ -227,6 +227,11 @@ impl Desktop {
         }
     }
 
+    /// Another account became active: a link waiting for the one before is dropped.
+    pub fn forget_waiting_link(&mut self) {
+        self.links.clear();
+    }
+
     /// Whether a tray icon is shown right now.
     pub fn tray_shown(&self) -> bool {
         self.tray.as_ref().is_some_and(|t| t.has_host())
@@ -727,6 +732,18 @@ fn account_unread(state: &AccountState) -> DesktopUnread {
     )
 }
 
+/// The active account's unread state with the marks of the other signed-in accounts.
+fn with_other_accounts(
+    mut out: DesktopUnread,
+    others: impl IntoIterator<Item = crate::ui::overlays::account_switcher::Summary>,
+) -> DesktopUnread {
+    for s in others {
+        out.mentions = out.mentions.saturating_add(s.mentions);
+        out.unread |= s.unread;
+    }
+    out
+}
+
 /// Shows the unread state on the tray icon and the badge when it changed.
 fn sync_unread(unread: DesktopUnread, cx: &mut App) {
     let d = cx.global_mut::<Desktop>();
@@ -812,11 +829,15 @@ impl Inlet {
 
     /// What the tray and the badge show. Every signed-in account adds its part here:
     /// with several accounts, this is the one place that sums them.
+    /// Every signed-in account counts: the active one from its state, the others from
+    /// their marks in the account switcher.
     fn desktop_unread(&self, cx: &App) -> DesktopUnread {
-        self.account
+        let active = self
+            .account
             .as_ref()
             .map(|a| account_unread(a.read(cx)))
-            .unwrap_or_default()
+            .unwrap_or_default();
+        with_other_accounts(active, self.switcher.background_marks())
     }
 
     /// Where the session is, for links.
@@ -879,6 +900,7 @@ impl Inlet {
             link_prompt: self.overlays.link_prompt.is_some(),
             link_confirm: self.overlays.pending_link.is_some(),
             notification_settings: self.notifications.settings.is_some(),
+            switcher: self.switcher_layer_open(),
             panel: self.inbox.open.is_some(),
             settings: self.settings.view.is_some(),
             viewer: self.media.viewer.is_some(),
@@ -886,8 +908,8 @@ impl Inlet {
     }
 
     /// Whether a layer covers the chat: the link prompt, the link confirmation, the
-    /// notification settings window, a panel (pins, inbox), the settings view or the
-    /// image viewer.
+    /// notification settings window, the account switcher, the settings view, the image
+    /// viewer or a panel (pins, inbox).
     pub(crate) fn layer_open(&self) -> bool {
         self.open_layers().topmost().is_some()
     }
@@ -955,6 +977,7 @@ impl Inlet {
             Some(Layer::LinkPrompt) => self.overlays.link_prompt = None,
             Some(Layer::LinkConfirm) => self.overlays.pending_link = None,
             Some(Layer::NotificationSettings) => self.notifications.settings = None,
+            Some(Layer::AccountSwitcher) => self.switcher.open = false,
             Some(Layer::Panel) => self.inbox.open = None,
             Some(Layer::Settings) => self.settings.view = None,
             Some(Layer::Viewer) => self.media.viewer = None,
@@ -1010,20 +1033,23 @@ pub(crate) enum Layer {
     LinkPrompt,
     LinkConfirm,
     NotificationSettings,
+    AccountSwitcher,
     /// The pinned messages or the inbox, under the channel header.
     Panel,
     Settings,
     Viewer,
 }
 
-/// Which layers are open. They are drawn bottom first (the viewer, the settings view,
-/// a panel, the notification settings window, the link confirmation, the link prompt,
-/// see `ui/overlays`), and the topmost one has the keyboard: Escape closes it first.
+/// Which layers are open. They are drawn bottom first (a panel, the image viewer, the
+/// settings view, the notification settings window, the account switcher, the link
+/// confirmation, the link prompt, see `ui/overlays`), and the topmost one has the
+/// keyboard: Escape closes it first.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct OpenLayers {
     pub link_prompt: bool,
     pub link_confirm: bool,
     pub notification_settings: bool,
+    pub switcher: bool,
     pub panel: bool,
     pub settings: bool,
     pub viewer: bool,
@@ -1035,14 +1061,16 @@ impl OpenLayers {
             Some(Layer::LinkPrompt)
         } else if self.link_confirm {
             Some(Layer::LinkConfirm)
+        } else if self.switcher {
+            Some(Layer::AccountSwitcher)
         } else if self.notification_settings {
             Some(Layer::NotificationSettings)
-        } else if self.panel {
-            Some(Layer::Panel)
         } else if self.settings {
             Some(Layer::Settings)
         } else if self.viewer {
             Some(Layer::Viewer)
+        } else if self.panel {
+            Some(Layer::Panel)
         } else {
             None
         }
@@ -1055,6 +1083,7 @@ impl OpenLayers {
             Some(Layer::LinkPrompt) => self.link_prompt = false,
             Some(Layer::LinkConfirm) => self.link_confirm = false,
             Some(Layer::NotificationSettings) => self.notification_settings = false,
+            Some(Layer::AccountSwitcher) => self.switcher = false,
             Some(Layer::Panel) => self.panel = false,
             Some(Layer::Settings) => self.settings = false,
             Some(Layer::Viewer) => self.viewer = false,
@@ -1256,6 +1285,7 @@ mod tests {
             link_prompt: true,
             link_confirm: true,
             notification_settings: true,
+            switcher: true,
             panel: true,
             settings: true,
             viewer: true,
@@ -1270,10 +1300,11 @@ mod tests {
             [
                 Layer::LinkPrompt,
                 Layer::LinkConfirm,
+                Layer::AccountSwitcher,
                 Layer::NotificationSettings,
-                Layer::Panel,
                 Layer::Settings,
-                Layer::Viewer
+                Layer::Viewer,
+                Layer::Panel
             ]
         );
     }
@@ -1311,5 +1342,36 @@ mod tests {
             DesktopUnread::of([unread(false, u32::MAX, false), unread(false, 1, false)]).mentions,
             u32::MAX
         );
+    }
+
+    #[test]
+    fn the_tray_counts_every_signed_in_account() {
+        use crate::ui::overlays::account_switcher::Summary;
+        // The active account has nothing; another has two mentions, a third only unread.
+        let active = DesktopUnread::of([unread(false, 0, false)]);
+        let total = with_other_accounts(
+            active,
+            [
+                Summary {
+                    mentions: 2,
+                    unread: true,
+                },
+                Summary {
+                    mentions: 0,
+                    unread: true,
+                },
+            ],
+        );
+        assert_eq!(total.badge(), Badge::Count(2));
+        assert_eq!(total.tray_state(), TrayState::Mention);
+        let quiet = with_other_accounts(
+            active,
+            [Summary {
+                mentions: 0,
+                unread: true,
+            }],
+        );
+        assert_eq!(quiet.tray_state(), TrayState::Unread);
+        assert_eq!(with_other_accounts(active, []), active);
     }
 }

@@ -96,11 +96,22 @@ impl Pins {
 
 impl Inlet {
     /// "Unpin" in the panel: the message actions send it (once per message at a time);
-    /// CHANNEL_PINS_UPDATE then reloads the list.
+    /// CHANNEL_PINS_UPDATE then reloads the list. The right to pin is checked again
+    /// when clicked (it may have gone since the panel was drawn).
     fn unpin_from_panel(&mut self, item: &Item, cx: &mut Context<Self>) {
-        let Some(id) = MessageId::parse(&item.message.id) else {
+        let (Some(id), Some(ch)) = (
+            MessageId::parse(&item.message.id),
+            ChannelId::parse(&item.message.channel_id),
+        ) else {
             return;
         };
+        let allowed = self
+            .account
+            .as_ref()
+            .is_some_and(|a| a.read(cx).channel_permissions(ch).can_pin());
+        if !allowed {
+            return;
+        }
         self.send_once(
             Kind::Unpin,
             actions::Cmd::Pin {

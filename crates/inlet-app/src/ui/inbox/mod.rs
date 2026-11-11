@@ -122,6 +122,16 @@ pub enum Tab {
     Mentions,
 }
 
+/// What a list's request on its way asked for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Asked {
+    First,
+    More,
+    /// Asked before the list was reset (other filters, another channel): its answer is
+    /// dropped, but it still counts as the one request on its way.
+    Dropped,
+}
+
 /// A list loaded page by page: what it holds, and its one request on the way.
 pub struct Paged<T> {
     pub items: Vec<T>,
@@ -129,12 +139,13 @@ pub struct Paged<T> {
     pub more: bool,
     /// The first page landed.
     pub loaded: bool,
-    /// The last load failed; shown with "Try again", never retried by itself.
+    /// The last load failed; shown with "Try again" and tried again when the panel or
+    /// the tab is shown again, never by itself.
     pub error: Option<String>,
     /// The list changed on the server since its first page was asked for.
     pub stale: bool,
-    /// The request on its way, and whether it asks for the first page.
-    in_flight: Option<(u64, bool)>,
+    /// The request on its way, and what its answer is for.
+    in_flight: Option<(u64, Asked)>,
     last_request_ms: Option<i64>,
     loaded_ms: i64,
     cap: usize,
@@ -180,7 +191,7 @@ impl<T> Paged<T> {
 
     /// Request `request` went out, for the first page (`first`) or the next one.
     pub fn start(&mut self, request: u64, first: bool, now: i64) {
-        self.in_flight = Some((request, first));
+        self.in_flight = Some((request, if first { Asked::First } else { Asked::More }));
         self.last_request_ms = Some(now);
         if first {
             self.stale = false;
@@ -190,14 +201,17 @@ impl<T> Paged<T> {
     /// The answer to `request`: whether it was the request on its way (an answer to a
     /// request the list no longer waits for is dropped).
     pub fn land(&mut self, request: u64, items: Vec<T>, more: bool, now: i64) -> bool {
-        let Some((r, first)) = self.in_flight else {
+        let Some((r, asked)) = self.in_flight else {
             return false;
         };
         if r != request {
             return false;
         }
         self.in_flight = None;
-        if first {
+        if asked == Asked::Dropped {
+            return false;
+        }
+        if asked == Asked::First {
             self.items = items;
             self.loaded_ms = now;
         } else {
@@ -214,18 +228,34 @@ impl<T> Paged<T> {
     }
 
     /// Request `request` failed. Whether it was the one on its way. A failed first page
-    /// is still wanted after "Try again".
+    /// is still wanted after "Try again"; a dropped request's failure is not shown.
     pub fn fail(&mut self, request: u64, reason: String) -> bool {
-        let Some((r, first)) = self.in_flight else {
+        let Some((r, asked)) = self.in_flight else {
             return false;
         };
         if r != request {
             return false;
         }
         self.in_flight = None;
-        self.stale |= first;
-        self.error = Some(reason);
+        match asked {
+            Asked::Dropped => {}
+            Asked::First => {
+                self.stale = true;
+                self.error = Some(reason);
+            }
+            Asked::More => self.error = Some(reason),
+        }
         true
+    }
+
+    /// The answer to `request` came for something the list no longer shows (another
+    /// channel): it is dropped. Whether it was the request on its way.
+    pub fn drop_answer(&mut self, request: u64) -> bool {
+        if self.in_flight.is_some_and(|(r, _)| r == request) {
+            self.in_flight = None;
+            return true;
+        }
+        false
     }
 
     /// Loaded more than `max_age` ago (or never).
@@ -233,9 +263,17 @@ impl<T> Paged<T> {
         !self.loaded || now.saturating_sub(self.loaded_ms) > max_age
     }
 
-    /// Forgets everything; an answer on its way is dropped when it comes.
+    /// Forgets what the list holds. The pace stays: a request on its way still counts
+    /// as the one on its way (its answer is dropped), and the next one waits for the
+    /// interval, so changing filters or channels quickly sends no more.
     pub fn reset(&mut self) {
-        *self = Paged::new(self.cap);
+        let in_flight = self.in_flight.map(|(r, _)| (r, Asked::Dropped));
+        let last_request_ms = self.last_request_ms;
+        *self = Paged {
+            in_flight,
+            last_request_ms,
+            ..Paged::new(self.cap)
+        };
     }
 }
 
@@ -259,31 +297,69 @@ pub enum JumpStep {
     GiveUp,
 }
 
+/// A jump waiting for its channel and its newest page.
+#[derive(Clone, Copy, Debug)]
+struct Waiting {
+    target: Target,
+    since: i64,
+    /// The channel that was open when the jump started.
+    from: Option<ChannelId>,
+    /// The target channel has been open since.
+    reached: bool,
+}
+
 /// A jump to a message: waits for its channel to open and its newest page to land, then
 /// shows the message, or loads the page around it first. One page request at a time; a
-/// newer jump replaces an older one.
+/// newer jump (or "Jump to present") makes the answer of an older one unwanted.
 #[derive(Default)]
 pub struct Jumper {
-    /// The jump waiting for its channel, when it started and which channel was open then.
-    target: Option<(Target, i64, Option<ChannelId>)>,
-    /// The page around a message on its way.
-    in_flight: Option<(u64, Target)>,
+    waiting: Option<Waiting>,
+    /// The page around a message on its way: request, jump, and when it went.
+    in_flight: Option<(u64, Target, i64)>,
+    /// The answer on its way belongs to a jump that was replaced or cancelled.
+    superseded: bool,
     /// Asked again once already, after a page came while the window was loading.
     retried: bool,
 }
 
 impl Jumper {
     pub fn start(&mut self, target: Target, open: Option<ChannelId>, now: i64) {
-        self.target = Some((target, now, open));
+        self.waiting = Some(Waiting {
+            target,
+            since: now,
+            from: open,
+            reached: open == Some(target.channel),
+        });
         self.retried = false;
+        // Whatever an older jump is loading must not land over this one.
+        self.superseded = self.in_flight.is_some();
     }
 
-    /// Whether a jump is under way: reading waits until it is done.
+    /// Stops the jump ("Jump to present"): an answer on its way is dropped.
+    pub fn cancel(&mut self) {
+        self.waiting = None;
+        self.superseded = self.in_flight.is_some();
+    }
+
+    /// The open channel `ch` could not load its newest page: a jump waiting in it ends.
+    pub fn give_up_in(&mut self, ch: ChannelId) {
+        if self.waiting.is_some_and(|w| w.target.channel == ch) {
+            self.waiting = None;
+        }
+    }
+
+    /// Whether a jump is under way: reading waits until it is done. Both the wait for
+    /// the channel and the page on its way end after [`JUMP_TIMEOUT_MS`], so a lost
+    /// answer never holds reading back.
     pub fn is_active(&self, now: i64) -> bool {
-        self.in_flight.is_some()
-            || self
-                .target
-                .is_some_and(|(_, since, _)| now.saturating_sub(since) < JUMP_TIMEOUT_MS)
+        let fresh = |since: i64| now.saturating_sub(since) < JUMP_TIMEOUT_MS;
+        self.in_flight.is_some_and(|(_, _, since)| fresh(since))
+            || self.waiting.is_some_and(|w| fresh(w.since))
+    }
+
+    /// Whether `request` is the page around a message on its way.
+    pub fn waits_for(&self, request: u64) -> bool {
+        self.in_flight.is_some_and(|(r, _, _)| r == request)
     }
 
     /// What to do now. `open` is the open channel; `ready` says its newest page landed
@@ -295,43 +371,57 @@ impl Jumper {
         shown: impl Fn(MessageId) -> bool,
         now: i64,
     ) -> JumpStep {
-        let Some((t, since, from)) = self.target else {
+        // A page that never came stops counting.
+        if self
+            .in_flight
+            .is_some_and(|(_, _, since)| now.saturating_sub(since) >= JUMP_TIMEOUT_MS)
+        {
+            self.in_flight = None;
+            self.superseded = false;
+        }
+        let Some(mut w) = self.waiting else {
             return JumpStep::Wait;
         };
-        // Too slow, or the person opened yet another channel meanwhile.
-        let elsewhere = open.is_some_and(|o| o != t.channel && Some(o) != from);
-        if now.saturating_sub(since) >= JUMP_TIMEOUT_MS || elsewhere {
-            self.target = None;
+        let t = w.target;
+        w.reached |= open == Some(t.channel);
+        self.waiting = Some(w);
+        // Too slow, or the person opened another channel meanwhile (the one the jump
+        // started from counts once the target was open).
+        let elsewhere = open.is_some_and(|o| o != t.channel && (Some(o) != w.from || w.reached));
+        if now.saturating_sub(w.since) >= JUMP_TIMEOUT_MS || elsewhere {
+            self.waiting = None;
             return JumpStep::GiveUp;
         }
         if open != Some(t.channel) || !ready {
             return JumpStep::Wait;
         }
         if shown(t.message) {
-            self.target = None;
+            self.waiting = None;
             return JumpStep::Show(t.message);
         }
         if self.in_flight.is_some() {
             return JumpStep::Wait;
         }
-        self.target = None;
+        self.waiting = None;
         JumpStep::Fetch(t)
     }
 
-    /// The page around `target` was asked for with `request`.
-    pub fn fetching(&mut self, request: u64, target: Target) {
-        self.in_flight = Some((request, target));
+    /// The page around `target` was asked for with `request` at `now`.
+    pub fn fetching(&mut self, request: u64, target: Target, now: i64) {
+        self.in_flight = Some((request, target, now));
+        self.superseded = false;
     }
 
     /// The page for `request` came (or failed): the jump it belongs to, if it is still
-    /// wanted. A newer jump waiting makes it unwanted.
+    /// wanted. A newer jump, or "Jump to present", makes it unwanted.
     pub fn answered(&mut self, request: u64) -> Option<Target> {
-        let (r, t) = self.in_flight?;
+        let (r, t, _) = self.in_flight?;
         if r != request {
             return None;
         }
         self.in_flight = None;
-        self.target.is_none().then_some(t)
+        let wanted = !std::mem::take(&mut self.superseded) && self.waiting.is_none();
+        wanted.then_some(t)
     }
 
     /// The page came while the window loaded its newest page: try once more after it.
@@ -340,7 +430,12 @@ impl Jumper {
             return false;
         }
         self.retried = true;
-        self.target = Some((target, now, Some(target.channel)));
+        self.waiting = Some(Waiting {
+            target,
+            since: now,
+            from: Some(target.channel),
+            reached: true,
+        });
         true
     }
 }
@@ -359,6 +454,8 @@ pub struct State {
     closed_outside: Option<(Panel, i64)>,
     /// Wakes the lists when a request had to wait for the interval.
     timer: Option<Task<()>>,
+    /// The unread tab's rows, worked out again only after the account state changed.
+    unread_rows: Option<Rc<Vec<unreads::UnreadRow>>>,
     /// Demo scenes: the scene's panel was opened.
     #[cfg(feature = "demo")]
     demo_done: bool,
@@ -370,8 +467,23 @@ impl State {
         self.next_request
     }
 
-    /// Signed out: nothing of the account stays. Request numbers go on counting, so a
-    /// late answer never fits a new request.
+    /// The account state changed: the unread tab works its rows out again when drawn.
+    pub fn state_changed(&mut self, changes: &inlet_state::Changes) {
+        if !changes.is_empty() {
+            self.unread_rows = None;
+        }
+    }
+
+    /// Another channel (or none) is open: the pins panel of the one before closes.
+    pub fn channel_changed(&mut self, open: Option<ChannelId>) {
+        if self.open == Some(Panel::Pins) && self.pins.channel != open {
+            self.open = None;
+        }
+    }
+
+    /// Signed out, or another account was switched to: nothing of the account stays
+    /// (lists, the open panel, a jump and its page on the way). Request numbers go on
+    /// counting, so a late answer never fits a new request.
     pub fn clear(&mut self) {
         let next_request = self.next_request;
         *self = State {
@@ -736,9 +848,9 @@ impl Inlet {
                 next,
             } => {
                 let pins = &mut self.inbox.pins;
-                if pins.channel.map(|c| c.to_string()).as_deref() == Some(channel_id.as_str())
-                    && pins.list.land(request, items, next.is_some(), now)
-                {
+                if pins.channel.map(|c| c.to_string()).as_deref() != Some(channel_id.as_str()) {
+                    pins.list.drop_answer(request);
+                } else if pins.list.land(request, items, next.is_some(), now) {
                     pins.next = next;
                 }
             }
@@ -771,16 +883,20 @@ impl Inlet {
             } => self.on_around(&channel_id, request, messages, rendered, cx),
             Ev::Failed { request, reason } => {
                 let reason = reason.unwrap_or_else(|| t!("inbox-load-failed"));
+                let was_jump = self.inbox.jump.waits_for(request);
                 let jumped = self.inbox.jump.answered(request).is_some();
                 if jumped {
                     self.chat.error = Some(t!("inbox-jump-failed", reason = reason.clone()));
+                } else if was_jump {
+                    // An older jump's page: a newer jump waiting for it goes on.
+                    self.step_jump(cx);
                 }
                 let lists = [
                     self.inbox.pins.list.fail(request, reason.clone()),
                     self.inbox.mentions.list.fail(request, reason.clone()),
                     self.inbox.saved.list.fail(request, reason),
                 ];
-                if !jumped && !lists.contains(&true) {
+                if !was_jump && !lists.contains(&true) {
                     return;
                 }
             }
@@ -920,7 +1036,7 @@ impl Inlet {
             JumpStep::Show(id) => self.jump_to_message(id, cx),
             JumpStep::Fetch(t) => {
                 let request = self.inbox.request_id();
-                self.inbox.jump.fetching(request, t);
+                self.inbox.jump.fetching(request, t, now_ms());
                 self.backend.send(MessagesCmd::Inbox(Cmd::Around {
                     channel_id: t.channel.to_string(),
                     message_id: t.message.to_string(),
@@ -1180,9 +1296,9 @@ impl Inlet {
         #[cfg(feature = "demo")]
         self.demo_panels(cx);
         let panel = self.inbox.open?;
-        // The pins belong to the channel they were opened for.
+        // The pins belong to the channel they were opened for (the panel closes when the
+        // channel changes, see `State::channel_changed`).
         if panel == Panel::Pins && self.inbox.pins.channel != self.open_channel_id() {
-            self.inbox.open = None;
             return None;
         }
         let (width, height) = match panel {
@@ -1549,7 +1665,7 @@ pub(crate) mod tests {
         assert!(jump.is_active(0));
         let step = jump.step(Some(ch), true, |id| shown(&rows, id), 10);
         assert_eq!(step, JumpStep::Fetch(target));
-        jump.fetching(1, target);
+        jump.fetching(1, target, 0);
         assert_eq!(
             jump.step(Some(ch), true, |id| shown(&rows, id), 20),
             JumpStep::Wait
@@ -1568,7 +1684,7 @@ pub(crate) mod tests {
         assert!(!state.messages(ch).unwrap().has_newest());
         assert!(!view.may_mark_read(&state, ch, true, true));
 
-        // The message is highlighted for 320 ms, then no more.
+        // The message is highlighted for 2 s, as Fluxer holds it, then no more.
         let now = now_ms();
         view.highlight(MessageId(10), now);
         let rows = view.build_rows(&state, ch);
@@ -1581,7 +1697,10 @@ pub(crate) mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(jumped(&rows), vec![MessageId(10)]);
-        assert_eq!(JUMP_HIGHLIGHT_MS, 320);
+        assert_eq!(JUMP_HIGHLIGHT_MS, 2_000);
+        assert!(view.is_highlighted(MessageId(10), now + 1_999));
+        assert!(!view.is_highlighted(MessageId(10), now + 2_000));
+        assert!(!view.is_highlighted(MessageId(11), now));
         view.highlight(MessageId(10), now - JUMP_HIGHLIGHT_MS);
         assert!(jumped(&view.build_rows(&state, ch)).is_empty());
 
@@ -1633,7 +1752,7 @@ pub(crate) mod tests {
         // window loaded is asked for once more only.
         jump.start(t, Some(b), 30);
         assert_eq!(jump.step(Some(b), true, |_| false, 31), JumpStep::Fetch(t));
-        jump.fetching(5, t);
+        jump.fetching(5, t, 0);
         let newer = Target {
             channel: b,
             message: MessageId(7),
@@ -1644,15 +1763,99 @@ pub(crate) mod tests {
             jump.step(Some(b), true, |_| false, 33),
             JumpStep::Fetch(newer)
         );
-        jump.fetching(6, newer);
+        jump.fetching(6, newer, 0);
         assert_eq!(jump.answered(6), Some(newer));
         assert!(jump.again(newer, 40));
         assert_eq!(
             jump.step(Some(b), true, |_| false, 41),
             JumpStep::Fetch(newer)
         );
-        jump.fetching(7, newer);
+        jump.fetching(7, newer, 0);
         assert_eq!(jump.answered(7), Some(newer));
         assert!(!jump.again(newer, 50));
+    }
+
+    #[test]
+    fn an_older_page_never_lands_over_a_newer_jump() {
+        let ch = ChannelId(1);
+        let a = Target {
+            channel: ch,
+            message: MessageId(10),
+        };
+        let b = Target {
+            channel: ch,
+            message: MessageId(20),
+        };
+        let mut jump = Jumper::default();
+        // A is not in the list: its page is asked for.
+        jump.start(a, Some(ch), 0);
+        assert_eq!(jump.step(Some(ch), true, |_| false, 1), JumpStep::Fetch(a));
+        jump.fetching(1, a, 1);
+        // B is in the list: shown at once, while A's page is still on its way.
+        jump.start(b, Some(ch), 2);
+        assert_eq!(
+            jump.step(Some(ch), true, |id| id == b.message, 3),
+            JumpStep::Show(b.message)
+        );
+        // A's page comes after: it is not wanted any more.
+        assert_eq!(jump.answered(1), None);
+        assert!(!jump.is_active(4));
+        // "Jump to present" drops a page on its way the same way.
+        jump.start(a, Some(ch), 10);
+        assert_eq!(jump.step(Some(ch), true, |_| false, 11), JumpStep::Fetch(a));
+        jump.fetching(2, a, 11);
+        jump.cancel();
+        assert_eq!(jump.answered(2), None);
+        // A newest page that fails ends the jump waiting for it.
+        jump.start(a, Some(ChannelId(2)), 20);
+        jump.give_up_in(ch);
+        assert!(!jump.is_active(21));
+        // Back in the channel the jump started from, after the target was open: given up.
+        let from = ChannelId(3);
+        jump.start(a, Some(from), 30);
+        assert_eq!(jump.step(Some(ch), false, |_| false, 31), JumpStep::Wait);
+        assert_eq!(jump.step(Some(from), true, |_| false, 32), JumpStep::GiveUp);
+    }
+
+    #[test]
+    fn a_lost_page_or_an_account_switch_never_stops_reading() {
+        let ch = ChannelId(1);
+        let t = Target {
+            channel: ch,
+            message: MessageId(10),
+        };
+        // A page whose answer never comes (it went to another account): reading waits at
+        // most the jump's timeout, and a new jump can load its page after it.
+        let mut jump = Jumper::default();
+        jump.start(t, Some(ch), 0);
+        assert_eq!(jump.step(Some(ch), true, |_| false, 1), JumpStep::Fetch(t));
+        jump.fetching(1, t, 1);
+        assert!(jump.is_active(1 + JUMP_TIMEOUT_MS - 1));
+        assert!(!jump.is_active(1 + JUMP_TIMEOUT_MS));
+        let later = 2 + JUMP_TIMEOUT_MS;
+        jump.start(t, Some(ch), later);
+        assert_eq!(
+            jump.step(Some(ch), true, |_| false, later),
+            JumpStep::Fetch(t)
+        );
+
+        // Switching accounts clears the panels: the open panel, the lists and a jump
+        // with its page on the way. Request numbers go on.
+        let mut state = State {
+            open: Some(Panel::Inbox),
+            ..State::default()
+        };
+        state.jump.start(t, Some(ch), 0);
+        state.jump.fetching(7, t, 0);
+        let request = state.request_id();
+        state.mentions.list.start(request, true, 0);
+        state
+            .mentions
+            .list
+            .land(request, vec![item(1, "301")], false, 0);
+        state.clear();
+        assert!(state.open.is_none() && !state.jump.is_active(1));
+        assert!(state.mentions.list.items.is_empty() && state.mentions.list.wants_first());
+        assert!(state.request_id() > request);
     }
 }

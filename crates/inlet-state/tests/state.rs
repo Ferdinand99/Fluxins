@@ -1413,6 +1413,39 @@ fn a_page_around_a_message_replaces_the_window() {
     );
     assert_eq!(s.messages(c).unwrap().pending_len(), 1);
 
+    // A page that overlaps a fresh window keeps what changed live meanwhile.
+    let mut s2 = state();
+    s2.apply_messages(
+        c,
+        MessagesPage::latest(
+            (1..4)
+                .rev()
+                .map(|i| message(mid(i, 0), GENERAL, OTHER))
+                .collect(),
+            3,
+        ),
+    );
+    s2.apply(&d(
+        "MESSAGE_UPDATE",
+        message_json(
+            mid(2, 0),
+            GENERAL,
+            OTHER,
+            json!({"content": "edited", "edited_timestamp": "2026-01-01T01:30:00Z"}),
+        ),
+    ));
+    s2.apply_around(
+        c,
+        &[
+            message(mid(2, 0), GENERAL, OTHER),
+            message(mid(1, 0), GENERAL, OTHER),
+        ],
+    );
+    assert_eq!(
+        s2.messages(c).unwrap().get(mid(2, 0)).unwrap().content,
+        "edited"
+    );
+
     // A jump near the end: the page reaches the channel's newest message (61, known
     // from the live event), so the window has its newest messages again.
     let end: Vec<_> = (59..62)

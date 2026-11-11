@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Everything drawn on top of the window content: modals, context menus, tooltips.
 
+pub mod account_switcher;
 mod context_menu;
 mod link_confirm;
 mod link_prompt;
@@ -34,16 +35,20 @@ impl Inlet {
     /// The overlays to draw over the current screen, bottom first.
     pub(crate) fn render_overlays(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let mut out = Vec::new();
-        // The viewer lies under the settings view and the prompts (Escape closes the
-        // topmost layer first).
+        // The pins or the inbox, under the channel header, lie lowest; the viewer lies
+        // under the settings view and the prompts (Escape closes the topmost layer
+        // first, see `desktop::OpenLayers`).
+        out.extend(self.render_panels(cx));
         out.extend(self.render_image_viewer(cx));
         if self.settings.view.is_some() {
             out.push(self.render_settings_overlay(cx));
         }
-        // The pins or the inbox, under the channel header.
-        out.extend(self.render_panels(cx));
         if self.notifications.settings.is_some() {
             out.push(self.render_notification_settings(cx));
+        }
+        // The account switcher: over the notification settings, under the link prompts.
+        if self.switcher_layer_open() {
+            out.push(self.render_account_switcher(cx));
         }
         if let Some(url) = self.overlays.pending_link.clone() {
             // A layer like the link prompt: it has the keyboard while it is topmost, and

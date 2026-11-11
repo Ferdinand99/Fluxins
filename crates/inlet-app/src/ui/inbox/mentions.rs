@@ -346,4 +346,36 @@ mod tests {
         m.landed(2, vec![item(2, "301"), item(1, "301")], false, 2_000);
         assert_eq!(ids(&m), vec!["1"]);
     }
+
+    #[test]
+    fn fast_filter_clicks_keep_the_pace() {
+        let mut m = Mentions::default();
+        assert!(m.list.wants_first() && m.list.may_start(0));
+        m.list.start(1, true, 0);
+        // Three filter changes within a second: no request while the first is on its
+        // way, and none before the second is over.
+        m.set_filters(false, true);
+        m.set_filters(false, false);
+        m.set_filters(true, true);
+        assert!(
+            !m.list.wants_first() && !m.list.may_start(300),
+            "the old request is still on its way"
+        );
+        // The old filters' answer is dropped, not shown; then the new filters want
+        // their first page.
+        assert!(!m.landed(1, vec![item(5, "301")], false, 400));
+        assert!(m.list.items.is_empty() && !m.list.loaded);
+        assert!(m.list.wants_first());
+        assert!(!m.list.may_start(999), "at most one request a second");
+        assert!(m.list.may_start(1_000));
+        m.list.start(2, true, 1_000);
+        assert!(m.landed(2, vec![item(6, "301")], false, 1_100));
+        assert_eq!(ids(&m), vec!["6"]);
+        // A failure of a dropped request shows nothing.
+        m.set_filters(false, true);
+        m.list.start(3, true, 2_000);
+        m.set_filters(true, true);
+        assert!(m.list.fail(3, "offline".into()));
+        assert!(m.list.error.is_none() && m.list.wants_first());
+    }
 }

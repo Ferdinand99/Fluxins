@@ -122,7 +122,8 @@ impl Inlet {
                             |this, _, _, cx| {
                                 this.chat.gateway_down = None;
                                 this.chat.status = t!("status-reconnecting");
-                                this.backend.send(Cmd::Reconnect);
+                                this.backend
+                                    .send(Cmd::Reconnect(this.switcher.active.clone()));
                                 cx.notify();
                             },
                         )),

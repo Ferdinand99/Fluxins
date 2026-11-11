@@ -178,6 +178,10 @@ impl Inlet {
     /// settings view or a panel (pins, inbox), and not moving to a message a jump is
     /// loading. A view that covers the chat must be added here, so nothing is read or
     /// marked as read behind it.
+    ///
+    /// Deviation: Fluxer keeps reading under its popouts (only modals and the media
+    /// viewer stop it). Inlet's pins and inbox panels cover most of the chat, so the
+    /// messages under them are not taken as seen.
     pub(crate) fn chat_is_visible(&self) -> bool {
         self.screen == Screen::Main
             && !self.show_about

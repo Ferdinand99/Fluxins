@@ -14,7 +14,8 @@ use crate::guilds::GuildState;
 use crate::ids::{ChannelId, GuildId, MessageId, RoleId, UserId};
 use crate::limits::{
     MAX_CHANNELS_PER_GUILD, MAX_EXPRESSIONS_PER_GUILD, MAX_GUILDS, MAX_MEMBERS_TOTAL,
-    MAX_PRIVATE_CHANNELS,
+    MAX_PRESENCES, MAX_PRIVATE_CHANNELS, MAX_USERS, PASSIVE_MAX_MEMBERS_TOTAL,
+    PASSIVE_MAX_PRESENCES, PASSIVE_MAX_USERS,
 };
 use crate::messages::{MessageWindow, MessageWindows, MessagesPage};
 use crate::permissions::{self, Permissions};
@@ -66,6 +67,8 @@ pub struct AccountState {
     now_ms: i64,
     /// Cached members other than the account, across guilds.
     member_total: usize,
+    /// The account is in the background ([`AccountState::set_passive`]).
+    passive: bool,
 }
 
 impl AccountState {
@@ -99,6 +102,7 @@ impl AccountState {
             voice: Voice::default(),
             now_ms,
             member_total: 0,
+            passive: false,
         };
         s.users.upsert(&r.user.user);
         for u in &r.users {
@@ -126,11 +130,15 @@ impl AccountState {
         match d {
             Dispatch::Ready(r) => {
                 let windows = std::mem::take(&mut self.windows);
+                let passive = self.passive;
                 *self = AccountState::from_ready_at(r, self.now_ms);
                 self.windows = windows;
                 let channels = &self.channels;
                 self.windows.retain(|ch| channels.get(ch).is_some());
                 self.windows.mark_stale();
+                if passive {
+                    self.set_passive(true);
+                }
                 c.reset = true;
             }
             Dispatch::Resumed => {}
@@ -667,6 +675,40 @@ impl AccountState {
         }
         self.windows.clear();
         c
+    }
+
+    /// An account in the background keeps only what its unread counts and badges need:
+    /// guilds, channels, roles, read states, notification settings and its own
+    /// members. Message windows, typing, other members and presences go, and users are
+    /// cut to the few seen last ([`crate::limits`], `PASSIVE_*`); while passive, new ones
+    /// stay within those caps. `false` brings the normal caps back (what was dropped
+    /// comes back with the next events or READY). Returns `reset` when it changed.
+    pub fn set_passive(&mut self, passive: bool) -> Changes {
+        let mut c = Changes::default();
+        if self.passive == passive {
+            return c;
+        }
+        self.passive = passive;
+        c.reset = true;
+        if passive {
+            c.merge(self.drop_message_windows());
+            self.typing = Typing::default();
+            for g in self.guilds.values_mut() {
+                g.members.clear_others();
+            }
+            self.member_total = 0;
+            self.presences.set_cap(PASSIVE_MAX_PRESENCES);
+            self.users.set_cap(PASSIVE_MAX_USERS);
+        } else {
+            self.presences.set_cap(MAX_PRESENCES);
+            self.users.set_cap(MAX_USERS);
+        }
+        c
+    }
+
+    /// Whether the account is in the background (see [`AccountState::set_passive`]).
+    pub fn is_passive(&self) -> bool {
+        self.passive
     }
 
     /// Moves the clock to `now_ms`: typing entries expire, timeouts and timed
@@ -1345,7 +1387,12 @@ impl AccountState {
     /// recently used member; only when it has no other member is the guild
     /// that caches the most looked up.
     fn enforce_member_cap(&mut self, grown: GuildId, c: &mut Changes) {
-        while self.member_total > MAX_MEMBERS_TOTAL {
+        let cap = if self.passive {
+            PASSIVE_MAX_MEMBERS_TOTAL
+        } else {
+            MAX_MEMBERS_TOTAL
+        };
+        while self.member_total > cap {
             let victim = match self.guilds.get(&grown) {
                 Some(g) if g.members.others_len() > 1 => grown,
                 _ => match self

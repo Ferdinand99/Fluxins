@@ -91,12 +91,17 @@ impl Inlet {
     }
 
     pub(super) fn render_unreads(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let rows = match &self.account {
-            Some(account) => unread_rows(account.read(cx)),
-            None => Vec::new(),
+        let rows = match (&self.inbox.unread_rows, &self.account) {
+            (Some(rows), _) => rows.clone(),
+            (None, Some(account)) => {
+                let rows = std::rc::Rc::new(unread_rows(account.read(cx)));
+                self.inbox.unread_rows = Some(rows.clone());
+                rows
+            }
+            (None, None) => std::rc::Rc::new(Vec::new()),
         };
         let mut items = Vec::with_capacity(rows.len());
-        for row in rows {
+        for row in rows.iter().cloned() {
             let (channel, guild) = self.channel_and_guild_names(&row.channel.to_string(), cx);
             let check = {
                 let row = row.clone();

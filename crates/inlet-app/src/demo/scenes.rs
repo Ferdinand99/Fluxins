@@ -21,6 +21,9 @@
 //! - `chat-reactions`, `chat-menu`, `chat-delete`: for `#general`, reactions under a few
 //!   messages and an own message; the hover bar shown on one message, the context menu
 //!   open on the own message, or its delete confirmation (see `actions.rs`).
+//! - `accounts`: as `default`, with two more accounts in the background (one on the same
+//!   instance with mentions, one on another instance) and the account switcher open.
+//! - `accounts-add`: the same accounts, on the sign-in screen to add one more.
 //! - `chat-pins`: for `#general`, the pinned messages panel open.
 //! - `inbox-unreads`, `inbox-saved`, `inbox-mentions`: for `#general`, the inbox open on
 //!   that tab (with the unread state of `default`; see `inbox.rs`).
@@ -55,6 +58,8 @@ pub enum Scene {
     ChatReactions,
     ChatMenu,
     ChatDelete,
+    Accounts,
+    AccountsAdd,
     ChatPins,
     InboxUnreads,
     InboxSaved,
@@ -79,6 +84,8 @@ impl Scene {
             "chat-reactions" => Scene::ChatReactions,
             "chat-menu" => Scene::ChatMenu,
             "chat-delete" => Scene::ChatDelete,
+            "accounts" => Scene::Accounts,
+            "accounts-add" => Scene::AccountsAdd,
             "chat-pins" => Scene::ChatPins,
             "inbox-unreads" => Scene::InboxUnreads,
             "inbox-saved" => Scene::InboxSaved,
@@ -302,7 +309,10 @@ pub fn data(scene: Scene) -> Data {
         });
     }
     let mut guild_settings = Vec::new();
-    let unread_demo = matches!(scene, Scene::Default | Scene::InboxUnreads);
+    let unread_demo = matches!(
+        scene,
+        Scene::Default | Scene::Accounts | Scene::AccountsAdd | Scene::InboxUnreads
+    );
     if unread_demo {
         // Unread messages, mentions and mutes in the sidebar and the rail.
         read_states.extend(unread::read_states());
@@ -347,6 +357,8 @@ mod tests {
             "chat-reactions",
             "chat-menu",
             "chat-delete",
+            "accounts",
+            "accounts-add",
             "chat-pins",
             "inbox-unreads",
             "inbox-saved",
