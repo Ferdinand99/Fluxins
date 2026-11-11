@@ -647,7 +647,11 @@ pub fn to_attachment(a: &p::Attachment) -> Attachment {
 /// URL (the proxy URL ends like the original). GIF pages (`gifv`) send an MP4 or WebM
 /// as their `video`.
 pub fn is_video(content_type: Option<&str>, url: &str, proxy_url: Option<&str>) -> bool {
-    if let Some(t) = content_type.map(str::trim).filter(|t| !t.is_empty()) {
+    // The media type without parameters (`video/mp4; codecs=...`).
+    let essence = content_type
+        .and_then(|t| t.split(';').next())
+        .map(str::trim);
+    if let Some(t) = essence.filter(|t| !t.is_empty()) {
         let t = t.to_ascii_lowercase();
         return t.starts_with("video/") || t == "application/mp4";
     }
@@ -763,6 +767,7 @@ mod tests {
     fn gif_pages_keep_their_video_apart_from_their_picture() {
         assert!(is_video(Some("video/mp4"), "https://x.example/a", None));
         assert!(is_video(Some("VIDEO/WEBM"), "", None));
+        assert!(is_video(Some("application/mp4; codecs=avc1"), "", None));
         assert!(!is_video(
             Some("image/gif"),
             "https://x.example/a.mp4",
