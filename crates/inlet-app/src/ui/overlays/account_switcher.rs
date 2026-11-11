@@ -275,9 +275,12 @@ impl Inlet {
         // with its outbox, the unread gate and settings writes (a new write session, so
         // late answers are ignored), the composer (its text is saved with the old
         // account's drafts, which are then forgotten here; the account ID is asked for
-        // again, so the next account's drafts file is used) and any open window.
+        // again, so the next account's drafts file is used), the panels and any open
+        // window.
         self.reset_messages();
         self.notifications.clear();
+        // The panels' lists and a jump on its way (its answer is the old account's).
+        self.inbox.clear();
         self.composer
             .view
             .update(cx, |v, cx| v.switch_account(window, cx));

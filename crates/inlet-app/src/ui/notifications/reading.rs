@@ -20,7 +20,7 @@
 
 use std::time::Instant;
 
-use inlet_state::{AccountState, AckKind, Changes, ChannelId, GuildId};
+use inlet_state::{AccountState, AckKind, Changes, ChannelId, GuildId, MessageId};
 
 use super::unread::{all_unread_targets, category_unread_targets, has_unread, unread_targets};
 use crate::app::Inlet;
@@ -171,6 +171,35 @@ impl Inlet {
                 category_unread_targets(account.read(cx), self.selected_guild_id(), cat)
             }
             Which::Everything => all_unread_targets(account.read(cx)),
+        };
+        self.send_read_marks(targets, cx);
+    }
+
+    /// "Mark as read" on channels the inbox lists, each up to the message given. The
+    /// person clicked it in the panel that covers the chat, so it is not held back by
+    /// [`Inlet::chat_is_visible`]; only channels with something unread are sent.
+    pub(crate) fn mark_listed_read(
+        &mut self,
+        targets: Vec<(ChannelId, MessageId)>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(account) = self.account.clone() else {
+            return;
+        };
+        let targets: Vec<(ChannelId, MessageId)> = {
+            let state = account.read(cx);
+            targets
+                .into_iter()
+                .filter(|(ch, _)| has_unread(state, *ch))
+                .collect()
+        };
+        self.send_read_marks(targets, cx);
+    }
+
+    /// Marks `targets` read in the state and sends one acknowledgement for them.
+    fn send_read_marks(&mut self, targets: Vec<(ChannelId, MessageId)>, cx: &mut Context<Self>) {
+        let Some(account) = self.account.clone() else {
+            return;
         };
         if targets.is_empty() {
             return;
