@@ -225,22 +225,50 @@ impl Throttle {
     }
 }
 
+/// The UI's way to the backend. Every command except the accounts domain's goes out
+/// with the account the UI shows ([`BackendHandle::set_account`]); the backend runs it
+/// only while that account is the active one, so no command meant for one account can
+/// ever run with another account's session and token.
 #[derive(Clone)]
 pub struct BackendHandle {
-    tx: TokioSender<Command>,
+    tx: TokioSender<(Option<AccountKey>, Command)>,
+    account: Arc<Mutex<Option<AccountKey>>>,
 }
 
 impl BackendHandle {
     /// Sends a command. If the backend thread has died, the UI notices because the
     /// event channel closes; nothing to do here.
     pub fn send(&self, command: impl Into<Command>) {
-        let _ = self.tx.send(command.into());
+        let command = command.into();
+        let account = match command {
+            Command::Accounts(_) => None,
+            _ => self
+                .account
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+        };
+        let _ = self.tx.send((account, command));
+    }
+
+    /// The account the UI shows from now on; the commands sent after this are for it.
+    pub fn set_account(&self, account: Option<AccountKey>) {
+        *self.account.lock().unwrap_or_else(|e| e.into_inner()) = account;
     }
 }
 
 /// Starts the backend thread. Events arrive on `events`. When the thread ends (a panic in
 /// the loop itself), `events` is dropped and the UI's receiver ends.
 pub fn start(events: UnboundedSender<Event>) -> BackendHandle {
+    start_with(events, Accounts::system)
+}
+
+/// Starts the backend thread with the stored accounts `store` makes (the system
+/// keychain in the app, an in-memory one in tests).
+pub fn start_with(
+    events: UnboundedSender<Event>,
+    store: impl FnOnce(Ui) -> Accounts + Send + 'static,
+) -> BackendHandle {
     let events = Ui::new(events);
     let (tx, rx) = unbounded_channel();
     std::thread::Builder::new()
@@ -251,10 +279,14 @@ pub fn start(events: UnboundedSender<Event>) -> BackendHandle {
                 .enable_all()
                 .build()
                 .expect("tokio runtime");
-            runtime.block_on(Backend::new(events).run(rx));
+            let store = store(events.clone());
+            runtime.block_on(Backend::with_store(events, store).run(rx));
         })
         .expect("backend thread");
-    BackendHandle { tx }
+    BackendHandle {
+        tx,
+        account: Arc::default(),
+    }
 }
 
 /// Messages from tasks back to the loop.
@@ -352,6 +384,12 @@ struct RealActive {
     ignores_typing: bool,
     /// The gateway stopped and waits for the person (no automatic restart).
     down: bool,
+    /// The account was restored from an older Inlet's entry (this origin) that may not
+    /// be moved yet; signing it out removes that entry too.
+    legacy: Option<String>,
+    /// The composer's state of this account: its ID and limit, sends that may be
+    /// retried, open member searches. Kept per account, so switching back finds it.
+    composer: composer::State,
     session: p::Session,
     gateway: p::GatewayHandle,
     forward: AbortHandle,
@@ -415,18 +453,11 @@ struct Backend {
     pending_confirm: Option<PendingConfirm>,
     open_guild: Option<AbortHandle>,
     open_channel: Option<AbortHandle>,
-    /// The composer's cache: account ID, message length limit, autocomplete data.
-    composer: composer::State,
     /// The request for older messages of the open channel.
     older: messages::OlderPages,
 }
 
 impl Backend {
-    fn new(events: Ui) -> Self {
-        let store = Accounts::system(events.clone());
-        Self::with_store(events, store)
-    }
-
     fn with_store(events: Ui, store: Accounts) -> Self {
         let (internal, _) = unbounded_channel();
         Self {
@@ -448,7 +479,6 @@ impl Backend {
             pending_confirm: None,
             open_guild: None,
             open_channel: None,
-            composer: Default::default(),
             older: Default::default(),
         }
     }
@@ -500,7 +530,7 @@ impl Backend {
         abort
     }
 
-    async fn run(mut self, mut rx: UnboundedReceiver<Command>) {
+    async fn run(mut self, mut rx: UnboundedReceiver<(Option<AccountKey>, Command)>) {
         let (internal, mut internal_rx) = unbounded_channel();
         self.internal = internal;
         loop {
@@ -509,10 +539,32 @@ impl Backend {
                 biased;
                 Some(msg) = internal_rx.recv() => self.internal(msg),
                 command = rx.recv() => match command {
-                    Some(command) => self.handle(command),
+                    Some((account, command)) => self.command(account, command),
                     None => break,
                 },
             }
+        }
+    }
+
+    /// A command from the UI, for `account` (`None` for the accounts domain). A command
+    /// for an account that is not the active one is dropped: it was sent before a
+    /// switch reached the backend, and running it would use the wrong session.
+    fn command(&mut self, account: Option<AccountKey>, command: Command) {
+        if !matches!(command, Command::Accounts(_)) && !self.acts_for(account.as_ref()) {
+            log::debug!("a command for an account that is not the active one was dropped");
+            return;
+        }
+        self.handle(command);
+    }
+
+    /// Whether a command sent for `account` may run now.
+    fn acts_for(&self, account: Option<&AccountKey>) -> bool {
+        match &self.active {
+            Some(Active::Real(r)) => account == Some(&r.key),
+            #[cfg(feature = "demo")]
+            Some(Active::Demo(_)) => true,
+            // No session: the domains answer "not connected" without a token.
+            None => true,
         }
     }
 

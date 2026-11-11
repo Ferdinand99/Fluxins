@@ -100,6 +100,16 @@ impl gpui::Global for CurrentBackend {}
 
 impl Inlet {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::new_with(window, cx, backend::start)
+    }
+
+    /// [`Inlet::new`] with the backend `start` gives (the system's in the app, one with
+    /// test accounts in tests).
+    pub(crate) fn new_with(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        start: impl FnOnce(futures::channel::mpsc::UnboundedSender<Event>) -> BackendHandle,
+    ) -> Self {
         let mut subscriptions = Vec::new();
         let sign_in = ui::accounts::SignInState::new(window, cx, &mut subscriptions);
         let composer = ui::composer::ComposerState::new(window, cx, &mut subscriptions);
@@ -114,7 +124,7 @@ impl Inlet {
             }
         }));
 
-        let (backend, _) = Self::spawn_backend(0, true, window, cx);
+        let (backend, _) = Self::spawn_backend_with(0, true, window, cx, start);
         let notifications = ui::notifications::State::new(window.is_window_active());
         Self {
             backend,
@@ -159,8 +169,18 @@ impl Inlet {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> (BackendHandle, u64) {
+        Self::spawn_backend_with(epoch, restore, window, cx, backend::start)
+    }
+
+    fn spawn_backend_with(
+        epoch: u64,
+        restore: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        start: impl FnOnce(futures::channel::mpsc::UnboundedSender<Event>) -> BackendHandle,
+    ) -> (BackendHandle, u64) {
         let (events_tx, mut events_rx) = futures::channel::mpsc::unbounded();
-        let backend = backend::start(events_tx);
+        let backend = start(events_tx);
         cx.set_global(CurrentBackend(backend.clone()));
         cx.spawn_in(window, async move |this, cx| {
             while let Some(event) = events_rx.next().await {
@@ -250,6 +270,7 @@ impl Inlet {
         self.media.reset();
         self.notifications.clear();
         self.switcher.signed_out();
+        self.backend.set_account(None);
         self.chat.status.clear();
         self.chat.error = None;
         self.chat.notice = None;

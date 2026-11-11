@@ -125,13 +125,16 @@ pub struct Legacy {
 
 /// What `restore_all` read, before it is handed to the backend.
 struct Read {
-    list: AccountList,
+    /// `None`: `accounts.json` is there but could not be read (it was backed up).
+    list: Option<AccountList>,
     /// Each listed account still in the keychain; `None` when the keychain could not be
     /// read (the account stays listed and is tried at the next start).
     sessions: Vec<(AccountRecord, Option<StoredSession>)>,
     /// Some listed account has no usable entry any more.
     dropped: bool,
     legacy: Option<Legacy>,
+    /// An older Inlet's entry without pins was dropped (it cannot be used safely).
+    pinless_legacy: bool,
 }
 
 /// The stored accounts. See the module documentation.
@@ -139,6 +142,8 @@ pub struct Accounts {
     store: Arc<dyn SecretStore>,
     /// `accounts.json`; `None` when there is no config folder (nothing is listed then).
     list_path: Option<PathBuf>,
+    /// `accounts.json` could not be read this run: it is never written over.
+    list_broken: bool,
     list: Vec<AccountInfo>,
     active: Option<AccountKey>,
     restored: Vec<Restored>,
@@ -146,6 +151,10 @@ pub struct Accounts {
     /// The live session of each account, to end it on the server at sign-out without a
     /// new discovery. Only the backend's own sessions are kept here.
     sessions: HashMap<AccountKey, p::Session>,
+    /// Whether each account's token was pasted, as last read or written. Used when the
+    /// keychain cannot tell at sign-out (an entry not moved yet); unknown counts as
+    /// pasted, so it is never revoked.
+    pasted: HashMap<AccountKey, bool>,
     /// Where notices after a sign-out go (`None` in tests).
     events: Option<Ui>,
     /// The origin an older Inlet signed in to (its entry is named after it).
@@ -161,11 +170,13 @@ impl Accounts {
         Accounts {
             store,
             list_path,
+            list_broken: false,
             list: Vec::new(),
             active: None,
             restored: Vec::new(),
             legacy: None,
             sessions: HashMap::new(),
+            pasted: HashMap::new(),
             events,
             last_instance: || None,
         }
@@ -188,11 +199,19 @@ impl Accounts {
         .with_last_instance(token_store::last_instance)
     }
 
+    fn notice(&self, text: String) {
+        if let Some(events) = &self.events {
+            let _ = events.unbounded_send(Ev::Notice(text));
+        }
+    }
+
     /// Reads the account list and every account's keychain entry. Accounts whose entry
     /// is gone or was written before pinning are dropped from the list (their entry is
-    /// removed). With no list yet, the single entry of an older Inlet is picked up as
-    /// [`Legacy`]; it is moved once its user ID is known ([`Accounts::migrate`]).
-    /// Afterwards `take_restored` gives the accounts to start, the active one first.
+    /// removed). The single entry of an older Inlet is looked for on every start until
+    /// it has been moved: a copy of a listed account's entry is deleted, anything else
+    /// is picked up as [`Legacy`] and moved once its user ID is known
+    /// ([`Accounts::migrate`]). Afterwards `take_restored` gives the accounts to start,
+    /// the active one first.
     pub async fn restore_all(&mut self) {
         let store = self.store.clone();
         let path = self.list_path.clone();
@@ -201,13 +220,21 @@ impl Accounts {
             tokio::task::spawn_blocking(move || read_all(&*store, path.as_deref(), last_instance))
                 .await
                 .unwrap_or_else(|_| Read {
-                    list: AccountList::default(),
+                    list: None,
                     sessions: Vec::new(),
                     dropped: false,
                     legacy: None,
+                    pinless_legacy: false,
                 });
         self.list.clear();
         self.restored.clear();
+        self.list_broken = read.list.is_none();
+        if self.list_broken {
+            self.notice(t!("notice-account-list-unreadable"));
+        }
+        if read.pinless_legacy {
+            self.notice(t!("notice-old-session-dropped"));
+        }
         for (record, stored) in read.sessions {
             let Some(key) = AccountKey::of(&record) else {
                 continue;
@@ -226,6 +253,7 @@ impl Accounts {
                 pasted,
             }) = stored
             {
+                self.pasted.insert(key.clone(), pasted);
                 self.restored.push(Restored {
                     key,
                     token,
@@ -234,9 +262,8 @@ impl Accounts {
                 });
             }
         }
-        self.active = read
-            .list
-            .active
+        let active = read.list.as_ref().and_then(|l| l.active.clone());
+        self.active = active
             .as_deref()
             .and_then(|e| self.list.iter().find(|a| a.key.entry() == e))
             .or_else(|| self.list.first())
@@ -289,9 +316,24 @@ impl Accounts {
         })
     }
 
-    /// Keeps a live session, to end it at sign-out without a new discovery.
-    pub fn remember_session(&mut self, k: AccountKey, session: p::Session) {
+    /// Keeps a live session and whether its token was pasted, to end it at sign-out
+    /// without a new discovery (or only forget it).
+    pub fn remember_session(&mut self, k: AccountKey, session: p::Session, pasted: bool) {
+        self.pasted.insert(k.clone(), pasted);
         self.sessions.insert(k, session);
+    }
+
+    /// Writes `file` to `accounts.json`, unless the list on disk could not be read this
+    /// run (then it is kept as it is).
+    fn write_list(path: Option<&std::path::Path>, broken: bool, file: &AccountList) -> Result<()> {
+        match path {
+            Some(_) if broken => {
+                log::warn!("the account list is not written over: it could not be read");
+                Ok(())
+            }
+            Some(path) => token_store::save_list(path, file),
+            None => Ok(()),
+        }
     }
 
     /// Stores a confirmed sign-in under its own entry and lists it as the active
@@ -323,6 +365,7 @@ impl Accounts {
         let entry = key.entry();
         let store = self.store.clone();
         let path = self.list_path.clone();
+        let broken = self.list_broken;
         let old =
             tokio::task::spawn_blocking(move || -> Result<Option<(p::Token, p::SessionPins)>> {
                 let old = token_store::load_session(&*store, &entry)
@@ -331,9 +374,7 @@ impl Accounts {
                     .filter(|o| should_revoke(o.pasted) && o.token != token)
                     .and_then(|o| Some((o.token, o.pins?)));
                 token_store::save_session(&*store, &entry, &token, &pins, pasted)?;
-                if let Some(path) = &path {
-                    token_store::save_list(path, &file)?;
-                }
+                Self::write_list(path.as_deref(), broken, &file)?;
                 token_store::set_last_instance(&origin);
                 Ok(old)
             })
@@ -349,27 +390,36 @@ impl Accounts {
                 session::revoke(&old_session).await;
             }
         }
+        self.pasted.insert(key.clone(), pasted);
         self.sessions.insert(key.clone(), s.session);
         Ok(key)
     }
 
     /// Signs an account out: ends its token on the server when `revoke` is set and the
-    /// token was not pasted (a pasted token is only forgotten), then removes its entry
-    /// and takes it off the list. With `revoke` set, the person gets a notice when the
-    /// server could not be told or the keychain kept the entry.
+    /// token is known not to be pasted, then removes its entry and takes it off the
+    /// list. A pasted token is only forgotten. When the keychain cannot be read, nothing
+    /// is revoked (the token might be pasted): the account is forgotten here and the
+    /// person is told to end the session elsewhere.
     pub async fn remove(&mut self, k: &AccountKey, revoke: bool) {
         let entry = k.entry();
         let store = self.store.clone();
-        let stored = tokio::task::spawn_blocking(move || {
-            token_store::load_session(&*store, &entry).ok().flatten()
-        })
-        .await
-        .ok()
-        .flatten();
+        let read = tokio::task::spawn_blocking(move || token_store::load_session(&*store, &entry))
+            .await
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("the keychain read stopped")));
         let live = self.sessions.remove(k);
-        let pasted = stored.as_ref().is_some_and(|s| s.pasted);
+        let known = self.pasted.remove(k);
+        let (pasted, unreadable, stored) = match read {
+            Ok(Some(s)) => (s.pasted, false, Some(s)),
+            // No entry (an older Inlet's entry not moved yet): what was last known, and
+            // unknown counts as pasted.
+            Ok(None) => (known.unwrap_or(true), false, None),
+            Err(err) => {
+                log::warn!("the keychain could not be read at sign-out: {err:#}");
+                (true, true, None)
+            }
+        };
         let mut told_server = false;
-        if revoke && should_revoke(pasted) {
+        if revoke && !unreadable && should_revoke(pasted) {
             let session = match (live, stored) {
                 (Some(session), _) => Some(session),
                 (
@@ -396,20 +446,26 @@ impl Accounts {
         let entry = k.entry();
         let store = self.store.clone();
         let path = self.list_path.clone();
+        let broken = self.list_broken;
         let file = list_file_of(&self.list, self.active.as_ref());
         let deleted = tokio::task::spawn_blocking(move || {
             let deleted = token_store::delete_session(&*store, &entry).is_ok();
-            if let Some(path) = &path {
-                if let Err(err) = token_store::save_list(path, &file) {
-                    log::warn!("could not write the account list: {err:#}");
-                }
+            if let Err(err) = Self::write_list(path.as_deref(), broken, &file) {
+                log::warn!("could not write the account list: {err:#}");
             }
             deleted
         })
         .await
         .unwrap_or(false);
         if let Some(events) = &self.events {
-            if revoke && !should_revoke(pasted) {
+            if revoke && unreadable {
+                let mut text = t!("notice-keychain-unreadable");
+                if !deleted {
+                    text.push(' ');
+                    text.push_str(&t!("notice-not-deleted"));
+                }
+                let _ = events.unbounded_send(Ev::Notice(text));
+            } else if revoke && !should_revoke(pasted) {
                 notice_forgotten(events, deleted);
             } else if revoke {
                 notice_sign_out(events, told_server, deleted);
@@ -426,13 +482,14 @@ impl Accounts {
         }
     }
 
-    /// Writes `accounts.json`.
+    /// Writes `accounts.json` (never over a list that could not be read).
     pub async fn save(&self) {
-        let Some(path) = self.list_path.clone() else {
-            return;
-        };
+        let path = self.list_path.clone();
+        let broken = self.list_broken;
         let file = list_file_of(&self.list, self.active.as_ref());
-        let saved = tokio::task::spawn_blocking(move || token_store::save_list(&path, &file)).await;
+        let saved =
+            tokio::task::spawn_blocking(move || Self::write_list(path.as_deref(), broken, &file))
+                .await;
         if !matches!(saved, Ok(Ok(()))) {
             log::warn!("could not write the account list");
         }
@@ -440,30 +497,41 @@ impl Accounts {
 
     /// Moves an older Inlet's entry for `origin` to the account's own entry and lists
     /// the account (see [`token_store::migrate_legacy`] for the order that keeps the
-    /// token). Returns whether it moved; on `false` the old entry is kept for the next
-    /// start.
-    pub async fn migrate(&mut self, origin: &str, info: AccountInfo, session: p::Session) -> bool {
+    /// token and never orphans it). Returns whether the account is listed now; on
+    /// `false` the old entry is kept and the next start tries again.
+    pub async fn migrate(
+        &mut self,
+        origin: &str,
+        info: AccountInfo,
+        session: p::Session,
+        pasted: bool,
+    ) -> bool {
+        self.remember_session(info.key.clone(), session, pasted);
         let mut list = self.list.clone();
         list.retain(|a| a.key != info.key);
         list.insert(0, info.clone());
         let file = list_file_of(&list, Some(&info.key));
         let store = self.store.clone();
         let path = self.list_path.clone();
+        let broken = self.list_broken;
         let origin = origin.to_string();
         let user_id = info.key.user_id.to_string();
         let moved = tokio::task::spawn_blocking(move || {
-            token_store::migrate_legacy(&*store, &origin, &user_id, || match &path {
-                Some(path) => token_store::save_list(path, &file),
-                None => Ok(()),
+            token_store::migrate_legacy(&*store, &origin, &user_id, || {
+                if broken {
+                    anyhow::bail!("the account list could not be read; not written over");
+                }
+                Self::write_list(path.as_deref(), false, &file)
             })
         })
         .await;
         match moved {
-            Ok(Ok(false)) => false,
-            Ok(Ok(true)) => {
+            Ok(Ok(token_store::Migration::Nothing)) => false,
+            Ok(Ok(_)) => {
+                // Listed on disk, so listed here too (also when the old entry could
+                // not be deleted yet; the next start deletes the copy).
                 self.list = list;
-                self.active = Some(info.key.clone());
-                self.sessions.insert(info.key, session);
+                self.active = Some(info.key);
                 true
             }
             Ok(Err(err)) => {
@@ -474,19 +542,18 @@ impl Accounts {
         }
     }
 
-    /// Signs out the session an older Inlet stored for `origin` (no account list yet):
-    /// ends it on the server when `revoke` is set and it was not pasted, then removes
-    /// the entry. Notices as for [`Accounts::remove`].
+    /// Signs out the session an older Inlet stored for `origin`: ends it on the server
+    /// when `revoke` is set and it is known not to be pasted, then removes the entry.
+    /// Notices as for [`Accounts::remove`].
     pub async fn forget_legacy(&mut self, origin: &str, revoke: bool) {
         let store = self.store.clone();
         let entry = origin.to_string();
-        let stored = tokio::task::spawn_blocking(move || {
-            token_store::load_session(&*store, &entry).ok().flatten()
-        })
-        .await
-        .ok()
-        .flatten();
-        let pasted = stored.as_ref().is_some_and(|s| s.pasted);
+        let read = tokio::task::spawn_blocking(move || token_store::load_session(&*store, &entry))
+            .await
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("the keychain read stopped")));
+        let unreadable = read.is_err();
+        let stored = read.ok().flatten();
+        let pasted = stored.as_ref().is_none_or(|s| s.pasted);
         let mut told_server = false;
         if let (
             true,
@@ -512,7 +579,9 @@ impl Accounts {
         .await
         .unwrap_or(false);
         if let Some(events) = &self.events {
-            if revoke && !should_revoke(pasted) {
+            if revoke && unreadable {
+                let _ = events.unbounded_send(Ev::Notice(t!("notice-keychain-unreadable")));
+            } else if revoke && !should_revoke(pasted) {
                 notice_forgotten(events, deleted);
             } else if revoke {
                 notice_sign_out(events, told_server, deleted);
@@ -553,10 +622,17 @@ fn read_all(
     path: Option<&std::path::Path>,
     last_instance: fn() -> Option<String>,
 ) -> Read {
-    let list = path.map(token_store::load_list).unwrap_or_default();
+    let list = match path.map(token_store::load_list) {
+        None => Some(AccountList::default()),
+        Some(Ok(list)) => Some(list),
+        Some(Err(err)) => {
+            log::warn!("{err:#}");
+            None
+        }
+    };
     let mut sessions = Vec::new();
     let mut dropped = false;
-    for record in &list.accounts {
+    for record in list.iter().flat_map(|l| &l.accounts) {
         let entry = record.entry();
         match token_store::load_session(store, &entry) {
             Ok(Some(stored)) if stored.pins.is_some() => {
@@ -578,8 +654,31 @@ fn read_all(
             }
         }
     }
-    let legacy = if list.accounts.is_empty() {
-        last_instance().and_then(|origin| match token_store::load_session(store, &origin) {
+    let mut pinless_legacy = false;
+    // An older Inlet's entry is looked for on every start until it is moved and gone.
+    let legacy = last_instance().and_then(|origin| {
+        let raw = match store.get(&origin) {
+            Ok(Some(raw)) => raw,
+            Ok(None) => return None,
+            Err(err) => {
+                log::warn!("keychain read failed: {err:#}");
+                return None;
+            }
+        };
+        // Already moved (the delete failed or the app stopped before it): the listed
+        // account of this origin holds the same bytes, so the old copy goes.
+        let moved = list
+            .iter()
+            .flat_map(|l| &l.accounts)
+            .filter(|r| r.origin == origin)
+            .any(|r| matches!(store.get(&r.entry()), Ok(Some(e)) if *e == *raw));
+        if moved {
+            if let Err(err) = store.delete(&origin) {
+                log::warn!("the old keychain entry could not be deleted yet: {err:#}");
+            }
+            return None;
+        }
+        match token_store::load_session(store, &origin) {
             Ok(Some(StoredSession {
                 token,
                 pins: Some(pins),
@@ -591,22 +690,20 @@ fn read_all(
                 pasted,
             }),
             Ok(Some(_)) => {
+                // Written before endpoint pinning: never used, never revoked (that would
+                // need discovery without pins). The person is told.
                 let _ = token_store::delete_session(store, &origin);
+                pinless_legacy = true;
                 None
             }
-            Ok(None) => None,
-            Err(err) => {
-                log::warn!("keychain read failed: {err:#}");
-                None
-            }
-        })
-    } else {
-        None
-    };
+            _ => None,
+        }
+    });
     Read {
         list,
         sessions,
         dropped,
         legacy,
+        pinless_legacy,
     }
 }

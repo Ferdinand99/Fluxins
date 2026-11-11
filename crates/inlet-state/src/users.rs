@@ -44,6 +44,12 @@ impl Users {
         }
     }
 
+    /// A new cap (lower for an account in the background); the least recently used
+    /// users go first.
+    pub(crate) fn set_cap(&mut self, cap: usize) {
+        self.cache.set_cap(cap);
+    }
+
     /// A user, if cached.
     pub fn get(&self, id: UserId) -> Option<&User> {
         self.cache.get(&id)

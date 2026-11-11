@@ -894,10 +894,11 @@ impl Inlet {
         }
     }
 
-    /// Whether a layer covers the chat: the link prompt, the settings view or the image
-    /// viewer.
+    /// Whether a layer covers the chat: the link prompt, the account switcher, the
+    /// settings view or the image viewer.
     pub(crate) fn layer_open(&self) -> bool {
         self.overlays.link_prompt.is_some()
+            || self.switcher_layer_open()
             || self.settings.view.is_some()
             || self.media.viewer.is_some()
     }
@@ -954,11 +955,13 @@ impl Inlet {
         }
     }
 
-    /// Escape on a layer: the link prompt first, then the settings view, then the image
-    /// viewer (the bottom one).
+    /// Escape on a layer: the link prompt first, then the account switcher, then the
+    /// settings view, then the image viewer (the bottom one).
     pub(crate) fn close_top_layer(&mut self, cx: &mut Context<Self>) {
         if self.overlays.link_prompt.is_some() {
             self.overlays.link_prompt = None;
+        } else if self.switcher_layer_open() {
+            self.switcher.open = false;
         } else if self.settings.view.is_some() {
             self.settings.view = None;
         } else if self.media.viewer.is_some() {

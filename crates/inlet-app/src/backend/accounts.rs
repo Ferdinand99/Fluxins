@@ -20,6 +20,8 @@
 
 mod store;
 #[cfg(test)]
+pub(crate) mod testkit;
+#[cfg(test)]
 mod tests;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -361,7 +363,20 @@ impl Backend {
     ) {
         self.connecting = None;
         self.set_known(list);
-        let (first, later) = startup_plan(restored);
+        // An older Inlet's entry that is not moved yet connects first: its user is only
+        // known after `me()`, and then it is moved. The listed accounts follow in the
+        // background.
+        let (first, later) = match &legacy {
+            Some(_) => (
+                None,
+                restored
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, r)| (r, STARTUP_STAGGER * (i as u32 + 1)))
+                    .collect(),
+            ),
+            None => startup_plan(restored),
+        };
         for (r, delay) in later {
             self.start_background(r, delay, 0);
         }
@@ -700,6 +715,13 @@ impl Backend {
         let Some(key) = self.install(connected, false, pasted) else {
             return;
         };
+        if let Some(Restore::Legacy(origin)) = &restore {
+            // Until the move is done, signing this account out also removes the old
+            // entry.
+            if let Some(Active::Real(r)) = &mut self.active {
+                r.legacy = Some(origin.clone());
+            }
+        }
         let store = self.store.clone();
         let internal = self.internal.clone();
         self.store_job(async move {
@@ -710,11 +732,11 @@ impl Backend {
                     name,
                     handle,
                 };
-                if accounts.migrate(&origin, info, session).await {
+                if accounts.migrate(&origin, info, session, pasted).await {
                     let _ = internal.send(Internal::ListChanged(accounts.list()));
                 }
             } else {
-                accounts.remember_session(key.clone(), session);
+                accounts.remember_session(key.clone(), session, pasted);
                 if let Some((token, pins)) = upgrade {
                     accounts.update_pins(&key, token, pins, pasted).await;
                 }
@@ -814,6 +836,7 @@ impl Backend {
         self.next_gen += 1;
         let events = self.global.for_account(key.clone());
         let foreground = Arc::new(AtomicBool::new(true));
+        let composer = super::composer::State::default();
         let guilds = Arc::new(Mutex::new(connected.guilds.clone()));
         let cache: ChannelCache = Arc::default();
         let names: SharedNames = Arc::default();
@@ -832,6 +855,7 @@ impl Backend {
             &names,
             &events,
             &foreground,
+            &composer,
             false,
         );
         let mut policy = ReconnectPolicy::default();
@@ -872,7 +896,9 @@ impl Backend {
             events,
             foreground,
             ignores_typing: false,
+            legacy: None,
             down: false,
+            composer,
             session,
             gateway,
             forward,
@@ -935,6 +961,7 @@ impl Backend {
         self.next_gen += 1;
         let events = self.global.for_account(key.clone());
         let foreground = Arc::new(AtomicBool::new(false));
+        let composer = super::composer::State::default();
         let guilds = Arc::new(Mutex::new(Vec::new()));
         let cache: ChannelCache = Arc::default();
         let names: SharedNames = Arc::default();
@@ -946,6 +973,7 @@ impl Backend {
             &names,
             &events,
             &foreground,
+            &composer,
             true,
         );
         let mut policy = ReconnectPolicy::default();
@@ -957,9 +985,9 @@ impl Backend {
             .map(|a| a.name.clone())
             .unwrap_or_default();
         let store = self.store.clone();
-        let (k, s) = (key.clone(), session.clone());
+        let (k, s, pasted) = (key.clone(), session.clone(), restored.pasted);
         self.store_job(async move {
-            store.lock().await.remember_session(k, s);
+            store.lock().await.remember_session(k, s, pasted);
         });
         self.background.push(RealActive {
             gen,
@@ -968,7 +996,9 @@ impl Backend {
             events,
             foreground,
             ignores_typing: true,
+            legacy: None,
             down: false,
+            composer,
             session,
             gateway,
             forward,
@@ -1024,7 +1054,7 @@ impl Backend {
         };
         self.demote_active();
         // `demote_active` pushed the old active account at the end: `ix` still holds.
-        let r = self.background.remove(ix);
+        let mut r = self.background.remove(ix);
         r.foreground.store(true, Ordering::Relaxed);
         apply_accent(&r.session);
         self.tell(Ev::SignedIn {
@@ -1034,12 +1064,24 @@ impl Backend {
         });
         let restart = r.ignores_typing || r.down;
         let gen = r.gen;
+        // The same spacing as "Reconnect": a quick switch back and forth to an account
+        // whose gateway keeps failing does not identify on every click.
+        let wait = if restart {
+            r.policy.manual(Instant::now())
+        } else {
+            Duration::ZERO
+        };
         let guilds = r.guilds.lock().unwrap().clone();
         self.events = r.events.clone();
         self.session_activated(&r.session);
         self.active = Some(Active::Real(r));
-        if restart {
+        if restart && wait.is_zero() {
             self.restart_gateway(gen);
+        } else if restart {
+            let _ = self
+                .events
+                .unbounded_send(Ev::Status(t!("status-reconnecting")));
+            self.schedule_restart(gen, wait);
         }
         let _ = self.events.unbounded_send(messages::Ev::Guilds(guilds));
         let store = self.store.clone();
@@ -1192,12 +1234,24 @@ impl Backend {
     /// Removes an account from the store (ending its token on the server when `revoke`
     /// is set and it was not pasted) and tells the UI the new list.
     fn forget_account(&mut self, key: AccountKey, revoke: bool) {
+        let legacy = self.engine_of(&key).and_then(|r| r.legacy.clone());
+        self.forget_account_with(key, revoke, legacy);
+    }
+
+    /// [`Backend::forget_account`] for an account whose old entry (`legacy`, the
+    /// origin) is known.
+    fn forget_account_with(&mut self, key: AccountKey, revoke: bool, legacy: Option<String>) {
         self.drop_engine(&key);
         let store = self.store.clone();
         let internal = self.internal.clone();
         self.store_job(async move {
             let mut accounts = store.lock().await;
             accounts.remove(&key, revoke).await;
+            if let Some(origin) = legacy {
+                // The old entry of this account, not moved yet: it goes too (already
+                // ended with the live session above when that was allowed).
+                accounts.forget_legacy(&origin, false).await;
+            }
             let _ = internal.send(Internal::ListChanged(accounts.list()));
         });
     }
@@ -1275,30 +1329,40 @@ impl Backend {
         }
         let active = self.active.take();
         self.events = self.global.clone();
+        let mut legacy = None;
         let restore = match active {
             Some(Active::Real(r)) => {
                 // Close the gateway first, so the server's reaction to the revoked token
                 // cannot be read as "the session ended" (the session is gone as well).
                 self.teardown(&r);
-                Some(Restore::Account(r.key))
+                legacy = r.legacy.clone();
+                Some(Restore::Account(r.key.clone()))
             }
             #[cfg(feature = "demo")]
             Some(Active::Demo(_)) => None,
             None => offline.and_then(|o| o.restore),
         };
-        match restore {
-            Some(Restore::Account(key)) => self.forget_account(key, true),
+        let gone = match restore {
+            Some(Restore::Account(key)) => {
+                self.forget_account_with(key.clone(), true, legacy);
+                Some(key)
+            }
             Some(Restore::Legacy(origin)) => {
                 let store = self.store.clone();
                 self.store_job(async move {
                     store.lock().await.forget_legacy(&origin, true).await;
                 });
+                None
             }
-            None => {}
-        }
+            None => None,
+        };
         if !self.promote_next() {
             crate::theme::set_accent(None);
             self.tell(Ev::SignedOut);
+        }
+        // Off the switcher and the tray at once, not only once the server was told.
+        if let Some(key) = gone {
+            self.tell(Ev::AccountRemoved { key, message: None });
         }
     }
 

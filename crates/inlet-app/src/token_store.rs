@@ -142,32 +142,61 @@ pub fn delete_session(store: &dyn SecretStore, entry: &str) -> Result<()> {
     store.delete(entry)
 }
 
+/// What [`migrate_legacy`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Migration {
+    /// There was no old entry (already migrated).
+    Nothing,
+    /// Moved and listed; the old entry is gone.
+    Moved,
+    /// Moved and listed, but the old entry could not be deleted. It is a copy of the
+    /// listed account's entry now, and the next start deletes it.
+    MovedOldKept,
+    /// The account's own entry already held another token (a newer sign-in): that one
+    /// is kept and listed, and the old entry is dropped (not revoked).
+    KeptNewer,
+}
+
 /// Moves the entry an older Inlet kept for `origin` (entry name = origin) to the
 /// account's own entry `<origin>#<user_id>`, byte for byte.
 ///
-/// Order, so a token is never lost: write the new entry, read it back and compare,
-/// then call `listed` (which writes the account list; an error stops here), and only
-/// then delete the old entry. If any step before the delete fails, the old entry stays
-/// and the next start tries again; repeating the copy is harmless. Returns whether
-/// an old entry was moved; `false` when there was none (already migrated).
+/// Order, so a token is never lost or orphaned: write the new entry (unless it is
+/// there already), read it back and compare, then call `listed` (which writes the
+/// account list; an error stops here), and only then delete the old entry. If any step
+/// up to the list fails, the old entry stays and the next start, which looks for it
+/// whatever the list holds, tries again; repeating the copy is harmless. A failed
+/// delete after the list was written is not an error: the account is listed.
 pub fn migrate_legacy(
     store: &dyn SecretStore,
     origin: &str,
     user_id: &str,
     listed: impl FnOnce() -> Result<()>,
-) -> Result<bool> {
+) -> Result<Migration> {
     let Some(old) = store.get(origin)? else {
-        return Ok(false);
+        return Ok(Migration::Nothing);
     };
     let new = entry_name(origin, user_id);
-    store.set(&new, &old)?;
-    match store.get(&new)? {
-        Some(back) if *back == *old => {}
-        _ => anyhow::bail!("the moved keychain entry did not read back the same"),
-    }
+    let newer = match store.get(&new)? {
+        Some(existing) if *existing != *old => true,
+        Some(_) => false,
+        None => {
+            store.set(&new, &old)?;
+            match store.get(&new)? {
+                Some(back) if *back == *old => false,
+                _ => anyhow::bail!("the moved keychain entry did not read back the same"),
+            }
+        }
+    };
     listed()?;
-    store.delete(origin)?;
-    Ok(true)
+    if let Err(err) = store.delete(origin) {
+        log::warn!("the old keychain entry could not be deleted yet: {err:#}");
+        return Ok(Migration::MovedOldKept);
+    }
+    if newer {
+        log::warn!("an old keychain entry was dropped; the newer entry of the account is kept");
+        return Ok(Migration::KeptNewer);
+    }
+    Ok(Migration::Moved)
 }
 
 // ---------- the account list (no secrets) ----------
@@ -210,27 +239,55 @@ pub fn list_file() -> Option<PathBuf> {
     config_dir().map(|d| d.join("accounts.json"))
 }
 
-/// Reads the account list. A missing file is an empty list; an unreadable one too
-/// (with a warning), as it holds nothing that cannot be rebuilt by signing in.
-pub fn load_list(path: &Path) -> AccountList {
-    match std::fs::read_to_string(path) {
-        Ok(text) => serde_json::from_str(&text).unwrap_or_else(|err| {
-            log::warn!("accounts.json could not be read: {err}");
-            AccountList::default()
-        }),
-        Err(_) => AccountList::default(),
+/// Reads the account list. A missing file is an empty list. A file that is there but
+/// cannot be read or parsed is an error: it is copied to `accounts.json.bad`, and the
+/// caller must not write a new list over it (the accounts it names would be lost
+/// from view; the keychain cannot be listed on every system).
+pub fn load_list(path: &Path) -> Result<AccountList> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(AccountList::default()),
+        Err(err) => {
+            backup_bad_list(path);
+            return Err(err).context("read the account list");
+        }
+    };
+    serde_json::from_str(&text).map_err(|err| {
+        backup_bad_list(path);
+        anyhow::anyhow!("the account list is not valid: {err}")
+    })
+}
+
+fn backup_bad_list(path: &Path) {
+    let bad = path.with_extension("json.bad");
+    if let Err(err) = std::fs::copy(path, &bad) {
+        log::warn!("the unreadable account list could not be backed up: {err}");
     }
 }
 
-/// Writes the account list (to a temporary file first, then renamed over the old one).
+/// Writes the account list: to a temporary file, synced to disk, then renamed over the
+/// old one, so a crash or power cut leaves either the old list or the new one.
 pub fn save_list(path: &Path, list: &AccountList) -> Result<()> {
+    use std::io::Write;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).context("create the config folder")?;
     }
     let json = serde_json::to_string_pretty(list).context("encode the account list")?;
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, json).context("write the account list")?;
-    std::fs::rename(&tmp, path).context("replace the account list")
+    {
+        let mut file = std::fs::File::create(&tmp).context("write the account list")?;
+        file.write_all(json.as_bytes())
+            .context("write the account list")?;
+        file.sync_all().context("write the account list")?;
+    }
+    std::fs::rename(&tmp, path).context("replace the account list")?;
+    #[cfg(unix)]
+    if let Some(dir) = path.parent() {
+        if let Ok(dir) = std::fs::File::open(dir) {
+            let _ = dir.sync_all();
+        }
+    }
+    Ok(())
 }
 
 fn state_file() -> Option<PathBuf> {
@@ -275,17 +332,29 @@ pub fn client_info() -> inlet_protocol::ClientInfo {
     info
 }
 
-/// An in-memory [`SecretStore`] for tests. `refuse_writes` makes `set` fail.
+/// An in-memory [`SecretStore`] for tests. The `refuse_*` flags make the calls fail.
 #[cfg(test)]
 #[derive(Default)]
 pub struct MemoryStore {
     pub entries: std::sync::Mutex<std::collections::HashMap<String, String>>,
     pub refuse_writes: std::sync::atomic::AtomicBool,
+    pub refuse_reads: std::sync::atomic::AtomicBool,
+    pub refuse_deletes: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(test)]
+impl MemoryStore {
+    pub fn refuse(flag: &std::sync::atomic::AtomicBool, on: bool) {
+        flag.store(on, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 #[cfg(test)]
 impl SecretStore for MemoryStore {
     fn get(&self, name: &str) -> Result<Option<Zeroizing<String>>> {
+        if self.refuse_reads.load(std::sync::atomic::Ordering::SeqCst) {
+            anyhow::bail!("locked");
+        }
         Ok(self
             .entries
             .lock()
@@ -306,6 +375,12 @@ impl SecretStore for MemoryStore {
     }
 
     fn delete(&self, name: &str) -> Result<()> {
+        if self
+            .refuse_deletes
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("refused");
+        }
         self.entries.lock().unwrap().remove(name);
         Ok(())
     }
@@ -382,7 +457,10 @@ mod tests {
         assert!(migrate_legacy(&store, origin, "42", || anyhow::bail!("disk full")).is_err());
         assert!(store.get(origin).unwrap().is_some());
         // Next start: it goes through.
-        assert!(migrate_legacy(&store, origin, "42", || Ok(())).unwrap());
+        assert_eq!(
+            migrate_legacy(&store, origin, "42", || Ok(())).unwrap(),
+            Migration::Moved
+        );
         assert!(store.get(origin).unwrap().is_none());
         let moved = load_session(&store, &entry_name(origin, "42"))
             .unwrap()
@@ -406,9 +484,17 @@ mod tests {
         save_list(&path, &list).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(!text.contains("token"), "no secret in the list");
-        assert_eq!(load_list(&path), list);
+        assert_eq!(load_list(&path).unwrap(), list);
+        // A broken file is an error (never read as an empty list) and is backed up.
         std::fs::write(&path, "not json").unwrap();
-        assert_eq!(load_list(&path), AccountList::default());
+        assert!(load_list(&path).is_err());
+        assert_eq!(
+            std::fs::read_to_string(path.with_extension("json.bad")).unwrap(),
+            "not json"
+        );
+        // A missing file is an empty list.
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(load_list(&path).unwrap(), AccountList::default());
         let _ = std::fs::remove_dir_all(dir);
     }
 }

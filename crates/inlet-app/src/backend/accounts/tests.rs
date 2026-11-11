@@ -1,90 +1,19 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Tests of several accounts: the keychain entries and their migration, separate
 //! limiters, what a background account may send, sign-out of a pasted token, the
-//! start-up spacing.
+//! start-up spacing, commands for the wrong account, the composer state per account.
 
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
-use futures::{SinkExt, StreamExt};
-use inlet_protocol::gateway::codec::ZstdStream;
-use serde_json::{json, Value};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::time::timeout;
-use tokio_tungstenite::tungstenite::handshake::server::{Request as WsRequest, Response};
-use tokio_tungstenite::tungstenite::Message as WsMessage;
-use tokio_tungstenite::WebSocketStream;
-use wiremock::matchers::{header, method, path};
-use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+use serde_json::Value;
+use tokio::net::TcpListener;
+use wiremock::Request;
 
+use super::testkit::*;
 use super::*;
 use crate::backend::{Event, Ui};
 use crate::token_store::{self, MemoryStore, SecretStore};
-
-fn discovery(base: &str, gateway: &str) -> Value {
-    json!({
-        "api_code_version": 1,
-        "endpoints": {
-            "api": format!("{base}/api"), "api_client": format!("{base}/api"),
-            "api_public": format!("{base}/api"), "gateway": gateway,
-            "media": format!("{base}/media"), "webapp": base, "invite": format!("{base}/invite")
-        },
-        "captcha": {"provider": "altcha"},
-        "features": {"account_identity": "email", "voice_enabled": true},
-        "limits": {"version": 2, "rules": [{"id": "default", "overrides": {"max_message_length": 4000}}]},
-        "app_public": {"branding": {"product_name": "Mock Social"}},
-        "sso": {"enabled": false},
-        "domain_migration": {"enabled": false}
-    })
-}
-
-/// A mock instance with discovery, `me` for each `(token, user ID)`, an empty guild
-/// list and the logout route.
-async fn mock_instance(gateway: &str, users: &[(&str, &str)]) -> (MockServer, p::Instance) {
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/.well-known/fluxer"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("ETag", "\"v1\"")
-                .set_body_json(discovery(&server.uri(), gateway)),
-        )
-        .mount(&server)
-        .await;
-    for (token, id) in users {
-        Mock::given(method("GET"))
-            .and(path("/api/v1/users/@me"))
-            .and(header("authorization", *token))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "id": id, "username": format!("user{id}"), "global_name": format!("User {id}"),
-                "discriminator": "0001", "avatar": null, "flags": 0
-            })))
-            .mount(&server)
-            .await;
-    }
-    Mock::given(method("GET"))
-        .and(path("/api/v1/users/@me/guilds"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
-        .mount(&server)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/api/v1/auth/logout"))
-        .respond_with(ResponseTemplate::new(204))
-        .mount(&server)
-        .await;
-    let info = p::ClientInfo {
-        installation_id: "00000000-0000-4000-a000-000000000000".into(),
-        ..p::ClientInfo::default()
-    };
-    let instance = p::Instance::discover_with(&server.uri(), info)
-        .await
-        .expect("discovery");
-    (server, instance)
-}
-
-async fn requests(server: &MockServer) -> Vec<Request> {
-    server.received_requests().await.unwrap_or_default()
-}
 
 fn temp_list(name: &str) -> std::path::PathBuf {
     std::env::temp_dir()
@@ -148,7 +77,7 @@ async fn old_keyring_entry_is_migrated_once_and_deleted() {
     let session = p::Session::from_token_unpinned(instance, token.clone());
     assert!(
         accounts
-            .migrate(LEGACY_ORIGIN, info.clone(), session.clone())
+            .migrate(LEGACY_ORIGIN, info.clone(), session.clone(), true)
             .await
     );
     assert!(
@@ -164,7 +93,11 @@ async fn old_keyring_entry_is_migrated_once_and_deleted() {
     assert_eq!(accounts.active(), Some(&key));
 
     // Only once: nothing left to move, and the new entry stays.
-    assert!(!accounts.migrate(LEGACY_ORIGIN, info.clone(), session).await);
+    assert!(
+        !accounts
+            .migrate(LEGACY_ORIGIN, info.clone(), session, true)
+            .await
+    );
     assert_eq!(*store.get(&key.entry()).unwrap().unwrap(), raw);
 
     // The next start reads the list and the new entry; no old entry any more.
@@ -352,81 +285,6 @@ async fn startup_staggers_accounts_by_two_seconds() {
     );
 }
 
-/// One connection of the mock gateway.
-struct Conn {
-    ws: WebSocketStream<TcpStream>,
-    codec: Option<ZstdStream>,
-}
-
-impl Conn {
-    #[allow(clippy::result_large_err)]
-    async fn accept(listener: &TcpListener) -> Conn {
-        let (stream, _) = timeout(Duration::from_secs(10), listener.accept())
-            .await
-            .expect("the gateway is dialled")
-            .unwrap();
-        let uri = Arc::new(StdMutex::new(String::new()));
-        let seen = uri.clone();
-        let callback = move |req: &WsRequest, resp: Response| {
-            *seen.lock().unwrap() = req.uri().to_string();
-            Ok(resp)
-        };
-        let ws = tokio_tungstenite::accept_hdr_async(stream, callback)
-            .await
-            .unwrap();
-        let compress = uri.lock().unwrap().contains("compress=zstd-stream");
-        Conn {
-            ws,
-            codec: compress.then(|| ZstdStream::new().unwrap()),
-        }
-    }
-
-    async fn send(&mut self, v: Value) {
-        let text = v.to_string();
-        let msg = match &mut self.codec {
-            Some(c) => WsMessage::binary(c.compress(text.as_bytes()).unwrap()),
-            None => WsMessage::text(text),
-        };
-        self.ws.send(msg).await.unwrap();
-    }
-
-    /// The next payload from the client (heartbeats skipped), or `None` after `wait`.
-    async fn recv(&mut self, wait: Duration) -> Option<Value> {
-        loop {
-            let msg = timeout(wait, self.ws.next()).await.ok()??.ok()?;
-            let bytes = match msg {
-                WsMessage::Text(t) => t.as_str().as_bytes().to_vec(),
-                WsMessage::Binary(b) => self.codec.as_mut()?.decompress(&b).ok()?,
-                WsMessage::Close(_) => return None,
-                _ => continue,
-            };
-            let v: Value = serde_json::from_slice(&bytes).ok()?;
-            if v["op"] == 1 {
-                continue;
-            }
-            return Some(v);
-        }
-    }
-
-    /// Hello, the client's Identify (returned), then READY.
-    async fn identify(&mut self, user: &str) -> Value {
-        self.send(json!({"op": 10, "d": {"heartbeat_interval": 45000}}))
-            .await;
-        let identify = self.recv(Duration::from_secs(10)).await.expect("identify");
-        assert_eq!(identify["op"], 2);
-        self.send(json!({"op": 0, "s": 1, "t": "READY", "d": {
-            "session_id": "s1", "version": 1,
-            "user": {"id": user, "username": "bg", "discriminator": "0001", "avatar": null, "flags": 0},
-            "guilds": [{"id": "100", "properties": {"id": "100", "name": "Guild", "owner_id": "9", "features": []},
-                        "channels": [{"id": "200", "type": 0, "guild_id": "100", "name": "general"}],
-                        "roles": [], "members": [], "member_count": 3, "joined_at": "2026-01-01T00:00:00Z"}],
-            "private_channels": [], "read_states": [], "user_guild_settings": []
-        }}))
-        .await;
-        identify
-    }
-}
-
 fn ignores_typing(identify: &Value) -> bool {
     identify["d"]["ignored_events"]
         .as_array()
@@ -526,6 +384,13 @@ async fn background_account_sends_no_op14_and_no_rest() {
     // Made active, it starts again with typing events, and opening a guild sends the
     // Lazy Request (the check above could see one).
     switch_and_open(&mut b, &key);
+    // Its gateway starts again with the spacing of "Reconnect" (a timer): wait for it.
+    drive(
+        &mut b,
+        &mut irx,
+        |b| matches!(&b.active, Some(Active::Real(r)) if !r.ignores_typing),
+    )
+    .await;
     // The UI is told which account is active, then gets that account's own image client
     // (its media endpoint), tagged with it, so the previous account's is not kept.
     let mut signed_in = false;
@@ -643,4 +508,368 @@ async fn store_tasks_run_in_the_order_they_were_asked_for() {
     let last = b.store_tail.take().unwrap();
     last.await.unwrap();
     assert_eq!(*order.lock().unwrap(), vec!["store session", "sign out"]);
+}
+
+/// A backend over `store`, with its own internal channel; the UI side is `rx`.
+fn backend_with(
+    store: Arc<MemoryStore>,
+) -> (
+    Backend,
+    futures::channel::mpsc::UnboundedReceiver<Event>,
+    tokio::sync::mpsc::UnboundedReceiver<Internal>,
+) {
+    let (tx, rx) = futures::channel::mpsc::unbounded();
+    let ui = Ui::new(tx);
+    let accounts = Accounts::new(store, None, None);
+    let mut b = Backend::with_store(ui, accounts);
+    let (itx, irx) = tokio::sync::mpsc::unbounded_channel();
+    b.internal = itx;
+    (b, rx, irx)
+}
+
+/// Waits for the store tasks the backend started so far.
+async fn store_done(b: &mut Backend) {
+    if let Some(tail) = b.store_tail.take() {
+        let _ = tail.await;
+    }
+}
+
+/// Two accounts on one mock instance (users 11 and 12, tokens `tok-a` and `tok-b`),
+/// both running in the background. Their gateways never connect.
+async fn two_accounts() -> (
+    wiremock::MockServer,
+    Backend,
+    futures::channel::mpsc::UnboundedReceiver<Event>,
+    tokio::sync::mpsc::UnboundedReceiver<Internal>,
+    AccountKey,
+    AccountKey,
+) {
+    let (server, instance) = mock_instance(
+        "ws://127.0.0.1:1/gateway",
+        &[("tok-a", "11"), ("tok-b", "12")],
+    )
+    .await;
+    let (mut b, rx, mut irx) = backend();
+    let ka = AccountKey::new(instance.origin(), "11").unwrap();
+    let kb = AccountKey::new(instance.origin(), "12").unwrap();
+    for (k, token) in [(&ka, "tok-a"), (&kb, "tok-b")] {
+        b.start_background(
+            Restored {
+                key: k.clone(),
+                token: p::Token::new(token),
+                pins: instance.session_pins(),
+                pasted: false,
+            },
+            Duration::ZERO,
+            0,
+        );
+    }
+    drive(&mut b, &mut irx, |b| b.background.len() == 2).await;
+    (server, b, rx, irx, ka, kb)
+}
+
+async fn wait_for_request(server: &wiremock::MockServer, path: &str) -> Request {
+    for _ in 0..100 {
+        if let Some(r) = requests(server)
+            .await
+            .into_iter()
+            .find(|r| r.url.path() == path)
+        {
+            return r;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("no request to {path}");
+}
+
+#[tokio::test]
+async fn a_command_for_another_account_is_dropped() {
+    let (server, mut b, _rx, _irx, ka, kb) = two_accounts().await;
+    handle(&mut b, Cmd::SwitchAccount(ka.clone()));
+    let open = |g: &str| {
+        crate::backend::Command::Messages(crate::backend::messages::Cmd::OpenGuild {
+            guild_id: Some(g.to_string()),
+        })
+    };
+    // Sent for B before a switch to B reached the backend: never run with A's session.
+    b.command(Some(kb.clone()), open("700"));
+    // Without an account: not run either while one is active.
+    b.command(None, open("701"));
+    // For A, while A is active: runs with A's token.
+    b.command(Some(ka.clone()), open("600"));
+    let r = wait_for_request(&server, "/api/v1/guilds/600/channels").await;
+    assert_eq!(token_of(&r), "tok-a");
+    let paths: Vec<String> = requests(&server)
+        .await
+        .iter()
+        .map(|r| r.url.path().to_string())
+        .collect();
+    assert!(!paths
+        .iter()
+        .any(|p| p.contains("/700/") || p.contains("/701/")));
+    let Some(Active::Real(active)) = &b.active else {
+        panic!("A is active")
+    };
+    assert_eq!(active.active_guild.as_deref(), Some("600"));
+    // The accounts domain needs no account (switching, signing in).
+    b.command(
+        None,
+        crate::backend::Command::Accounts(Cmd::SwitchAccount(kb.clone())),
+    );
+    assert!(matches!(&b.active, Some(Active::Real(r)) if r.key == kb));
+}
+
+#[tokio::test]
+async fn switching_back_keeps_the_composer_state_of_the_account() {
+    let (_server, mut b, mut rx, _irx, ka, kb) = two_accounts().await;
+    handle(&mut b, Cmd::SwitchAccount(ka.clone()));
+    let outgoing = crate::backend::composer::Outgoing {
+        channel_id: "200".into(),
+        nonce: "nonce-a".into(),
+        content: "hello <@5>".into(),
+        mentions: Default::default(),
+        reply_to: Some("199".into()),
+        silent: true,
+    };
+    {
+        let Some(Active::Real(a)) = &b.active else {
+            panic!("A is active")
+        };
+        a.composer.remember_send(a.gen, &outgoing);
+        a.composer.mark_failed(a.gen, "nonce-a", true);
+        a.composer.set_session(a.gen, "11".into(), 4000);
+    }
+    crate::backend::composer::handle(
+        &mut b,
+        crate::backend::composer::Cmd::SearchMembers {
+            guild_id: "600".into(),
+            query: "ad".into(),
+            nonce: "search-a".into(),
+        },
+    );
+    // A → B → A.
+    handle(&mut b, Cmd::SwitchAccount(kb.clone()));
+    handle(&mut b, Cmd::SwitchAccount(ka.clone()));
+    let Some(Active::Real(a)) = &b.active else {
+        panic!("A is active again")
+    };
+    let plan = a
+        .composer
+        .retry_of(a.gen, "nonce-a", std::time::Instant::now())
+        .expect("the retry still finds the message, with its reply and mentions");
+    assert_eq!(plan.message.reply_to.as_deref(), Some("199"));
+    assert!(plan.message.silent);
+    assert_eq!(a.composer.session(a.gen), Some(("11".into(), 4000)));
+    // The member search made before the switches is still answered.
+    let chunk: p::models::GuildMembersChunk = serde_json::from_value(serde_json::json!({
+        "guild_id": "600", "nonce": "search-a", "chunk_index": 0, "chunk_count": 1,
+        "members": [{"user": {"id": "5", "username": "ada"}, "roles": []}]
+    }))
+    .unwrap();
+    crate::backend::composer::members_chunk(&a.composer, &a.events, &chunk);
+    let mut answered = false;
+    while let Ok(event) = rx.try_recv() {
+        if let Event::Tagged { account, event } = event {
+            if let Event::Composer(crate::backend::composer::Ev::Members { guild_id, members }) =
+                *event
+            {
+                assert_eq!(account, ka);
+                assert_eq!(guild_id, "600");
+                answered = !members.is_empty();
+            }
+        }
+    }
+    assert!(answered);
+    // B has a state of its own: nothing of A's there.
+    let b_engine = b.background.iter().find(|r| r.key == kb).unwrap();
+    assert!(b_engine
+        .composer
+        .retry_of(b_engine.gen, "nonce-a", std::time::Instant::now())
+        .is_none());
+}
+
+#[tokio::test]
+async fn an_unreadable_keychain_at_sign_out_never_revokes() {
+    let (server, instance) =
+        mock_instance("ws://127.0.0.1:1/gateway", &[("tok-locked", "21")]).await;
+    let store = Arc::new(MemoryStore::default());
+    let mut accounts = Accounts::new(store.clone(), None, None);
+    // A token Inlet was given (not pasted), with its live session.
+    let session = p::Session::from_token_unpinned(instance, p::Token::new("tok-locked"));
+    let k = accounts.add(signed_in(session, "21"), false).await.unwrap();
+    // The keychain is locked at sign-out: it cannot say whether the token was pasted.
+    MemoryStore::refuse(&store.refuse_reads, true);
+    accounts.remove(&k, true).await;
+    let logouts = requests(&server)
+        .await
+        .iter()
+        .filter(|r| r.url.path() == "/api/v1/auth/logout")
+        .count();
+    assert_eq!(logouts, 0, "never revoked without knowing");
+    assert!(accounts.list().is_empty(), "forgotten here");
+    MemoryStore::refuse(&store.refuse_reads, false);
+    assert!(store.get(&k.entry()).unwrap().is_none());
+
+    // An entry that is not there (not moved yet) and nothing known about it: not
+    // revoked either.
+    let mut accounts = Accounts::new(store.clone(), None, None);
+    let unknown = AccountKey::new(LEGACY_ORIGIN, "22").unwrap();
+    accounts.remove(&unknown, true).await;
+    assert_eq!(
+        requests(&server)
+            .await
+            .iter()
+            .filter(|r| r.url.path() == "/api/v1/auth/logout")
+            .count(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn a_failed_delete_keeps_the_account_listed_and_the_next_start_cleans_up() {
+    let store = Arc::new(MemoryStore::default());
+    let token = p::Token::new("legacy-del");
+    token_store::save_session(&*store, LEGACY_ORIGIN, &token, &pins(), false).unwrap();
+    let list = temp_list("delete-fails");
+    let mut accounts =
+        Accounts::new(store.clone(), Some(list.clone()), None).with_last_instance(legacy_origin);
+    accounts.restore_all().await;
+    let (_, legacy) = accounts.take_restored();
+    assert!(legacy.is_some());
+    let key = AccountKey::new(LEGACY_ORIGIN, "42").unwrap();
+    let info = AccountInfo {
+        key: key.clone(),
+        name: "Ada".into(),
+        handle: "ada".into(),
+    };
+    let session = legacy_session(&token);
+    // The old entry cannot be deleted: the account is listed all the same.
+    MemoryStore::refuse(&store.refuse_deletes, true);
+    assert!(
+        accounts
+            .migrate(LEGACY_ORIGIN, info.clone(), session, false)
+            .await
+    );
+    assert_eq!(accounts.list(), vec![info.clone()]);
+    assert!(
+        store.get(LEGACY_ORIGIN).unwrap().is_some(),
+        "the copy is still there"
+    );
+    accounts.save().await;
+    MemoryStore::refuse(&store.refuse_deletes, false);
+    // Next start: the account comes from the list, and the copy is deleted.
+    let mut next =
+        Accounts::new(store.clone(), Some(list.clone()), None).with_last_instance(legacy_origin);
+    next.restore_all().await;
+    let (restored, legacy) = next.take_restored();
+    assert!(legacy.is_none());
+    assert_eq!(restored.len(), 1);
+    assert_eq!(restored[0].key, key);
+    assert!(store.get(LEGACY_ORIGIN).unwrap().is_none());
+    let _ = std::fs::remove_dir_all(list.parent().unwrap());
+}
+
+#[tokio::test]
+async fn an_entry_not_moved_is_found_on_every_start_even_with_other_accounts_listed() {
+    let store = Arc::new(MemoryStore::default());
+    let token = p::Token::new("legacy-keep");
+    token_store::save_session(&*store, LEGACY_ORIGIN, &token, &pins(), false).unwrap();
+    let list = temp_list("not-moved");
+    let mut accounts =
+        Accounts::new(store.clone(), Some(list.clone()), None).with_last_instance(legacy_origin);
+    accounts.restore_all().await;
+    let _ = accounts.take_restored();
+    let key = AccountKey::new(LEGACY_ORIGIN, "42").unwrap();
+    let info = AccountInfo {
+        key: key.clone(),
+        name: "Ada".into(),
+        handle: "ada".into(),
+    };
+    // The copy fails (the keychain refuses writes): nothing moves, nothing is lost.
+    MemoryStore::refuse(&store.refuse_writes, true);
+    assert!(
+        !accounts
+            .migrate(LEGACY_ORIGIN, info.clone(), legacy_session(&token), false)
+            .await
+    );
+    MemoryStore::refuse(&store.refuse_writes, false);
+    // Another account is added meanwhile: the list is no longer empty.
+    let (_server, instance) =
+        mock_instance("ws://127.0.0.1:1/gateway", &[("tok-other", "43")]).await;
+    let other = p::Session::from_token_unpinned(instance, p::Token::new("tok-other"));
+    let kb = accounts.add(signed_in(other, "43"), true).await.unwrap();
+    // Next start: the old entry is still found, and moves then.
+    let mut next =
+        Accounts::new(store.clone(), Some(list.clone()), None).with_last_instance(legacy_origin);
+    next.restore_all().await;
+    let (restored, legacy) = next.take_restored();
+    assert_eq!(
+        restored.iter().map(|r| &r.key).collect::<Vec<_>>(),
+        vec![&kb]
+    );
+    let legacy = legacy.expect("the entry not moved is picked up again");
+    assert_eq!(legacy.token.expose_secret(), "legacy-keep");
+    assert!(
+        next.migrate(LEGACY_ORIGIN, info, legacy_session(&token), false)
+            .await
+    );
+    assert_eq!(next.list().len(), 2);
+    assert!(store.get(LEGACY_ORIGIN).unwrap().is_none());
+    assert!(store.get(&key.entry()).unwrap().is_some());
+    let _ = std::fs::remove_dir_all(list.parent().unwrap());
+}
+
+fn legacy_session(token: &p::Token) -> p::Session {
+    let doc: p::Discovery =
+        serde_json::from_value(discovery(LEGACY_ORIGIN, "wss://fluxer.example/gateway")).unwrap();
+    let instance =
+        p::Instance::from_cached(LEGACY_ORIGIN, doc, None, p::ClientInfo::default()).unwrap();
+    p::Session::from_token_unpinned(instance, token.clone())
+}
+
+#[tokio::test]
+async fn signing_out_an_account_not_moved_yet_removes_the_old_entry() {
+    let (server, instance) = mock_instance("ws://127.0.0.1:1/gateway", &[("tok-old", "31")]).await;
+    let origin = instance.origin().to_string();
+    let store = Arc::new(MemoryStore::default());
+    let token = p::Token::new("tok-old");
+    token_store::save_session(&*store, &origin, &token, &instance.session_pins(), false).unwrap();
+    let (mut b, mut rx, _irx) = backend_with(store.clone());
+    let credential = Credential::Stored {
+        token: token.clone(),
+        pins: instance.session_pins(),
+        pasted: false,
+    };
+    let connected = session::connect(instance.clone(), credential.clone())
+        .await
+        .expect("connects");
+    // The move fails (the keychain refuses writes): the account runs from the old entry.
+    MemoryStore::refuse(&store.refuse_writes, true);
+    b.restored_connected(connected, credential, Some(Restore::Legacy(origin.clone())));
+    store_done(&mut b).await;
+    MemoryStore::refuse(&store.refuse_writes, false);
+    assert!(store.get(&origin).unwrap().is_some());
+    let key = AccountKey::new(&origin, "31").unwrap();
+    assert!(store.get(&key.entry()).unwrap().is_none());
+
+    b.sign_out();
+    store_done(&mut b).await;
+    assert!(
+        store.get(&origin).unwrap().is_none(),
+        "the old entry goes too"
+    );
+    let logouts = requests(&server)
+        .await
+        .iter()
+        .filter(|r| r.url.path() == "/api/v1/auth/logout")
+        .count();
+    assert_eq!(logouts, 1, "an issued token is ended with the live session");
+    // The account leaves the switcher and the tray at once.
+    let mut removed = false;
+    while let Ok(event) = rx.try_recv() {
+        if let Event::Accounts(Ev::AccountRemoved { key: k, .. }) = event {
+            removed |= k == key;
+        }
+    }
+    assert!(removed);
 }

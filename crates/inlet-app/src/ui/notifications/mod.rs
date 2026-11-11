@@ -170,7 +170,9 @@ impl Inlet {
         let action = escape_action(
             self.notifications.settings.is_some(),
             self.chat_is_visible(),
-            self.overlays.pending_link.is_some() || self.overlays.link_prompt.is_some(),
+            self.overlays.pending_link.is_some()
+                || self.overlays.link_prompt.is_some()
+                || self.switcher_layer_open(),
             shift,
         );
         match action {

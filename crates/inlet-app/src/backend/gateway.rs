@@ -44,6 +44,7 @@ impl Backend {
         names: &SharedNames,
         events: &Ui,
         foreground: &Arc<AtomicBool>,
+        composer: &composer::State,
         background: bool,
     ) -> (p::GatewayHandle, AbortHandle) {
         let (gateway, rx) = session.connect_gateway(gateway_options(background));
@@ -51,7 +52,7 @@ impl Backend {
         let internal = self.internal.clone();
         let (guilds, cache, names) = (guilds.clone(), cache.clone(), names.clone());
         let foreground = foreground.clone();
-        let composer = self.composer.clone();
+        let composer = composer.clone();
         let forward = self.spawn_guarded("gateway", Some(gen), async move {
             let on_connected = {
                 let internal = internal.clone();
@@ -131,6 +132,7 @@ impl Backend {
             &r.names,
             &r.events,
             &r.foreground,
+            &r.composer,
             background,
         );
         // A new gateway handle does not know the guild on screen yet.

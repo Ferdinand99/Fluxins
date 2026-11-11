@@ -98,7 +98,13 @@ pub struct Switcher {
     pub adding: bool,
     /// The channel to open once the selected guild's channels arrive.
     wanted_channel: Option<String>,
+    /// Moves the clock of the passive states once a minute (timed mutes end).
+    ticker: Option<gpui::Task<()>>,
 }
+
+/// How often the passive states' clocks move: often enough for a timed mute to end
+/// within a minute in the switcher and the tray, cheap for ten accounts.
+const BACKGROUND_TICK: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl Switcher {
     pub fn is_active(&self, k: &AccountKey) -> bool {
@@ -137,6 +143,7 @@ impl Switcher {
         self.background.clear();
         self.summaries.clear();
         self.wanted_channel = None;
+        self.ticker = None;
     }
 }
 
@@ -165,10 +172,12 @@ impl Inlet {
         };
         let changes = match (&*dispatch, self.switcher.background.get(&account)) {
             (inlet_protocol::Dispatch::Ready(ready), None) => {
-                let state = crate::ui::chat::messages::account_state_from(ready);
+                let mut state = crate::ui::chat::messages::account_state_from(ready);
+                state.set_passive(true);
                 self.switcher
                     .background
                     .insert(account.clone(), cx.new(|_| state));
+                self.start_background_ticker(cx);
                 let mut c = Changes::default();
                 c.reset = true;
                 c
@@ -188,6 +197,39 @@ impl Inlet {
             if let Some(state) = self.switcher.background.get(&account) {
                 let s = summary(state.read(cx));
                 self.switcher.summaries.insert(account, s);
+            }
+        }
+    }
+
+    /// Starts the once-a-minute clock of the passive states, once.
+    fn start_background_ticker(&mut self, cx: &mut Context<Self>) {
+        if self.switcher.ticker.is_some() {
+            return;
+        }
+        self.switcher.ticker = Some(cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(BACKGROUND_TICK).await;
+            if this
+                .update(cx, |this, cx| this.tick_background(cx))
+                .is_err()
+            {
+                break;
+            }
+        }));
+    }
+
+    /// Moves every passive state's clock; marks whose mutes or settings changed are
+    /// worked out again.
+    pub(crate) fn tick_background(&mut self, cx: &mut Context<Self>) {
+        let now = chrono::Utc::now().timestamp_millis();
+        let keys: Vec<AccountKey> = self.switcher.background.keys().cloned().collect();
+        for key in keys {
+            let Some(state) = self.switcher.background.get(&key).cloned() else {
+                continue;
+            };
+            let changes = state.update(cx, |s, _| s.tick(now));
+            if changes.settings || changes.read_state {
+                let s = summary(state.read(cx));
+                self.switcher.summaries.insert(key, s);
             }
         }
     }
@@ -219,9 +261,11 @@ impl Inlet {
                 },
             );
             if let Some(state) = self.account.take() {
+                // Passive: no message windows, no members or presences, few users.
                 state.update(cx, |s, _| {
-                    s.drop_message_windows();
+                    s.set_passive(true);
                 });
+                self.start_background_ticker(cx);
                 let s = summary(state.read(cx));
                 self.switcher.summaries.insert(old.clone(), s);
                 self.switcher.background.insert(old, state);
@@ -263,8 +307,14 @@ impl Inlet {
             self.instance = a.key.origin.to_string();
         }
         self.switcher.active = Some(key.clone());
+        // Every command from here on is for the new account; the backend drops one that
+        // reaches it while another account is active.
+        self.backend.set_account(Some(key.clone()));
         self.switcher.summaries.remove(&key);
         if let Some(state) = self.switcher.background.remove(&key).or(first) {
+            state.update(cx, |s, _| {
+                s.set_passive(false);
+            });
             self.account = Some(state);
             self.start_ticker(cx);
             let mut changes = Changes::default();
@@ -292,8 +342,10 @@ impl Inlet {
     ) {
         self.switcher.open = false;
         if !self.switcher.is_active(&key) {
-            self.switch_ui_to(key.clone(), window, cx);
-            self.backend.send(Cmd::SwitchAccount(key));
+            // The backend switches first, so the commands that open the new account's
+            // place reach it with that account active.
+            self.backend.send(Cmd::SwitchAccount(key.clone()));
+            self.switch_ui_to(key, window, cx);
         }
         cx.notify();
     }
@@ -329,8 +381,8 @@ impl Inlet {
         if self.switcher.active.is_some() {
             self.screen = Screen::Main;
         } else if let Some(first) = self.switcher.accounts.first().map(|a| a.key.clone()) {
-            self.switch_ui_to(first.clone(), window, cx);
-            self.backend.send(Cmd::SwitchAccount(first));
+            self.backend.send(Cmd::SwitchAccount(first.clone()));
+            self.switch_ui_to(first, window, cx);
         }
         cx.notify();
     }
@@ -397,6 +449,11 @@ impl Inlet {
             .unwrap_or_else(|| key.origin.host().to_string())
     }
 
+    /// Whether the account switcher is up (a layer: it has the keyboard and Escape).
+    pub(crate) fn switcher_layer_open(&self) -> bool {
+        self.switcher.open && self.screen == Screen::Main
+    }
+
     pub(crate) fn render_account_switcher(&self, cx: &mut Context<Self>) -> AnyElement {
         let rows: Vec<AnyElement> = self
             .switcher
@@ -443,7 +500,7 @@ impl Inlet {
             } else {
                 t!("accounts-add")
             });
-        modal(
+        let element = modal(
             "account-switcher",
             440.,
             [
@@ -474,8 +531,14 @@ impl Inlet {
                     )
                     .into_any_element(),
             ],
-        )
-        .into_any_element()
+        );
+        // The topmost layer (unless a link prompt is over it): it has the keyboard, so
+        // typing never reaches the composer behind it, and Escape closes it.
+        if self.overlays.link_prompt.is_none() {
+            self.layer_keys(element, cx).into_any_element()
+        } else {
+            element.into_any_element()
+        }
     }
 
     fn account_row(&self, ix: usize, a: &AccountInfo, cx: &mut Context<Self>) -> AnyElement {
@@ -619,31 +682,214 @@ mod tests {
         AccountKey::new(origin, user).unwrap()
     }
 
+    /// A window for the test: `Inlet` lives in it as an entity, not drawn.
+    struct Probe;
+
+    impl gpui::Render for Probe {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
+
+    /// The real switch path, A → B → A → B, against a mock instance (REST) and a mock
+    /// gateway: the switcher's own `switch_account`, the real backend thread with two
+    /// stored accounts (A active, B started in the background). Every request carries
+    /// the token of the account whose server or channel it is for, and each switch
+    /// opens the channel that account had open, the second and later switches too.
+    #[gpui::test]
+    fn switching_account_keeps_the_last_channel(cx: &mut gpui::TestAppContext) {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        use crate::backend::accounts::testkit::{
+            by_token, mock_instance, ready_json, requests, serve_gateway,
+        };
+        use crate::backend::accounts::Accounts;
+        use crate::token_store::{self, AccountList, AccountRecord, MemoryStore};
+
+        cx.executor().allow_parking();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let listener = rt
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (server, instance) = rt.block_on(mock_instance(
+            &format!("ws://127.0.0.1:{port}/gateway"),
+            &[("tok-a", "11"), ("tok-b", "12")],
+        ));
+        {
+            let _guard = rt.enter();
+            serve_gateway(
+                listener,
+                HashMap::from([
+                    ("tok-a".to_string(), ready_json("11", "600", "601")),
+                    ("tok-b".to_string(), ready_json("12", "700", "701")),
+                ]),
+            );
+        }
+        let origin = instance.origin().to_string();
+        let ka = key(&origin, "11");
+        let kb = key(&origin, "12");
+        // Both stored, A the active one.
+        let store = Arc::new(MemoryStore::default());
+        for (k, token) in [(&ka, "tok-a"), (&kb, "tok-b")] {
+            token_store::save_session(
+                &*store,
+                &k.entry(),
+                &inlet_protocol::Token::new(token),
+                &instance.session_pins(),
+                false,
+            )
+            .unwrap();
+        }
+        let list = std::env::temp_dir()
+            .join(format!("inlet-switch-{}", std::process::id()))
+            .join("accounts.json");
+        let record = |k: &AccountKey, name: &str| AccountRecord {
+            origin: origin.clone(),
+            user_id: k.user_id.to_string(),
+            name: name.into(),
+            handle: name.into(),
+        };
+        token_store::save_list(
+            &list,
+            &AccountList {
+                accounts: vec![record(&ka, "a"), record(&kb, "b")],
+                active: Some(ka.entry()),
+            },
+        )
+        .unwrap();
+
+        let window = cx.add_window(|_, _| Probe);
+        let (store2, list2) = (store.clone(), list.clone());
+        let inlet = window
+            .update(cx, |_, window, cx| {
+                cx.new(|cx| {
+                    Inlet::new_with(window, cx, move |tx| {
+                        crate::backend::start_with(tx, move |ui| {
+                            Accounts::new(store2, Some(list2), Some(ui))
+                        })
+                    })
+                })
+            })
+            .unwrap();
+
+        let wait = |cx: &mut gpui::TestAppContext,
+                    what: &str,
+                    done: &dyn Fn(&Inlet, &[wiremock::Request]) -> bool| {
+            for _ in 0..600 {
+                cx.run_until_parked();
+                let reqs = rt.block_on(requests(&server));
+                if inlet.read_with(cx, |i, _| done(i, &reqs)) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            panic!("timed out waiting for: {what}");
+        };
+        let loads = |reqs: &[wiremock::Request], channel: &str| {
+            let path = format!("/api/v1/channels/{channel}/messages");
+            reqs.iter().filter(|r| r.url.path() == path).count()
+        };
+        let act = |cx: &mut gpui::TestAppContext,
+                   f: &dyn Fn(&mut Inlet, &mut Window, &mut Context<Inlet>)| {
+            window
+                .update(cx, |_, window, cx| {
+                    inlet.update(cx, |this, cx| f(this, window, cx))
+                })
+                .unwrap();
+        };
+
+        // A is up, B runs in the background.
+        wait(cx, "A signed in, B in the background", &|i, _| {
+            i.screen == Screen::Main
+                && i.switcher.is_active(&ka)
+                && i.account.is_some()
+                && i.switcher.background.contains_key(&kb)
+        });
+        // A opens guild 600; its first channel 601 loads.
+        act(cx, &|this, _, cx| this.select_guild(Some("600".into()), cx));
+        wait(cx, "A opens #601", &|i, r| {
+            i.selected_channel.as_deref() == Some("601") && loads(r, "601") >= 1
+        });
+
+        // To B, which opens guild 700 and its channel 701.
+        let k = kb.clone();
+        act(cx, &move |this, window, cx| {
+            this.switch_account(k.clone(), window, cx)
+        });
+        wait(cx, "B is shown", &|i, _| i.account.is_some());
+        act(cx, &|this, _, cx| this.select_guild(Some("700".into()), cx));
+        wait(cx, "B opens #701", &|i, r| {
+            i.selected_channel.as_deref() == Some("701") && loads(r, "701") >= 1
+        });
+
+        // Back to A: #601 again, without a click.
+        let k = ka.clone();
+        act(cx, &move |this, window, cx| {
+            this.switch_account(k.clone(), window, cx)
+        });
+        wait(cx, "A is back in #601", &|i, r| {
+            i.switcher.is_active(&ka)
+                && i.selected_guild.as_deref() == Some("600")
+                && i.selected_channel.as_deref() == Some("601")
+                && loads(r, "601") >= 2
+        });
+        // And B again (the second switch to it): #701.
+        let k = kb.clone();
+        act(cx, &move |this, window, cx| {
+            this.switch_account(k.clone(), window, cx)
+        });
+        wait(cx, "B is back in #701", &|i, r| {
+            i.switcher.is_active(&kb)
+                && i.selected_guild.as_deref() == Some("700")
+                && i.selected_channel.as_deref() == Some("701")
+                && loads(r, "701") >= 2
+        });
+
+        // Every request went out with the token of the account it was for.
+        let reqs = rt.block_on(requests(&server));
+        let seen = by_token(&reqs);
+        let a_paths = seen.get("tok-a").cloned().unwrap_or_default();
+        let b_paths = seen.get("tok-b").cloned().unwrap_or_default();
+        assert!(
+            !a_paths
+                .iter()
+                .any(|p| p.contains("/700") || p.contains("/701")),
+            "A's token on B's server: {a_paths:?}"
+        );
+        assert!(
+            !b_paths
+                .iter()
+                .any(|p| p.contains("/600") || p.contains("/601")),
+            "B's token on A's server: {b_paths:?}"
+        );
+        assert!(a_paths
+            .iter()
+            .any(|p| p.ends_with("/channels/601/messages")));
+        assert!(b_paths
+            .iter()
+            .any(|p| p.ends_with("/channels/701/messages")));
+        let _ = std::fs::remove_dir_all(list.parent().unwrap());
+        drop(rt);
+    }
+
     #[test]
-    fn switching_account_keeps_the_last_channel() {
+    fn places_are_kept_per_account() {
         let a = key("https://one.example", "1");
         let b = key("https://one.example", "2");
         let c = key("https://two.example", "1");
         let mut places = Places::default();
-        // A has #general open in guild 10; switch to B, which was never shown.
         let at_a = Place {
             guild: Some("10".into()),
             channel: Some("100".into()),
         };
         places.leave(a.clone(), at_a.clone());
         assert_eq!(places.arrive(&b), None);
-        // B opens a DM, then C (another instance), then back to A, then to B.
-        let at_b = Place {
-            guild: None,
-            channel: Some("200".into()),
-        };
-        places.leave(b.clone(), at_b.clone());
         places.leave(c.clone(), Place::default());
-        assert_eq!(places.arrive(&a), Some(at_a.clone()));
-        assert_eq!(places.arrive(&b), Some(at_b));
+        assert_eq!(places.arrive(&a), Some(at_a));
         // The same user ID on another instance is another account.
         assert_eq!(places.arrive(&c), Some(Place::default()));
-        // A signed-out account starts over.
         places.forget(&a);
         assert_eq!(places.arrive(&a), None);
     }

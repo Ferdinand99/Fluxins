@@ -46,11 +46,12 @@ impl Inlet {
         if self.notifications.settings.is_some() {
             out.push(self.render_notification_settings(cx));
         }
-        if let Some(prompt) = self.overlays.link_prompt.clone() {
-            out.push(self.render_link_prompt(prompt, cx));
-        }
+        // The account switcher is a layer under the link prompt.
         if self.switcher.open && self.screen == crate::app::Screen::Main {
             out.push(self.render_account_switcher(cx));
+        }
+        if let Some(prompt) = self.overlays.link_prompt.clone() {
+            out.push(self.render_link_prompt(prompt, cx));
         }
         out
     }

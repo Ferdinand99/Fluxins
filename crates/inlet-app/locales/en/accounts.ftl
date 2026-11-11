@@ -96,3 +96,6 @@ sign-in-back = Back
 sign-in-too-many-accounts = At most { $max } accounts can be signed in at once. Sign one out first.
 error-account-id = The instance sent an account ID that Inlet cannot use.
 error-account-mismatch = A stored session belongs to another account than Inlet expected, so it was not used. Sign in again.
+notice-keychain-unreadable = The system keychain could not be read, so Inlet only forgot the account here and did not end its session on the server. End it under Devices in Fluxer's settings.
+notice-account-list-unreadable = The list of accounts could not be read. It was kept as accounts.json.bad and is not written over; sign in again to use Inlet now.
+notice-old-session-dropped = A session saved by an older Inlet could not be used safely and was removed. Sign in again, and end the old session under Devices in Fluxer's settings.
