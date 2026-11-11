@@ -22,18 +22,36 @@ The scripts that take the screenshots are `scripts/windows-screenshot.ps1`,
 `scripts/macos-screenshot.sh` and `scripts/xvfb-screens.sh`; `inlet-visual` (a demo
 build tool in `crates/inlet-app/src/bin/visual.rs`) compares them.
 
-## When the look changes on purpose
+## Adding or updating a scene
 
-1. Push the change and let CI fail on the screenshots.
-2. Check the artifacts `visual-<os>` of that run: every difference must be wanted.
-3. Run `scripts/update-visual-baselines.sh <run id>` (GitHub CLI) on the branch the run
-   was made for: it shows the run's repository, branch and commit, refuses runs from
-   forks, other branches or other commits (unless `--other-run`), and copies the
-   screenshots to `baseline/<os>/`. Look at them and commit them with the change.
+There are two kinds of screenshots:
+
+- **Numbered demo runs** (`Run-Demo` lines in `scripts/windows-screenshot.ps1`, `scene`
+  lines in `scripts/xvfb-screens.sh`): for checking by eye. They are not compared, only
+  checked for crashes, panics and borrow errors. For a new screen of your feature, add a
+  demo scene in `crates/inlet-app/src/demo/scenes.rs` and a line at the end of each
+  list, numbered after the last one.
+- **Scene files** (`scenes/*.toml`): compared with the baselines on every pull request.
+  Add one only for a state that should never change by accident.
+
+When your change alters how a gated scene looks (for example a new header button),
+the screenshot jobs go red; that is expected:
+
+1. Push, and let the `Windows/macOS/Linux screenshots (demo)` jobs run.
+2. Open the run's artifacts `visual-<os>`: `report.md`, and `diff/` where the differing
+   pixels are red. Every red area must be the change you meant, and nothing else.
+3. On the same branch and commit as that run, run
+   `scripts/update-visual-baselines.sh <run id>` (GitHub CLI). It shows the run's
+   repository, branch and commit, refuses runs from forks, other branches or other
+   commits (unless `--other-run`), and copies the screenshots to `baseline/<os>/`.
+4. Look at the new pictures and commit them with your change. The next run must be
+   green on all three platforms.
+
+To add a scene file: copy an existing one to `scenes/NN-<name>.toml` (numbered after
+the last), set `name` and what to open (`scene`, `guild`, `channel`, …), keep
+`window = [1280, 860]`, push, and take its baselines from that run as above. A scene
+without a baseline fails, and so does a baseline without a scene file (remove both
+together when you rename or drop one). Use `ignore` only for an area that really changes
+from run to run, never to hide a difference.
 
 Baselines are never taken from a local machine and never updated automatically.
-
-## Adding a scene
-
-Add `scenes/NN-<name>.toml` (numbers after the existing ones), push, and take the
-baselines from that run as above. A scene without a baseline fails the check.

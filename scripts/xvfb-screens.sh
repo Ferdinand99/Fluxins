@@ -120,15 +120,33 @@ mkdir -p "$out/visual"
 Xvfb :98 -screen 0 2600x1800x24 -dpi 96 >/dev/null 2>&1 &
 xvfb_scenes=$!
 sleep 2
-echo "scene pointer: $(DISPLAY=:98 xdotool getmouselocation 2>&1)" >&2
+# Where the pointer is (it cannot be moved); every scene window must stay clear of it.
+pointer=$(DISPLAY=:98 xdotool getmouselocation --shell)
+px=$(printf '%s\n' "$pointer" | sed -n 's/^X=//p')
+py=$(printf '%s\n' "$pointer" | sed -n 's/^Y=//p')
+echo "scene pointer: $px,$py" >&2
 for file in "$scenes_dir"/*.toml; do
   name=$(sed -n 's/^name *= *"\([^"]*\)".*/\1/p' "$file" | head -1)
+  size=$(sed -n 's/^window *= *\[ *\([0-9]*\) *, *\([0-9]*\) *\].*/\1 \2/p' "$file" | head -1)
+  read -r sw sh <<<"$size"
+  if [ -z "$sw" ] || [ -z "$sh" ] || [ "$sw" -ge "$px" ] || [ "$sh" -ge "$py" ]; then
+    echo "scene $name: window ${sw}x${sh} reaches the pointer at $px,$py; make the screen larger" >&2
+    failed="$failed scene-$name"
+    continue
+  fi
   DISPLAY=:98 RUST_LOG=info INLET_DEMO_SCENE="$file" "$bin" >"$out/visual/$name.log" 2>&1 &
   pid=$!
   sleep 8
   if kill -0 "$pid" 2>/dev/null; then
     id=$(DISPLAY=:98 xdotool search --onlyvisible --pid "$pid" 2>/dev/null | head -1)
     [ -n "$id" ] || id=$(DISPLAY=:98 xdotool search --onlyvisible --name "^Inlet" | head -1)
+    # The window as placed: the pointer must be outside it, or hover states show.
+    eval "$(DISPLAY=:98 xdotool getwindowgeometry --shell "$id" 2>/dev/null | grep -E '^(X|Y|WIDTH|HEIGHT)=[0-9]+$')"
+    if [ -z "${WIDTH:-}" ] || { [ "$px" -ge "$X" ] && [ "$px" -lt $((X + WIDTH)) ] && [ "$py" -ge "$Y" ] && [ "$py" -lt $((Y + HEIGHT)) ]; }; then
+      echo "scene $name: the pointer at $px,$py is over the window (${X:-?},${Y:-?} ${WIDTH:-?}x${HEIGHT:-?}) or the window was not found" >&2
+      failed="$failed scene-$name"
+    fi
+    unset X Y WIDTH HEIGHT
     if ! DISPLAY=:98 import -window "$id" "$out/visual/$name.png" 2>/dev/null; then
       echo "scene $name: no window" >&2; failed="$failed scene-$name"
     fi

@@ -131,31 +131,94 @@ mod tests {
         })
     }
 
-    fn count_bind_keys_fns(dir: &Path) -> usize {
-        let mut n = 0;
+    /// Key bindings made outside a domain's `bind_keys`: (file, function, the call in
+    /// `run` that reaches it).
+    const OTHER_BINDERS: [(&str, &str, &str); 1] =
+        [("desktop.rs", "install_actions", "desktop::init(cx)")];
+
+    /// The non-test part of every source file under `dir` except `lib.rs`, with its path
+    /// below `src` (`ui/chat/mod.rs`).
+    fn sources(src: &Path, dir: &Path, out: &mut Vec<(String, String)>) {
         for entry in std::fs::read_dir(dir).expect("read src/") {
             let path = entry.expect("an entry").path();
             if path.is_dir() {
-                n += count_bind_keys_fns(&path);
-            } else if path.extension().is_some_and(|e| e == "rs") && !path.ends_with("lib.rs") {
+                sources(src, &path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") && path != src.join("lib.rs") {
                 let text = std::fs::read_to_string(&path).expect("read a source file");
-                n += text.matches("pub fn bind_keys(cx: &mut App)").count();
+                let code = match text.find("#[cfg(test)]\nmod tests") {
+                    Some(at) => text[..at].to_string(),
+                    None => text,
+                };
+                let name = path
+                    .strip_prefix(src)
+                    .expect("below src/")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                out.push((name, code));
             }
         }
-        n
+    }
+
+    /// The name of the function the byte offset `at` of `code` is in.
+    fn enclosing_fn(code: &str, at: usize) -> &str {
+        let before = &code[..at];
+        let start = before.rfind("fn ").map_or(0, |i| i + 3);
+        let name = &before[start..];
+        let end = name
+            .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .unwrap_or(name.len());
+        &name[..end]
+    }
+
+    /// Every function that binds keys is a domain's `bind_keys` (whatever its
+    /// visibility) or one of [`OTHER_BINDERS`], and every one of those is reached from
+    /// start-up. A new place that binds keys fails here until it is listed.
+    #[test]
+    fn every_place_that_binds_keys_is_reached_from_start_up() {
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        sources(&src, &src, &mut files);
+        let definitions: usize = files
+            .iter()
+            .map(|(_, code)| code.matches("fn bind_keys(").count())
+            .sum();
+        assert_eq!(
+            definitions,
+            DOMAINS.len(),
+            "a `fn bind_keys` is missing from DOMAINS and from lib.rs's bind_keys"
+        );
+        for (file, code) in &files {
+            for (at, _) in code.match_indices(".bind_keys(") {
+                let function = enclosing_fn(code, at);
+                let listed = OTHER_BINDERS
+                    .iter()
+                    .any(|(f, name, _)| f == file && *name == function);
+                assert!(
+                    function == "bind_keys" || listed,
+                    "{file}: `{function}` binds keys; make it a domain's bind_keys or list it \
+                     in OTHER_BINDERS"
+                );
+            }
+        }
+        let lib = std::fs::read_to_string(src.join("lib.rs")).expect("read lib.rs");
+        let run = &lib[lib.find("pub fn run()").expect("run in lib.rs")..];
+        for (file, function, call) in OTHER_BINDERS {
+            let (_, code) = files
+                .iter()
+                .find(|(f, _)| f == file)
+                .unwrap_or_else(|| panic!("{file} is gone"));
+            assert!(
+                code.matches(&format!("{function}(cx)")).count() >= 1,
+                "{file}: nothing calls {function}"
+            );
+            assert!(run.contains(call), "start-up does not call {call}");
+        }
     }
 
     /// Start-up registers the bindings of every domain. A merge that drops a call from
-    /// `bind_keys` (as happened when `main.rs` became `lib.rs`) fails here, and so does a
-    /// new domain with bindings that is not listed.
+    /// `bind_keys` (as happened when `main.rs` became `lib.rs`) fails here.
     #[gpui::test]
     fn start_up_binds_the_keys_of_every_domain(cx: &mut TestAppContext) {
-        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        assert_eq!(
-            count_bind_keys_fns(&src),
-            DOMAINS.len(),
-            "a domain's bind_keys is missing from DOMAINS and from lib.rs's bind_keys"
-        );
         let all = bound(cx, super::bind_keys);
         for (domain, bind) in DOMAINS {
             let own = bound(cx, bind);
