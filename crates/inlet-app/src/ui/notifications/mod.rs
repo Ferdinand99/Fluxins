@@ -164,11 +164,11 @@ impl Inlet {
         self.notifications.badges.guild(guild_id)
     }
 
-    /// Whether the chat is on screen: signed in, and not under the About view. A view
-    /// that replaces the chat (the settings view when it exists) must be added here, so
-    /// nothing is read or marked as read behind it.
+    /// Whether the chat is on screen: signed in, and not under the About view or the
+    /// settings view. A view that replaces the chat must be added here, so nothing is
+    /// read or marked as read behind it.
     pub(crate) fn chat_is_visible(&self) -> bool {
-        self.screen == Screen::Main && !self.show_about
+        self.screen == Screen::Main && !self.show_about && self.settings.view.is_none()
     }
 
     /// Escape (`shift` false) or Shift+Escape.
@@ -176,7 +176,7 @@ impl Inlet {
         let action = escape_action(
             self.notifications.settings.is_some(),
             self.chat_is_visible(),
-            self.overlays.pending_link.is_some(),
+            self.overlays.pending_link.is_some() || self.overlays.link_prompt.is_some(),
             shift,
         );
         match action {

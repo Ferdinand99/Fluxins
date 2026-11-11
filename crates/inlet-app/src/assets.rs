@@ -32,6 +32,8 @@ pub enum Icon {
     BellSlash,
     /// A ticked box (`check-square`).
     CheckSquare,
+    /// Settings (`gear`).
+    Gear,
 }
 
 impl Icon {
@@ -50,6 +52,7 @@ impl Icon {
             Icon::Bell => include_bytes!("../assets/icons/bell.svg"),
             Icon::BellSlash => include_bytes!("../assets/icons/bell-slash.svg"),
             Icon::CheckSquare => include_bytes!("../assets/icons/check-square.svg"),
+            Icon::Gear => include_bytes!("../assets/icons/gear.svg"),
         }
     }
 

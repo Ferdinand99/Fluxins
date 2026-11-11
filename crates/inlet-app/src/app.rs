@@ -213,14 +213,15 @@ impl Inlet {
         cx.notify();
     }
 
-    /// Events from the platform integration (tray, deep links, notifications clicked).
-    fn on_platform_event(
+    /// Events from the platform integration (later starts, tray, deep links,
+    /// notifications clicked); handled in `desktop`.
+    pub(crate) fn on_platform_event(
         &mut self,
         event: backend::platform::Ev,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) {
-        match event {}
+        self.on_desktop_event(event, window, cx);
     }
 
     /// Back to the sign-in screen with nothing of the old session on screen.
@@ -231,6 +232,8 @@ impl Inlet {
         // A new session asks again for the account ID and limit.
         self.composer.reset_session();
         self.overlays.pending_link = None;
+        self.overlays.link_prompt = None;
+        self.overlays.link_channel = None;
         self.guilds.clear();
         self.channels.clear();
         self.selected_guild = None;

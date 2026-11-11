@@ -3,9 +3,14 @@
 //! This is the protocol KDE Plasma, most Wayland bars, XFCE, Cinnamon and GNOME
 //! with the AppIndicator extension use for tray icons. The icon is sent as pixels
 //! (`IconPixmap`), so no icon theme or file on disk is needed.
+//!
+//! The tray host (plasmashell, the GNOME extension, a bar) can restart. A thread
+//! follows `NameOwnerChanged` of the StatusNotifierWatcher name: when the host goes
+//! away the tray reports that it has no host (the app must not hide its window
+//! then), and when a host comes back the item registers with it again.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use zbus::blocking::Connection;
@@ -276,8 +281,58 @@ impl Menu {
 }
 
 pub(crate) struct Tray {
-    conn: Connection,
+    /// Shared with the host watcher only as a weak reference.
+    conn: Arc<Connection>,
     state: Arc<Mutex<State>>,
+    /// Whether a tray host has the item registered right now.
+    host: Arc<AtomicBool>,
+}
+
+fn register(conn: &Connection, service: &str) -> zbus::Result<()> {
+    conn.call_method(
+        Some(WATCHER),
+        "/StatusNotifierWatcher",
+        Some(WATCHER),
+        "RegisterStatusNotifierItem",
+        &(service,),
+    )
+    .map(|_| ())
+}
+
+/// Follows the watcher name and registers the item again with every new host. The
+/// subscription is made before this returns, so no restart is missed. The thread
+/// holds only a weak reference to the tray's connection: once the tray is dropped
+/// the next signal ends it, and the icon goes away with the connection.
+fn watch_host(conn: &Arc<Connection>, service: String, host: Arc<AtomicBool>) -> Result<()> {
+    let watch = Connection::session()?;
+    let proxy = zbus::blocking::fdo::DBusProxy::new(&watch)?;
+    let changes = proxy.receive_name_owner_changed_with_args(&[(0, WATCHER)])?;
+    let weak = Arc::downgrade(conn);
+    std::thread::Builder::new()
+        .name("inlet-tray-host".into())
+        .spawn(move || {
+            let _keep = (watch, proxy);
+            for signal in changes {
+                let Some(conn) = weak.upgrade() else { return };
+                let Ok(args) = signal.args() else { continue };
+                if args.new_owner().is_none() {
+                    log::info!("the tray host went away");
+                    host.store(false, Ordering::Relaxed);
+                    continue;
+                }
+                match register(&conn, &service) {
+                    Ok(()) => {
+                        log::info!("registered the tray icon with the new tray host");
+                        host.store(true, Ordering::Relaxed);
+                    }
+                    Err(err) => {
+                        log::warn!("could not register with the new tray host: {err}");
+                        host.store(false, Ordering::Relaxed);
+                    }
+                }
+            }
+        })?;
+    Ok(())
 }
 
 impl Tray {
@@ -312,20 +367,23 @@ impl Tray {
             COUNTER.fetch_add(1, Ordering::Relaxed)
         );
         conn.request_name(name.as_str())?;
-        let registered = conn.call_method(
-            Some(WATCHER),
-            "/StatusNotifierWatcher",
-            Some(WATCHER),
-            "RegisterStatusNotifierItem",
-            &(name.as_str(),),
-        );
-        if let Err(err) = registered {
+        let conn = Arc::new(conn);
+        let host = Arc::new(AtomicBool::new(false));
+        // Subscribe before registering, so a host that restarts in between is seen.
+        watch_host(&conn, name.clone(), host.clone())?;
+        if let Err(err) = register(&conn, &name) {
             log::info!("no StatusNotifierWatcher: {err}");
             return Err(Error::Unsupported(
                 "this desktop has no tray host (StatusNotifierWatcher)",
             ));
         }
-        Ok(Self { conn, state })
+        host.store(true, Ordering::Relaxed);
+        Ok(Self { conn, state, host })
+    }
+
+    /// Whether a tray host shows the icon right now.
+    pub(crate) fn has_host(&self) -> bool {
+        self.host.load(Ordering::Relaxed)
     }
 
     pub(crate) fn set_icon(&self, icon: &Icon) -> Result<()> {
@@ -494,6 +552,36 @@ mod tests {
             icon_pixmap(&call),
             expected(super::super::TrayState::Mention)
         );
+
+        // The host restarts: the tray reports no host while it is gone and registers
+        // again with the new one.
+        assert!(tray.inner.has_host());
+        host.release_name(WATCHER).unwrap();
+        wait_for(|| !tray.inner.has_host());
+        let (tx, registered_again) = mpsc::channel();
+        let new_host = Connection::session().unwrap();
+        new_host
+            .object_server()
+            .at("/StatusNotifierWatcher", Watcher { registered: tx })
+            .unwrap();
+        new_host.request_name(WATCHER).unwrap();
+        assert_eq!(
+            registered_again
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap(),
+            service
+        );
+        wait_for(|| tray.inner.has_host());
+    }
+
+    fn wait_for(done: impl Fn() -> bool) {
+        for _ in 0..500 {
+            if done() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("timed out");
     }
 
     fn icon_pixmap(
