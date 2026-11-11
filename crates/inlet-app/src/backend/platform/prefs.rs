@@ -110,6 +110,10 @@ pub fn load_section<T: DeserializeOwned + Default>(path: &Path, key: &str) -> T 
 /// Writes `value` under `key` into `path`, keeping the file's other keys, through a
 /// temporary file so a crash never leaves half a file.
 pub fn save_section<T: Serialize>(path: &Path, key: &str, value: &T) -> std::io::Result<()> {
+    // One writer at a time: two sections saved at once from different threads would
+    // each read the file before the other wrote it, and one change would be lost.
+    static WRITING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one = WRITING.lock().unwrap_or_else(|e| e.into_inner());
     let mut root = std::fs::read_to_string(path)
         .ok()
         .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
@@ -190,6 +194,29 @@ mod tests {
         std::fs::write(&path, "{not json").unwrap();
         save(&path, &prefs).unwrap();
         assert_eq!(load(&path), prefs);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn sections_saved_at_once_keep_each_other() {
+        let path = temp_file("sections");
+        let threads: Vec<_> = ["a", "b", "c", "d"]
+            .into_iter()
+            .map(|key| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for n in 0..25u32 {
+                        save_section(&path, key, &n).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        for key in ["a", "b", "c", "d"] {
+            assert_eq!(load_section::<u32>(&path, key), 24, "{key}");
+        }
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
