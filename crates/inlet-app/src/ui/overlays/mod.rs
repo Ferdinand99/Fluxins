@@ -39,6 +39,8 @@ impl Inlet {
         // The pins or the inbox, under the channel header, lie lowest; the viewer lies
         // under the settings view and the prompts (Escape closes the topmost layer
         // first, see `desktop::OpenLayers`).
+        // The search panel lies lowest: a popout (pins, inbox) opens over it.
+        out.extend(self.render_search_panel(cx));
         out.extend(self.render_panels(cx));
         out.extend(self.render_image_viewer(cx));
         if self.settings.view.is_some() {
@@ -55,6 +57,8 @@ impl Inlet {
         if self.status_picker_open() {
             out.push(self.render_status_picker(cx));
         }
+        // The quick switcher: over the status picker, under the link prompts.
+        out.extend(self.render_quick_switcher(cx));
         if let Some(url) = self.overlays.pending_link.clone() {
             // A layer like the link prompt: it has the keyboard while it is topmost, and
             // Escape closes it.

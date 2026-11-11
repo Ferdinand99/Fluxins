@@ -130,6 +130,14 @@ impl Switcher {
             .map(|(_, s)| *s)
     }
 
+    /// The passive states of the accounts in the background (guilds, channels and read
+    /// states; no members), for the quick switcher.
+    pub fn background_states(
+        &self,
+    ) -> impl Iterator<Item = (&AccountKey, &Entity<AccountState>)> + '_ {
+        self.background.iter().filter(|(k, _)| !self.is_active(k))
+    }
+
     fn summary_of(&self, k: &AccountKey) -> Summary {
         self.summaries.get(k).copied().unwrap_or_default()
     }
@@ -296,6 +304,7 @@ impl Inlet {
         self.notifications.clear();
         // The panels' lists and a jump on its way (its answer is the old account's).
         self.inbox.clear();
+        self.reset_search(false);
         // Messages with files still on their way become drafts of the old account
         // again (the backend stops their uploads); the notice below says so.
         let uploads_stopped = panel_uploads

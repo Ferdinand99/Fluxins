@@ -181,7 +181,7 @@ impl Inlet {
     }
 
     /// Whether the chat is on screen: signed in, and not under the About view, the
-    /// settings view or a panel (pins, inbox), and not moving to a message a jump is
+    /// settings view, a panel (pins, inbox, search) or the quick switcher, and not moving to a message a jump is
     /// loading. A view that covers the chat must be added here, so nothing is read or
     /// marked as read behind it.
     ///
@@ -193,6 +193,7 @@ impl Inlet {
             && !self.show_about
             && self.settings.view.is_none()
             && self.inbox.open.is_none()
+            && !self.search_covers_chat()
             && !self
                 .inbox
                 .jump

@@ -928,12 +928,14 @@ impl Inlet {
         OpenLayers {
             link_prompt: self.overlays.link_prompt.is_some(),
             link_confirm: self.overlays.pending_link.is_some(),
+            quick_switcher: self.quick_switcher_open(),
             notification_settings: self.notifications.settings.is_some(),
             status_picker: self.status_picker_open(),
             switcher: self.switcher_layer_open(),
             panel: self.inbox.open.is_some(),
             settings: self.settings.view.is_some(),
             viewer: self.media.viewer.is_some(),
+            search: self.search_panel_open(),
         }
     }
 
@@ -959,12 +961,17 @@ impl Inlet {
                 .layer_focus
                 .get_or_insert_with(|| cx.focus_handle())
                 .clone();
-            // Only the status picker has a field that may keep the keyboard, and only
-            // while it is the topmost layer: any layer that opens over it takes the
-            // keyboard in the same frame.
-            let field_keeps_it = self.is_top_layer(Layer::StatusPicker)
-                && self.status_picker_field_focused(window, cx);
-            if !handle.is_focused(window) && !field_keeps_it {
+            // One rule for fields in layers: a field inside the topmost layer (the
+            // status picker's custom status, the search field) may keep the keyboard,
+            // because only the topmost layer carries this focus handle. Anything else
+            // gives it back to the layer; a layer that opens over another takes the
+            // handle, so a field under it loses the keyboard at once. A field focused
+            // as it appears is not in the drawn tree for one frame: the topmost layer's
+            // own fields are asked for that frame.
+            let field_keeps_it = (self.is_top_layer(Layer::StatusPicker)
+                && self.status_picker_field_focused(window, cx))
+                || self.search_field_has_keyboard(window, cx);
+            if !handle.contains_focused(window, cx) && !field_keeps_it {
                 if !self.overlays.layer_had_focus {
                     // Where the keyboard was, to give it back when the layers close.
                     self.overlays.focus_before = window.focused(cx);
@@ -991,6 +998,21 @@ impl Inlet {
         }
     }
 
+    /// Gives the keyboard to a field of a layer that opens now (the search field, the
+    /// quick switcher's), noting where it was so it goes back when the layers close.
+    pub(crate) fn focus_layer_field(
+        &mut self,
+        field: &gpui::FocusHandle,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.overlays.layer_had_focus {
+            self.overlays.focus_before = window.focused(cx);
+            self.overlays.layer_had_focus = true;
+        }
+        field.focus(window, cx);
+    }
+
     /// Adds the layer's focus, key context and Escape to the topmost layer's element.
     pub(crate) fn layer_keys<E: InteractiveElement>(
         &self,
@@ -1011,6 +1033,7 @@ impl Inlet {
         match self.open_layers().topmost() {
             Some(Layer::LinkPrompt) => self.overlays.link_prompt = None,
             Some(Layer::LinkConfirm) => self.overlays.pending_link = None,
+            Some(layer @ (Layer::QuickSwitcher | Layer::Search)) => self.close_search_layer(layer),
             Some(Layer::NotificationSettings) => self.notifications.settings = None,
             Some(Layer::StatusPicker) => self.social.picker = None,
             Some(Layer::AccountSwitcher) => self.switcher.open = false,
@@ -1068,6 +1091,8 @@ impl Inlet {
 pub(crate) enum Layer {
     LinkPrompt,
     LinkConfirm,
+    /// The quick switcher (Ctrl+K).
+    QuickSwitcher,
     NotificationSettings,
     /// The status picker over the user panel.
     StatusPicker,
@@ -1076,22 +1101,27 @@ pub(crate) enum Layer {
     Panel,
     Settings,
     Viewer,
+    /// The search panel, docked on the right under the channel header.
+    Search,
 }
 
-/// Which layers are open. They are drawn bottom first (a panel, the image viewer, the
-/// settings view, the notification settings window, the account switcher, the status
-/// picker, the link confirmation, the link prompt, see `ui/overlays`), and the topmost
-/// one has the keyboard: Escape closes it first.
+/// Which layers are open. They are drawn bottom first (the search panel, a panel, the
+/// image viewer, the settings view, the notification settings window, the account
+/// switcher, the status picker, the quick switcher, the link confirmation, the link
+/// prompt, see `ui/overlays`), and the topmost one has the keyboard: Escape closes it
+/// first.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct OpenLayers {
     pub link_prompt: bool,
     pub link_confirm: bool,
+    pub quick_switcher: bool,
     pub notification_settings: bool,
     pub status_picker: bool,
     pub switcher: bool,
     pub panel: bool,
     pub settings: bool,
     pub viewer: bool,
+    pub search: bool,
 }
 
 impl OpenLayers {
@@ -1100,6 +1130,8 @@ impl OpenLayers {
             Some(Layer::LinkPrompt)
         } else if self.link_confirm {
             Some(Layer::LinkConfirm)
+        } else if self.quick_switcher {
+            Some(Layer::QuickSwitcher)
         } else if self.status_picker {
             Some(Layer::StatusPicker)
         } else if self.switcher {
@@ -1112,6 +1144,8 @@ impl OpenLayers {
             Some(Layer::Viewer)
         } else if self.panel {
             Some(Layer::Panel)
+        } else if self.search {
+            Some(Layer::Search)
         } else {
             None
         }
@@ -1123,6 +1157,8 @@ impl OpenLayers {
         match self.topmost() {
             Some(Layer::LinkPrompt) => self.link_prompt = false,
             Some(Layer::LinkConfirm) => self.link_confirm = false,
+            Some(Layer::QuickSwitcher) => self.quick_switcher = false,
+            Some(Layer::Search) => self.search = false,
             Some(Layer::NotificationSettings) => self.notification_settings = false,
             Some(Layer::StatusPicker) => self.status_picker = false,
             Some(Layer::AccountSwitcher) => self.switcher = false,
@@ -1326,12 +1362,14 @@ mod tests {
         let mut layers = OpenLayers {
             link_prompt: true,
             link_confirm: true,
+            quick_switcher: true,
             notification_settings: true,
             status_picker: true,
             switcher: true,
             panel: true,
             settings: true,
             viewer: true,
+            search: true,
         };
         let mut order = Vec::new();
         while let Some(top) = layers.topmost() {
@@ -1343,12 +1381,14 @@ mod tests {
             [
                 Layer::LinkPrompt,
                 Layer::LinkConfirm,
+                Layer::QuickSwitcher,
                 Layer::StatusPicker,
                 Layer::AccountSwitcher,
                 Layer::NotificationSettings,
                 Layer::Settings,
                 Layer::Viewer,
-                Layer::Panel
+                Layer::Panel,
+                Layer::Search
             ]
         );
     }
