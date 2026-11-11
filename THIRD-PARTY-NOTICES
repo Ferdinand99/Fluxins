@@ -6,7 +6,7 @@ Inlet is licensed under the GNU Affero General Public License, version 3 or late
 reproduced, followed by the crates that use that text. Fonts and icons built into
 the binary are listed at the end.
 
-- Apache License 2.0: 424 crate(s)
+- Apache License 2.0: 426 crate(s)
 - MIT License: 138 crate(s)
 - ISC License: 24 crate(s)
 - Unicode License v3: 23 crate(s)
@@ -545,6 +545,8 @@ Used by:
   - png 0.18.1 (https://github.com/image-rs/image-png)
   - polling 3.11.0 (https://github.com/smol-rs/polling)
   - pollster 0.4.0 (https://github.com/zesterer/pollster)
+  - prost 0.14.5 (https://github.com/tokio-rs/prost)
+  - prost-derive 0.14.5 (https://github.com/tokio-rs/prost)
   - psl-types 2.0.11 (https://github.com/addr-rs/psl-types)
   - rayon 1.12.0 (https://github.com/rayon-rs/rayon)
   - rayon-core 1.13.0 (https://github.com/rayon-rs/rayon)
