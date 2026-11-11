@@ -46,12 +46,14 @@ env:
 #   and the default linkers, check them and package them: Windows and Linux on pushes
 #   to v0, all three on main, on tags (release.yml) and on manual runs that ask for it.
 #
-# Caches: one rust-cache entry per operating system (shared-key), saved only by the
-# build job on pushes to v0. The tests job of the same system and every pull request
-# restore it and save nothing. Each entry holds the git dependencies (about 2.2 GB),
-# the registry and the dependencies built with [profile.ci], so three entries and the
-# small fuzz one stay within GitHub's 10 GB per repository. The release jobs use no
-# cache.
+# Caches: one rust-cache entry for Windows and one for macOS (shared-key), saved only
+# by the build job on pushes to v0. The tests job of the same system and every pull
+# request restore it and save nothing. Each entry holds the git dependencies (about
+# 2.2 GB of the Fluxer and Zed repositories), the registry and the dependencies built
+# with [profile.ci]: Windows about 4.5 GB, macOS about 2.8 GB, and the fuzz entry
+# 0.1 GB. A Linux entry (about 2.9 GB) would take the repository past GitHub's 10 GB
+# limit and evict the others, so Linux builds without a cache, which costs about three
+# minutes on the slowest path of a pull request. The release jobs use no cache.
 
 jobs:
   # Pull requests that only change documentation skip every other job. A skipped job
@@ -624,11 +626,6 @@ jobs:
           rustc --version
           cargo --version
 
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          shared-key: linux-ci
-          save-if: ${{ github.ref == 'refs/heads/v0' }}
-
       # The extra test CA of inlet-protocol is for tests only. The crate also
       # refuses to compile it in release mode; this checks the feature graph.
       - name: The app does not enable test-only features
@@ -710,12 +707,6 @@ jobs:
           rustup toolchain install
           rustc --version
           cargo --version
-
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          # The entry of the Linux job, as in windows-tests.
-          shared-key: linux-ci
-          save-if: false
 
       - name: Test
         run: cargo test --workspace --profile ci --locked
