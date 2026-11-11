@@ -13,6 +13,7 @@
 //! `backend::messages::fetch::PageAnswer`) and requests carry an ID, so an answer to a
 //! request that a newer one replaced is recognised.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::rc::Rc;
@@ -415,7 +416,11 @@ pub enum JumpAction {
 pub struct MessageView {
     pub rows: Vec<Row>,
     conversions: Conversions,
-    outbox: Vec<OutboxEntry>,
+    /// Messages of the account on their way or failed, for every channel (threads
+    /// included). The thread panel's view shares this one store
+    /// ([`MessageView::share_outbox`]), so a failed thread send keeps its row and Retry
+    /// when the panel closes, and shows again when the thread opens.
+    outbox: Rc<RefCell<Vec<OutboxEntry>>>,
     /// The account's read position when the channel was opened: the "NEW" line goes
     /// above the first message after it.
     unread_after: Option<(ChannelId, MessageId)>,
@@ -936,7 +941,8 @@ impl MessageView {
             }
         }
         let author = model::clean_name(state.me().display_name());
-        for o in &self.outbox {
+        let outbox = self.outbox.clone();
+        for o in outbox.borrow().iter() {
             if ChannelId::parse(&o.out.channel_id) == Some(ch) {
                 rows.push(Row::Pending(Rc::new(PendingRow {
                     nonce: o.out.nonce.clone(),
@@ -1036,9 +1042,20 @@ impl MessageView {
         self.revealed.insert(id)
     }
 
-    /// Whether a pending row of `nonce` is in this list.
-    pub(crate) fn has_pending(&self, nonce: &str) -> bool {
-        self.outbox.iter().any(|o| o.out.nonce == nonce)
+    /// Uses `other`'s outbox from now on (a second list over the same account).
+    pub(crate) fn share_outbox(&mut self, other: &MessageView) {
+        self.outbox = other.outbox.clone();
+    }
+
+    /// Numbers this view's requests after `last` (the newest request of a view it
+    /// replaces), so an answer meant for that view never pairs with this one.
+    pub(crate) fn continue_requests(&mut self, last: u64) {
+        self.next_request = self.next_request.max(last);
+    }
+
+    /// The newest request this view made.
+    pub(crate) fn last_request(&self) -> u64 {
+        self.next_request
     }
 
     /// "Mark as unread": the "NEW" line goes above the first message after `after`.
@@ -1049,11 +1066,12 @@ impl MessageView {
 
     /// Adds or updates an outbox entry: a message being sent, or one that failed.
     pub fn upsert_pending(&mut self, out: Pending) {
-        match self.outbox.iter_mut().find(|o| o.out.nonce == out.nonce) {
+        let mut outbox = self.outbox.borrow_mut();
+        match outbox.iter_mut().find(|o| o.out.nonce == out.nonce) {
             Some(entry) => entry.out = out,
             None => {
                 let blocks = Rc::new(markdown::parse(&out.text));
-                self.outbox.push(OutboxEntry {
+                outbox.push(OutboxEntry {
                     out,
                     blocks,
                     queued_ms: u64::try_from(now_ms()).unwrap_or(0),
@@ -1067,9 +1085,10 @@ impl MessageView {
     /// and reply that is not older than the row ([`is_own_copy`]). Each message clears at most
     /// one row. Whether any went.
     pub fn clear_arrived(&mut self, me: &str, channel_id: &str, messages: &[p::Message]) -> bool {
-        let before = self.outbox.len();
+        let mut outbox = self.outbox.borrow_mut();
+        let before = outbox.len();
         for m in messages {
-            if let Some(ix) = self.outbox.iter().position(|o| {
+            if let Some(ix) = outbox.iter().position(|o| {
                 o.out.channel_id == channel_id
                     && is_own_copy(
                         m,
@@ -1082,24 +1101,25 @@ impl MessageView {
                         },
                     )
             }) {
-                self.outbox.remove(ix);
+                outbox.remove(ix);
             }
         }
-        self.outbox.len() != before
+        outbox.len() != before
     }
 
     /// The server took the message with this nonce: its row goes. Whether one went.
     pub fn sent(&mut self, nonce: &str) -> bool {
-        let before = self.outbox.len();
-        self.outbox.retain(|o| o.out.nonce != nonce);
-        self.outbox.len() != before
+        let mut outbox = self.outbox.borrow_mut();
+        let before = outbox.len();
+        outbox.retain(|o| o.out.nonce != nonce);
+        outbox.len() != before
     }
 
     /// Retry of a failed row: it shows "sending" again, and the command sends it with
     /// its first nonce.
     pub fn retry(&mut self, nonce: &str) -> Option<Cmd> {
-        let entry = self
-            .outbox
+        let mut outbox = self.outbox.borrow_mut();
+        let entry = outbox
             .iter_mut()
             .find(|o| o.out.nonce == nonce && o.out.failed.is_some())?;
         entry.out.failed = None;
@@ -1148,18 +1168,18 @@ impl Inlet {
                 older,
             } => self.on_page_failed(channel_id, request, older, cx),
             Ev::Pending(out) => {
-                // A send from the thread panel's composer shows in the panel.
-                if let Some(out) = self.panel_pending(out, cx) {
-                    self.chat.view.upsert_pending(out);
-                    self.refresh_rows(cx);
-                }
+                // One outbox for every channel, threads included: the row lands on its
+                // own channel, in the chat or in the thread panel.
+                self.chat.view.upsert_pending(out);
+                self.refresh_rows(cx);
+                self.refresh_panel_rows(cx);
             }
             Ev::Sent { nonce } => {
                 if self.chat.view.sent(&nonce) {
                     self.refresh_rows(cx);
+                    self.refresh_panel_rows(cx);
                     cx.notify();
                 }
-                self.panel_sent(&nonce, cx);
             }
             Ev::Action(ev) => self.on_action_event(ev, cx),
             Ev::Inbox(ev) => self.on_inbox_event(ev, cx),
@@ -1222,9 +1242,7 @@ impl Inlet {
         self.panel_on_dispatch(&dispatch, window_active, &mut changes, cx);
         if let p::Dispatch::MessageCreate(m) = &dispatch {
             if let Some(nonce) = &m.nonce {
-                let before = self.chat.view.outbox.len();
-                self.chat.view.outbox.retain(|o| &o.out.nonce != nonce);
-                if self.chat.view.outbox.len() != before {
+                if self.chat.view.sent(nonce) {
                     self.refresh_rows(cx);
                 }
             }
@@ -1440,7 +1458,7 @@ impl Inlet {
     /// page. Before READY there is no state yet; READY loads the channel then.
     fn load_open_channel(&mut self, cx: &mut Context<Self>) {
         // A forum has no messages of its own: the forum view lists its posts.
-        if self.forum_is_open() {
+        if self.forum_selected() {
             return;
         }
         let (Some(channel_id), Some(account)) =
@@ -1721,16 +1739,17 @@ impl Inlet {
     /// Sends a failed message again, with the nonce it had: the row shows "sending"
     /// until the gateway's MESSAGE_CREATE with that nonce replaces it.
     pub(crate) fn retry_pending(&mut self, nonce: &str, cx: &mut Context<Self>) {
-        if self.panel_retry(nonce, cx) {
-            return;
-        }
         if let Some(cmd) = self.chat.view.retry(nonce) {
             if let Cmd::Resend { channel_id, .. } = &cmd {
                 let channel_id = channel_id.clone();
-                self.composer_resent(&channel_id, cx);
+                // The slowmode of the composer that has the channel counts it.
+                if !self.panel_resent(&channel_id, cx) {
+                    self.composer_resent(&channel_id, cx);
+                }
             }
             self.backend.send(cmd);
             self.refresh_rows(cx);
+            self.refresh_panel_rows(cx);
         }
         cx.notify();
     }

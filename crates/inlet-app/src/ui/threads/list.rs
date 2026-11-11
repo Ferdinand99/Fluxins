@@ -89,6 +89,16 @@ impl Inlet {
         };
         match result {
             Ok((threads, has_more)) => {
+                // Only public threads of this channel, whatever the server sent.
+                let channel = b.channel;
+                let threads: Vec<p::Channel> = threads
+                    .into_iter()
+                    .filter(|t| {
+                        t.is_thread()
+                            && t.kind != p::models::channel_type::PRIVATE_THREAD
+                            && ChannelId::parse_opt(t.parent_id.as_deref()) == Some(channel)
+                    })
+                    .collect();
                 b.archived.on_page(request, threads, has_more);
             }
             Err(reason) => {

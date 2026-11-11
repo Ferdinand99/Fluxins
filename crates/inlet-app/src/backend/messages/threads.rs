@@ -10,8 +10,11 @@
 //! - Thread panel: one newest page per opened thread (opening another aborts it);
 //!   older pages one at a time and at most one a second, only while the person scrolls
 //!   at the top of the panel.
-//! - Archived threads and forum pages: one page per opening and per click on "Load
-//!   more", one at a time per list (`inlet_state::ThreadPages`). Forum pages are
+//! - Archived threads: one page per opening and per click on "Load more", one at a
+//!   time and at most one a second for the account, across lists ([`Pace`]); a page
+//!   still waiting for its turn when a newer list asks is dropped.
+//! - Forum pages: one page per opening and per click on "Load more", one at a time per
+//!   list (`inlet_state::ThreadPages`). Forum pages are
 //!   thread searches, which the protocol paces with message search (one a second per
 //!   account, refused without a call past a 3 s wait).
 //! - First messages of forum posts: at most one request per forum opening for the
@@ -23,6 +26,8 @@
 //!   never the same subscription twice in a row; the protocol coalesces op 14 over
 //!   300 ms and sends it again after a reconnect.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use inlet_protocol as p;
@@ -226,6 +231,28 @@ pub struct ForumPage {
     pub has_more: bool,
 }
 
+/// One request at a time and at most one a second: a request takes its turn after the
+/// one before it finished and a second after that one started.
+#[derive(Clone, Default)]
+pub struct Pace {
+    last: Arc<tokio::sync::Mutex<Option<tokio::time::Instant>>>,
+}
+
+impl Pace {
+    /// Waits for the turn; the turn lasts until the returned guard drops.
+    pub async fn turn(&self) -> tokio::sync::OwnedMutexGuard<Option<tokio::time::Instant>> {
+        let mut last = self.last.clone().lock_owned().await;
+        if let Some(at) = *last {
+            tokio::time::sleep_until(at + PACE_INTERVAL).await;
+        }
+        *last = Some(tokio::time::Instant::now());
+        last
+    }
+}
+
+/// Shortest time between two archived pages.
+const PACE_INTERVAL: Duration = Duration::from_secs(1);
+
 /// The thread domain's part of the backend.
 #[derive(Default)]
 pub struct State {
@@ -234,9 +261,12 @@ pub struct State {
     /// The older page of the panel's thread, and when the last one started.
     older: Option<AbortHandle>,
     older_last: Option<Instant>,
-    /// The archived page and the forum page on their way.
-    archived: Option<AbortHandle>,
+    /// The archived page on its way (and whether its request has started), and the
+    /// forum page.
+    archived: Option<(AbortHandle, Arc<AtomicBool>)>,
     forum: Option<AbortHandle>,
+    /// Archived pages go one at a time and at most one a second, across lists.
+    archived_pace: Pace,
     /// The last subscription sent: session, guild, member lists.
     subscribed: Option<(u64, String, Vec<String>)>,
 }
@@ -264,7 +294,7 @@ impl State {
         for task in [
             self.open.take(),
             self.older.take(),
-            self.archived.take(),
+            self.archived.take().map(|(t, _)| t),
             self.forum.take(),
         ]
         .into_iter()
@@ -444,12 +474,21 @@ pub(super) fn handle(backend: &mut Backend, cmd: Cmd) {
             before,
             request,
         } => {
-            // A newer list replaces the one before: its request is answered as stopped.
-            if let Some(task) = backend.threads.archived.take() {
-                task.abort();
+            // A newer list replaces the one before: a request still waiting for its turn
+            // is dropped (answered as stopped); one already sent finishes, and the new
+            // one waits for it and for the pace.
+            if let Some((task, started)) = backend.threads.archived.take() {
+                if !started.load(Ordering::Acquire) {
+                    task.abort();
+                }
             }
             let answer = ListAnswer::new(&events, ListKind::Archived, channel_id.clone(), request);
+            let started = Arc::new(AtomicBool::new(false));
+            let pace = backend.threads.archived_pace.clone();
+            let flag = started.clone();
             let task = backend.spawn_guarded("archived threads", None, async move {
+                let _turn = pace.turn().await;
+                flag.store(true, Ordering::Release);
                 let result = client
                     .public_archived_threads(&channel_id, before.as_deref(), LIST_PAGE)
                     .await
@@ -457,7 +496,7 @@ pub(super) fn handle(backend: &mut Backend, cmd: Cmd) {
                     .map_err(|err| reason(&internal, gen, err));
                 answer.archived(result);
             });
-            backend.threads.archived = Some(task);
+            backend.threads.archived = Some((task, started));
         }
         Cmd::ForumPage {
             forum_id,
@@ -596,6 +635,44 @@ mod tests {
         assert!(s.admit_older(t0));
         assert!(!s.admit_older(t0 + Duration::from_millis(500)));
         assert!(s.admit_older(t0 + Duration::from_millis(1_000)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn archived_pages_go_one_at_a_time_and_one_a_second() {
+        use tokio::time::Instant;
+        let pace = Pace::default();
+        let t0 = Instant::now();
+        // The first page goes at once.
+        let first = pace.turn().await;
+        assert_eq!(Instant::now(), t0);
+        // A second one (Load More, or the list opened again) waits for the first to
+        // finish and for a second after it started.
+        let p2 = pace.clone();
+        let second = tokio::spawn(async move {
+            let _turn = p2.turn().await;
+            Instant::now()
+        });
+        tokio::time::sleep(Duration::from_millis(3_000)).await;
+        assert!(
+            !second.is_finished(),
+            "one at a time: the first is still running"
+        );
+        drop(first);
+        let at = second.await.unwrap();
+        assert_eq!(
+            at,
+            t0 + Duration::from_millis(3_000),
+            "right after the first ended"
+        );
+        // Back to back: a second apart.
+        let third = pace.turn().await;
+        assert_eq!(Instant::now(), at + PACE_INTERVAL);
+        drop(third);
+        // After a pause, no wait.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let before = Instant::now();
+        let _fourth = pace.turn().await;
+        assert_eq!(Instant::now(), before);
     }
 
     #[test]

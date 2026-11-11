@@ -26,10 +26,10 @@ use inlet_state::{AccountState, AckKind, Changes, ChannelId, GuildId, MessageId,
 use super::{ThreadIcon, PANEL_WIDTH};
 use crate::app::Inlet;
 use crate::backend::composer::{Cmd as ComposerCmd, Ev as ComposerEv, Outgoing};
-use crate::backend::messages::{self, threads as backend, Pending};
+use crate::backend::messages::{self, threads as backend};
 use crate::model::{self, Message};
 use crate::theme;
-use crate::ui::chat::messages::{splice_range, MessageView};
+use crate::ui::chat::messages::{splice_range, JumpAction, MessageView};
 use crate::ui::composer::{begin_send, edit_last, ChannelContext, ComposerEvent, ComposerView};
 use crate::ui::HEADER_HEIGHT;
 
@@ -39,6 +39,10 @@ const DEFAULT_MAX_LEN: usize = 2000;
 const MIN_PANEL_WIDTH: f32 = 280.;
 /// `/msg` sends of the panel's composer remembered for their failure.
 const MAX_DM_NONCES: usize = 8;
+/// Newest pages asked for again in a row (as the chat).
+const MAX_NEWEST_RETRIES: u8 = 3;
+/// Shortest time between two newest pages the person asks for.
+const RELOAD_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// The thread open in the side panel.
 pub struct Panel {
@@ -51,14 +55,29 @@ pub struct Panel {
     /// The panel's own list window.
     pub list: ListState,
     scroll_hooked: bool,
+    /// Newest pages asked for again in a row while too many live messages came in.
+    newest_retries: u8,
+    /// When the newest page was last loaded again by the person (at most once a second).
+    last_reload: Option<std::time::Instant>,
 }
 
 impl Panel {
-    pub fn new(thread: ChannelId, guild: GuildId, parent: ChannelId, compact: bool) -> Self {
+    /// A panel over `chat`'s account: it shares the chat's outbox (pending and failed
+    /// sends of every channel) and numbers its requests after `last_request`, the newest
+    /// request of the panel before it.
+    pub fn new(
+        thread: ChannelId,
+        guild: GuildId,
+        parent: ChannelId,
+        chat: &MessageView,
+        last_request: u64,
+    ) -> Self {
         let list = ListState::new(0, ListAlignment::Bottom, px(800.));
         list.set_follow_mode(FollowMode::Tail);
         let mut view = MessageView::new();
-        view.compact = compact;
+        view.compact = chat.compact;
+        view.share_outbox(chat);
+        view.continue_requests(last_request);
         Panel {
             thread,
             guild,
@@ -66,6 +85,8 @@ impl Panel {
             view,
             list,
             scroll_hooked: false,
+            newest_retries: 0,
+            last_reload: None,
         }
     }
 }
@@ -87,8 +108,10 @@ pub fn can_open(state: &AccountState, thread: ChannelId) -> Option<(GuildId, Cha
 }
 
 /// The panel's width in a window `window_width` wide: Fluxer's 450 px, but at most
-/// half of the space beside the guild rail and the channel list (Fluxer caps it at 60%
-/// of the window), and never under 280 px, so a narrow window keeps a usable chat.
+/// half of the space beside the guild rail and the channel list, and never under 280 px,
+/// so a narrow window keeps a usable chat.
+// Deviation: Fluxer's panel is 360-900 px (450 by default, resizable) and at most 60% of
+// the window; Inlet's is not resizable and goes down to 280 px in narrow windows.
 pub fn panel_width(window_width: f32) -> f32 {
     let center = window_width - crate::ui::rail::RAIL_WIDTH - crate::ui::sidebar::SIDEBAR_WIDTH;
     if window_width <= 0. {
@@ -112,8 +135,9 @@ pub fn thread_context(state: &AccountState, thread: ChannelId) -> ChannelContext
     }
 }
 
-/// A send from the panel's composer: its pending row goes in the panel's list, and the
-/// returned command sends it. `None` for a send to anything but the panel's thread.
+/// A send from the panel's composer: its pending row goes in the account's outbox (which
+/// the panel shares with the chat, keyed by channel), and the returned command sends it.
+/// `None` for a send to anything but the panel's thread.
 pub fn send_from_panel(panel: &mut Panel, message: Outgoing) -> Option<ComposerCmd> {
     (message.channel_id == panel.thread.to_string()).then(|| begin_send(&mut panel.view, message))
 }
@@ -154,8 +178,9 @@ impl Inlet {
         {
             return;
         }
-        let compact = self.chat.view.compact;
-        self.threads.panel = Some(Panel::new(thread, guild, parent, compact));
+        self.retire_panel();
+        let last = self.threads.panel_requests;
+        self.threads.panel = Some(Panel::new(thread, guild, parent, &self.chat.view, last));
         let composer = self.thread_composer(window, cx);
         let ctx = thread_context(account.read(cx), thread);
         let weak = account.downgrade();
@@ -199,12 +224,19 @@ impl Inlet {
         self.focus_center(window, cx);
     }
 
-    /// Closes the panel without moving the keyboard.
+    /// Closes the panel without moving the keyboard. Its failed sends stay in the
+    /// account's outbox and show again when the thread opens.
     pub(crate) fn drop_thread_panel(&mut self, cx: &mut Context<Self>) {
-        if self.threads.panel.take().is_some() {
+        if self.retire_panel() {
             self.subscribe_threads();
             cx.notify();
         }
+    }
+
+    /// Takes the panel away, keeping its request numbering for the next one. Whether
+    /// there was one.
+    fn retire_panel(&mut self) -> bool {
+        self.threads.retire_panel()
     }
 
     /// Opens the thread's window in the account state and asks for its newest page.
@@ -275,18 +307,64 @@ impl Inlet {
             self.threads.loads.remove(&ch);
         }
         let raw = page.messages.clone();
+        if !older {
+            // Own messages the page already has are no longer pending (one whose
+            // gateway echo was lost), as in the chat.
+            let me = account.read(cx).me_id().to_string();
+            self.chat.view.clear_arrived(&me, &thread_id, &raw);
+        }
         let mut changes = account.update(cx, |s, _| s.apply_messages(ch, page));
+        let mut again = false;
         if let Some(panel) = self.threads.panel.as_mut().filter(|_| open) {
             panel.view.remember(account.read(cx), &raw, rendered);
             if !older && panel.view.accept_newest(ch, request) {
                 panel.view.set_loaded();
-                if self.panel_may_read(window_active, cx) {
-                    changes.merge(self.read_channel(ch, AckKind::Explicit, false, cx));
+                let detached =
+                    panel.view.jump_action(account.read(cx), ch) == JumpAction::LoadNewest;
+                if !detached {
+                    panel.newest_retries = 0;
+                    if self.panel_may_read(window_active, cx) {
+                        changes.merge(self.read_channel(ch, AckKind::Explicit, false, cx));
+                    }
+                } else if panel.newest_retries < MAX_NEWEST_RETRIES {
+                    // Too many live messages came during the load: ask again, as the
+                    // chat does.
+                    panel.newest_retries += 1;
+                    again = true;
                 }
             }
         }
         self.after_changes(changes, false, cx);
+        if again {
+            self.load_panel_newest(cx);
+        }
         self.refresh_panel_rows(cx);
+    }
+
+    /// "Jump to present", or the bottom reached in a panel that lost its newest
+    /// messages: the newest page again (at most once a second), and the list follows it.
+    fn panel_to_present(&mut self, cx: &mut Context<Self>) {
+        let (Some(account), Some(panel)) = (self.account.clone(), self.threads.panel.as_mut())
+        else {
+            return;
+        };
+        if panel.view.jump_action(account.read(cx), panel.thread) == JumpAction::LoadNewest {
+            let now = std::time::Instant::now();
+            if panel
+                .last_reload
+                .is_some_and(|last| now.saturating_duration_since(last) < RELOAD_INTERVAL)
+            {
+                return;
+            }
+            panel.last_reload = Some(now);
+            panel.newest_retries = 0;
+            self.load_panel_newest(cx);
+        }
+        if let Some(panel) = self.threads.panel.as_mut() {
+            panel.list.scroll_to_end();
+            panel.list.set_follow_mode(FollowMode::Tail);
+        }
+        cx.notify();
     }
 
     pub(super) fn on_panel_page_failed(
@@ -390,7 +468,7 @@ impl Inlet {
         let ch = panel.thread;
         panel.view.prune(account.read(cx), changes);
         if can_open(account.read(cx), ch).is_none() {
-            self.threads.panel = None;
+            self.retire_panel();
             self.chat.notice = Some(t!("threads-unavailable"));
             self.subscribe_threads();
             cx.notify();
@@ -431,6 +509,8 @@ impl Inlet {
 
     /// Once a second (the chat's tick): the panel's thread is read if it is watched.
     pub(crate) fn tick_thread_panel(&mut self, cx: &mut Context<Self>) {
+        // The forum's new posts are read too once the window has focus again.
+        self.read_forum(false, cx);
         let Some(ch) = self.threads.panel.as_ref().map(|p| p.thread) else {
             return;
         };
@@ -460,56 +540,17 @@ impl Inlet {
         panel.view.rows = new;
     }
 
-    /// A pending row of the panel's thread goes in the panel. Returns the row when it is
-    /// the chat's.
-    pub(crate) fn panel_pending(
-        &mut self,
-        out: Pending,
-        cx: &mut Context<Self>,
-    ) -> Option<Pending> {
-        let panel =
-            self.threads.panel.as_mut().filter(|p| {
-                p.thread.to_string() == out.channel_id || p.view.has_pending(&out.nonce)
-            });
-        let Some(panel) = panel else {
-            return Some(out);
-        };
-        panel.view.upsert_pending(out);
-        self.refresh_panel_rows(cx);
-        None
-    }
-
-    /// The server took the message with this nonce.
-    pub(crate) fn panel_sent(&mut self, nonce: &str, cx: &mut Context<Self>) {
-        if let Some(panel) = self.threads.panel.as_mut() {
-            if panel.view.sent(nonce) {
-                self.refresh_panel_rows(cx);
-                cx.notify();
-            }
-        }
-    }
-
-    /// Retry on a failed row of the panel; whether the row was the panel's.
-    pub(crate) fn panel_retry(&mut self, nonce: &str, cx: &mut Context<Self>) -> bool {
-        let Some(panel) = self
-            .threads
-            .panel
-            .as_mut()
-            .filter(|p| p.view.has_pending(nonce))
-        else {
+    /// Retry on a failed row of `channel_id`: when it is the panel's thread, the panel's
+    /// composer counts it for slowmode. Whether it was the panel's.
+    pub(crate) fn panel_resent(&mut self, channel_id: &str, cx: &mut Context<Self>) -> bool {
+        let thread = self.threads.panel.as_ref().map(|p| p.thread.to_string());
+        let (Some(view), Some(thread)) = (self.threads.composer.clone(), thread) else {
             return false;
         };
-        if let Some(cmd) = panel.view.retry(nonce) {
-            if let messages::Cmd::Resend { channel_id, .. } = &cmd {
-                if let Some(view) = &self.threads.composer {
-                    let channel_id = channel_id.clone();
-                    view.update(cx, |v, cx| v.on_resend(&channel_id, cx));
-                }
-            }
-            self.backend.send(cmd);
-            self.refresh_panel_rows(cx);
+        if thread != channel_id {
+            return false;
         }
-        cx.notify();
+        view.update(cx, |v, cx| v.on_resend(channel_id, cx));
         true
     }
 
@@ -675,6 +716,10 @@ impl Inlet {
                         if at_top {
                             this.load_panel_older(cx);
                         }
+                        let detached = this.threads.panel.as_ref().is_some_and(|p| p.view.detached);
+                        if at_bottom && detached {
+                            this.panel_to_present(cx);
+                        }
                         if at_bottom && this.panel_may_read(active, cx) {
                             let changes = this.read_channel(thread, AckKind::Automatic, false, cx);
                             this.after_changes(changes, false, cx);
@@ -712,6 +757,39 @@ impl Inlet {
             .is_some_and(|parent| parent.is_forum());
         let list_state = panel.list.clone();
         let composer = self.threads.composer.clone();
+        // A panel that lost its newest messages (scrolled back past the window's limit)
+        // gets back to them, as the chat does.
+        let jump = panel.view.detached.then(|| {
+            let label = match panel.view.detached_new {
+                0 => t!("chat-jump-to-present"),
+                1 => t!("chat-jump-new-message"),
+                n => t!("chat-jump-new-messages", count = n),
+            };
+            div()
+                .absolute()
+                .bottom(px(16.))
+                .left_0()
+                .right_0()
+                .flex()
+                .justify_center()
+                .child(
+                    div()
+                        .id("thread-jump-to-present")
+                        .px_4()
+                        .py_2()
+                        .rounded_full()
+                        .bg(theme::bg_textarea())
+                        .border_1()
+                        .border_color(theme::accent_border())
+                        .text_size(px(14.))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(theme::text())
+                        .cursor_pointer()
+                        .hover(|s| s.bg(theme::guild_item()))
+                        .child(label)
+                        .on_click(cx.listener(|this, _, _, cx| this.panel_to_present(cx))),
+                )
+        });
         Some(
             div()
                 .id("thread-panel")
@@ -765,6 +843,7 @@ impl Inlet {
                 )
                 .child(
                     div()
+                        .relative()
                         .flex_1()
                         .min_h_0()
                         .w_full()
@@ -780,7 +859,8 @@ impl Inlet {
                             )
                             .flex_1()
                             .w_full(),
-                        ),
+                        )
+                        .children(jump),
                 )
                 .children(composer)
                 .into_any_element(),
@@ -885,7 +965,8 @@ mod tests {
         );
         let (guild, parent) = can_open(&state, thread).expect("a public thread opens");
         assert_eq!(parent.to_string(), GENERAL);
-        let mut panel = Panel::new(thread, guild, parent, false);
+        let mut chat = MessageView::new();
+        let mut panel = Panel::new(thread, guild, parent, &chat, 0);
 
         // The chat's composer and the panel's, sharing the drafts, in one window with the
         // app's key bindings.
@@ -957,8 +1038,7 @@ mod tests {
             "the chat's draft is untouched"
         );
 
-        // The send shows as a pending row in the panel's own list, never in the chat's.
-        let mut chat = MessageView::new();
+        // The send shows as a pending row in the panel's list, never in the chat's.
         let cmd = send_from_panel(&mut panel, out.clone()).expect("the panel's thread");
         assert!(matches!(cmd, ComposerCmd::Send(ref o) if o.channel_id == THREAD));
         let rows = panel.view.build_rows(&state, thread);
@@ -974,5 +1054,66 @@ mod tests {
         let mut other = out.clone();
         other.channel_id = GENERAL.into();
         assert!(send_from_panel(&mut panel, other).is_none());
+    }
+
+    /// A send from the panel fails after the panel closed: the failure lands on the
+    /// thread's row in the account's outbox, and the thread opened again shows it with
+    /// Retry and the same nonce.
+    #[test]
+    fn a_failed_thread_send_keeps_its_row_after_the_panel_closes() {
+        use crate::backend::composer::Mentions;
+        let state = state();
+        let thread = ChannelId::parse(THREAD).unwrap();
+        let (guild, parent) = can_open(&state, thread).unwrap();
+        let mut chat = MessageView::new();
+        let mut panel = Panel::new(thread, guild, parent, &chat, 0);
+        let out = Outgoing {
+            channel_id: THREAD.into(),
+            nonce: "4242".into(),
+            content: "a long answer".into(),
+            mentions: Mentions::default(),
+            reply_to: None,
+            silent: false,
+        };
+        send_from_panel(&mut panel, out.clone()).expect("sent from the panel");
+        panel.view.begin_newest(thread);
+        let last = panel.view.last_request();
+        drop(panel);
+        // The backend's failure arrives with the panel closed; the app hands it to the
+        // chat's view, which holds the outbox of every channel.
+        let mut failed = crate::ui::composer::pending_of(&out);
+        failed.failed = Some("the network is unreachable".into());
+        chat.upsert_pending(failed);
+        let general = ChannelId::parse(GENERAL).unwrap();
+        assert!(
+            !chat
+                .build_rows(&state, general)
+                .iter()
+                .any(|r| matches!(r, Row::Pending(_))),
+            "not in the parent channel"
+        );
+        // The thread opens again: its failed row is there, with its text.
+        let mut reopened = Panel::new(thread, guild, parent, &chat, last);
+        let rows = reopened.view.build_rows(&state, thread);
+        assert!(rows.iter().any(|r| matches!(
+            r,
+            Row::Pending(p) if p.nonce == "4242" && p.failed.is_some()
+        )));
+        // Retry sends it again with the same nonce and text.
+        match reopened.view.retry("4242") {
+            Some(messages::Cmd::Resend {
+                channel_id,
+                nonce,
+                text,
+            }) => {
+                assert_eq!(channel_id, THREAD);
+                assert_eq!(nonce, "4242");
+                assert_eq!(text, "a long answer");
+            }
+            _ => panic!("Retry resends the failed thread message"),
+        }
+        // The new panel numbers its requests after the old one's.
+        let ch = thread;
+        assert!(reopened.view.begin_newest(ch) > last);
     }
 }

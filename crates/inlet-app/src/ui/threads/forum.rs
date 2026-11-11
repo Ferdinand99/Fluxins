@@ -78,6 +78,15 @@ impl ForumView {
 }
 
 impl Inlet {
+    /// Whether the selected channel is a forum or media channel: the forum view shows
+    /// in place of the chat even when it could not open (no account state yet, or no
+    /// access), so the chat's composer never shows under a forum.
+    pub(crate) fn forum_selected(&self) -> bool {
+        self.selected_channel
+            .as_ref()
+            .is_some_and(|id| self.channels.iter().any(|c| &c.id == id && c.is_forum()))
+    }
+
     /// Whether the forum view is up (its channel is the selected one).
     pub(crate) fn forum_is_open(&self) -> bool {
         self.threads
@@ -228,7 +237,17 @@ impl Inlet {
         };
         match result {
             Ok(page) => {
-                if f.pages.on_page(request, page.posts, page.has_more) {
+                // Only public posts of this forum, whatever the server sent.
+                let forum = f.forum;
+                let posts: Vec<p::Channel> = page
+                    .posts
+                    .into_iter()
+                    .filter(|t| {
+                        t.kind == p::models::channel_type::PUBLIC_THREAD
+                            && ChannelId::parse_opt(t.parent_id.as_deref()) == Some(forum)
+                    })
+                    .collect();
+                if f.pages.on_page(request, posts, page.has_more) {
                     f.keep_previews(page.previews);
                 }
             }
@@ -295,7 +314,7 @@ impl Inlet {
 
     /// The forum's new posts are read while it is on screen with focus (Fluxer's
     /// `useForumViewing`), through the chat's gate.
-    fn read_forum(&mut self, at_open: bool, cx: &mut Context<Self>) {
+    pub(super) fn read_forum(&mut self, at_open: bool, cx: &mut Context<Self>) {
         let Some(forum) = self.threads.forum.as_ref().map(|f| f.forum) else {
             return;
         };
@@ -324,6 +343,13 @@ impl Inlet {
             self.close_forum();
             self.chat.notice = Some(t!("threads-unavailable"));
             return;
+        }
+        if changes.reset {
+            // A new session: op 28 may go once more (one sent while the gateway was
+            // down was dropped).
+            if let Some(f) = self.threads.forum.as_mut() {
+                f.op28.open(forum);
+            }
         }
         if !changes.channels.is_empty() || changes.reset {
             self.ask_forum_extras(cx);

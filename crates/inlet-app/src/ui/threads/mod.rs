@@ -94,6 +94,9 @@ pub struct State {
     /// The newest request of the thread list or forum list, so the next list numbers
     /// its requests after it and an old answer never pairs with a new list.
     list_requests: u64,
+    /// The newest request of the thread panels so far, for the same reason: closing and
+    /// reopening a thread quickly never pairs the new panel with the old one's answer.
+    panel_requests: u64,
     /// Demo screenshots: the scene's thread or list was opened once.
     #[cfg(feature = "demo")]
     demo_done: bool,
@@ -104,7 +107,7 @@ impl State {
     /// screen or on its way. The panel's composer goes too (its text was saved with the
     /// old account's drafts); the next thread opens a new one.
     pub fn reset(&mut self) {
-        self.panel = None;
+        self.retire_panel();
         self.composer = None;
         self.composer_events = None;
         self.browser = None;
@@ -112,6 +115,19 @@ impl State {
         self.loads.clear();
         self.dm_nonces.clear();
         self.max_len = None;
+    }
+}
+
+impl State {
+    /// Takes the panel away, keeping its request numbering. Whether there was one.
+    pub(crate) fn retire_panel(&mut self) -> bool {
+        match self.panel.take() {
+            Some(p) => {
+                self.panel_requests = self.panel_requests.max(p.view.last_request());
+                true
+            }
+            None => false,
+        }
     }
 }
 
@@ -152,7 +168,7 @@ impl Inlet {
     /// The chat (or the open forum), with the thread panel beside it and the thread list
     /// over its top right corner.
     pub(crate) fn render_center(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let main = if self.forum_is_open() {
+        let main = if self.forum_selected() {
             self.render_forum(cx).into_any_element()
         } else {
             self.render_chat(cx).into_any_element()
@@ -261,6 +277,18 @@ impl Inlet {
     ) {
         self.panel_after_changes(changes, members, cx);
         self.forum_after_changes(changes, cx);
+        // The thread list closes when the account can no longer view its channel.
+        if let (Some(account), Some(b)) = (self.account.clone(), self.threads.browser.as_ref()) {
+            let state = account.read(cx);
+            let viewable = state
+                .channels()
+                .guild_of(b.channel)
+                .is_some_and(|g| state.permissions(g, b.channel).can_view());
+            if !viewable {
+                self.threads.browser = None;
+                cx.notify();
+            }
+        }
     }
 
     /// Thread events and messages for the open guild, with the member list of the
