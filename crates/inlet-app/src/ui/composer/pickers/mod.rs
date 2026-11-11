@@ -685,15 +685,8 @@ impl Inlet {
                     .px(px(12.))
                     .py(px(8.))
                     .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .px(px(8.))
-                            .py(px(6.))
-                            .rounded(px(6.))
-                            .bg(theme::bg_textarea())
-                            .text_size(px(14.))
-                            .child(search),
+                        // The field draws its own box and focus ring.
+                        div().flex_1().min_w_0().text_size(px(14.)).child(search),
                     )
                     .children(tools),
             )

@@ -18,12 +18,12 @@ use crate::backend::Ui;
 
 /// Featured search terms and the demo picture of each.
 const CATEGORIES: [(&str, &str); 6] = [
-    ("happy", "picture"),
-    ("thumbs up", "thumb"),
-    ("wow", "sky"),
-    ("party", "article"),
-    ("dance", "video"),
-    ("thank you", "author"),
+    ("happy", "pickstill-0"),
+    ("thumbs up", "pickstill-1"),
+    ("wow", "pickstill-2"),
+    ("party", "pickstill-3"),
+    ("dance", "pickstill-4"),
+    ("thank you", "pickstill-5"),
 ];
 /// Favourite emoji of the demo account.
 const FAVOURITES: [&str; 3] = ["unicode:heart", "unicode:tada", "unicode:rocket"];
@@ -57,14 +57,10 @@ fn gif(n: usize, stem: &str) -> p::Gif {
 }
 
 fn gifs() -> Vec<p::Gif> {
-    let first = if moving() { "gif" } else { "thumb" };
-    [
-        first, "picture", "sky", "article", "author", "video", "footer", "thumb",
-    ]
-    .iter()
-    .enumerate()
-    .map(|(n, stem)| gif(n, stem))
-    .collect()
+    let kind = if moving() { "pick" } else { "pickstill" };
+    (0..8u8)
+        .map(|n| gif(usize::from(n), &format!("{kind}-{}", n + 2)))
+        .collect()
 }
 
 fn categories() -> Vec<p::api::gifs::GifCategory> {
