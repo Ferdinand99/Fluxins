@@ -212,7 +212,10 @@ impl Inlet {
         still: Option<&MediaRequest>,
         cx: &mut Context<Self>,
     ) -> Shown {
-        if let Some(anim) = moving {
+        // While the picker is the layer on top, only its own images may take a place in
+        // the budget: the frozen chat under it shows stills and leaves the room to it.
+        let may_move = self.media.images.animations.borrow().may_admit();
+        if let Some(anim) = moving.filter(|_| may_move) {
             let images = &self.media.images;
             let known = images.animations.borrow().known(anim);
             if known.is_none_or(|bytes| images.animations.borrow().fits(bytes)) {
@@ -222,6 +225,7 @@ impl Inlet {
                         let mut budget = images.animations.borrow_mut();
                         budget.remember(anim, bytes);
                         if budget.admit_image(image.id, bytes) {
+                            budget.mark_if_top_layer(image.id);
                             return Shown::Ready(image);
                         }
                         drop(budget);

@@ -223,6 +223,11 @@ pub struct AnimationBudget {
     /// Images the topmost layer draws itself this frame (a picker's grid): they move
     /// while the layer is open, and count against [`MAX_PLAYING`] like any other.
     in_top_layer: HashSet<ImageId>,
+    /// A layer that draws images of its own (the picker) is on top: only images drawn
+    /// while [`drawing_top_layer`](Self::drawing_top_layer) is set may take a place.
+    top_layer_only: bool,
+    /// The top layer is drawing its images now.
+    drawing_top_layer: bool,
     /// The animation of the open layer (the image viewer): it always moves, and takes
     /// one of the [`MAX_PLAYING`] places before the chat is drawn.
     reserved: Option<ImageId>,
@@ -260,6 +265,8 @@ impl AnimationBudget {
             known: HashMap::new(),
             admitted: HashSet::new(),
             in_top_layer: HashSet::new(),
+            top_layer_only: false,
+            drawing_top_layer: false,
             reserved: None,
             max_playing: MAX_PLAYING,
             playing: 0,
@@ -296,6 +303,8 @@ impl AnimationBudget {
         self.playing = 0;
         self.admitted.clear();
         self.in_top_layer.clear();
+        self.top_layer_only = false;
+        self.drawing_top_layer = false;
         self.reserved = None;
         self.wake = None;
         self.frame += 1;
@@ -333,6 +342,31 @@ impl AnimationBudget {
     pub fn in_top_layer(&mut self, id: ImageId) {
         if self.admitted.contains(&id) {
             self.in_top_layer.insert(id);
+        }
+    }
+
+    /// Whether the topmost layer draws images of its own this frame (the picker). Call
+    /// it after [`next_frame`](Self::next_frame), before anything is drawn.
+    pub fn set_top_layer_only(&mut self, on: bool) {
+        self.top_layer_only = on;
+    }
+
+    /// The top layer starts (`true`) or ends drawing its images. Only while it is the
+    /// top layer ([`set_top_layer_only`](Self::set_top_layer_only)) does this count.
+    pub fn drawing_top_layer(&mut self, on: bool) {
+        self.drawing_top_layer = on && self.top_layer_only;
+    }
+
+    /// Whether an animation drawn now may take a place in the budget: always, unless a
+    /// layer with images of its own is on top and this one is not the layer's.
+    pub fn may_admit(&self) -> bool {
+        !self.top_layer_only || self.drawing_top_layer
+    }
+
+    /// Marks an image just admitted as the top layer's, when the top layer is drawing.
+    pub fn mark_if_top_layer(&mut self, id: ImageId) {
+        if self.drawing_top_layer {
+            self.in_top_layer(id);
         }
     }
 
@@ -766,6 +800,47 @@ mod tests {
         }
         let (_, picker2) = draw(&mut b);
         assert!(picker2.iter().all(|f| *f == 0));
+    }
+
+    #[test]
+    fn the_picker_on_top_gets_the_budget_before_the_frozen_chat() {
+        let mut b = AnimationBudget::default();
+        b.next_frame(LIVE, Instant::now());
+        // No layer of that kind: everything may take a place, nothing is marked.
+        assert!(b.may_admit());
+        b.drawing_top_layer(true);
+        assert!(b.may_admit());
+        assert!(b.admit_image(ImageId(1), 1));
+        b.mark_if_top_layer(ImageId(1));
+        assert!(
+            !b.in_top_layer.contains(&ImageId(1)),
+            "not on top: not marked"
+        );
+        // The picker on top: the chat (drawn first) may not take the budget...
+        let open = Stage {
+            layer_open: true,
+            ..LIVE
+        };
+        b.next_frame(open, Instant::now());
+        b.set_top_layer_only(true);
+        assert!(!b.may_admit(), "the chat under the picker shows stills");
+        // ...the picker's own images may, all of it, and they move.
+        b.drawing_top_layer(true);
+        assert!(b.may_admit());
+        assert!(b.admit_image(ImageId(2), ANIMATION_BUDGET_BYTES));
+        b.mark_if_top_layer(ImageId(2));
+        assert!(b.in_top_layer.contains(&ImageId(2)));
+        b.drawing_top_layer(false);
+        assert!(!b.may_admit());
+        // Another layer over the picker (a link prompt): nothing of the picker is
+        // marked, so nothing under the top layer moves.
+        b.next_frame(open, Instant::now());
+        b.set_top_layer_only(false);
+        b.drawing_top_layer(true);
+        assert!(b.admit_image(ImageId(3), 1));
+        b.mark_if_top_layer(ImageId(3));
+        assert!(!b.in_top_layer.contains(&ImageId(3)));
+        assert_eq!(b.frame_to_draw(ImageId(3), Motion::Gif, three), 0);
     }
 
     #[test]

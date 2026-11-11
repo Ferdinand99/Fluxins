@@ -16,7 +16,7 @@ use gpui::{
 use crate::buffer::{Buffer, TooLong};
 use crate::fragment::Fragment;
 use crate::selection::{self, Move, Selection};
-use crate::tokens::{Resolve, Token, TokenSpan};
+use crate::tokens::{Id, Resolve, Token, TokenSpan};
 use crate::trigger::{trigger_at, Trigger};
 
 actions!(
@@ -295,22 +295,31 @@ impl Editor {
         Ok(())
     }
 
-    /// Inserts a token at the caret, replacing the selection (a picker's custom emoji).
-    /// Returns false, and changes nothing, when the label is empty or the token does not
-    /// fit, or while an input method is composing.
-    pub fn insert_token(
+    /// Inserts a custom emoji pill (`:name:`) at the caret, replacing the selection: what
+    /// a picker puts in. Only custom emoji can go in this way; mentions come only from
+    /// autocomplete, which checks the right to mention. Returns false, and changes
+    /// nothing, when the name is empty, the pill does not fit, or an input method is
+    /// composing.
+    pub fn insert_custom_emoji(
         &mut self,
-        token: Token,
-        label: &str,
+        id: Id,
+        name: &str,
+        animated: bool,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if self.marked.is_some() {
+        if self.marked.is_some() || name.is_empty() {
             return false;
         }
+        let token = Token::CustomEmoji {
+            id,
+            name: name.to_owned(),
+            animated,
+        };
+        let label = format!(":{name}:");
         if !self
             .buffer
-            .replace_with_token(self.selection.range(), token, label)
+            .replace_with_token(self.selection.range(), token, &label)
         {
             return false;
         }

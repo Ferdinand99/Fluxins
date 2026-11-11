@@ -43,8 +43,11 @@ picker-stickers-none = No stickers match your search.
 picker-sticker-locked = You cannot use stickers from other communities here.
 picker-memes-empty = You have no saved media yet.
 picker-memes-none = No saved media match your search.
+picker-memes-failed = Could not load your saved media: { $error }
 
 ## Results
 
 picker-send-failed = Could not send: { $error }
 picker-prefs-failed = Could not save your emoji or GIF settings: { $error }
+picker-prefs-load-failed = Could not load your emoji and GIF settings: { $error }
+picker-insert-failed = That did not fit in the message box.

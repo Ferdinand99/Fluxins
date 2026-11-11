@@ -28,14 +28,14 @@
 //! - memes: one `GET` when the memes tab opens and READY gave none;
 //! - a picked sticker or meme is one message (`POST`).
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use inlet_protocol as p;
 use inlet_protocol::api::gifs::GifCategory;
 use inlet_protocol::api::preferences::Preferences;
 use inlet_protocol::proto::preferences::{
-    EmojiPickerState, EmojiState, FavoriteGifEntry, FavoriteGifMediaFormat, FavoriteGifSettings,
-    UsageStat,
+    EmojiPickerState, EmojiState, FavoriteGifEntry, FavoriteGifSettings, UsageStat,
 };
 
 use super::State;
@@ -85,7 +85,7 @@ pub enum Cmd {
     LoadPreferences,
     /// A change to the synced preferences, on top of `base` (the snapshot the UI knows).
     EditPreferences {
-        base: Box<p::SyncedPreferences>,
+        base: Arc<p::SyncedPreferences>,
         edit: PrefEdit,
     },
     /// The account's saved memes, when READY did not bring them.
@@ -110,9 +110,10 @@ pub enum Ev {
         nonce: u64,
         result: Result<Vec<p::Gif>, String>,
     },
+    /// The featured search terms, and the featured GIF (the trending tile's picture).
     Categories {
         nonce: u64,
-        result: Result<Vec<GifCategory>, String>,
+        result: Result<(Vec<GifCategory>, Option<Box<p::Gif>>), String>,
     },
     /// The preferences as stored, read for the pickers.
     Preferences(Box<p::SyncedPreferences>),
@@ -121,7 +122,11 @@ pub enum Ev {
     Edited(Box<p::SyncedPreferences>),
     /// A preference write failed: the UI goes back to the stored snapshot.
     PreferencesFailed(String),
+    /// Reading the preferences failed; the pickers ask again next time they open.
+    PreferencesLoadFailed(String),
     Memes(Vec<p::Meme>),
+    /// Reading the memes failed; the tab says so and asks again when it opens next.
+    MemesFailed(String),
     /// A sticker or meme was not sent.
     SendFailed(String),
 }
@@ -298,32 +303,116 @@ impl PrefEdit {
     }
 }
 
-/// A favourite GIF entry for a GIF from a search: the page URL, the media proxy URL and
-/// the formats' proxy URLs. Provider URLs (`src`) are left empty: Inlet never loads them,
-/// and Fluxer's own client finds a favourite by its page URL.
+/// The content type Fluxer gives a GIF format key (`inferFormatContentType` in Fluxer's
+/// `GifMediaFormatKeys.ts`); empty for a key it does not know.
+pub fn format_content_type(key: &str) -> &'static str {
+    match key {
+        "gif" | "mediumgif" | "nanogif" | "tinygif" => "image/gif",
+        "webp" | "mediumwebp" | "nanowebp" | "tinywebp" => "image/webp",
+        "mp4" | "loopedmp4" | "mediummp4" | "nanomp4" | "tinymp4" => "video/mp4",
+        "webm" | "mediumwebm" | "nanowebm" | "tinywebm" => "video/webm",
+        _ => "",
+    }
+}
+
+/// Fluxer's preview order of the formats (`PREVIEW_FORMAT_PRIORITY`).
+const PREVIEW_FORMAT_PRIORITY: [&str; 17] = [
+    "tinywebm",
+    "tinymp4",
+    "mediumwebm",
+    "mediummp4",
+    "webm",
+    "mp4",
+    "loopedmp4",
+    "nanowebm",
+    "nanomp4",
+    "tinywebp",
+    "tinygif",
+    "mediumwebp",
+    "webp",
+    "mediumgif",
+    "gif",
+    "nanowebp",
+    "nanogif",
+];
+/// The image formats of a GIF, best first for a tile (Fluxer's preview order, images
+/// only).
+pub const IMAGE_KEYS: [&str; 8] = [
+    "tinywebp",
+    "tinygif",
+    "mediumwebp",
+    "webp",
+    "mediumgif",
+    "gif",
+    "nanowebp",
+    "nanogif",
+];
+/// The width, in device pixels, Fluxer picks a stored preview for (a 200 px tile at 2x).
+const STORED_PREVIEW_WIDTH: u64 = 400;
+
+/// A favourite GIF entry for a GIF from a search, in the shape Fluxer stores
+/// (`slimFavoriteGifEntry`): one preview format in `proxy_url` with its size and
+/// `content_type`, and `media` empty, so Fluxer's client reads it unchanged. Fluxer picks
+/// its preview among every format and prefers a video; Inlet plays no video, so it picks
+/// the best image format by Fluxer's rule (`pickBestPreviewFormat(media, 'image')`: the
+/// narrowest at least 400 px wide, else the widest; then Fluxer's order). Without an
+/// image format the default one is kept, with no content type.
 pub fn favourite_entry(gif: &p::Gif) -> FavoriteGifEntry {
+    let priority = |key: &str| {
+        PREVIEW_FORMAT_PRIORITY
+            .iter()
+            .position(|k| *k == key)
+            .unwrap_or(PREVIEW_FORMAT_PRIORITY.len())
+    };
+    let images: Vec<(&String, &p::api::gifs::GifFormat)> = gif
+        .media
+        .iter()
+        .filter(|(key, f)| {
+            format_content_type(key).starts_with("image/")
+                && !f.proxy_src.is_empty()
+                && f.width > 0
+                && f.height > 0
+        })
+        .collect();
+    let filling: Vec<_> = images
+        .iter()
+        .filter(|(_, f)| f.width >= STORED_PREVIEW_WIDTH)
+        .copied()
+        .collect();
+    let narrowest_filling = !filling.is_empty();
+    let mut pool = if narrowest_filling { filling } else { images };
+    pool.sort_by(|(ka, a), (kb, b)| {
+        let by_width = if narrowest_filling {
+            a.width.cmp(&b.width)
+        } else {
+            b.width.cmp(&a.width)
+        };
+        by_width
+            .then(priority(ka).cmp(&priority(kb)))
+            .then(ka.cmp(kb))
+    });
+    let dim = |v: u64| u32::try_from(v).unwrap_or(0);
+    let (proxy_url, width, height, content_type) = match pool.first() {
+        Some((key, f)) => (
+            f.proxy_src.clone(),
+            dim(f.width),
+            dim(f.height),
+            format_content_type(key).to_owned(),
+        ),
+        None => (
+            gif.proxy_src.clone(),
+            dim(gif.width),
+            dim(gif.height),
+            String::new(),
+        ),
+    };
     FavoriteGifEntry {
         url: gif.url.clone(),
-        proxy_url: gif.proxy_src.clone(),
-        width: u32::try_from(gif.width).unwrap_or(0),
-        height: u32::try_from(gif.height).unwrap_or(0),
-        media: gif
-            .media
-            .iter()
-            .take(16)
-            .map(|(name, f)| {
-                (
-                    name.clone(),
-                    FavoriteGifMediaFormat {
-                        src: String::new(),
-                        proxy_src: f.proxy_src.clone(),
-                        width: u32::try_from(f.width).unwrap_or(0),
-                        height: u32::try_from(f.height).unwrap_or(0),
-                    },
-                )
-            })
-            .collect(),
-        content_type: String::new(),
+        proxy_url,
+        width,
+        height,
+        media: Default::default(),
+        content_type,
         placeholder: String::new(),
     }
 }
@@ -399,6 +488,8 @@ impl Backend {
                     result: Err(none()),
                 },
                 Cmd::EditPreferences { .. } => Ev::PreferencesFailed(none()),
+                Cmd::LoadPreferences => Ev::PreferencesLoadFailed(none()),
+                Cmd::LoadMemes => Ev::MemesFailed(none()),
                 Cmd::SendSticker { .. } | Cmd::SendMeme { .. } => Ev::SendFailed(none()),
                 _ => return,
             };
@@ -440,7 +531,7 @@ impl Backend {
                 }
                 self.spawn_guarded("gif featured", None, async move {
                     let result = match ctx.client.gif_featured(&locale).await {
-                        Ok(f) => Ok(f.categories),
+                        Ok(f) => Ok((f.categories, f.gifs.into_iter().next().map(Box::new))),
                         Err(err) => match reason(&ctx.internal, ctx.gen, err) {
                             Some(r) => Err(r),
                             None => return,
@@ -477,7 +568,11 @@ impl Backend {
                                 ))));
                         }
                         Err(err) => {
-                            let _ = reason(&ctx.internal, ctx.gen, err);
+                            if let Some(r) = reason(&ctx.internal, ctx.gen, err) {
+                                let _ = ctx.events.unbounded_send(super::Ev::Pickers(
+                                    Ev::PreferencesLoadFailed(r),
+                                ));
+                            }
                         }
                     }
                 });
@@ -503,7 +598,11 @@ impl Backend {
                                 .unbounded_send(super::Ev::Pickers(Ev::Memes(memes)));
                         }
                         Err(err) => {
-                            let _ = reason(&ctx.internal, ctx.gen, err);
+                            if let Some(r) = reason(&ctx.internal, ctx.gen, err) {
+                                let _ = ctx
+                                    .events
+                                    .unbounded_send(super::Ev::Pickers(Ev::MemesFailed(r)));
+                            }
                         }
                     }
                 });

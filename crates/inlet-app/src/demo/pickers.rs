@@ -134,10 +134,10 @@ pub fn answer(events: &Ui, cmd: Cmd) {
         },
         Cmd::FeaturedGifs { nonce, .. } => Ev::Categories {
             nonce,
-            result: Ok(categories()),
+            result: Ok((categories(), Some(Box::new(gif(9, "pickstill-9"))))),
         },
         Cmd::LoadPreferences => Ev::Preferences(Box::new(preferences())),
-        Cmd::EditPreferences { base, .. } => Ev::Edited(base),
+        Cmd::EditPreferences { base, .. } => Ev::Edited(Box::new((*base).clone())),
         Cmd::LoadMemes => Ev::Memes(Vec::new()),
         Cmd::SharedGif { .. } | Cmd::SendSticker { .. } | Cmd::SendMeme { .. } => return,
     };

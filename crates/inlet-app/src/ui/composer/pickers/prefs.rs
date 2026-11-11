@@ -9,6 +9,7 @@
 //! what is shown.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 use inlet_protocol as p;
 use inlet_protocol::api::preferences::Preferences;
@@ -18,18 +19,23 @@ use crate::backend::composer::gif::{self, Cmd, PrefEdit};
 
 /// Recently used emoji shown (three rows).
 pub const MAX_RECENT: usize = 27;
+/// Edits on their way at once (the protocol queues at most 256 per account); more are
+/// refused until answers come back.
+pub const MAX_PENDING: usize = 64;
 
 #[derive(Default)]
 pub struct PickerPrefs {
     /// The snapshot as the server stored it; `None` until READY, an update or a load
     /// brought it.
-    stored: Option<p::SyncedPreferences>,
+    stored: Option<Arc<p::SyncedPreferences>>,
     /// `stored` with the edits on their way applied.
     shown: Preferences,
     /// Edits sent and not answered yet, oldest first.
     pending: VecDeque<PrefEdit>,
     /// A load was asked for.
     pub asked: bool,
+    /// Bumped whenever what is shown may have changed (the pickers' cached grids use it).
+    rev: u64,
 }
 
 impl PickerPrefs {
@@ -40,7 +46,7 @@ impl PickerPrefs {
 
     /// A snapshot from READY, USER_SETTINGS_UPDATE or a load.
     pub fn set_stored(&mut self, stored: p::SyncedPreferences) {
-        self.stored = Some(stored);
+        self.stored = Some(Arc::new(stored));
         self.recompute();
     }
 
@@ -49,12 +55,26 @@ impl PickerPrefs {
     pub fn edited(&mut self, stored: Option<p::SyncedPreferences>) {
         self.pending.pop_front();
         if let Some(s) = stored {
-            self.stored = Some(s);
+            self.stored = Some(Arc::new(s));
         }
         self.recompute();
     }
 
+    /// A new session: edits of the old one get no answer, so they are dropped.
+    pub fn clear_pending(&mut self) {
+        if !self.pending.is_empty() {
+            self.pending.clear();
+            self.recompute();
+        }
+    }
+
+    /// Changes whenever what is shown may have changed.
+    pub fn rev(&self) -> u64 {
+        self.rev
+    }
+
     fn recompute(&mut self) {
+        self.rev += 1;
         self.shown = self
             .stored
             .as_ref()
@@ -65,14 +85,18 @@ impl PickerPrefs {
         }
     }
 
-    /// Shows `edit` at once and gives the command that stores it.
-    pub fn edit(&mut self, edit: PrefEdit) -> Cmd {
-        edit.apply(&mut self.shown);
-        self.pending.push_back(edit.clone());
-        Cmd::EditPreferences {
-            base: Box::new(self.stored.clone().unwrap_or_default()),
-            edit,
+    /// Shows `edit` at once and gives the command that stores it; `None` (nothing
+    /// changes) while [`MAX_PENDING`] edits wait for their answer. The base is shared,
+    /// not copied.
+    pub fn edit(&mut self, edit: PrefEdit) -> Option<Cmd> {
+        if self.pending.len() >= MAX_PENDING {
+            return None;
         }
+        edit.apply(&mut self.shown);
+        self.rev += 1;
+        self.pending.push_back(edit.clone());
+        let base = self.stored.clone().unwrap_or_default();
+        Some(Cmd::EditPreferences { base, edit })
     }
 
     /// The favourite emoji keys, in the order they were added.
@@ -192,7 +216,7 @@ mod tests {
             key: "unicode:wave".into(),
             on: true,
         });
-        assert!(matches!(cmd, Cmd::EditPreferences { .. }));
+        assert!(matches!(cmd, Some(Cmd::EditPreferences { .. })));
         assert!(prefs.is_favourite("unicode:wave"));
         prefs.edit(PrefEdit::UsedEmoji {
             key: "unicode:smile".into(),
@@ -208,5 +232,29 @@ mod tests {
         // Skin tones: only Fluxer's values.
         prefs.edit(PrefEdit::SkinTone("\u{1F3FE}".into()));
         assert_eq!(prefs.skin_tone(), inlet_emoji::SkinTone::MediumDark);
+    }
+
+    #[test]
+    fn edits_on_their_way_are_bounded_and_a_new_session_drops_them() {
+        let mut prefs = PickerPrefs::default();
+        prefs.set_stored(p::SyncedPreferences::empty());
+        let rev = prefs.rev();
+        for i in 0..MAX_PENDING {
+            let edit = PrefEdit::FavouriteEmoji {
+                key: format!("custom:1:{}", i + 1),
+                on: true,
+            };
+            assert!(prefs.edit(edit).is_some());
+        }
+        assert!(prefs.rev() > rev);
+        let refused = PrefEdit::FavouriteEmoji {
+            key: "unicode:wave".into(),
+            on: true,
+        };
+        assert!(prefs.edit(refused).is_none());
+        assert!(!prefs.is_favourite("unicode:wave"));
+        assert_eq!(prefs.favourites().len(), MAX_PENDING);
+        prefs.clear_pending();
+        assert!(prefs.favourites().is_empty());
     }
 }

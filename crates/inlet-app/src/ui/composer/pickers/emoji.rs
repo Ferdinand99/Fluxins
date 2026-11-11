@@ -8,7 +8,6 @@
 //! emoji through the session's image client and the one animation budget.
 
 use std::ops::Range;
-use std::rc::Rc;
 
 use gpui::{
     canvas, div, prelude::*, px, uniform_list, AnyElement, App, ClickEvent, Context, Corners,
@@ -23,7 +22,7 @@ use crate::app::Inlet;
 use crate::backend::composer::gif::PrefEdit;
 use crate::backend::composer::snowflake_u64;
 use crate::theme;
-use crate::ui::media::emoji::{self as media_emoji, paint_emoji, Picture};
+use crate::ui::media::emoji::{self as media_emoji, paint_emoji};
 
 /// Emoji per row.
 pub const COLUMNS: usize = 9;
@@ -71,6 +70,21 @@ impl Cell {
 pub enum Row {
     Header(SharedString),
     Cells(Vec<Cell>),
+}
+
+/// What the emoji grid is built from, apart from the account state's emoji themselves:
+/// when none of it changes, a redraw uses the grid it has.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GridKey {
+    pub query: String,
+    /// [`PickerPrefs::rev`]: favourites and recently used.
+    pub prefs_rev: u64,
+    /// The communities in picker order, each with where its emoji list lives and how long
+    /// it is (the account state replaces the list when the emoji change).
+    pub guilds: Vec<(inlet_state::GuildId, usize, usize)>,
+    pub channel_guild: Option<String>,
+    pub external: bool,
+    pub global: bool,
 }
 
 /// One community's custom emoji: `(id, name, animated)`.
@@ -307,12 +321,8 @@ impl Inlet {
             .collect()
     }
 
-    pub(super) fn render_emoji_tab(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let Some(open) = self.composer.pickers.open.as_ref() else {
-            return div().into_any_element();
-        };
-        let (query, handle) = (open.query.clone(), open.list.clone());
-        let guilds = self.picker_guild_emojis(cx);
+    /// The grid's key this frame (cheap: no emoji are copied).
+    fn emoji_grid_key(&self, query: &str, cx: &App) -> GridKey {
         let (channel_guild, external, _) = self.picker_channel(cx);
         let global = self
             .composer
@@ -320,30 +330,56 @@ impl Inlet {
             .setup
             .as_ref()
             .is_some_and(|s| s.global_expressions);
-        let inputs = Inputs {
-            prefs: &self.composer.pickers.prefs,
-            now_ms: chrono::Utc::now().timestamp_millis(),
-            guilds: &guilds,
-            channel_guild: channel_guild.as_deref(),
+        GridKey {
+            query: query.to_owned(),
+            prefs_rev: self.composer.pickers.prefs.rev(),
+            guilds: self.picker_guild_lists(cx, false),
+            channel_guild,
             external,
             global,
+        }
+    }
+
+    pub(super) fn render_emoji_tab(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(open) = self.composer.pickers.open.as_ref() else {
+            return div().into_any_element();
         };
-        let (rows, jumps) = rows(&inputs, &query);
-        if rows.is_empty() {
+        let (query, handle) = (open.query.clone(), open.list.clone());
+        let key = self.emoji_grid_key(&query, cx);
+        // Built again only when the key changes, not on every redraw.
+        let mut cache = std::mem::take(&mut self.composer.pickers.emoji_rows);
+        let grid = cache.get(key.clone(), || {
+            let guilds = self.picker_guild_emojis(cx);
+            let inputs = Inputs {
+                prefs: &self.composer.pickers.prefs,
+                now_ms: chrono::Utc::now().timestamp_millis(),
+                guilds: &guilds,
+                channel_guild: key.channel_guild.as_deref(),
+                external: key.external,
+                global: key.global,
+            };
+            rows(&inputs, &key.query)
+        });
+        self.composer.pickers.emoji_rows = cache;
+        if grid.0.is_empty() {
             return empty(t!("picker-emoji-none"));
         }
         let tone = self.composer.pickers.prefs.skin_tone();
-        let jump_bar = self.render_jump_bar(&rows, &jumps, tone, &handle, cx);
-        let rows = Rc::new(rows);
-        let count = rows.len();
+        self.picker_images(true);
+        let jump_bar = self.render_jump_bar(&grid.0, &grid.1, tone, &handle, cx);
+        self.picker_images(false);
+        let count = grid.0.len();
         let list = uniform_list(
             "picker-emoji-grid",
             count,
             cx.processor(move |this: &mut Inlet, range: Range<usize>, _, cx| {
-                range
-                    .filter_map(|ix| rows.get(ix).map(|r| (ix, r)))
+                this.picker_images(true);
+                let out = range
+                    .filter_map(|ix| grid.0.get(ix).map(|r| (ix, r)))
                     .map(|(ix, row)| this.render_emoji_row(ix, row, tone, cx))
-                    .collect::<Vec<_>>()
+                    .collect::<Vec<_>>();
+                this.picker_images(false);
+                out
             }),
         )
         .track_scroll(&handle)
@@ -456,11 +492,9 @@ impl Inlet {
         size: f32,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        // Marked as the picker's by the budget when the picker is on top and drawing.
         let picture = self.custom_emoji_picture(id, animated, cx);
         let budget = self.media.images.animations().clone();
-        if let Picture::Ready(image) = &picture {
-            budget.borrow_mut().in_top_layer(image.id);
-        }
         canvas(
             |_, _, _| (),
             move |bounds, (), window, cx| paint_emoji(&picture, bounds, &budget, window, cx),
@@ -489,24 +523,21 @@ impl Inlet {
             }
         }
         let tone = self.composer.pickers.prefs.skin_tone();
-        self.edit_prefs(PrefEdit::UsedEmoji {
-            key: cell.key(),
-            at_ms: chrono::Utc::now().timestamp_millis(),
-        });
-        match (target, cell) {
-            (Target::Composer, Cell::Unicode(e)) => {
-                let glyph = if e.skin_tones {
-                    inlet_emoji::with_skin_tone(e, tone).into_owned()
-                } else {
-                    e.glyph.to_owned()
-                };
-                self.insert_into_composer(Insert::Text(glyph), window, cx);
+        let glyph_of = |e: &inlet_emoji::Emoji| {
+            if e.skin_tones {
+                inlet_emoji::with_skin_tone(e, tone).into_owned()
+            } else {
+                e.glyph.to_owned()
             }
-            (Target::Composer, Cell::Custom(c)) => {
-                let Some(id) = snowflake_u64(&c.id) else {
-                    return;
-                };
-                self.insert_into_composer(
+        };
+        let key = cell.key();
+        let done = match (target, cell) {
+            (Target::Composer | Target::Panel, Cell::Unicode(e)) => {
+                self.insert_into_composer(target, Insert::Text(glyph_of(e)), window, cx)
+            }
+            (Target::Composer | Target::Panel, Cell::Custom(c)) => match snowflake_u64(&c.id) {
+                Some(id) => self.insert_into_composer(
+                    target,
                     Insert::CustomEmoji {
                         id,
                         name: c.name,
@@ -514,20 +545,27 @@ impl Inlet {
                     },
                     window,
                     cx,
-                );
-            }
+                ),
+                None => false,
+            },
             (Target::Reaction { ch, id, .. }, Cell::Unicode(e)) => {
-                let glyph = if e.skin_tones {
-                    inlet_emoji::with_skin_tone(e, tone).into_owned()
-                } else {
-                    e.glyph.to_owned()
-                };
-                self.toggle_reaction(ch, id, p::Emoji::unicode(glyph), cx);
+                self.toggle_reaction(ch, id, p::Emoji::unicode(glyph_of(e)), cx);
+                true
             }
             (Target::Reaction { ch, id, .. }, Cell::Custom(c)) => {
                 self.toggle_reaction(ch, id, p::Emoji::custom(c.id, c.name, c.animated), cx);
+                true
             }
+        };
+        // Only what went in counts as used; a refused pick leaves the picker open.
+        if !done {
+            cx.notify();
+            return;
         }
+        self.edit_prefs(PrefEdit::UsedEmoji {
+            key,
+            at_ms: chrono::Utc::now().timestamp_millis(),
+        });
         self.picked(keep_open, cx);
     }
 

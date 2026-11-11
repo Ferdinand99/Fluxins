@@ -4,7 +4,6 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use inlet_protocol::proto::preferences::FavoriteGifMediaFormat;
 use serde_json::{json, Value};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
@@ -176,14 +175,59 @@ fn base64(data: &[u8]) -> String {
 
 /// A snapshot from a newer Fluxer client: a top-level field Inlet does not know
 /// (950, "set by a newer client") and `emoji_picker.favorite_emoji_ids = [unicode:wave]`.
+fn varint(mut v: u64, out: &mut Vec<u8>) {
+    while v >= 0x80 {
+        out.push((v as u8 & 0x7f) | 0x80);
+        v >>= 7;
+    }
+    out.push(v as u8);
+}
+
+fn bytes_field(field: u64, data: &[u8], out: &mut Vec<u8>) {
+    varint(field << 3 | 2, out);
+    varint(data.len() as u64, out);
+    out.extend_from_slice(data);
+}
+
+fn varint_field(field: u64, v: u64, out: &mut Vec<u8>) {
+    varint(field << 3, out);
+    varint(v, out);
+}
+
+/// The favourite GIF as Fluxer's client stores it (`slimFavoriteGifEntry`): the page
+/// URL, the video preview of the best format in `proxy_url`, its size and content type,
+/// and no formats.
+fn fluxer_favourite() -> FavoriteGifEntry {
+    FavoriteGifEntry {
+        url: "https://klipy.com/gifs/dancing-cat".into(),
+        proxy_url: "https://media.example/external/x/https/static.klipy.com/dancing.mp4".into(),
+        width: 498,
+        height: 280,
+        media: Default::default(),
+        content_type: "video/mp4".into(),
+        placeholder: String::new(),
+    }
+}
+
+/// A snapshot from a newer Fluxer client: a top-level field Inlet does not know
+/// (950, "set by a newer client"), `emoji_picker.favorite_emoji_ids = [unicode:wave]`
+/// and one favourite GIF in the shape Fluxer stores it.
 fn snapshot() -> (Vec<u8>, Vec<u8>) {
     let unknown: Vec<u8> = [&[0xB2, 0x3B, 21][..], b"set by a newer client"].concat();
-    let favourite = b"unicode:wave";
-    let mut picker = vec![0x12, favourite.len() as u8];
-    picker.extend_from_slice(favourite);
+    let mut picker = Vec::new();
+    bytes_field(2, b"unicode:wave", &mut picker);
+    let fav = fluxer_favourite();
+    let mut entry = Vec::new();
+    bytes_field(1, fav.url.as_bytes(), &mut entry);
+    bytes_field(2, fav.proxy_url.as_bytes(), &mut entry);
+    varint_field(3, u64::from(fav.width), &mut entry);
+    varint_field(4, u64::from(fav.height), &mut entry);
+    bytes_field(6, fav.content_type.as_bytes(), &mut entry);
+    let mut gifs = Vec::new();
+    bytes_field(1, &entry, &mut gifs);
     let mut bytes = unknown.clone();
-    bytes.extend_from_slice(&[0xA2, 0x01, picker.len() as u8]);
-    bytes.extend_from_slice(&picker);
+    bytes_field(20, &picker, &mut bytes);
+    bytes_field(25, &gifs, &mut bytes);
     (bytes, unknown)
 }
 
@@ -223,10 +267,12 @@ async fn favourites_round_trip_through_synced_preferences() {
     let first_base = stored.clone();
     prefs.set_stored(stored);
     assert_eq!(prefs.favourites(), ["unicode:wave"]);
+    // ...and the favourite GIF Fluxer stored, as it is.
+    assert_eq!(prefs.favourite_gifs(), [fluxer_favourite()]);
 
     // A right click makes a custom emoji a favourite: shown at once, then stored where
     // Fluxer keeps it, with the field Inlet does not know kept.
-    let Cmd::EditPreferences { base, edit } = prefs.edit(PrefEdit::FavouriteEmoji {
+    let Some(Cmd::EditPreferences { base, edit }) = prefs.edit(PrefEdit::FavouriteEmoji {
         key: "custom:1:2".into(),
         on: true,
     }) else {
@@ -263,19 +309,18 @@ async fn favourites_round_trip_through_synced_preferences() {
 
     // Four edits at once from the snapshot the UI first had (its own write replaced
     // it): one batch, one PATCH, no conflict and no new read; nothing is lost.
-    let gif = FavoriteGifEntry {
-        url: "https://klipy.com/gifs/cat".into(),
-        proxy_url: "https://media.example/external/x/cat.gif".into(),
-        media: [(
-            "tinygif".to_string(),
-            FavoriteGifMediaFormat {
-                proxy_src: "https://media.example/external/x/tiny.gif".into(),
-                ..Default::default()
-            },
-        )]
-        .into(),
-        ..Default::default()
-    };
+    // A GIF from a search becomes a favourite in Fluxer's shape.
+    let found: p::Gif = serde_json::from_value(json!({
+        "id": "1", "url": "https://klipy.com/gifs/cat",
+        "proxy_src": "https://media.example/external/x/https/static.klipy.com/cat.mp4",
+        "width": 498, "height": 280,
+        "media": {
+            "tinymp4": {"proxy_src": "https://media.example/external/x/tiny.mp4", "width": 220, "height": 124},
+            "tinygif": {"proxy_src": "https://media.example/external/x/tiny.gif", "width": 220, "height": 124}
+        }
+    }))
+    .unwrap();
+    let gif = favourite_entry(&found);
     let now = 1_800_000_000_000;
     let edits = [
         PrefEdit::UsedEmoji {
@@ -317,13 +362,30 @@ async fn favourites_round_trip_through_synced_preferences() {
     assert_eq!(prefs.favourites(), ["custom:1:2"]);
     assert_eq!(prefs.recent(now, 10), ["custom:1:2"]);
     assert_eq!(prefs.skin_tone(), inlet_emoji::SkinTone::Medium);
-    assert_eq!(prefs.favourite_gifs().len(), 1);
     assert!(prefs.is_favourite_gif("https://klipy.com/gifs/cat"));
     let last = requests(&server, "PATCH", "/api/v1/users/@me/settings").await;
-    assert!(sent(&last[1])
+    let stored = sent(&last[1]);
+    assert!(stored
         .bytes()
         .windows(unknown.len())
         .any(|w| w == unknown.as_slice()));
+    // Fluxer's favourite is kept as it was; Inlet's is in the same shape: one image
+    // preview, its size and content type, no formats (Fluxer reads it unchanged).
+    let entries = &stored.get().favorite_gifs.as_ref().unwrap().entries;
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0], fluxer_favourite());
+    assert_eq!(
+        entries[1],
+        FavoriteGifEntry {
+            url: "https://klipy.com/gifs/cat".into(),
+            proxy_url: "https://media.example/external/x/tiny.gif".into(),
+            width: 220,
+            height: 124,
+            media: Default::default(),
+            content_type: "image/gif".into(),
+            placeholder: String::new(),
+        }
+    );
 }
 
 #[test]
@@ -464,33 +526,64 @@ fn usage_is_capped_by_frecency_like_fluxer() {
 }
 
 #[test]
-fn a_favourite_gif_keeps_no_provider_url() {
+fn a_favourite_gif_is_stored_in_fluxers_shape() {
+    let fmt = |key: &str, w: u32| {
+        (
+            key.to_string(),
+            json!({"src": format!("https://static.klipy.com/{key}"), "proxy_src": format!("https://media.example.org/external/s/{key}"), "width": w, "height": w / 2}),
+        )
+    };
+    let media: serde_json::Map<String, Value> = [
+        fmt("tinywebm", 220),
+        fmt("tinymp4", 220),
+        fmt("tinygif", 220),
+        fmt("tinywebp", 220),
+        fmt("mediumgif", 498),
+        fmt("webp", 498),
+        fmt("mp4", 640),
+    ]
+    .into_iter()
+    .collect();
     let gif: p::Gif = serde_json::from_value(json!({
         "id": "1", "url": "https://klipy.com/gifs/cat",
-        "proxy_src": "https://media.example.org/external/s/cat.gif",
-        "width": 200, "height": 100,
-        "media": {"tinygif": {
-            "src": "https://static.klipy.com/cat.gif",
-            "proxy_src": "https://media.example.org/external/s/tiny.gif",
-            "width": 100, "height": 50
-        }}
+        "proxy_src": "https://media.example.org/external/s/default.mp4",
+        "width": 640, "height": 320, "media": media
     }))
     .unwrap();
     let entry = favourite_entry(&gif);
+    // Fluxer's rule for images: the narrowest at least 400 px wide, then its order
+    // (`webp` before `mediumgif`). No formats, no provider URL.
     assert_eq!(entry.url, "https://klipy.com/gifs/cat");
+    assert_eq!(entry.proxy_url, "https://media.example.org/external/s/webp");
+    assert_eq!((entry.width, entry.height), (498, 249));
+    assert_eq!(entry.content_type, "image/webp");
+    assert!(entry.media.is_empty());
+    // Only small images: the widest of them.
+    let small: p::Gif = serde_json::from_value(json!({
+        "id": "2", "url": "https://klipy.com/gifs/dog",
+        "media": {"tinygif": {"proxy_src": "https://media.example.org/external/s/a", "width": 220, "height": 100},
+                  "nanogif": {"proxy_src": "https://media.example.org/external/s/b", "width": 90, "height": 40}}
+    }))
+    .unwrap();
     assert_eq!(
-        entry.media["tinygif"],
-        FavoriteGifMediaFormat {
-            src: String::new(),
-            proxy_src: "https://media.example.org/external/s/tiny.gif".into(),
-            width: 100,
-            height: 50,
-        }
+        favourite_entry(&small).proxy_url,
+        "https://media.example.org/external/s/a"
     );
-    // Its preview goes through the media proxy only.
-    let media = p::Media::new("https://media.example.org").unwrap();
-    let preview = entry.preview(&media, Default::default()).unwrap();
-    assert!(preview.starts_with("https://media.example.org/external/"));
+    // No image at all: the default format, no content type.
+    let video: p::Gif = serde_json::from_value(json!({
+        "id": "3", "url": "https://klipy.com/gifs/x",
+        "proxy_src": "https://media.example.org/external/s/x.mp4", "width": 10, "height": 10,
+        "media": {"tinymp4": {"proxy_src": "https://media.example.org/external/s/t.mp4", "width": 220, "height": 100}}
+    }))
+    .unwrap();
+    let v = favourite_entry(&video);
+    assert_eq!(v.proxy_url, "https://media.example.org/external/s/x.mp4");
+    assert_eq!(v.content_type, "");
+    // Fluxer's content types.
+    assert_eq!(format_content_type("tinymp4"), "video/mp4");
+    assert_eq!(format_content_type("nanowebm"), "video/webm");
+    assert_eq!(format_content_type("mediumgif"), "image/gif");
+    assert_eq!(format_content_type("other"), "");
 }
 
 #[test]

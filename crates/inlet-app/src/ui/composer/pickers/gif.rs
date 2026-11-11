@@ -30,7 +30,7 @@ use crate::backend::composer::gif::{favourite_entry, locale, Cmd, PrefEdit};
 use crate::backend::composer::Cmd as ComposerCmd;
 use crate::theme;
 use crate::ui::media::animation_budget::Motion;
-use crate::ui::media::image::{picture_of, Shown};
+use crate::ui::media::image::picture_of;
 
 /// How long the search waits after the last key.
 pub const SEARCH_DEBOUNCE: Duration = Duration::from_millis(350);
@@ -105,8 +105,9 @@ impl SearchDebounce {
 /// The GIF answers of this account.
 #[derive(Default)]
 pub struct GifState {
-    next_nonce: u64,
     featured: Option<Result<Vec<GifCategory>, String>>,
+    /// The instance's featured GIF: the trending tile's picture until trending is open.
+    featured_gif: Option<Box<p::Gif>>,
     featured_waiting: Option<u64>,
     trending: Option<Result<Vec<p::Gif>, String>>,
     trending_waiting: Option<u64>,
@@ -118,9 +119,35 @@ pub struct GifState {
 }
 
 impl GifState {
+    /// A nonce no earlier request of this process had (see [`super::next_nonce`]).
     fn nonce(&mut self) -> u64 {
-        self.next_nonce += 1;
-        self.next_nonce
+        super::next_nonce()
+    }
+
+    /// The search text changed at `now`. Returns whether a search may follow (then the
+    /// caller waits [`SEARCH_DEBOUNCE`] and calls [`take_due`](Self::take_due)); empty
+    /// text cancels the search on its way.
+    pub fn query_changed(&mut self, text: &str, now: Instant) -> bool {
+        self.debounce.typed(text, now);
+        if text.trim().is_empty() {
+            self.cancel_search();
+            return false;
+        }
+        true
+    }
+
+    /// The search to send at `now`, if the typing has stopped: its nonce and text. The
+    /// answer with that nonce is the one shown.
+    pub fn take_due(&mut self, now: Instant) -> Option<(u64, String)> {
+        let query = self.debounce.due(now)?;
+        Some(self.start_search(query))
+    }
+
+    /// A search goes out now: its nonce, and its text kept to match the answer.
+    fn start_search(&mut self, query: String) -> (u64, String) {
+        let nonce = self.nonce();
+        self.search_waiting = Some((nonce, query.clone()));
+        (nonce, query)
     }
 
     /// The picker closed or the text was cleared: a search on its way is not wanted.
@@ -142,10 +169,17 @@ impl GifState {
         }
     }
 
-    pub fn answered_categories(&mut self, nonce: u64, result: Result<Vec<GifCategory>, String>) {
+    pub fn answered_categories(
+        &mut self,
+        nonce: u64,
+        result: Result<(Vec<GifCategory>, Option<Box<p::Gif>>), String>,
+    ) {
         if self.featured_waiting == Some(nonce) {
             self.featured_waiting = None;
-            self.featured = Some(result);
+            self.featured = Some(result.map(|(categories, gif)| {
+                self.featured_gif = gif;
+                categories
+            }));
         }
     }
 }
@@ -163,9 +197,48 @@ enum Tile {
     Favourite(Box<FavoriteGifEntry>),
 }
 
-/// Only `http(s)` links are put into a message.
-fn sendable(url: &str) -> bool {
-    Url::parse(url).is_ok_and(|u| matches!(u.scheme(), "http" | "https"))
+/// The link to put into a message: an `http(s)` URL without spaces or control
+/// characters, as the parser wrote it (`None` for anything else).
+fn sendable(url: &str) -> Option<String> {
+    if url.is_empty() || url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return None;
+    }
+    let parsed = Url::parse(url).ok()?;
+    matches!(parsed.scheme(), "http" | "https").then(|| parsed.as_str().to_owned())
+}
+
+/// Whether a stored favourite is a video: Fluxer stores most favourites with a video
+/// preview (`content_type` `video/*`, or a video file when the type is missing).
+fn is_video(entry: &FavoriteGifEntry) -> bool {
+    if entry.content_type.starts_with("video/") {
+        return true;
+    }
+    let path = Url::parse(&entry.proxy_url)
+        .map(|u| u.path().to_ascii_lowercase())
+        .unwrap_or_default();
+    entry.content_type.is_empty() && (path.ends_with(".mp4") || path.ends_with(".webm"))
+}
+
+/// A favourite's preview through the media proxy. Inlet plays no video, so a video
+/// favourite is never asked for as an animation: the proxy gives its first frame as a
+/// still image (WebP), as for video attachments.
+fn favourite_preview(entry: &FavoriteGifEntry, media: &p::Media, t: Transform) -> Option<String> {
+    if !is_video(entry) {
+        return entry.preview(media, t);
+    }
+    if t.animated {
+        return None;
+    }
+    let still = Transform {
+        format: Some(inlet_protocol::ImageFormat::Webp),
+        ..t
+    };
+    // Formats an older client stored, images first, then the stored preview.
+    crate::backend::composer::gif::IMAGE_KEYS
+        .iter()
+        .filter_map(|k| entry.media.get(*k))
+        .find_map(|f| media.external(&f.proxy_src, still))
+        .or_else(|| media.external(&entry.proxy_url, still))
 }
 
 /// The requests for a GIF preview of `w` x `h` logical pixels from a preview URL
@@ -204,6 +277,7 @@ impl Inlet {
     /// The GIF home's featured terms, asked for once (again after a failure).
     pub(super) fn gif_home_needed(&mut self) {
         let gifs = &mut self.composer.pickers.gifs;
+        // Asked again after a failure (the backend allows one request per 10 s).
         if matches!(gifs.featured, Some(Ok(_))) || gifs.featured_waiting.is_some() {
             return;
         }
@@ -239,9 +313,7 @@ impl Inlet {
             };
         }
         let gifs = &mut self.composer.pickers.gifs;
-        gifs.debounce.typed(&text, Instant::now());
-        if empty {
-            gifs.cancel_search();
+        if !gifs.query_changed(&text, Instant::now()) {
             return;
         }
         gifs.timer = Some(cx.spawn(async move |this, cx| {
@@ -251,16 +323,18 @@ impl Inlet {
     }
 
     fn gif_search_due(&mut self, cx: &mut Context<Self>) {
-        let Some(query) = self.composer.pickers.gifs.debounce.due(Instant::now()) else {
+        let Some((nonce, query)) = self.composer.pickers.gifs.take_due(Instant::now()) else {
             return;
         };
-        self.gif_search(query, cx);
+        self.send_gif_search(nonce, query, cx);
     }
 
     fn gif_search(&mut self, query: String, cx: &mut Context<Self>) {
-        let gifs = &mut self.composer.pickers.gifs;
-        let nonce = gifs.nonce();
-        gifs.search_waiting = Some((nonce, query.clone()));
+        let (nonce, query) = self.composer.pickers.gifs.start_search(query);
+        self.send_gif_search(nonce, query, cx);
+    }
+
+    fn send_gif_search(&mut self, nonce: u64, query: String, cx: &mut Context<Self>) {
         self.backend.send(ComposerCmd::Pickers(Cmd::SearchGifs {
             query,
             locale: locale(),
@@ -279,10 +353,12 @@ impl Inlet {
                 if !favourites.is_empty() {
                     tiles.push(Tile::Favourites(favourites.last().cloned().map(Box::new)));
                 }
+                // Fluxer's trending tile shows the featured GIF.
                 let first = match &pickers.gifs.trending {
                     Some(Ok(g)) => g.first().cloned().map(Box::new),
                     _ => None,
-                };
+                }
+                .or_else(|| pickers.gifs.featured_gif.clone());
                 tiles.push(Tile::Trending(first));
                 match &pickers.gifs.featured {
                     Some(Ok(cats)) => tiles.extend(
@@ -368,7 +444,8 @@ impl Inlet {
             "picker-gif-grid",
             count,
             cx.processor(move |this: &mut Inlet, range: Range<usize>, _, cx| {
-                range
+                this.picker_images(true);
+                let out = range
                     .filter_map(|ix| rows.get(ix).map(|r| (ix, r)))
                     .map(|(ix, row)| {
                         let mut el = div().h(px(ROW_H)).flex().flex_row().gap(px(8.));
@@ -377,7 +454,9 @@ impl Inlet {
                         }
                         el.into_any_element()
                     })
-                    .collect::<Vec<_>>()
+                    .collect::<Vec<_>>();
+                this.picker_images(false);
+                out
             }),
         )
         .track_scroll(&handle)
@@ -408,14 +487,8 @@ impl Inlet {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let (moving, still) = requests(preview, self.media.scale);
+        // Marked as the picker's by the budget when the picker is on top and drawing.
         let shown = self.moving(moving.as_ref(), still.as_ref(), cx);
-        if let Shown::Ready(image) = &shown {
-            self.media
-                .images
-                .animations()
-                .borrow_mut()
-                .in_top_layer(image.id);
-        }
         let anim = self.media.images.animator(Motion::Gif);
         picture_of(shown, (TILE_W, TILE_H), 6., ObjectFit::Cover, &anim)
     }
@@ -432,7 +505,7 @@ impl Inlet {
             (Tile::Favourites(Some(e)) | Tile::Favourite(e), Some(m)) => {
                 let e = e.clone();
                 let m = m.clone();
-                self.gif_picture(move |t| e.preview(&m, t), cx)
+                self.gif_picture(move |t| favourite_preview(&e, &m, t), cx)
             }
             (Tile::Trending(Some(g)) | Tile::Gif(g), Some(m)) => {
                 let g = g.clone();
@@ -509,7 +582,8 @@ impl Inlet {
         let Some(open) = self.composer.pickers.open.as_mut() else {
             return;
         };
-        if open.target != Target::Composer {
+        let target = open.target;
+        if matches!(target, Target::Reaction { .. }) {
             return;
         }
         match tile {
@@ -534,11 +608,16 @@ impl Inlet {
                 }
             }
             Tile::Gif(g) => {
-                if !sendable(&g.url) {
+                let Some(link) = sendable(&g.url) else {
+                    return;
+                };
+                let query = (open.gif_view == GifView::Search).then(|| open.query.clone());
+                // Only a GIF that went in is shared with the instance.
+                if !self.insert_into_composer(target, Insert::Text(format!("{link} ")), window, cx)
+                {
+                    cx.notify();
                     return;
                 }
-                let query = (open.gif_view == GifView::Search).then(|| open.query.clone());
-                self.insert_into_composer(Insert::Text(format!("{} ", g.url)), window, cx);
                 self.backend.send(ComposerCmd::Pickers(Cmd::SharedGif {
                     gif: g,
                     query,
@@ -547,11 +626,12 @@ impl Inlet {
                 self.picked(keep_open, cx);
             }
             Tile::Favourite(e) => {
-                if !sendable(&e.url) {
+                let Some(link) = sendable(&e.url) else {
                     return;
+                };
+                if self.insert_into_composer(target, Insert::Text(format!("{link} ")), window, cx) {
+                    self.picked(keep_open, cx);
                 }
-                self.insert_into_composer(Insert::Text(format!("{} ", e.url)), window, cx);
-                self.picked(keep_open, cx);
             }
         }
         cx.notify();
@@ -587,10 +667,122 @@ mod tests {
         .unwrap();
         let (moving, still) = requests(|t| elsewhere.preview(&media, t), 2.);
         assert!(moving.is_none() && still.is_none());
-        // Only web links are ever put into a message.
-        assert!(sendable("https://klipy.com/gifs/cat"));
-        assert!(!sendable("javascript:alert(1)"));
-        assert!(!sendable("file:///etc/passwd"));
+        // Only web links are ever put into a message, as the parser wrote them, and none
+        // that would bring more lines or spaces with it.
+        assert_eq!(
+            sendable("https://klipy.com/gifs/cat").as_deref(),
+            Some("https://klipy.com/gifs/cat")
+        );
+        assert_eq!(
+            sendable("HTTPS://Klipy.com/gifs/a%20b").as_deref(),
+            Some("https://klipy.com/gifs/a%20b")
+        );
+        for bad in [
+            "javascript:alert(1)",
+            "file:///etc/passwd",
+            "https://klipy.com/gifs/cat
+@everyone look",
+            "https://klipy.com/gifs/ca	t",
+            "https://klipy.com/gifs/cat <@1>",
+            "",
+        ] {
+            assert_eq!(sendable(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_favourite_stored_by_fluxer_shows_a_still_of_its_video() {
+        let media = p::Media::new("https://media.example.org").unwrap();
+        // What Fluxer stores (`slimFavoriteGifEntry`): the video preview, no formats.
+        let fluxer = FavoriteGifEntry {
+            url: "https://klipy.com/gifs/cat".into(),
+            proxy_url: "https://media.example.org/external/s/https/static.klipy.com/tiny.mp4"
+                .into(),
+            width: 220,
+            height: 124,
+            content_type: "video/mp4".into(),
+            ..Default::default()
+        };
+        assert!(is_video(&fluxer));
+        let (moving, still) = requests(|t| favourite_preview(&fluxer, &media, t), 2.);
+        assert!(
+            moving.is_none(),
+            "a video is never asked for as an animation"
+        );
+        let still = still.unwrap();
+        assert!(still.url.path().starts_with("/external/"));
+        assert!(still.url.query().unwrap().contains("format=webp"));
+        // Without a content type, a video file is a video too.
+        let untyped = FavoriteGifEntry {
+            content_type: String::new(),
+            ..fluxer.clone()
+        };
+        assert!(is_video(&untyped));
+        // What Inlet stores (an image format) moves.
+        let gif: p::Gif = serde_json::from_value(serde_json::json!({
+            "id": "1", "url": "https://klipy.com/gifs/cat",
+            "media": {
+                "tinygif": {"proxy_src": "https://media.example.org/external/s/https/static.klipy.com/tiny.gif", "width": 220, "height": 124},
+                "tinymp4": {"proxy_src": "https://media.example.org/external/s/https/static.klipy.com/tiny.mp4", "width": 220, "height": 124}
+            }
+        }))
+        .unwrap();
+        let ours = favourite_entry(&gif);
+        assert!(!is_video(&ours));
+        let (moving, _) = requests(|t| favourite_preview(&ours, &media, t), 2.);
+        assert!(moving.is_some());
+        // A provider URL in `proxy_url` gives nothing.
+        let elsewhere = FavoriteGifEntry {
+            proxy_url: "https://static.klipy.com/tiny.mp4".into(),
+            ..fluxer
+        };
+        let (moving, still) = requests(|t| favourite_preview(&elsewhere, &media, t), 2.);
+        assert!(moving.is_none() && still.is_none());
+    }
+
+    #[test]
+    fn typing_in_the_gif_search_sends_one_search_for_the_newest_text() {
+        let t0 = Instant::now();
+        let ms = |n: u64| t0 + Duration::from_millis(n);
+        let mut gifs = GifState::default();
+        // What `gif_query_changed` and its timer do: every key may start a timer; only
+        // the timer after the last key finds a search due.
+        assert!(gifs.query_changed("c", ms(0)));
+        assert!(gifs.query_changed("ca", ms(100)));
+        assert!(gifs.query_changed("cat", ms(200)));
+        assert_eq!(gifs.take_due(ms(350)), None, "the first key's timer");
+        assert_eq!(gifs.take_due(ms(450)), None, "the second key's timer");
+        let (nonce, query) = gifs.take_due(ms(550)).unwrap();
+        assert_eq!(query, "cat");
+        assert_eq!(gifs.take_due(ms(900)), None, "asked once");
+        // The answer with that nonce is shown; an older one is not.
+        gifs.answered_gifs(nonce.wrapping_sub(1), Ok(Vec::new()));
+        assert!(gifs.search.is_none());
+        gifs.answered_gifs(nonce, Ok(Vec::new()));
+        assert_eq!(gifs.search, Some(("cat".into(), Ok(Vec::new()))));
+        // Clearing the field cancels what was on its way.
+        assert!(gifs.query_changed("dog", ms(1_000)));
+        assert!(!gifs.query_changed("", ms(1_100)));
+        assert_eq!(gifs.take_due(ms(2_000)), None);
+        // Nonces are never reused, not even by a state made after a sign-out.
+        let mut again = GifState::default();
+        assert!(again.query_changed("cat", ms(0)));
+        assert!(again.take_due(ms(400)).unwrap().0 > nonce);
+    }
+
+    #[test]
+    fn the_trending_tile_shows_the_featured_gif() {
+        let mut gifs = GifState {
+            featured_waiting: Some(7),
+            ..GifState::default()
+        };
+        let gif: p::Gif = serde_json::from_value(
+            serde_json::json!({"id": "9", "url": "https://klipy.com/gifs/x"}),
+        )
+        .unwrap();
+        gifs.answered_categories(7, Ok((Vec::new(), Some(Box::new(gif)))));
+        assert_eq!(gifs.featured_gif.as_ref().map(|g| g.id.as_str()), Some("9"));
+        assert_eq!(gifs.featured, Some(Ok(Vec::new())));
     }
 
     #[test]

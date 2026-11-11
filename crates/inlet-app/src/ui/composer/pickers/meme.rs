@@ -71,7 +71,11 @@ impl Inlet {
         };
         let (query, handle) = (open.query.clone(), open.list.clone());
         let Some(memes) = self.composer.pickers.memes.as_ref() else {
-            return empty(t!("picker-loading"));
+            // A failed load says so (and is asked again when the tab opens next).
+            return empty(match &self.composer.pickers.memes_error {
+                Some(e) => t!("picker-memes-failed", error = e.clone()),
+                None => t!("picker-loading"),
+            });
         };
         let found: Vec<p::Meme> = matching(memes, &query).into_iter().cloned().collect();
         if found.is_empty() {
@@ -140,11 +144,15 @@ impl Inlet {
             .child(picture)
             .on_click(cx.listener(move |this, _, _, cx| {
                 let meme_id = id.clone();
-                this.send_to_channel(|channel_id, nonce| Cmd::SendMeme {
-                    channel_id,
-                    meme_id,
-                    nonce,
-                });
+                let target = this.composer.pickers.open.as_ref().map(|o| o.target);
+                if let Some(target) = target {
+                    let send = |channel_id, nonce| Cmd::SendMeme {
+                        channel_id,
+                        meme_id,
+                        nonce,
+                    };
+                    this.send_to_channel(target, send, cx);
+                }
                 this.picked(false, cx);
             }))
             .into_any_element()

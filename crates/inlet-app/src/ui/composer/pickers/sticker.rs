@@ -5,7 +5,6 @@
 //! rule). A click sends the sticker at once as a message of its own, as Fluxer does.
 
 use std::ops::Range;
-use std::rc::Rc;
 
 use gpui::{div, prelude::*, px, uniform_list, AnyElement, Context, ObjectFit, SharedString};
 
@@ -39,6 +38,18 @@ pub struct StickerCell {
 pub enum Row {
     Header(SharedString),
     Cells(Vec<StickerCell>),
+}
+
+/// What the sticker grid is built from: a redraw with the same key uses the grid it has.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GridKey {
+    pub query: String,
+    /// The communities in picker order, with where their sticker lists live and their
+    /// lengths (the account state replaces a list when the stickers change).
+    pub guilds: Vec<(inlet_state::GuildId, usize, usize)>,
+    pub channel_guild: Option<String>,
+    pub external: bool,
+    pub global: bool,
 }
 
 /// One community's stickers: `(sticker, tags)`.
@@ -136,25 +147,46 @@ impl Inlet {
             .setup
             .as_ref()
             .is_some_and(|s| s.global_expressions);
-        let sets = self.picker_guild_stickers(cx);
-        let rows = rows(&sets, &query, channel_guild.as_deref(), external, global);
-        if rows.is_empty() {
-            return empty(if sets.is_empty() {
-                t!("picker-stickers-empty")
-            } else {
+        let key = GridKey {
+            query,
+            guilds: self.picker_guild_lists(cx, true),
+            channel_guild,
+            external,
+            global,
+        };
+        // Built again only when the key changes, not on every redraw.
+        let mut cache = std::mem::take(&mut self.composer.pickers.sticker_rows);
+        let grid = cache.get(key.clone(), || {
+            let sets = self.picker_guild_stickers(cx);
+            let rows = rows(
+                &sets,
+                &key.query,
+                key.channel_guild.as_deref(),
+                key.external,
+                key.global,
+            );
+            (rows, !sets.is_empty())
+        });
+        self.composer.pickers.sticker_rows = cache;
+        if grid.0.is_empty() {
+            return empty(if grid.1 {
                 t!("picker-stickers-none")
+            } else {
+                t!("picker-stickers-empty")
             });
         }
-        let rows = Rc::new(rows);
-        let count = rows.len();
+        let count = grid.0.len();
         let list = uniform_list(
             "picker-sticker-grid",
             count,
             cx.processor(move |this: &mut Inlet, range: Range<usize>, _, cx| {
-                range
-                    .filter_map(|ix| rows.get(ix).map(|r| (ix, r)))
+                this.picker_images(true);
+                let out = range
+                    .filter_map(|ix| grid.0.get(ix).map(|r| (ix, r)))
                     .map(|(ix, row)| this.render_sticker_row(ix, row, cx))
-                    .collect::<Vec<_>>()
+                    .collect::<Vec<_>>();
+                this.picker_images(false);
+                out
             }),
         )
         .track_scroll(&handle)
@@ -208,13 +240,6 @@ impl Inlet {
             }
             None => Shown::Unavailable,
         };
-        if let Shown::Ready(image) = &shown {
-            self.media
-                .images
-                .animations()
-                .borrow_mut()
-                .in_top_layer(image.id);
-        }
         let anim = self.media.images.animator(Motion::Sticker);
         let picture = picture_of(shown, (PICTURE, PICTURE), 0., ObjectFit::Contain, &anim);
         let (id, locked) = (cell.sticker.id.clone(), cell.locked);
@@ -244,11 +269,15 @@ impl Inlet {
                     this.chat.notice = Some(t!("picker-sticker-locked"));
                 } else {
                     let sticker_id = id.clone();
-                    this.send_to_channel(|channel_id, nonce| Cmd::SendSticker {
-                        channel_id,
-                        sticker_id,
-                        nonce,
-                    });
+                    let target = this.composer.pickers.open.as_ref().map(|o| o.target);
+                    if let Some(target) = target {
+                        let send = |channel_id, nonce| Cmd::SendSticker {
+                            channel_id,
+                            sticker_id,
+                            nonce,
+                        };
+                        this.send_to_channel(target, send, cx);
+                    }
                     this.picked(false, cx);
                 }
                 cx.notify();

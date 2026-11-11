@@ -33,6 +33,7 @@ mod meme;
 pub mod prefs;
 mod sticker;
 
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gpui::{
@@ -103,6 +104,8 @@ pub enum Tab {
 pub enum Target {
     /// The main composer.
     Composer,
+    /// The thread panel's composer (its keys were pressed there).
+    Panel,
     /// A reaction on a message; the picker opens at `at`.
     Reaction {
         ch: ChannelId,
@@ -116,7 +119,7 @@ pub enum Target {
 pub fn visible_tabs(target: &Target, setup: Option<&Setup>) -> Vec<Tab> {
     match target {
         Target::Reaction { .. } => vec![Tab::Emoji],
-        Target::Composer => {
+        Target::Composer | Target::Panel => {
             let gifs = setup.is_some_and(|s| s.gif_enabled);
             [Tab::Gifs, Tab::Memes, Tab::Stickers, Tab::Emoji]
                 .into_iter()
@@ -141,6 +144,59 @@ pub fn usable(
         Some(_) => external_right && global,
         None => global,
     }
+}
+
+/// Whether two targets are the same composer or the same message.
+fn same_target(a: &Target, b: &Target) -> bool {
+    match (a, b) {
+        (Target::Composer, Target::Composer) | (Target::Panel, Target::Panel) => true,
+        (Target::Reaction { ch: a, id: b, .. }, Target::Reaction { ch: c, id: d, .. }) => {
+            a == c && b == d
+        }
+        _ => false,
+    }
+}
+
+/// A value built from a key, kept until the key changes (the tabs' grids, so a redraw
+/// does not build them again).
+pub(crate) struct Cached<K, V> {
+    key: Option<K>,
+    value: Option<Rc<V>>,
+    /// How often it was built.
+    pub builds: u64,
+}
+
+impl<K, V> Default for Cached<K, V> {
+    fn default() -> Self {
+        Cached {
+            key: None,
+            value: None,
+            builds: 0,
+        }
+    }
+}
+
+impl<K: PartialEq, V> Cached<K, V> {
+    /// The value for `key`, built only when the key differs from the last one.
+    pub fn get(&mut self, key: K, build: impl FnOnce() -> V) -> Rc<V> {
+        match (&self.key, &self.value) {
+            (Some(k), Some(v)) if *k == key => v.clone(),
+            _ => {
+                let v = Rc::new(build());
+                self.key = Some(key);
+                self.value = Some(v.clone());
+                self.builds += 1;
+                v
+            }
+        }
+    }
+}
+
+/// A process-wide counter for the GIF answers: an answer from a session before a
+/// sign-out can never match a newer request.
+pub(crate) fn next_nonce() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// The open picker.
@@ -168,8 +224,13 @@ pub struct PickersState {
     /// The saved memes; `None` until READY or a load brought them.
     memes: Option<Vec<p::Meme>>,
     memes_asked: bool,
-    /// Closed by a click outside on this tab, at this time.
-    closed_by_click: Option<(Tab, Instant)>,
+    /// Why the last load of the memes failed (asked again when the tab opens).
+    memes_error: Option<String>,
+    /// The emoji and sticker grids, built again only when what they show changes.
+    emoji_rows: Cached<emoji::GridKey, (Vec<emoji::Row>, Vec<usize>)>,
+    sticker_rows: Cached<sticker::GridKey, (Vec<sticker::Row>, bool)>,
+    /// Closed by a click outside for this target and tab, at this time.
+    closed_by_click: Option<(Tab, Target, Instant)>,
     #[cfg(feature = "demo")]
     demo_done: bool,
 }
@@ -242,32 +303,34 @@ pub struct PickerButtons {
 }
 
 impl ComposerView {
-    /// Puts a pick into the composer at the caret. Nothing happens without an open
-    /// channel, or while a message is edited inline (the pickers write into the box).
+    /// Puts a pick into the composer at the caret. Returns whether it went in: not
+    /// without an open channel, while a message is edited inline (the pickers write into
+    /// the box), while an input method is composing, or when the text would be too long.
     pub(crate) fn insert_picked(
         &mut self,
         pick: Insert,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
-        if self.channel.is_none() || self.edit.is_some() {
-            return;
+    ) -> bool {
+        if self.channel.is_none()
+            || self.edit.is_some()
+            || self.editor.read(cx).marked_range().is_some()
+        {
+            return false;
         }
-        self.editor.update(cx, |e, cx| match pick {
-            Insert::Text(text) => {
-                let _ = e.insert_text(&text, window, cx);
-            }
+        let done = self.editor.update(cx, |e, cx| match pick {
+            Insert::Text(text) => e.insert_text(&text, window, cx).is_ok(),
             Insert::CustomEmoji { id, name, animated } => {
-                let label = format!(":{name}:");
-                let token = inlet_editor::Token::CustomEmoji {
-                    id: inlet_editor::Id(id),
-                    name,
-                    animated,
-                };
-                e.insert_token(token, &label, window, cx);
+                e.insert_custom_emoji(inlet_editor::Id(id), &name, animated, window, cx)
             }
         });
         cx.notify();
+        done
+    }
+
+    /// The open channel of this composer.
+    pub(crate) fn channel_id(&self) -> Option<&str> {
+        self.channel.as_ref().map(|c| c.channel_id.as_str())
     }
 
     /// The buttons at the right of the composer box (GIF, sticker, emoji), 32 px each with
@@ -329,14 +392,58 @@ impl Inlet {
     ) -> E {
         element
             .on_action(cx.listener(|this, _: &ToggleEmojiPicker, window, cx| {
-                this.toggle_picker(Tab::Emoji, Target::Composer, window, cx)
+                let target = this.key_target(window, cx);
+                this.toggle_picker(Tab::Emoji, target, window, cx)
             }))
             .on_action(cx.listener(|this, _: &ToggleGifPicker, window, cx| {
-                this.toggle_picker(Tab::Gifs, Target::Composer, window, cx)
+                let target = this.key_target(window, cx);
+                this.toggle_picker(Tab::Gifs, target, window, cx)
             }))
             .on_action(cx.listener(|this, _: &ToggleStickerPicker, window, cx| {
-                this.toggle_picker(Tab::Stickers, Target::Composer, window, cx)
+                let target = this.key_target(window, cx);
+                this.toggle_picker(Tab::Stickers, target, window, cx)
             }))
+    }
+
+    /// The composer a picker key is for: the thread panel's when it has the keyboard
+    /// (or the open picker is the panel's), the main one otherwise.
+    fn key_target(&self, window: &Window, cx: &App) -> Target {
+        if let Some(open) = &self.composer.pickers.open {
+            if !matches!(open.target, Target::Reaction { .. }) {
+                return open.target;
+            }
+        }
+        let in_panel = self
+            .threads
+            .composer
+            .as_ref()
+            .is_some_and(|v| v.focus_handle(cx).contains_focused(window, cx));
+        if in_panel {
+            Target::Panel
+        } else {
+            Target::Composer
+        }
+    }
+
+    /// The composer view a target writes into.
+    fn target_view(&self, target: Target) -> Option<Entity<ComposerView>> {
+        match target {
+            Target::Composer => Some(self.composer.view.clone()),
+            Target::Panel => self.threads.composer.clone(),
+            Target::Reaction { .. } => None,
+        }
+    }
+
+    /// The channel a target's picks go to (a sticker or meme is sent there).
+    fn target_channel(&self, target: Target, cx: &App) -> Option<String> {
+        match target {
+            Target::Composer => self.selected_channel.clone(),
+            Target::Panel => {
+                let view = self.threads.composer.as_ref()?;
+                view.read(cx).channel_id().map(str::to_owned)
+            }
+            Target::Reaction { ch, .. } => Some(ch.to_string()),
+        }
     }
 
     /// Drops the pickers' state when another account is shown (or none).
@@ -391,13 +498,7 @@ impl Inlet {
         self.pickers_follow_account(cx);
         let pickers = &mut self.composer.pickers;
         if let Some(open) = &mut pickers.open {
-            let same_target = match (&open.target, &target) {
-                (Target::Composer, Target::Composer) => true,
-                (Target::Reaction { ch: a, id: b, .. }, Target::Reaction { ch: c, id: d, .. }) => {
-                    a == c && b == d
-                }
-                _ => false,
-            };
+            let same_target = same_target(&open.target, &target);
             if same_target && open.tab == tab {
                 pickers.close();
                 cx.notify();
@@ -410,11 +511,15 @@ impl Inlet {
                 return;
             }
         }
-        // The click outside that closed it was this toggle's own (its button).
+        // The click outside that closed it was this toggle's own (its button): the same
+        // tab for the same target. Another target (Add reaction on another message)
+        // opens at once.
         if pickers
             .closed_by_click
             .take()
-            .is_some_and(|(t, at)| t == tab && at.elapsed() < REOPEN_GUARD)
+            .is_some_and(|(t, closed, at)| {
+                t == tab && same_target(&closed, &target) && at.elapsed() < REOPEN_GUARD
+            })
         {
             return;
         }
@@ -422,7 +527,7 @@ impl Inlet {
         let top = self.open_layers().topmost();
         let ready = self.screen == Screen::Main
             && self.account.is_some()
-            && self.selected_channel.is_some()
+            && self.target_channel(target, cx).is_some()
             && matches!(top, None | Some(Layer::Picker));
         let shown = visible_tabs(&target, self.composer.pickers.setup.as_ref()).contains(&tab);
         if !ready || !shown {
@@ -495,6 +600,7 @@ impl Inlet {
             Tab::Memes => {
                 let pickers = &mut self.composer.pickers;
                 if pickers.memes.is_none() && !pickers.memes_asked {
+                    pickers.memes_error = None;
                     pickers.memes_asked = true;
                     self.backend.send(ComposerCmd::Pickers(Cmd::LoadMemes));
                 }
@@ -512,16 +618,21 @@ impl Inlet {
         cx.notify();
     }
 
-    /// Sends a preference edit (shown at once).
+    /// Sends a preference edit (shown at once). Too many edits waiting: dropped.
     fn edit_prefs(&mut self, edit: PrefEdit) {
-        let cmd = self.composer.pickers.prefs.edit(edit);
-        self.backend.send(ComposerCmd::Pickers(cmd));
+        if let Some(cmd) = self.composer.pickers.prefs.edit(edit) {
+            self.backend.send(ComposerCmd::Pickers(cmd));
+        }
     }
 
-    /// The open channel as the pickers see it: its guild, and whether the account may
+    /// The picker's channel as the pickers see it: its guild, and whether the account may
     /// use external emoji and external stickers there.
     fn picker_channel(&self, cx: &App) -> (Option<String>, bool, bool) {
-        let (Some(account), Some(ch)) = (self.account.as_ref(), self.open_channel_id()) else {
+        let target = self.composer.pickers.open.as_ref().map(|o| o.target);
+        let ch = target
+            .and_then(|t| self.target_channel(t, cx))
+            .and_then(|c| ChannelId::parse(&c));
+        let (Some(account), Some(ch)) = (self.account.as_ref(), ch) else {
             return (None, false, false);
         };
         let state = account.read(cx);
@@ -555,6 +666,15 @@ impl Inlet {
             Ev::Gifs { nonce, result } => pickers.gifs.answered_gifs(nonce, result),
             Ev::Categories { nonce, result } => pickers.gifs.answered_categories(nonce, result),
             Ev::Preferences(stored) => pickers.prefs.set_stored(*stored),
+            Ev::PreferencesLoadFailed(reason) => {
+                // Asked again the next time a picker opens.
+                pickers.prefs.asked = false;
+                self.chat.notice = Some(t!("picker-prefs-load-failed", error = reason));
+            }
+            Ev::MemesFailed(reason) => {
+                pickers.memes_asked = false;
+                pickers.memes_error = Some(reason);
+            }
             Ev::Edited(stored) => pickers.prefs.edited(Some(*stored)),
             Ev::PreferencesFailed(reason) => {
                 pickers.prefs.edited(None);
@@ -577,6 +697,8 @@ impl Inlet {
                 // memes as they are now.
                 self.pickers_follow_account(cx);
                 let pickers = &mut self.composer.pickers;
+                // A new session: edits of the old one get no answer.
+                pickers.prefs.clear_pending();
                 if let Some(Ok(prefs)) = ready.user_settings().and_then(|s| s.synced_preferences())
                 {
                     pickers.prefs.set_stored(prefs);
@@ -621,7 +743,7 @@ impl Inlet {
         // The channel went away (signed out, another channel): nothing to pick for.
         let gone = match target {
             Target::Reaction { ch, .. } => self.open_channel_id() != Some(ch),
-            Target::Composer => self.selected_channel.is_none(),
+            Target::Composer | Target::Panel => self.target_channel(target, cx).is_none(),
         };
         if self.screen != Screen::Main || gone {
             self.composer.pickers.close();
@@ -679,7 +801,7 @@ impl Inlet {
             }])
             .on_mouse_down_out(cx.listener(move |this, _: &MouseDownEvent, _, cx| {
                 this.composer.pickers.close();
-                this.composer.pickers.closed_by_click = Some((tab, Instant::now()));
+                this.composer.pickers.closed_by_click = Some((tab, target, Instant::now()));
                 cx.notify();
             }))
             .children(header)
@@ -705,7 +827,7 @@ impl Inlet {
             frame.into_any_element()
         };
         Some(match target {
-            Target::Composer => div()
+            Target::Composer | Target::Panel => div()
                 .absolute()
                 .right(px(COMPOSER_RIGHT))
                 .bottom(px(COMPOSER_BOTTOM))
@@ -778,20 +900,46 @@ impl Inlet {
         }
     }
 
-    /// A pick for the composer: into the main composer at its caret.
-    fn insert_into_composer(&mut self, pick: Insert, window: &mut Window, cx: &mut Context<Self>) {
-        self.composer
-            .view
-            .update(cx, |v, cx| v.insert_picked(pick, window, cx));
+    /// A pick for a composer, at its caret. Returns whether it went in; when it did not,
+    /// the notice bar says so and nothing counts as used.
+    fn insert_into_composer(
+        &mut self,
+        target: Target,
+        pick: Insert,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let done = self
+            .target_view(target)
+            .is_some_and(|view| view.update(cx, |v, cx| v.insert_picked(pick, window, cx)));
+        if !done {
+            self.chat.notice = Some(t!("picker-insert-failed"));
+        }
+        done
     }
 
-    /// Sends a sticker or meme to the open channel.
-    fn send_to_channel(&mut self, cmd: impl FnOnce(String, String) -> Cmd) {
-        let Some(channel_id) = self.selected_channel.clone() else {
+    /// Sends a sticker or meme to the target's channel (the thread's, from the panel).
+    fn send_to_channel(
+        &mut self,
+        target: Target,
+        cmd: impl FnOnce(String, String) -> Cmd,
+        cx: &App,
+    ) {
+        let Some(channel_id) = self.target_channel(target, cx) else {
             return;
         };
         self.backend
             .send(ComposerCmd::Pickers(cmd(channel_id, p::new_nonce())));
+    }
+
+    /// The picker's images start (or stop) being drawn: while the picker is the layer on
+    /// top, only they take places in the animation budget, and they move.
+    fn picker_images(&self, drawing: bool) {
+        self.media
+            .images
+            .animations()
+            .borrow_mut()
+            .drawing_top_layer(drawing);
     }
 
     /// Guild IDs in picker order: the open guild first, then the account's other guilds.
@@ -804,6 +952,28 @@ impl Inlet {
         let mut ids: Vec<GuildId> = current.into_iter().collect();
         ids.extend(state.guilds().map(|g| g.id).filter(|g| Some(*g) != current));
         ids
+    }
+
+    /// For the grids' keys: each community in picker order with where its emoji (or
+    /// sticker) list lives and how long it is. Nothing is copied; the account state puts
+    /// a new list in place when a community's emoji or stickers change.
+    fn picker_guild_lists(&self, cx: &App, stickers: bool) -> Vec<(GuildId, usize, usize)> {
+        let Some(account) = self.account.as_ref() else {
+            return Vec::new();
+        };
+        let order = self.picker_guild_order(cx);
+        let state = account.read(cx);
+        order
+            .into_iter()
+            .filter_map(|g| {
+                let gs = state.guild(g)?;
+                Some(if stickers {
+                    (g, gs.stickers.as_ptr() as usize, gs.stickers.len())
+                } else {
+                    (g, gs.emojis.as_ptr() as usize, gs.emojis.len())
+                })
+            })
+            .collect()
     }
 
     /// Demo scenes `picker-emoji` and `picker-gif`: the picker opens on its tab once the
@@ -884,5 +1054,125 @@ mod tests {
         // A direct message: the global feature.
         assert!(!usable("2", None, true, false));
         assert!(usable("2", None, false, true));
+    }
+
+    #[test]
+    fn a_redraw_with_nothing_changed_does_not_build_the_grid_again() {
+        let key = emoji::GridKey {
+            query: String::new(),
+            prefs_rev: 1,
+            guilds: vec![(GuildId::parse("1").unwrap(), 0x1000, 3)],
+            channel_guild: Some("1".into()),
+            external: false,
+            global: false,
+        };
+        let mut cache: Cached<emoji::GridKey, u32> = Cached::default();
+        for _ in 0..30 {
+            assert_eq!(*cache.get(key.clone(), || 1), 1);
+        }
+        assert_eq!(cache.builds, 1, "thirty redraws, one build");
+        // Each thing the grid shows builds it again, once.
+        let changes = [
+            emoji::GridKey {
+                query: "cat".into(),
+                ..key.clone()
+            },
+            emoji::GridKey {
+                prefs_rev: 2,
+                ..key.clone()
+            },
+            emoji::GridKey {
+                guilds: vec![(GuildId::parse("1").unwrap(), 0x2000, 3)],
+                ..key.clone()
+            },
+            emoji::GridKey {
+                global: true,
+                ..key.clone()
+            },
+        ];
+        for (n, changed) in changes.into_iter().enumerate() {
+            cache.get(changed.clone(), || 2);
+            cache.get(changed, || 3);
+            assert_eq!(cache.builds, n as u64 + 2);
+        }
+    }
+
+    #[test]
+    fn a_click_outside_closes_only_its_own_toggle() {
+        let a = Target::Reaction {
+            ch: ChannelId::parse("1").unwrap(),
+            id: MessageId::parse("2").unwrap(),
+            at: point(px(0.), px(0.)),
+        };
+        let b = Target::Reaction {
+            ch: ChannelId::parse("1").unwrap(),
+            id: MessageId::parse("3").unwrap(),
+            at: point(px(5.), px(5.)),
+        };
+        assert!(same_target(&a, &a));
+        assert!(
+            !same_target(&a, &b),
+            "Add reaction on another message opens at once"
+        );
+        assert!(!same_target(&a, &Target::Composer));
+        assert!(!same_target(&Target::Composer, &Target::Panel));
+        assert!(same_target(&Target::Panel, &Target::Panel));
+        assert_ne!(next_nonce(), next_nonce());
+    }
+
+    #[gpui::test]
+    fn a_pick_goes_in_at_the_caret_or_not_at_all(cx: &mut gpui::TestAppContext) {
+        use gpui::EntityInputHandler;
+        let (view, cx) =
+            cx.add_window_view(|window, cx| ComposerView::new(Rc::default(), 2000, window, cx));
+        let text = |s: &str| Insert::Text(s.to_owned());
+        // No channel open: nothing goes in.
+        let done = view.update_in(cx, |v, window, cx| v.insert_picked(text("x"), window, cx));
+        assert!(!done);
+        view.update_in(cx, |v, window, cx| {
+            v.set_channel(
+                super::super::ChannelContext {
+                    channel_id: "301".into(),
+                    guild_id: Some("100".into()),
+                    placeholder: String::new(),
+                    slowmode_secs: 0,
+                },
+                window,
+                cx,
+            )
+        });
+        let wave = Insert::CustomEmoji {
+            id: 41,
+            name: "wave".into(),
+            animated: false,
+        };
+        let party = Insert::CustomEmoji {
+            id: 42,
+            name: "party".into(),
+            animated: true,
+        };
+        for pick in [text("hi \u{1F600}"), wave, party] {
+            assert!(view.update_in(cx, |v, window, cx| v.insert_picked(pick, window, cx)));
+        }
+        view.read_with(cx, |v, cx| {
+            let editor = v.editor.read(cx);
+            assert_eq!(editor.to_wire(), "hi \u{1F600}<:wave:41><a:party:42>");
+            let allowed = editor.buffer().allowed_mentions();
+            assert!(allowed.users.is_empty() && allowed.roles.is_empty() && !allowed.everyone);
+        });
+        // Too long: refused.
+        let long = text(&"x".repeat(3000));
+        assert!(!view.update_in(cx, |v, window, cx| v.insert_picked(long, window, cx)));
+        // While an input method composes, nothing goes in.
+        let composing = view.update_in(cx, |v, window, cx| {
+            v.editor.update(cx, |e, cx| {
+                e.replace_and_mark_text_in_range(None, "n", Some(1..1), window, cx)
+            });
+            v.insert_picked(text("\u{1F44D}"), window, cx)
+        });
+        assert!(!composing);
+        view.read_with(cx, |v, cx| {
+            assert!(!v.editor.read(cx).buffer().text().contains('\u{1F44D}'));
+        });
     }
 }
