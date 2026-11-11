@@ -99,6 +99,8 @@ impl Inlet {
             } else {
                 self.notifications.gate.note(ch, message, now);
             }
+            // Its desktop notification has been seen now.
+            self.dismiss_channel_alert(ch, cx);
         }
         changes
     }

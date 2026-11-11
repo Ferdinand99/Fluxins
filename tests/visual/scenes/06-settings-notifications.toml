@@ -1,0 +1,10 @@
+# The Notifications settings tab, over the chat (the settings with their defaults).
+name = "settings-notifications"
+window = [1280, 860]
+scale = 1.0
+theme = "dark"
+ignore = []
+scene = "default"
+guild = "g1"
+channel = "c-general"
+settings = "notifications"

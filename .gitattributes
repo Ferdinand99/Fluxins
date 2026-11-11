@@ -6,3 +6,4 @@
 *.otf binary
 *.woff2 binary
 *.pack binary
+*.wav binary

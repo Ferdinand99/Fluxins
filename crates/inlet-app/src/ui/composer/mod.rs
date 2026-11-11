@@ -274,6 +274,22 @@ impl Inlet {
         }
     }
 
+    /// A page of `channel_id` arrived: the composer looks again whether a draft that
+    /// came back at an account switch was sent after all.
+    pub(crate) fn composer_messages_arrived(
+        &mut self,
+        channel_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.selected_channel.as_deref() != Some(channel_id) {
+            return;
+        }
+        self.composer
+            .view
+            .update(cx, |v, cx| v.recheck_sent_draft(window, cx));
+    }
+
     /// Retry in the message list sends again: the composer's slowmode counts it.
     pub(crate) fn composer_resent(&mut self, channel_id: &str, cx: &mut Context<Self>) {
         self.composer

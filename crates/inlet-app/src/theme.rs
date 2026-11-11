@@ -226,6 +226,25 @@ pub fn separator_line() -> Hsla {
     h(rgba(0xc9c5d30b))
 }
 
+// ---- Status dots (`--status-online`, `-idle`, `-dnd`, `-offline`) -------------
+
+/// Online: `hsl(152,72%,40%)`.
+pub fn status_online() -> Hsla {
+    h(rgb(0x1daf6b))
+}
+/// Idle: `hsl(45,93%,50%)`.
+pub fn status_idle() -> Hsla {
+    h(rgb(0xf6bb09))
+}
+/// Do not disturb: `hsl(0,84%,60%)`.
+pub fn status_dnd() -> Hsla {
+    h(rgb(0xef4343))
+}
+/// Offline and invisible: `hsl(218,11%,65%)`.
+pub fn status_offline() -> Hsla {
+    h(rgb(0x9ca3b0))
+}
+
 // ---- Media ------------------------------------------------------------------
 
 /// `--brand-primary-foreground` without an instance accent.

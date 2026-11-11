@@ -102,6 +102,15 @@ image-webp = "0.2"
 # protocol accepts only in test builds (never in a release build).
 inlet-protocol = { path = "../inlet-protocol", features = ["test-extra-ca"] }
 
+# Plays the notification sound (Inlet's own, assets/sounds) on the default output
+# device: WASAPI and CoreAudio through cpal. On Linux, ALSA is loaded at run time
+# (libloading), so a system without libasound still starts, only without sound.
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+cpal = "0.18"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libloading = "0.8"
+
 # Embeds the app icon and version info in inlet.exe.
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"

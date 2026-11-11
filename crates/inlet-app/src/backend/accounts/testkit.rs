@@ -210,15 +210,33 @@ pub(crate) fn ready_json(user: &str, guild: &str, channel: &str) -> Value {
 /// gets Hello, and after Identify the READY its token maps to (`readies`); then it
 /// answers heartbeats and ignores the rest.
 pub(crate) fn serve_gateway(listener: TcpListener, readies: HashMap<String, Value>) {
+    serve_gateway_then(listener, readies, HashMap::new());
+}
+
+/// As [`serve_gateway`], and after the READY of a token the dispatches `then` holds for
+/// it, as `(event name, data)`, in order.
+pub(crate) fn serve_gateway_then(
+    listener: TcpListener,
+    readies: HashMap<String, Value>,
+    then: HashMap<String, Vec<(String, Value)>>,
+) {
     let readies = Arc::new(readies);
+    let then = Arc::new(then);
     tokio::spawn(async move {
         loop {
             let mut conn = Conn::accept_forever(&listener).await;
             let readies = readies.clone();
+            let then = then.clone();
             tokio::spawn(async move {
                 let readies = readies.clone();
-                conn.identify_with(move |token| readies.get(token).cloned().unwrap_or(Value::Null))
+                let identify = conn
+                    .identify_with(move |token| readies.get(token).cloned().unwrap_or(Value::Null))
                     .await;
+                let token = identify["d"]["token"].as_str().unwrap_or_default();
+                for (seq, (name, data)) in then.get(token).into_iter().flatten().enumerate() {
+                    conn.send(json!({"op": 0, "s": seq + 2, "t": name, "d": data}))
+                        .await;
+                }
                 while conn.recv(Duration::from_secs(3600)).await.is_some() {}
             });
         }

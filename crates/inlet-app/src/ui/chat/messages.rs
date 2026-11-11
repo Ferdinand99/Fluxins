@@ -1171,7 +1171,13 @@ impl Inlet {
                 request,
                 page,
                 rendered,
-            } => self.on_page(channel_id, request, page, rendered, active, cx),
+            } => {
+                let channel = channel_id.clone();
+                self.on_page(channel_id, request, page, rendered, active, cx);
+                // A draft of a message that was sent after all can only be told once
+                // the channel's messages are in.
+                self.composer_messages_arrived(&channel, window, cx);
+            }
             Ev::PageFailed {
                 channel_id,
                 request,
@@ -1235,7 +1241,9 @@ impl Inlet {
         let Some(account) = self.account.clone() else {
             return;
         };
+        let alert = Self::alert_probe(&account, &dispatch, cx);
         let mut changes = account.update(cx, |s, _| s.apply(&dispatch));
+        self.alert_after(self.switcher.active.clone(), alert, &dispatch, &account, cx);
         self.settings_applied(&dispatch, &mut changes, cx);
         self.note_saved(&dispatch);
         self.inbox_on_dispatch(&dispatch, &rendered, cx);
@@ -1390,6 +1398,7 @@ impl Inlet {
         self.notifications
             .refresh_badges(account.read(cx), &changes);
         self.inbox.state_changed(&changes);
+        self.typing_changed(&changes, cx);
         self.chat.view.conversions.prune(account.read(cx), &changes);
         self.threads_after_changes(&changes, members, cx);
         let Some(ch) = self.open_channel_id() else {

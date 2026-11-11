@@ -946,6 +946,34 @@ impl ComposerView {
         true
     }
 
+    /// The open channel's messages arrived: if its draft is a message that was sent
+    /// after all, that part goes from the draft and from the box.
+    pub fn recheck_sent_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(channel) = self.open_channel_id() else {
+            return;
+        };
+        let shown = Draft::of(self.editor.read(cx).buffer()).map(|d| d.wire);
+        let stored = self
+            .shared
+            .borrow()
+            .drafts
+            .get(&channel)
+            .map(|d| d.wire.clone());
+        // Only while the box still shows that draft, untouched.
+        if shown.is_none() || shown != stored || !self.drop_sent_draft(&channel, cx) {
+            return;
+        }
+        let kept = self.shared.borrow().drafts.get(&channel).cloned();
+        let error = self.error.take();
+        self.editor.update(cx, |e, cx| match &kept {
+            Some(d) => e.set_wire(&d.wire, d, window, cx),
+            None => e.clear(window, cx),
+        });
+        self.quiet_text = Some(self.editor.read(cx).buffer().text().to_owned());
+        self.error = error;
+        cx.notify();
+    }
+
     /// Sign-out: every channel's attachments go, pasted images with them.
     pub(super) fn clear_attachments(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let staged = self.attachments.clear();

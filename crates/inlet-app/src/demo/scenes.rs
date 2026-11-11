@@ -36,6 +36,8 @@
 //!   the thread list open.
 //! - `forum`, `media-channel`: the same data, for `c-forum` (posts with tags, unread
 //!   counts) and `c-gallery` (the grid).
+//! - `status-picker`: the account on "Do Not Disturb" with a custom status, the status
+//!   picker open, and two people typing in the open channel (see `social.rs`).
 //! - `composer-attachments`: for `#general`, three files in the composer's tray (a photo
 //!   with alt text, a spoiler, a document), an upload on its way above the box, and its
 //!   message pending in the list.
@@ -89,6 +91,7 @@ pub enum Scene {
     ThreadList,
     Forum,
     MediaChannel,
+    StatusPicker,
     ComposerAttachments,
 }
 
@@ -122,6 +125,7 @@ impl Scene {
             "thread-list" => Scene::ThreadList,
             "forum" => Scene::Forum,
             "media-channel" => Scene::MediaChannel,
+            "status-picker" => Scene::StatusPicker,
             "composer-attachments" => Scene::ComposerAttachments,
             _ => return None,
         })
@@ -269,6 +273,7 @@ fn ready(
     read_states: Vec<Value>,
     guild_settings: Vec<Value>,
     unread_demo: bool,
+    user_settings: Value,
 ) -> p::Ready {
     let guilds: Vec<Value> = guilds
         .iter()
@@ -316,6 +321,8 @@ fn ready(
         "users": [],
         "read_states": read_states,
         "user_guild_settings": guild_settings,
+        "presences": social::presences(),
+        "user_settings": user_settings,
     }))
     .expect("the demo READY is valid")
 }
@@ -447,6 +454,7 @@ pub fn data(scene: Scene) -> Data {
         read_states,
         guild_settings,
         unread_demo,
+        social::user_settings(scene),
     );
     if threads {
         super::threads::decorate(&mut ready, &messages);
@@ -494,6 +502,7 @@ mod tests {
             "thread-list",
             "forum",
             "media-channel",
+            "status-picker",
             "composer-attachments",
         ] {
             let scene = Scene::from_name(name).expect(name);

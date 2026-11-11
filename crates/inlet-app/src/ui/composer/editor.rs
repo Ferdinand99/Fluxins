@@ -156,7 +156,7 @@ pub struct ComposerView {
     pub(super) shared: Rc<RefCell<Shared>>,
     seen_generation: u64,
     /// The account state on the UI thread: roles, channels, emoji and rights.
-    account: Option<WeakEntity<AccountState>>,
+    pub(super) account: Option<WeakEntity<AccountState>>,
     /// Autocomplete data of the open channel, from the account state.
     pub(super) directory: Option<(String, Directory)>,
     /// Members per guild: from the account state and from searches.
@@ -175,7 +175,7 @@ pub struct ComposerView {
     last_typing: Option<Instant>,
     last_search: Option<(String, String)>,
     /// Text the composer put in itself (a restored draft): not typing.
-    quiet_text: Option<String>,
+    pub(super) quiet_text: Option<String>,
     /// The text of the last `/msg`, put back if it fails.
     dm_backup: Option<(String, Draft)>,
     /// Files attached to the message being written, per channel.
@@ -1766,13 +1766,31 @@ my other words"
                 }),
             }),
         );
-        view.update(cx, |v, cx| v.set_account(Some(account.downgrade()), cx));
+        // The channel opens before its messages are in: the draft shows as it is.
         open(&view, "301", cx);
-        let text = view.read_with(cx, |v, cx| v.editor.read(cx).buffer().text().to_owned());
-        assert_eq!(text, "my other words", "only the part already sent goes");
+        let text = |cx: &mut VisualTestContext| {
+            view.read_with(cx, |v, cx| v.editor.read(cx).buffer().text().to_owned())
+        };
+        assert!(text(cx).starts_with("from the trip"));
+        // The page arrives (the app calls this for the open channel).
+        view.update(cx, |v, cx| v.set_account(Some(account.downgrade()), cx));
+        view.update_in(cx, |v, window, cx| v.recheck_sent_draft(window, cx));
+        cx.run_until_parked();
+        assert_eq!(
+            text(cx),
+            "my other words",
+            "only the part already sent goes"
+        );
         assert!(
             view.read_with(cx, |v, _| v.error.is_some()),
             "and it says so"
         );
+        // Opened again with the messages in, the check at opening finds it too.
+        let shared = view.read_with(cx, |v, _| v.shared.clone());
+        assert!(shared
+            .borrow()
+            .drafts
+            .get("301")
+            .is_some_and(|d| d.sent_check.is_none()));
     }
 }

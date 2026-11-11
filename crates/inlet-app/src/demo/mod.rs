@@ -380,6 +380,7 @@ impl MockSession {
         for out in outgoing {
             let _ = events.unbounded_send(msgs::Ev::Pending(out));
         }
+        social::start_typing(&events);
         let _ = events.unbounded_send(acc::Ev::Status("Demo mode".into()));
 
         Self {

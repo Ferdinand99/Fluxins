@@ -1,0 +1,10 @@
+# Presence: the account on Do Not Disturb with a custom status, the status picker open
+# over the user panel, and two people typing in #general.
+name = "status-picker"
+window = [1280, 860]
+scale = 1.0
+theme = "dark"
+ignore = []
+scene = "status-picker"
+guild = "g1"
+channel = "c-general"

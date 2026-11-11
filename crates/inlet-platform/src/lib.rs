@@ -11,6 +11,10 @@
 //! Tray and badge calls talk to the shell and must not run while gpui's app is
 //! borrowed; with gpui, use the wrappers in `gpui_glue`, which run them in a task.
 //!
+//! Notifications are silent: Windows toasts carry `<audio silent="true"/>` and gpui
+//! sets no sound on macOS or Linux. An app that wants a sound plays its own, after
+//! asking [`quiet_mode`] whether the system wants quiet.
+//!
 //! Events from the OS (tray clicks, menu choices, notification clicks, deep links)
 //! arrive on one queue, [`events`].
 
@@ -27,6 +31,7 @@ pub mod jump_list;
 mod linux_bus;
 mod motion;
 mod notify;
+mod quiet;
 mod single_instance;
 #[cfg(windows)]
 mod toast;
@@ -49,6 +54,7 @@ pub use notify::{
     clean_text, dismiss, escape_markup, notify, Notification, Preview, BODY_MAX_GRAPHEMES,
     TITLE_MAX_GRAPHEMES,
 };
+pub use quiet::quiet_mode;
 pub use single_instance::{single_instance, Instance, SingleInstance};
 pub use tray::{Tray, TrayItem, TrayState};
 
