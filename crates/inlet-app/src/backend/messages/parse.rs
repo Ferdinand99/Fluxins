@@ -8,9 +8,7 @@ use std::sync::{Arc, Mutex};
 use inlet_protocol as p;
 use inlet_protocol::models::channel_type;
 
-use crate::model::{
-    self, Attachment, Channel, ChannelKind, Embed, EmbedField, Message, Names, Reply,
-};
+use crate::model::{self, Channel, ChannelKind, Embed, EmbedField, Message, Names, Reply};
 
 /// Channel lists per guild (`None` = direct messages), shared by REST tasks and the
 /// gateway forwarder.
@@ -125,6 +123,7 @@ fn convert_message(m: &p::Message, names: &SharedNames) -> Message {
         author: model::clean_name(m.author.display_name()),
         author_username: model::clean_name(&m.author.username),
         author_bot: m.author.bot,
+        author_avatar: crate::backend::media::user_avatar(&m.author).map(Box::new),
         timestamp_ms,
         timestamp,
         content: m.content.clone(),
@@ -133,14 +132,8 @@ fn convert_message(m: &p::Message, names: &SharedNames) -> Message {
         attachments: m
             .attachments
             .iter()
-            .map(|a| Attachment {
-                filename: model::clean_name(&a.filename),
-                url: a
-                    .url
-                    .clone()
-                    .or_else(|| a.proxy_url.clone())
-                    .unwrap_or_default(),
-            })
+            .take(crate::backend::media::MAX_ATTACHMENTS)
+            .map(crate::backend::media::to_attachment)
             .collect(),
         embeds: m
             .embeds
@@ -221,7 +214,8 @@ fn capped(s: &str) -> &str {
     }
 }
 
-/// Converts an embed object. Images, thumbnails and videos become links.
+/// Converts an embed object. Its media (images, thumbnails, videos, icons) is filled
+/// by the media domain.
 pub fn to_embed(v: &serde_json::Value, names: &Names) -> Option<Embed> {
     if !v.is_object() {
         return None;
@@ -239,7 +233,7 @@ pub fn to_embed(v: &serde_json::Value, names: &Names) -> Option<Embed> {
             .unwrap_or_default(),
         fields: Vec::new(),
         footer: str_at(v, &["footer", "text"]).map(|t| model::snippet(t, 256)),
-        media: Vec::new(),
+        ..Default::default()
     };
     if let Some(fields) = v.get("fields").and_then(|f| f.as_array()) {
         for f in fields.iter().take(25) {
@@ -249,27 +243,22 @@ pub fn to_embed(v: &serde_json::Value, names: &Names) -> Option<Embed> {
             let value = str_at(f, &["value"])
                 .map(|t| crate::ui::markdown::parse_embed_with(capped(t), names))
                 .unwrap_or_default();
-            embed.fields.push(EmbedField { name, value });
-        }
-    }
-    for (key, label) in [
-        ("image", t!("embed-image")),
-        ("thumbnail", t!("embed-thumbnail")),
-        ("video", t!("embed-video")),
-    ] {
-        if let Some(url) = str_at(v, &[key, "url"]) {
-            embed.media.push(Attachment {
-                filename: label,
-                url: url.to_string(),
+            let inline = f.get("inline").and_then(|i| i.as_bool()).unwrap_or(false);
+            embed.fields.push(EmbedField {
+                name,
+                value,
+                inline,
             });
         }
     }
+    crate::backend::media::fill_embed(v, &mut embed);
     let empty = embed.title.is_none()
         && embed.author.is_none()
         && embed.description.is_empty()
         && embed.fields.is_empty()
         && embed.footer.is_none()
-        && embed.media.is_empty();
+        && embed.thumbnail.is_none()
+        && !embed.has_media();
     (!empty).then_some(embed)
 }
 
@@ -294,7 +283,7 @@ mod tests {
         assert_eq!(e.title.as_deref(), Some("Welcome to IWGamin's Pack!"));
         assert_eq!(e.color, Some(0xF1C40F));
         assert_eq!(e.fields.len(), 1);
-        assert_eq!(e.media.len(), 1);
+        assert!(e.image.is_some());
         match &e.description[0] {
             crate::ui::markdown::Block::Text(i) => assert!(i.text.contains("@ada")),
             other => panic!("{other:?}"),

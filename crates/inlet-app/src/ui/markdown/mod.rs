@@ -39,6 +39,45 @@ pub fn mono_font() -> &'static str {
     crate::assets::mono_font()
 }
 
+/// The URLs of the links a message's text hides in spoilers: inside an inline `||…||`
+/// (the rule that makes them inert, [`inline::link_in_spoiler`]) or anywhere in a
+/// spoiler around whole blocks. The embeds of these links are covered until the
+/// message's spoilers are shown.
+pub fn spoilered_links(blocks: &[Block]) -> Vec<String> {
+    fn all_links(inline: &Inline, out: &mut Vec<String>) {
+        out.extend(inline.links.iter().map(|l| l.url.clone()));
+    }
+    fn hidden_links(inline: &Inline, out: &mut Vec<String>) {
+        out.extend(inline::spoilered_links(inline).map(|l| l.url.clone()));
+    }
+    fn walk(blocks: &[Block], hidden: bool, out: &mut Vec<String>) {
+        let inline = |i: &Inline, out: &mut Vec<String>| {
+            if hidden {
+                all_links(i, out)
+            } else {
+                hidden_links(i, out)
+            }
+        };
+        for b in blocks {
+            match b {
+                Block::Text(i) | Block::Heading(_, i) | Block::Subtext(i) => inline(i, out),
+                Block::Quote(inner) | Block::Alert(_, inner) => walk(inner, hidden, out),
+                Block::List(list) => list.items.iter().for_each(|item| walk(item, hidden, out)),
+                Block::Table(t) => t
+                    .header
+                    .iter()
+                    .chain(t.rows.iter().flatten())
+                    .for_each(|i| inline(i, out)),
+                Block::Spoiler(inner) => walk(inner, true, out),
+                Block::Code(_) => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(blocks, false, &mut out);
+    out
+}
+
 /// Prefix of the internal link a channel mention carries; clicking it opens the channel.
 pub const CHANNEL_LINK: &str = "inlet-channel:";
 

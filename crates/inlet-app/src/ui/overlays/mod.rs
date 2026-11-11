@@ -33,6 +33,9 @@ impl Inlet {
     /// The overlays to draw over the current screen, bottom first.
     pub(crate) fn render_overlays(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let mut out = Vec::new();
+        // The viewer lies under the settings view and the prompts (Escape closes the
+        // topmost layer first).
+        out.extend(self.render_image_viewer(cx));
         if self.settings.view.is_some() {
             out.push(self.render_settings_overlay(cx));
         }

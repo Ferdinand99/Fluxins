@@ -12,6 +12,9 @@ publish = false
 # Built-in sample data, started with INLET_DEMO=1. Only for screenshots and UI checks;
 # off in normal builds.
 demo = []
+# Trust the private test instance's CA (REST, gateway and media). Debug builds only:
+# inlet-protocol refuses it in a release build.
+test-extra-ca = ["inlet-protocol/test-extra-ca"]
 
 [[bin]]
 name = "inlet"
@@ -23,6 +26,8 @@ inlet-emoji = { path = "../inlet-emoji" }
 inlet-protocol = { path = "../inlet-protocol" }
 # Per-account client state: the message windows the chat shows.
 inlet-state = { path = "../inlet-state" }
+# Images: fetched from the media proxy, decoded and cached with hard limits.
+inlet-media = { path = "../inlet-media" }
 # Tray, badge, single instance, deep links, autostart (with its gpui glue).
 inlet-platform = { path = "../inlet-platform", features = ["gpui"] }
 
@@ -32,6 +37,7 @@ gpui_platform.workspace = true
 fluxer_markdown_parser = { git = "https://github.com/fluxerapp/fluxer", rev = "f1cba64e64bda5f57ad3cf827c1d5a98ecdd80df" }
 
 anyhow = "1"
+bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 dirs = "6"
 env_logger = "0.11"
@@ -40,16 +46,17 @@ fluent-bundle = "0.16"
 futures = "0.3"
 keyring = { version = "3.6", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust", "vendored"] }
 log = "0.4"
-# Only for the `Method` of `inlet_protocol::Client::request_json` (the version and
-# features inlet-protocol already uses).
-reqwest = { version = "0.12", default-features = false }
+# The media proxy client (images, saved files): no cookies, no token, no redirects.
+# Also gives the `Method` of `inlet_protocol::Client::request_json`. Same version and
+# TLS stack as inlet-protocol.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Code block highlighting: the parser and grammars only, with the pure-Rust regex engine.
 syntect = { version = "5.3", default-features = false, features = ["default-syntaxes", "regex-fancy"] }
 # The system locale, for the date and time format in the chat.
 sys-locale = "0.3"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "fs", "io-util"] }
 unic-langid = "0.9"
 unicode-segmentation = "1"
 url = "2"
