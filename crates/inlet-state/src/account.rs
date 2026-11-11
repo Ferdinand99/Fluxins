@@ -580,6 +580,48 @@ impl AccountState {
         c
     }
 
+    /// Replaces the channel's window with a page around a message (a jump to a
+    /// message that is not loaded; `GET /messages?around=`). The window keeps
+    /// its newest messages only when the page reaches the channel's newest
+    /// message; otherwise [`MessageWindow::has_newest`] is `false` until the
+    /// newest page is loaded again, so the channel is not read meanwhile. Does
+    /// nothing for an unknown channel, an empty page, or a window that is
+    /// loading its newest page (jump again once it has landed).
+    ///
+    /// [`MessageWindow::has_newest`]: crate::messages::MessageWindow::has_newest
+    pub fn apply_around(&mut self, ch: ChannelId, messages: &[Message]) -> Changes {
+        let mut c = Changes::default();
+        let Some(channel) = self.channels.get(ch) else {
+            return c;
+        };
+        let newest = MessageId::parse_opt(channel.last_message_id.as_deref());
+        let (changed, evicted) = self.windows.apply_around(ch, messages, newest);
+        if changed {
+            c.message(ch);
+        }
+        if let Some(e) = evicted {
+            c.message(e);
+        }
+        if !changed {
+            return c;
+        }
+        for m in messages {
+            c.users |= self.users.upsert(&m.author);
+        }
+        let last = messages
+            .iter()
+            .filter(|m| ChannelId::parse(&m.channel_id) == Some(ch))
+            .filter_map(|m| MessageId::parse(&m.id))
+            .max();
+        if let Some(last) = last {
+            self.bump_channel_last(ch, last);
+            if self.read_states.bump_last(ch, last) {
+                c.read(ch, self.channels.guild_of(ch));
+            }
+        }
+        c
+    }
+
     /// The account read `ch` up to `message` (or up to the newest message),
     /// as Fluxer's `applyAck`: the mentions go to 0 and the ack never moves
     /// back. Use [`AckKind::Explicit`] after the user read the channel (it

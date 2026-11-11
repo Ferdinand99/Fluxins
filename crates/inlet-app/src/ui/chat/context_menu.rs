@@ -170,7 +170,7 @@ impl ActionsState {
             .is_some_and(|(_, saved)| *saved)
     }
 
-    fn set_saved(&mut self, id: MessageId, saved: bool) {
+    pub(crate) fn set_saved(&mut self, id: MessageId, saved: bool) {
         self.saved.retain(|(m, _)| *m != id);
         if self.saved.len() >= MAX_SAVED {
             self.saved.pop_front();
@@ -415,6 +415,10 @@ impl Inlet {
             } => {
                 if let Some(id) = MessageId::parse(&message_id) {
                     self.chat.actions.end(kind, id);
+                }
+                // The inbox's saved list hid the row already: it loads again.
+                if kind == Kind::Unsave {
+                    self.inbox_unsave_failed(cx);
                 }
                 self.chat.error = Some(match kind {
                     Kind::Delete => t!("action-delete-failed", reason = reason),

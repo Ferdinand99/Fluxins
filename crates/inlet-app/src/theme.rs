@@ -383,6 +383,21 @@ pub fn reaction_me_text() -> Hsla {
     h(rgb(0xb0adff))
 }
 
+// ---- Panels (pins, inbox) ------------------------------------------------------
+
+/// A message card in a panel (`--message-preview-card-background`: white 2.2 %).
+pub fn preview_card_bg() -> Hsla {
+    h(rgba(0xffffff06))
+}
+/// Its border (`--message-preview-card-border`: white 7 %).
+pub fn preview_card_border() -> Hsla {
+    h(rgba(0xffffff12))
+}
+/// The line under a card's header (`--message-preview-card-divider`: white 5 %).
+pub fn preview_card_divider() -> Hsla {
+    h(rgba(0xffffff0d))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
