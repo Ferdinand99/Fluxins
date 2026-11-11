@@ -602,11 +602,19 @@ jobs:
 
       # Package list follows Zed's script/linux.
       - name: Install system packages for gpui
-        # A mirror that does not answer fails the step instead of hanging the job.
-        timeout-minutes: 10
+        timeout-minutes: 15
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
+          # The runner's Azure mirror sometimes fails to resolve; fall back to the
+          # main Ubuntu archive and retry the index download a few times.
+          if ! getent hosts azure.archive.ubuntu.com >/dev/null; then
+            sudo sed -i 's#http://azure.archive.ubuntu.com#http://archive.ubuntu.com#g'               /etc/apt/sources.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true
+          fi
+          for attempt in 1 2 3; do
+            sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::ForceIPv4=true update && break
+            echo "apt-get update failed (attempt $attempt), retrying"
+            sleep 15
+          done
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::ForceIPv4=true install -y --no-install-recommends \
             build-essential cmake clang lld mold pkg-config \
             libasound2-dev \
             libfontconfig-dev \
@@ -684,11 +692,19 @@ jobs:
 
       # Package list follows Zed's script/linux.
       - name: Install system packages for gpui
-        # A mirror that does not answer fails the step instead of hanging the job.
-        timeout-minutes: 10
+        timeout-minutes: 15
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
+          # The runner's Azure mirror sometimes fails to resolve; fall back to the
+          # main Ubuntu archive and retry the index download a few times.
+          if ! getent hosts azure.archive.ubuntu.com >/dev/null; then
+            sudo sed -i 's#http://azure.archive.ubuntu.com#http://archive.ubuntu.com#g'               /etc/apt/sources.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true
+          fi
+          for attempt in 1 2 3; do
+            sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::ForceIPv4=true update && break
+            echo "apt-get update failed (attempt $attempt), retrying"
+            sleep 15
+          done
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::ForceIPv4=true install -y --no-install-recommends \
             build-essential cmake clang lld mold pkg-config \
             libasound2-dev \
             libfontconfig-dev \
@@ -746,11 +762,19 @@ jobs:
 
       # Package list follows Zed's script/linux.
       - name: Install system packages for gpui
-        # A mirror that does not answer fails the step instead of hanging the job.
-        timeout-minutes: 10
+        timeout-minutes: 15
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
+          # The runner's Azure mirror sometimes fails to resolve; fall back to the
+          # main Ubuntu archive and retry the index download a few times.
+          if ! getent hosts azure.archive.ubuntu.com >/dev/null; then
+            sudo sed -i 's#http://azure.archive.ubuntu.com#http://archive.ubuntu.com#g'               /etc/apt/sources.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true
+          fi
+          for attempt in 1 2 3; do
+            sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::ForceIPv4=true update && break
+            echo "apt-get update failed (attempt $attempt), retrying"
+            sleep 15
+          done
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::ForceIPv4=true install -y --no-install-recommends \
             build-essential cmake clang lld pkg-config \
             libasound2-dev \
             libfontconfig-dev \
@@ -818,11 +842,19 @@ jobs:
           persist-credentials: false
 
       - name: Install Xvfb, software Vulkan and the capture tools
-        # A mirror that does not answer fails the step instead of hanging the job.
-        timeout-minutes: 10
+        timeout-minutes: 15
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
+          # The runner's Azure mirror sometimes fails to resolve; fall back to the
+          # main Ubuntu archive and retry the index download a few times.
+          if ! getent hosts azure.archive.ubuntu.com >/dev/null; then
+            sudo sed -i 's#http://azure.archive.ubuntu.com#http://archive.ubuntu.com#g'               /etc/apt/sources.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true
+          fi
+          for attempt in 1 2 3; do
+            sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::ForceIPv4=true update && break
+            echo "apt-get update failed (attempt $attempt), retrying"
+            sleep 15
+          done
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=20 -o Acquire::ForceIPv4=true install -y --no-install-recommends \
             xvfb x11-utils imagemagick xdotool \
             libvulkan1 mesa-vulkan-drivers libegl1 libgl1-mesa-dri \
             libxkbcommon-x11-0 libxcb1 libx11-xcb1 libwayland-client0 libfontconfig1 \
