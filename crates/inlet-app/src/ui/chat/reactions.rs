@@ -35,25 +35,6 @@ pub const MAX_MESSAGES: usize = 50;
 pub const MAX_EMOJI: usize = 20;
 /// The quick reactions in the action bar.
 pub const QUICK: [&str; 3] = ["\u{1F44D}", "\u{2764}\u{FE0F}", "\u{1F602}"];
-/// The emoji offered until the emoji picker arrives (the bar's "add reaction").
-pub const PICKER: [&str; 16] = [
-    "\u{1F44D}",
-    "\u{1F44E}",
-    "\u{2764}\u{FE0F}",
-    "\u{1F602}",
-    "\u{1F62E}",
-    "\u{1F622}",
-    "\u{1F621}",
-    "\u{1F389}",
-    "\u{1F525}",
-    "\u{1F440}",
-    "\u{1F64F}",
-    "\u{1F44F}",
-    "\u{2705}",
-    "\u{274C}",
-    "\u{1F914}",
-    "\u{1F680}",
-];
 /// Longest label of an emoji that is not drawn as an image.
 const MAX_LABEL_CHARS: usize = 32;
 

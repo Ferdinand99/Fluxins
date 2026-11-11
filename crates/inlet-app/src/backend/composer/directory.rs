@@ -133,6 +133,8 @@ struct Inner {
     outbox: VecDeque<SentMessage>,
     /// IDs of server messages a late Retry took as its copy.
     claimed: VecDeque<String>,
+    /// When the GIF pickers last asked for trending (0) and the featured terms (1).
+    gif_home: [Option<Instant>; 2],
 }
 
 /// Whether a Retry must first look for the message: the failure was unclear and the
@@ -161,6 +163,22 @@ impl State {
 
     pub fn session(&self, gen: u64) -> Option<(String, usize)> {
         self.of(gen)?.session.clone()
+    }
+
+    /// Whether the GIF picker may ask for trending (`kind` 0) or the featured terms
+    /// (`kind` 1) now: at most once per [`super::gif::GIF_HOME_INTERVAL`] per account.
+    pub fn gif_home_slot(&self, gen: u64, kind: usize, now: Instant) -> bool {
+        let Some(mut inner) = self.of(gen) else {
+            return false;
+        };
+        let Some(last) = inner.gif_home.get_mut(kind) else {
+            return false;
+        };
+        if last.is_some_and(|t| now.saturating_duration_since(t) < super::gif::GIF_HOME_INTERVAL) {
+            return false;
+        }
+        *last = Some(now);
+        true
     }
 
     pub fn set_session(&self, gen: u64, user_id: String, max_len: usize) {
