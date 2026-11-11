@@ -95,7 +95,7 @@ pub fn init(cx: &mut App) {
             cx.background_executor()
                 .timer(std::time::Duration::from_secs(3))
                 .await;
-            cx.update(|cx| send_test_notification(cx));
+            cx.update(send_test_notification);
         })
         .detach();
     }
