@@ -209,4 +209,4 @@ pub use ratelimit::{RateLimitConfig, RateLimiter};
 pub use reqwest::Method;
 pub use rest::{new_nonce, Client};
 pub use token::Token;
-pub use upload::{safe_filename, ProgressFn, UploadFile, UploadLimits};
+pub use upload::{safe_filename, ProgressFn, Segment, UploadData, UploadFile, UploadLimits};

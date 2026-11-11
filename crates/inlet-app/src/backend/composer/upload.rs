@@ -32,7 +32,7 @@
 
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -79,6 +79,9 @@ pub struct FileToSend {
     pub spoiler: bool,
     /// Alt text.
     pub description: Option<String>,
+    /// The person chose to send this file with its photo metadata (it could not be
+    /// removed).
+    pub keep_metadata: bool,
     pub source: Source,
 }
 
@@ -89,6 +92,7 @@ impl std::fmt::Debug for FileToSend {
             .field("size", &self.size)
             .field("content_type", &self.content_type)
             .field("spoiler", &self.spoiler)
+            .field("keep_metadata", &self.keep_metadata)
             .field("pasted", &matches!(self.source, Source::Memory(_)))
             .finish()
     }
@@ -188,14 +192,25 @@ impl Limits {
     }
 }
 
-/// Bytes held by uploads.
+/// Bytes held by uploads, and the most held at once.
 #[derive(Clone, Default)]
-pub struct Gauge(Arc<AtomicU64>);
+pub struct Gauge(Arc<AtomicU64>, Arc<AtomicU64>);
 
 impl Gauge {
+    fn add(&self, n: u64) {
+        let now = self.0.fetch_add(n, Ordering::SeqCst) + n;
+        self.1.fetch_max(now, Ordering::SeqCst);
+    }
+
     #[cfg(test)]
     pub fn bytes(&self) -> u64 {
         self.0.load(Ordering::SeqCst)
+    }
+
+    /// The peak since the last call; starts again from what is held now.
+    #[cfg(test)]
+    pub fn take_peak(&self) -> u64 {
+        self.1.swap(self.bytes(), Ordering::SeqCst)
     }
 }
 
@@ -210,7 +225,7 @@ struct HeldInner {
 
 impl Held {
     fn new(data: Bytes, gauge: &Gauge) -> Held {
-        gauge.0.fetch_add(data.len() as u64, Ordering::SeqCst);
+        gauge.add(data.len() as u64);
         Held(Arc::new(HeldInner {
             data,
             gauge: gauge.clone(),
@@ -235,12 +250,22 @@ impl Drop for HeldInner {
 pub trait Files: Send + Sync {
     /// The size of a regular file (not a folder, device or pipe).
     fn len(&self, path: &Path) -> std::io::Result<u64>;
-    /// `range` of a file that must still be `len` bytes long.
-    fn read(&self, path: &Path, len: u64, range: Range<u64>) -> std::io::Result<Bytes>;
+    /// `range` of a file that must still be `len` bytes long. Stops with an error as
+    /// soon as `cancel` is set.
+    fn read(
+        &self,
+        path: &Path,
+        len: u64,
+        range: Range<u64>,
+        cancel: &AtomicBool,
+    ) -> std::io::Result<Bytes>;
 }
 
 /// The real disk.
 pub struct Disk;
+
+/// Bytes read between looks at Cancel.
+const READ_CHUNK: usize = 1024 * 1024;
 
 impl Files for Disk {
     fn len(&self, path: &Path) -> std::io::Result<u64> {
@@ -251,7 +276,13 @@ impl Files for Disk {
         Ok(meta.len())
     }
 
-    fn read(&self, path: &Path, len: u64, range: Range<u64>) -> std::io::Result<Bytes> {
+    fn read(
+        &self,
+        path: &Path,
+        len: u64,
+        range: Range<u64>,
+        cancel: &AtomicBool,
+    ) -> std::io::Result<Bytes> {
         use std::io::{Read, Seek, SeekFrom};
         let mut file = std::fs::File::open(path)?;
         let meta = file.metadata()?;
@@ -260,7 +291,12 @@ impl Files for Disk {
         }
         file.seek(SeekFrom::Start(range.start))?;
         let mut buf = vec![0; (range.end - range.start) as usize];
-        file.read_exact(&mut buf)?;
+        for chunk in buf.chunks_mut(READ_CHUNK) {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(std::io::Error::other("cancelled"));
+            }
+            file.read_exact(chunk)?;
+        }
         Ok(Bytes::from(buf))
     }
 }
@@ -282,6 +318,9 @@ pub(super) struct Job {
     pub message: Outgoing,
     files: Vec<JobFile>,
     strip_exif: bool,
+    /// Set by Cancel, an account switch and the session's end: reads and metadata
+    /// removal that are running stop.
+    cancel: Arc<AtomicBool>,
 }
 
 impl Job {
@@ -290,14 +329,38 @@ impl Job {
     }
 }
 
-/// A file ready to go: in memory, or read part by part from disk.
+/// A piece of a file ready to go.
+#[derive(Clone)]
+enum Out {
+    /// Bytes in memory (part of a held buffer, or new bytes).
+    Memory(Bytes),
+    /// A range of a file on disk, read when it is sent.
+    Disk {
+        path: PathBuf,
+        range: Range<u64>,
+        file_len: u64,
+    },
+}
+
+impl Out {
+    fn len(&self) -> u64 {
+        match self {
+            Out::Memory(b) => b.len() as u64,
+            Out::Disk { range, .. } => range.end - range.start,
+        }
+    }
+}
+
+/// A file ready to go: pieces in memory and on disk, in order.
 struct Ready {
     name: String,
     content_type: String,
     spoiler: bool,
     description: Option<String>,
     len: u64,
-    data: Data,
+    pieces: Vec<Out>,
+    /// Keeps the memory of `pieces` counted while it is in use.
+    _held: Option<Held>,
 }
 
 enum Kept {
@@ -313,7 +376,19 @@ struct Entry {
     names: Vec<String>,
     kept: Kept,
     task: Option<AbortHandle>,
+    cancel: Arc<AtomicBool>,
     running: bool,
+}
+
+impl Entry {
+    /// Stops the task and anything it runs on the blocking pool.
+    fn stop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+        if let Some(t) = self.task.take() {
+            t.abort();
+        }
+        self.running = false;
+    }
 }
 
 #[derive(Default)]
@@ -343,6 +418,16 @@ pub(super) enum Retry {
     Gone(Vec<String>),
 }
 
+/// Why a file's metadata could not be removed, as the row says it.
+fn metadata_refusal(name: &str, e: exif::Error) -> Option<SendError> {
+    match e {
+        exif::Error::Cancelled => None,
+        exif::Error::Unreadable | exif::Error::Unsupported => {
+            Some(local(t!("composer-upload-metadata-failed", name = name)))
+        }
+    }
+}
+
 impl Uploads {
     pub fn with_files(files: Arc<dyn Files>) -> Self {
         Uploads {
@@ -361,6 +446,12 @@ impl Uploads {
     #[cfg(test)]
     pub fn held_bytes(&self) -> u64 {
         self.gauge.bytes()
+    }
+
+    /// The most bytes held at once since the last call.
+    #[cfg(test)]
+    pub fn peak_bytes(&self) -> u64 {
+        self.gauge.take_peak()
     }
 
     /// Takes an upload in for the account session `gen`.
@@ -382,6 +473,7 @@ impl Uploads {
             message: upload.message,
             files,
             strip_exif: upload.strip_exif,
+            cancel: Arc::default(),
         });
         let mut book = self.book();
         book.entries.retain(|e| e.nonce != job.message.nonce);
@@ -391,6 +483,7 @@ impl Uploads {
             names: job.names(),
             kept: Kept::Job(job.clone()),
             task: None,
+            cancel: job.cancel.clone(),
             running: true,
         });
         job
@@ -408,10 +501,23 @@ impl Uploads {
         Some(match &e.kept {
             Kept::Job(job) => {
                 e.running = true;
+                // A new attempt: an earlier Cancel flag must not stop it.
+                job.cancel.store(false, Ordering::Relaxed);
                 Retry::Job(job.clone())
             }
             Kept::Gone => Retry::Gone(e.names.clone()),
         })
+    }
+
+    /// What a Retry of `nonce` does: upload it again, fail it again because its files
+    /// are gone, or (`None`) send it as a message without files. A message that had
+    /// files is never sent without them.
+    pub(super) fn resend_of(&self, gen: u64, nonce: &str, had_files: bool) -> Option<Retry> {
+        match self.retry_of(gen, nonce) {
+            Some(r) => Some(r),
+            None if had_files => Some(Retry::Gone(Vec::new())),
+            None => None,
+        }
     }
 
     /// Runs `job` as a task made by `spawn`, and remembers the task for Cancel.
@@ -431,8 +537,8 @@ impl Uploads {
         }
     }
 
-    /// Cancel: the upload stops where it is and lets go of its files. Whether one was
-    /// there.
+    /// Cancel: the upload stops where it is (a read or metadata removal on the blocking
+    /// pool too) and lets go of its files. Whether one was there.
     pub fn cancel(&self, nonce: &str) -> bool {
         let entry = {
             let mut book = self.book();
@@ -440,38 +546,33 @@ impl Uploads {
             ix.map(|ix| book.entries.remove(ix))
         };
         match entry {
-            Some(e) => {
-                if let Some(t) = &e.task {
-                    t.abort();
-                }
+            Some(mut e) => {
+                e.stop();
                 true
             }
             None => false,
         }
     }
 
-    /// The account of session `gen` is no longer the active one: its running uploads
-    /// stop where they are (they never go on behind another account). Their files are
-    /// kept for Retry while the limits allow. Returns the stopped messages and their
-    /// file names, to show them as failed.
-    pub(super) fn stop_gen(&self, gen: u64) -> Vec<(Outgoing, Vec<String>)> {
-        let mut book = self.book();
-        let mut stopped = Vec::new();
-        for e in book
-            .entries
-            .iter_mut()
-            .filter(|e| e.gen == gen && e.running)
-        {
-            if let Some(t) = e.task.take() {
-                t.abort();
-            }
-            e.running = false;
-            if let Kept::Job(job) = &e.kept {
-                stopped.push((job.message.clone(), e.names.clone()));
-            }
-        }
-        trim(&mut book);
+    /// The account of session `gen` is no longer the active one: its uploads stop at
+    /// once and let go of their files (nothing is sent from it in the background).
+    /// Returns their nonces; the composer keeps their text as a draft.
+    pub(super) fn drop_gen(&self, gen: u64) -> Vec<String> {
+        let stopped: Vec<Entry> = {
+            let mut book = self.book();
+            let (gone, keep) = std::mem::take(&mut book.entries)
+                .into_iter()
+                .partition(|e| e.gen == gen);
+            book.entries = keep;
+            gone
+        };
         stopped
+            .into_iter()
+            .map(|mut e| {
+                e.stop();
+                e.nonce
+            })
+            .collect()
     }
 
     /// The session `gen` ended (sign-out, the token ended): its uploads stop and let go
@@ -479,10 +580,7 @@ impl Uploads {
     pub fn forget_gen(&self, gen: u64) {
         let mut book = self.book();
         for e in book.entries.iter_mut().filter(|e| e.gen == gen) {
-            if let Some(t) = e.task.take() {
-                t.abort();
-            }
-            e.running = false;
+            e.stop();
             e.kept = Kept::Gone;
         }
         trim(&mut book);
@@ -518,6 +616,7 @@ impl Uploads {
             let _turn = self.turn.clone().acquire_owned().await;
             self.attempt(&ctx, &job, look_since_ms).await
         };
+        let sent = outcome.is_ok();
         match outcome {
             Ok(()) => {
                 self.finished(&nonce, true);
@@ -529,7 +628,7 @@ impl Uploads {
             }
             Err(None) => self.finished(&nonce, false),
         }
-        let _ = ctx.events.unbounded_send(Ev::UploadDone { nonce });
+        let _ = ctx.events.unbounded_send(Ev::UploadDone { nonce, sent });
     }
 
     async fn attempt(
@@ -564,7 +663,7 @@ impl Uploads {
             .instance()
             .discovery()
             .presigned_attachment_uploads();
-        let ready = self.prepare(job, &limits, presigned).await?;
+        let ready = self.prepare(job, &limits).await?;
         let total = ready.iter().map(|r| r.len).sum::<u64>();
         let progress = Progress::new(ctx.events.clone(), job.message.nonce.clone(), total);
         if presigned {
@@ -581,20 +680,20 @@ impl Uploads {
         self.as_form(ctx, job, ready, &progress).await
     }
 
-    /// Reads what must be in memory and removes metadata. A file from disk that goes
-    /// to storage in parts stays on disk.
-    async fn prepare(
-        &self,
-        job: &Job,
-        limits: &Limits,
-        presigned: bool,
-    ) -> Result<Vec<Ready>, Option<SendError>> {
+    /// Each file as pieces: a file from disk stays on disk; a photo whose metadata is
+    /// removed is read once and sent as ranges of that one buffer. Fails closed: with
+    /// metadata removal on, a photo that cannot be cleaned is not sent unless the
+    /// person chose to send that file as it is.
+    async fn prepare(&self, job: &Job, limits: &Limits) -> Result<Vec<Ready>, Option<SendError>> {
         let mut out = Vec::with_capacity(job.files.len());
         for jf in &job.files {
             let f = &jf.file;
-            let strip = job.strip_exif && exif::applies_to(&f.content_type);
-            let data = match &jf.data {
-                Data::Memory(held) => Data::Memory(held.clone()),
+            let wants_strip = job.strip_exif && !f.keep_metadata;
+            let (len, head) = match &jf.data {
+                Data::Memory(held) => {
+                    let d = held.data();
+                    (d.len() as u64, d.slice(..d.len().min(32)))
+                }
                 Data::Disk(path) => {
                     let len = self.disk_len(path).await?;
                     if len > limits.max_file_size {
@@ -603,39 +702,54 @@ impl Uploads {
                             max: limits.max_file_size,
                         }));
                     }
-                    if strip || !presigned {
-                        Data::Memory(self.read(path, len, 0..len).await?)
-                    } else {
-                        Data::Disk(path.clone())
-                    }
+                    let head = self.read(path, len, 0..len.min(32), &job.cancel).await?;
+                    (len, head.data().clone())
                 }
             };
-            let data = match data {
-                Data::Memory(held) if strip => {
-                    let input = held.data().clone();
-                    let stripped = tokio::task::spawn_blocking(move || exif::strip(&input))
-                        .await
-                        .ok()
-                        .flatten();
-                    match stripped {
-                        Some(bytes) => Data::Memory(Held::new(bytes, &self.gauge)),
-                        None => Data::Memory(held),
-                    }
+            let strip = wants_strip && exif::sniff(&head) != exif::Kind::Other;
+            let ready = if strip {
+                let held = match &jf.data {
+                    Data::Memory(held) => held.clone(),
+                    // Read once; the cleaned file is ranges of this buffer.
+                    Data::Disk(path) => self.read(path, len, 0..len, &job.cancel).await?,
+                };
+                let input = held.data().clone();
+                let cancel = job.cancel.clone();
+                let planned =
+                    tokio::task::spawn_blocking(move || exif::plan(&input, &cancel)).await;
+                let pieces = match planned {
+                    Ok(Ok(Some(pieces))) => pieces
+                        .into_iter()
+                        .map(|p| match p {
+                            exif::Piece::Keep(r) => Out::Memory(held.data().slice(r)),
+                            exif::Piece::New(b) => Out::Memory(Bytes::from(b)),
+                        })
+                        .collect(),
+                    Ok(Ok(None)) => vec![Out::Memory(held.data().clone())],
+                    Ok(Err(e)) => return Err(metadata_refusal(&f.name, e)),
+                    // A panic in the cleaner: never the original.
+                    Err(_) => return Err(metadata_refusal(&f.name, exif::Error::Unreadable)),
+                };
+                Ready::new(f, pieces, Some(held))
+            } else {
+                match &jf.data {
+                    Data::Memory(held) => Ready::new(
+                        f,
+                        vec![Out::Memory(held.data().clone())],
+                        Some(held.clone()),
+                    ),
+                    Data::Disk(path) => Ready::new(
+                        f,
+                        vec![Out::Disk {
+                            path: path.clone(),
+                            range: 0..len,
+                            file_len: len,
+                        }],
+                        None,
+                    ),
                 }
-                other => other,
             };
-            let len = match &data {
-                Data::Memory(h) => h.data().len() as u64,
-                Data::Disk(path) => self.disk_len(path).await?,
-            };
-            out.push(Ready {
-                name: f.name.clone(),
-                content_type: f.content_type.clone(),
-                spoiler: f.spoiler,
-                description: f.description.clone(),
-                len,
-                data,
-            });
+            out.push(ready);
         }
         limits
             .check(out.iter().map(|r| (r.name.as_str(), r.len)))
@@ -658,31 +772,64 @@ impl Uploads {
         path: &Path,
         len: u64,
         range: Range<u64>,
+        cancel: &Arc<AtomicBool>,
     ) -> Result<Held, Option<SendError>> {
         let files = self.files.clone();
         let path = path.to_owned();
-        let bytes = tokio::task::spawn_blocking(move || files.read(&path, len, range))
+        let flag = cancel.clone();
+        let read = tokio::task::spawn_blocking(move || files.read(&path, len, range, &flag))
             .await
             .ok()
-            .and_then(Result::ok)
-            .ok_or_else(|| Some(local(t!("composer-upload-file-changed"))))?;
-        Ok(Held::new(bytes, &self.gauge))
+            .and_then(Result::ok);
+        match read {
+            Some(bytes) => Ok(Held::new(bytes, &self.gauge)),
+            None if cancel.load(Ordering::Relaxed) => Err(None),
+            None => Err(Some(local(t!("composer-upload-file-changed")))),
+        }
     }
 
-    /// The bytes of `range` of a ready file.
-    async fn part(&self, ready: &Ready, range: Range<u64>) -> Result<Held, Step> {
-        match &ready.data {
-            Data::Memory(held) => {
-                let end = (range.end as usize).min(held.data().len());
-                let start = (range.start as usize).min(end);
-                // The slice shares the held buffer, which stays counted while it lives.
-                Ok(Held::new(held.data().slice(start..end), &Gauge::default()))
+    /// The bytes of `range` of a ready file: a slice of memory, or read from disk.
+    async fn part(
+        &self,
+        ready: &Ready,
+        range: Range<u64>,
+        cancel: &Arc<AtomicBool>,
+    ) -> Result<Held, Step> {
+        let mut out: Vec<Bytes> = Vec::new();
+        let mut at = 0u64;
+        for piece in &ready.pieces {
+            let start = at;
+            let end = at + piece.len();
+            at = end;
+            let (lo, hi) = (range.start.max(start), range.end.min(end));
+            if lo >= hi {
+                continue;
             }
-            Data::Disk(path) => self
-                .read(path, ready.len, range)
-                .await
-                .map_err(|e| Step::Local(e.map_or_else(String::new, |e| e.reason))),
+            match piece {
+                Out::Memory(b) => out.push(b.slice((lo - start) as usize..(hi - start) as usize)),
+                Out::Disk {
+                    path,
+                    range: r,
+                    file_len,
+                } => {
+                    let held = self
+                        .read(
+                            path,
+                            *file_len,
+                            r.start + (lo - start)..r.start + (hi - start),
+                            cancel,
+                        )
+                        .await
+                        .map_err(|e| Step::Local(e.map_or_else(String::new, |e| e.reason)))?;
+                    out.push(held.data().clone());
+                }
+            }
         }
+        Ok(match out.len() {
+            // One slice of a held buffer: counted already.
+            1 => Held::new(out.pop().unwrap_or_default(), &Gauge::default()),
+            _ => Held::new(Bytes::from(out.concat()), &self.gauge),
+        })
     }
 
     /// Plans the upload, sends every file (or part) to storage and completes the
@@ -717,7 +864,7 @@ impl Uploads {
                     .part_url(i)
                     .ok_or_else(|| Step::Upload(p::Error::Decode("a part has no URL".into())))?;
                 let len = range.end - range.start;
-                let part = self.part(r, range).await?;
+                let part = self.part(r, range, &job.cancel).await?;
                 put_part(ctx, url, &part, &plan.content_type, progress).await?;
                 drop(part);
                 progress.add(len);
@@ -737,7 +884,9 @@ impl Uploads {
             .collect())
     }
 
-    /// One `multipart/form-data` message with every file in it.
+    /// One `multipart/form-data` message with every file in it. Files from disk are
+    /// read 64 KiB at a time while the body goes out; only cleaned photos and pasted
+    /// images are in memory.
     async fn as_form(
         &self,
         ctx: &Ctx,
@@ -745,26 +894,37 @@ impl Uploads {
         ready: Vec<Ready>,
         progress: &Progress,
     ) -> Result<(), Option<SendError>> {
-        let mut held = Vec::with_capacity(ready.len());
-        let mut files = Vec::with_capacity(ready.len());
-        for r in ready {
-            let data = match &r.data {
-                Data::Memory(h) => h.clone(),
-                Data::Disk(path) => self.read(path, r.len, 0..r.len).await?,
-            };
-            files.push(p::UploadFile {
+        let files: Vec<p::UploadFile> = ready
+            .iter()
+            .map(|r| p::UploadFile {
                 filename: r.name.clone(),
-                data: data.data().clone(),
+                data: p::UploadData(
+                    r.pieces
+                        .iter()
+                        .map(|piece| match piece {
+                            Out::Memory(b) => p::Segment::Bytes(b.clone()),
+                            Out::Disk {
+                                path,
+                                range,
+                                file_len,
+                            } => p::Segment::File {
+                                path: path.clone(),
+                                range: range.clone(),
+                                file_len: *file_len,
+                            },
+                        })
+                        .collect(),
+                ),
                 content_type: Some(r.content_type.clone()),
                 description: r.description.clone(),
                 spoiler: r.spoiler,
-            });
-            held.push(data);
-        }
+            })
+            .collect();
         let message = job
             .message
             .to_message()
             .map_err(|e| failed(&ctx.internal, ctx.gen, e.into()))?;
+        ctx.state.mark_posting(ctx.gen, &job.message.nonce);
         let result = ctx
             .client
             .send_with_files(
@@ -775,11 +935,25 @@ impl Uploads {
             )
             .await;
         drop(files);
-        drop(held);
+        drop(ready);
         // The gateway's MESSAGE_CREATE brings the message into the list.
         result
             .map(|_| ())
             .map_err(|err| failed(&ctx.internal, ctx.gen, err))
+    }
+}
+
+impl Ready {
+    fn new(f: &FileToSend, pieces: Vec<Out>, held: Option<Held>) -> Ready {
+        Ready {
+            name: f.name.clone(),
+            content_type: f.content_type.clone(),
+            spoiler: f.spoiler,
+            description: f.description.clone(),
+            len: pieces.iter().map(Out::len).sum(),
+            pieces,
+            _held: held,
+        }
     }
 }
 
@@ -795,7 +969,7 @@ impl Backend {
                 nonce.clone(),
                 upload.message.content.clone(),
             );
-            self.emit(Ev::UploadDone { nonce });
+            self.emit(Ev::UploadDone { nonce, sent: true });
             return;
         }
         let Some(ctx) = self.send_ctx() else {
@@ -810,22 +984,12 @@ impl Backend {
         });
     }
 
-    /// The account of `r` stops being the active one: its uploads stop where they are,
-    /// and their rows fail with Retry (which uploads them again once the account is
-    /// active again). A stopped upload may have been posting: Retry looks first when it
-    /// comes late.
+    /// The account of `r` stops being the active one: its uploads stop at once and let
+    /// go of their files, and nothing of them is sent in the background. The composer
+    /// keeps their text as a draft of that account and says so.
     pub(in crate::backend) fn stop_uploads(&self, r: &RealActive) {
-        let ctx = Ctx {
-            client: r.session.client().clone(),
-            events: r.events.clone(),
-            internal: self.internal.clone(),
-            gen: r.gen,
-            state: r.composer.clone(),
-        };
-        for (message, names) in self.uploads.stop_gen(r.gen) {
-            let mut e = local(t!("composer-upload-switched"));
-            e.ambiguous = true;
-            ctx.failed_with_files(&message, e, names);
+        for nonce in self.uploads.drop_gen(r.gen) {
+            r.composer.forget_send(r.gen, &nonce);
         }
     }
 
@@ -837,35 +1001,35 @@ impl Backend {
         }
     }
 
-    /// Retry of a failed upload: uploads it again with its first nonce. `false` when
-    /// `nonce` was no upload.
+    /// Retry of a failed message that had files: uploads it again with its first
+    /// nonce. One whose files are no longer kept (or that this session never sent)
+    /// fails again with "attach them again": its text is never sent without its files.
     pub(super) fn upload_resend(
         &self,
         ctx: &Ctx,
         channel_id: &str,
         nonce: &str,
         text: &str,
+        had_files: bool,
     ) -> bool {
-        match self.uploads.retry_of(ctx.gen, nonce) {
-            None => false,
-            Some(Retry::Gone(names)) => {
-                let plan =
-                    ctx.retry_plan(channel_id.into(), nonce.into(), text.into(), Instant::now());
+        let Some(retry) = self.uploads.resend_of(ctx.gen, nonce, had_files) else {
+            return false;
+        };
+        let plan = ctx.retry_plan(channel_id.into(), nonce.into(), text.into(), Instant::now());
+        match retry {
+            Retry::Gone(names) => {
                 let gone = local(t!("composer-upload-gone"));
                 report_failure(&self.events, &plan.message, gone, names);
-                true
             }
-            Some(Retry::Job(job)) => {
-                let plan =
-                    ctx.retry_plan(channel_id.into(), nonce.into(), text.into(), Instant::now());
+            Retry::Job(job) => {
                 ctx.state.remember_send(ctx.gen, &job.message);
                 self.uploads
                     .launch(ctx.clone(), job, plan.look_since_ms, |fut| {
                         self.spawn_guarded("upload", None, fut)
                     });
-                true
             }
         }
+        true
     }
 }
 
@@ -999,6 +1163,7 @@ async fn post_uploaded(
         .message
         .to_message()
         .map_err(|e| failed(&ctx.internal, ctx.gen, e.into()))?;
+    ctx.state.mark_posting(ctx.gen, &job.message.nonce);
     // The gateway's MESSAGE_CREATE brings the message into the list.
     ctx.client
         .send_with_uploads(&job.message.channel_id, &message, uploaded)
@@ -1097,6 +1262,7 @@ mod tests {
             content_type: "image/png".into(),
             spoiler: false,
             description: None,
+            keep_metadata: false,
             source: Source::Memory(bytes),
         }
     }
@@ -1171,7 +1337,13 @@ mod tests {
             Err(std::io::Error::other("no disk in this test"))
         }
 
-        fn read(&self, path: &Path, _: u64, _: Range<u64>) -> std::io::Result<Bytes> {
+        fn read(
+            &self,
+            path: &Path,
+            _: u64,
+            _: Range<u64>,
+            _: &AtomicBool,
+        ) -> std::io::Result<Bytes> {
             self.0
                 .lock()
                 .unwrap()
@@ -1359,6 +1531,7 @@ mod tests {
                     content_type: "video/mp4".into(),
                     spoiler: false,
                     description: None,
+                    keep_metadata: false,
                     source: Source::Path(file.clone()),
                 }],
                 strip_exif: true,
@@ -1393,6 +1566,10 @@ mod tests {
         assert_eq!(body["attachments"][0]["filename"], "clip.mp4");
         assert!(sent(&events(&mut rx)), "the row goes");
         assert_eq!(uploads.held_bytes(), 0, "nothing held after the upload");
+        assert!(
+            uploads.peak_bytes() <= 10 * MIB + 64 * 1024,
+            "one part in memory at a time"
+        );
     }
 
     #[tokio::test]
@@ -1406,7 +1583,7 @@ mod tests {
             .expect("an image is attached");
         assert!(matches!(staged.source, Source::Memory(_)));
         assert!(staged.name.ends_with(".jpg"), "{}", staged.name);
-        let stripped = exif::strip(clipboard.bytes()).unwrap();
+        let stripped = exif::strip(clipboard.bytes()).unwrap().unwrap();
 
         let (server, ctx, mut rx) = fixture_with(presigned()).await;
         // The plan asks for the size after metadata removal.
@@ -1455,7 +1632,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_failed_upload_retries_with_the_same_nonce_and_never_twice() {
+    async fn a_failed_upload_retries_with_the_same_nonce() {
         let (server, ctx, mut rx) = fixture_with(presigned()).await;
         Mock::given(method("POST"))
             .and(path(PLAN))
@@ -1499,8 +1676,9 @@ mod tests {
             "the row keeps the file name"
         );
 
-        // Retry: the whole upload again, with the first nonce, so the server can drop a
-        // copy; it is sent once more, not twice.
+        // Retry: the whole upload again, with the first nonce. Two POSTs reach the mock;
+        // Fluxer keeps one message per nonce for five minutes (`sendOncePerNonce`), and
+        // a later Retry looks for a copy first (the next test).
         let Some(Retry::Job(job)) = uploads.retry_of(ctx.gen, "777") else {
             panic!("the upload was kept for Retry");
         };
@@ -1567,8 +1745,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn switching_accounts_stops_the_upload_and_keeps_it_for_retry() {
-        let (server, ctx, _rx) = fixture_with(presigned()).await;
+    async fn switching_accounts_stops_the_upload_and_frees_it_at_once() {
+        let (server, ctx, mut rx) = fixture_with(presigned()).await;
         Mock::given(method("POST"))
             .and(path(PLAN))
             .respond_with(single_plan(&server, "k4", 3, "image/png"))
@@ -1577,6 +1755,11 @@ mod tests {
         Mock::given(method("PUT"))
             .and(path("/storage/k4"))
             .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(60)))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(POSTS))
+            .respond_with(created("903"))
             .mount(&server)
             .await;
         let uploads = Uploads::default();
@@ -1599,27 +1782,177 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        // The account is switched away from: its upload stops and is reported.
-        let stopped = uploads.stop_gen(ctx.gen);
-        assert_eq!(stopped.len(), 1);
-        assert_eq!(stopped[0].0.nonce, "777");
-        assert_eq!(stopped[0].1, vec!["a.png".to_owned()]);
+        // The account is switched away from: its upload stops and lets go of its files
+        // at once; the composer turns its text back into a draft.
+        assert_eq!(uploads.drop_gen(ctx.gen), vec!["777".to_owned()]);
+        let started = Instant::now();
+        while uploads.held_bytes() > 0 {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "memory was freed"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(
             requests(&server, "POST", POSTS).await.is_empty(),
-            "nothing posted"
+            "nothing is sent from the old account in the background"
         );
-        // Back on that account Retry has the files; another account never sends them.
+        assert!(uploads.retry_of(ctx.gen, "777").is_none());
+        let events = events(&mut rx);
+        assert!(failure(&events).is_none() && !sent(&events));
+    }
+
+    /// The instance has no pre-signed uploads: the form's body is read from disk while
+    /// it goes out, so the file is never in memory; Cancel stops it the same way.
+    #[tokio::test]
+    async fn the_form_streams_files_from_disk_and_cancel_stops_it() {
+        let (server, ctx, mut rx) = fixture_with(json!({})).await;
+        Mock::given(method("POST"))
+            .and(path(POSTS))
+            .respond_with(created("904"))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(POSTS))
+            .respond_with(created("905").set_delay(Duration::from_secs(60)))
+            .mount(&server)
+            .await;
+        let dir = std::env::temp_dir().join(format!("inlet-form-{}", p::new_nonce()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("film.mp4");
+        let size = 20 * MIB;
+        let content: Vec<u8> = (0..size).map(|i| (i % 253) as u8).collect();
+        std::fs::write(&file, &content).unwrap();
+        let from_disk = |nonce: &str| Upload {
+            message: Outgoing {
+                nonce: nonce.into(),
+                ..message()
+            },
+            files: vec![FileToSend {
+                name: "film.mp4".into(),
+                size,
+                content_type: "video/mp4".into(),
+                spoiler: false,
+                description: None,
+                keep_metadata: false,
+                source: Source::Path(file.clone()),
+            }],
+            strip_exif: true,
+        };
+        let uploads = Uploads::default();
+        run(&uploads, &ctx, from_disk("777")).await;
+        let posts = requests(&server, "POST", POSTS).await;
+        assert_eq!(posts.len(), 1);
+        let body = &posts[0].body;
+        assert!(
+            body.windows(content.len().min(4096))
+                .any(|w| w == &content[..4096]),
+            "the file is in the form"
+        );
+        assert!(sent(&events(&mut rx)));
+        assert!(
+            uploads.peak_bytes() < MIB,
+            "never held in memory: {}",
+            uploads.peak_bytes()
+        );
+
+        // Cancel while the form goes out: nothing more is sent, nothing is held.
+        let job = uploads.take_in(ctx.gen, from_disk("778"));
+        ctx.state.remember_send(ctx.gen, &job.message);
+        uploads.launch(ctx.clone(), job, None, |fut| {
+            tokio::spawn(fut).abort_handle()
+        });
+        let started = Instant::now();
+        while requests(&server, "POST", POSTS).await.len() < 2 {
+            assert!(started.elapsed() < Duration::from_secs(10), "it started");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(uploads.cancel("778"));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(uploads.held_bytes(), 0);
+        assert!(uploads.retry_of(ctx.gen, "778").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_photo_that_cannot_be_cleaned_is_never_sent_as_it_is() {
+        let (server, ctx, mut rx) = fixture_with(json!({})).await;
+        Mock::given(method("POST"))
+            .and(path(POSTS))
+            .respond_with(created("906"))
+            .mount(&server)
+            .await;
+        // A JPEG with a GPS position, then a segment that runs past the end.
+        let mut broken = super::exif::tests::jpeg_with_exif(1);
+        broken.truncate(broken.len() - 19);
+        broken.extend_from_slice(&[0xFF, 0xDB, 0x40, 0x00, 1, 2]);
+        let photo = |keep: bool| FileToSend {
+            // The name does not decide: the bytes are a JPEG.
+            name: "notes.txt".into(),
+            content_type: "text/plain".into(),
+            keep_metadata: keep,
+            ..pasted("notes.txt", Bytes::from(broken.clone()))
+        };
+        let uploads = Uploads::default();
+        run(
+            &uploads,
+            &ctx,
+            Upload {
+                message: message(),
+                files: vec![photo(false)],
+                strip_exif: true,
+            },
+        )
+        .await;
+        assert!(
+            requests(&server, "POST", POSTS).await.is_empty(),
+            "not sent"
+        );
+        let reason = failure(&events(&mut rx)).expect("the row says why");
+        assert!(reason.contains("notes.txt"), "{reason}");
+        // The person chose to send this file as it is.
+        run(
+            &uploads,
+            &ctx,
+            Upload {
+                message: Outgoing {
+                    nonce: "779".into(),
+                    ..message()
+                },
+                files: vec![photo(true)],
+                strip_exif: true,
+            },
+        )
+        .await;
+        assert_eq!(requests(&server, "POST", POSTS).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_retry_never_posts_the_text_without_its_files() {
+        let (server, ctx, mut rx) = fixture_with(json!({})).await;
+        // A row with files whose upload this backend no longer knows (or never knew).
+        let mut backend_view = crate::ui::chat::messages::MessageView::new();
+        let mut row = crate::ui::composer::pending_of(&message());
+        row.files = vec!["a.png".into()];
+        row.failed = Some("timed out".into());
+        backend_view.upsert_pending(row);
+        let Some(messages::Cmd::Resend { files, .. }) = backend_view.retry("777") else {
+            panic!("a failed row retries");
+        };
+        assert!(files, "the command says the message had files");
+        let uploads = Uploads::default();
+        // The backend does not know the upload: it fails again, never as plain text.
         assert!(matches!(
-            uploads.retry_of(ctx.gen + 1, "777"),
+            uploads.resend_of(ctx.gen, "777", files),
             Some(Retry::Gone(_))
         ));
-        assert!(matches!(
-            uploads.retry_of(ctx.gen, "777"),
-            Some(Retry::Job(_))
-        ));
-        assert_eq!(uploads.held_bytes(), 3, "kept for Retry");
-        uploads.forget_gen(ctx.gen);
-        assert_eq!(uploads.held_bytes(), 0);
+        assert!(
+            uploads.resend_of(ctx.gen, "777", false).is_none(),
+            "a plain message"
+        );
+        let _ = (&server, &mut rx);
     }
 }

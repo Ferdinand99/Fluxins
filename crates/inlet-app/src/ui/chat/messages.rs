@@ -1020,6 +1020,7 @@ impl MessageView {
             channel_id: entry.out.channel_id.clone(),
             nonce: entry.out.nonce.clone(),
             text: entry.out.text.clone(),
+            files: !entry.out.files.is_empty(),
         })
     }
 }

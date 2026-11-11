@@ -20,7 +20,7 @@
 //!   complete request for files in parts, then the message).
 
 mod directory;
-mod exif;
+pub mod exif;
 mod gif;
 mod send;
 pub mod upload;
@@ -105,8 +105,8 @@ pub enum Ev {
         sent: u64,
         total: u64,
     },
-    /// The upload ended (sent or failed; the message list's row says which).
-    UploadDone { nonce: String },
+    /// The upload ended: `sent`, or failed (the message list's row shows Retry).
+    UploadDone { nonce: String, sent: bool },
 }
 
 pub(super) fn handle(backend: &mut Backend, cmd: Cmd) {

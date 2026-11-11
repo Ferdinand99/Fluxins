@@ -29,7 +29,7 @@ use inlet_editor::{Editor, EditorEvent, EditorStyle, Trigger};
 use inlet_protocol as p;
 use inlet_state::{AccountState, ChannelId, GuildId};
 
-use super::attachments::Attachments;
+use super::attachments::{Attachments, InFlight};
 use super::autocomplete::{self, Candidate, Pick, Section, Sources};
 use super::commands::{self, Parsed};
 use super::drafts::{Draft, Drafts};
@@ -415,6 +415,8 @@ impl ComposerView {
         self.autocomplete = None;
         self.dismissed_at = None;
         self.reply = None;
+        // The alt text field belongs to the channel that was open.
+        self.attachments.alt = None;
         self.edit = None;
         self.error = None;
         let draft = self.shared.borrow().drafts.get(&ctx.channel_id).cloned();
@@ -474,13 +476,22 @@ impl ComposerView {
     /// Another account becomes active: the open channel's text is kept as its draft and
     /// saved with the old account's drafts, then the view forgets the old account as it
     /// does after a sign-out (reply, edit, failed sends, autocomplete).
-    pub fn switch_account(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    ///
+    /// Messages with files that are not sent yet become drafts of their channels
+    /// again, with a line naming their files (the backend stops their uploads at
+    /// once). Returns whether there were any, for the notice.
+    pub fn switch_account(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         self.store_draft(cx);
+        let restored = {
+            let mut shared = self.shared.borrow_mut();
+            self.attachments.back_to_drafts(&mut shared.drafts)
+        };
         let write = self.shared.borrow_mut().drafts.switch_account();
         if let Some(write) = write {
             cx.background_spawn(async move { write.run() }).detach();
         }
         self.check_generation(window, cx);
+        restored > 0
     }
 
     /// Keeps the text of the open channel as its draft.
@@ -799,6 +810,21 @@ impl ComposerView {
             window.play_system_bell();
             return;
         }
+        if with_files {
+            if !self.may_attach() {
+                self.error = Some(t!("composer-attach-no-permission"));
+                window.play_system_bell();
+                return;
+            }
+            if let Some(stuck) = self.attachments.stuck(&ch.channel_id) {
+                self.error = Some(t!(
+                    "composer-attach-metadata-blocked",
+                    name = stuck.file.name.clone()
+                ));
+                window.play_system_bell();
+                return;
+            }
+        }
         let reply = self.reply.take();
         let outgoing = Outgoing {
             channel_id: ch.channel_id.clone(),
@@ -811,6 +837,13 @@ impl ComposerView {
         // The app shows it in the message list as pending (by its nonce) and sends it.
         if with_files {
             let files = self.take_attachments(&ch.channel_id, window, cx);
+            // Kept until it is sent, so an account switch can give the text back.
+            self.attachments.sending(InFlight {
+                nonce: outgoing.nonce.clone(),
+                channel_id: ch.channel_id.clone(),
+                draft: Draft::of(self.editor.read(cx).buffer()),
+                names: files.iter().map(|f| f.name.clone()).collect(),
+            });
             cx.emit(ComposerEvent::Upload(Upload {
                 message: outgoing,
                 files,
@@ -997,7 +1030,7 @@ impl ComposerView {
             .capture_action(cx.listener(Self::on_down))
             .capture_action(cx.listener(Self::on_submit_key))
             .capture_action(cx.listener(Self::on_paste))
-            .child(attach)
+            .when(self.may_attach(), |d| d.child(attach))
             .child(div().flex_1().min_w_0().child(self.editor.clone()))
     }
 }
@@ -1508,5 +1541,115 @@ mod tests {
         // Nothing left to cancel: Escape goes on to the app.
         cx.simulate_keystrokes("escape");
         assert_eq!(host.read_with(cx, |h, _| h.marked_read), 1);
+    }
+
+    /// A direct message channel: files may always be attached there.
+    fn open_dm(view: &Entity<ComposerView>, id: &str, cx: &mut VisualTestContext) {
+        view.update_in(cx, |v, window, cx| {
+            v.set_channel(
+                ChannelContext {
+                    channel_id: id.into(),
+                    guild_id: None,
+                    placeholder: format!("@{id}"),
+                    slowmode_secs: 0,
+                },
+                window,
+                cx,
+            )
+        });
+    }
+
+    fn staged(
+        view: &Entity<ComposerView>,
+        id: &str,
+        cx: &mut VisualTestContext,
+    ) -> Vec<(String, bool)> {
+        view.read_with(cx, |v, _| {
+            v.attachments
+                .staged(id)
+                .iter()
+                .map(|s| {
+                    (
+                        s.file.name.clone(),
+                        matches!(s.file.source, crate::backend::composer::Source::Memory(_)),
+                    )
+                })
+                .collect()
+        })
+    }
+
+    #[gpui::test]
+    fn pasting_a_screenshot_attaches_a_png_that_stays_in_memory(cx: &mut TestAppContext) {
+        let (_host, view, cx) = host(cx);
+        open_dm(&view, "9", cx);
+        // Windows puts screenshots on the clipboard as a bitmap.
+        let screenshot = gpui::Image::from_bytes(
+            gpui::ImageFormat::Bmp,
+            super::super::attachments::tests::bmp(16, 9),
+        );
+        cx.write_to_clipboard(gpui::ClipboardItem {
+            entries: vec![gpui::ClipboardEntry::Image(screenshot)],
+        });
+        cx.simulate_keystrokes("ctrl-v");
+        cx.run_until_parked();
+        assert_eq!(staged(&view, "9", cx), [("image.png".to_owned(), true)]);
+        let text = view.read_with(cx, |v, cx| v.editor.read(cx).buffer().text().to_owned());
+        assert_eq!(text, "", "the image is no text");
+        // A kind of image that cannot be sent says so instead of doing nothing.
+        let svg = gpui::Image::from_bytes(gpui::ImageFormat::Svg, b"<svg/>".to_vec());
+        cx.write_to_clipboard(gpui::ClipboardItem {
+            entries: vec![gpui::ClipboardEntry::Image(svg)],
+        });
+        cx.simulate_keystrokes("ctrl-v");
+        assert!(view.read_with(cx, |v, _| v.error.is_some()));
+        assert_eq!(staged(&view, "9", cx).len(), 1);
+        // Without the right to attach files in a guild channel, nothing is attached.
+        open(&view, "1", cx);
+        cx.simulate_keystrokes("ctrl-v");
+        assert!(staged(&view, "1", cx).is_empty());
+    }
+
+    #[gpui::test]
+    fn an_account_switch_keeps_an_upload_as_a_draft(cx: &mut TestAppContext) {
+        let (host, view, cx) = host(cx);
+        let dir = std::env::temp_dir().join(format!("inlet-upload-draft-{}", p::new_nonce()));
+        let file = super::super::drafts::path_for(&dir, "fluxer.example", "7").unwrap();
+        view.update_in(cx, |v, window, cx| {
+            v.set_session(2000, Some(file.clone()), window, cx)
+        });
+        open_dm(&view, "9", cx);
+        let photo = crate::backend::composer::FileToSend {
+            name: "beach.png".into(),
+            size: 3,
+            content_type: "image/png".into(),
+            spoiler: false,
+            description: None,
+            keep_metadata: false,
+            source: crate::backend::composer::Source::Memory(bytes::Bytes::from_static(b"abc")),
+        };
+        view.update(cx, |v, _| v.attachments.add("9", vec![photo]).map(|_| ()))
+            .unwrap();
+        type_text(&view, "from the trip", cx);
+        cx.simulate_keystrokes("enter");
+        let uploads = host.read_with(cx, |h, _| {
+            h.events
+                .iter()
+                .filter(|e| matches!(e, ComposerEvent::Upload(_)))
+                .count()
+        });
+        assert_eq!(uploads, 1, "the message went out with its file");
+        // The account is switched while it uploads: the text and the file's name come
+        // back as the old account's draft, and the app says so.
+        let stopped = view.update_in(cx, |v, window, cx| v.switch_account(window, cx));
+        assert!(stopped);
+        cx.run_until_parked();
+        let shared = view.read_with(cx, |v, _| v.shared.clone());
+        shared.borrow_mut().drafts.attach(file.clone());
+        let draft = shared.borrow().drafts.get("9").cloned().expect("a draft");
+        assert!(draft.wire.contains("from the trip"), "{}", draft.wire);
+        assert!(draft.wire.contains("beach.png"), "{}", draft.wire);
+        // Once a message is sent, a switch has nothing to give back.
+        assert!(!view.update_in(cx, |v, window, cx| v.switch_account(window, cx)));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -105,7 +105,12 @@ impl ComposerView {
         cx.notify();
     }
 
-    pub fn on_upload_done(&mut self, nonce: &str, cx: &mut Context<Self>) {
+    /// The upload ended. A sent message's text is no longer kept; a failed one keeps
+    /// it (its row offers Retry) until it is sent.
+    pub fn on_upload_done(&mut self, nonce: &str, sent: bool, cx: &mut Context<Self>) {
+        if sent {
+            self.attachments.sent(nonce);
+        }
         if self.uploads.done(nonce) {
             cx.notify();
         }
@@ -114,6 +119,7 @@ impl ComposerView {
     /// Cancel on an upload row: the backend stops it, the row and the message's pending
     /// row go.
     fn cancel_upload(&mut self, nonce: String, cx: &mut Context<Self>) {
+        self.attachments.sent(&nonce);
         if self.uploads.done(&nonce) {
             cx.emit(ComposerEvent::CancelUpload { nonce });
         }

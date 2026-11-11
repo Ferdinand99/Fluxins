@@ -444,6 +444,7 @@ impl Backend {
         channel_id: String,
         nonce: String,
         text: String,
+        had_files: bool,
     ) {
         #[cfg(feature = "demo")]
         if let Some(Active::Demo(m)) = &mut self.active {
@@ -462,7 +463,7 @@ impl Backend {
             report_failure(&self.events, &message, not_connected(), Vec::new());
             return;
         };
-        if self.upload_resend(&ctx, &channel_id, &nonce, &text) {
+        if self.upload_resend(&ctx, &channel_id, &nonce, &text, had_files) {
             return;
         }
         let plan = ctx.retry_plan(channel_id, nonce, text, Instant::now());
@@ -936,6 +937,7 @@ pub(super) mod tests {
                 channel_id,
                 nonce,
                 text,
+                files: false,
             }) = view.retry("777")
             else {
                 panic!("a failed row retries");

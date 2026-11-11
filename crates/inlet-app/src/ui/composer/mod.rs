@@ -339,7 +339,9 @@ impl Inlet {
             Ev::UploadProgress { nonce, sent, total } => {
                 view.update(cx, |v, cx| v.on_upload_progress(&nonce, sent, total, cx))
             }
-            Ev::UploadDone { nonce } => view.update(cx, |v, cx| v.on_upload_done(&nonce, cx)),
+            Ev::UploadDone { nonce, sent } => {
+                view.update(cx, |v, cx| v.on_upload_done(&nonce, sent, cx))
+            }
         }
     }
 }

@@ -281,7 +281,10 @@ impl Inlet {
         self.notifications.clear();
         // The panels' lists and a jump on its way (its answer is the old account's).
         self.inbox.clear();
-        self.composer
+        // Messages with files still on their way become drafts of the old account
+        // again (the backend stops their uploads); the notice below says so.
+        let uploads_stopped = self
+            .composer
             .view
             .update(cx, |v, cx| v.switch_account(window, cx));
         self.composer.reset_session();
@@ -303,7 +306,7 @@ impl Inlet {
         self.selected_channel = None;
         self.chat.status.clear();
         self.chat.error = None;
-        self.chat.notice = None;
+        self.chat.notice = uploads_stopped.then(|| t!("composer-upload-switched"));
         self.chat.gateway_down = None;
         if let Some(a) = self.switcher.accounts.iter().find(|a| a.key == key) {
             self.username = a.name.clone();
