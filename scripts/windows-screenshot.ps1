@@ -220,6 +220,9 @@ Run-Demo "36-composer-attachments" @{ INLET_DEMO = "1"; INLET_DEMO_LIVE_SECS = "
 # The composer's picker on the emoji tab and on the GIF tab.
 Run-Demo "37-picker-emoji" @{ INLET_DEMO = "1"; INLET_DEMO_LIVE_SECS = "3600"; INLET_DEMO_SCENE = "picker-emoji"; INLET_DEMO_GUILD = "g1"; INLET_DEMO_CHANNEL = "c-general" } 10
 Run-Demo "38-picker-gif" @{ INLET_DEMO = "1"; INLET_DEMO_LIVE_SECS = "3600"; INLET_DEMO_SCENE = "picker-gif"; INLET_DEMO_GUILD = "g1"; INLET_DEMO_CHANNEL = "c-general" } 10
+# Message search: the search panel with results; the quick switcher over every account.
+Run-Demo "39-search-results" @{ INLET_DEMO = "1"; INLET_DEMO_LIVE_SECS = "3600"; INLET_DEMO_SCENE = "search-results"; INLET_DEMO_GUILD = "g1"; INLET_DEMO_CHANNEL = "c-general" } 10
+Run-Demo "40-quick-switcher" @{ INLET_DEMO = "1"; INLET_DEMO_LIVE_SECS = "3600"; INLET_DEMO_SCENE = "quick-switcher"; INLET_DEMO_GUILD = "g1"; INLET_DEMO_CHANNEL = "c-general" } 10
 
 # A demo that quit before its screenshot crashed: fail the job, the pictures are not
 # worth checking.
