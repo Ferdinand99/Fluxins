@@ -1226,6 +1226,7 @@ impl Inlet {
             self.chat.view.newest_retries = 0;
             self.load_open_channel(cx);
             self.inbox_on_dispatch(&dispatch, &[], cx);
+            self.members_on_dispatch(&dispatch, cx);
             return;
         }
         let Some(account) = self.account.clone() else {
@@ -1235,6 +1236,7 @@ impl Inlet {
         self.settings_applied(&dispatch, &mut changes, cx);
         self.note_saved(&dispatch);
         self.inbox_on_dispatch(&dispatch, &rendered, cx);
+        self.members_on_dispatch(&dispatch, cx);
         let edits = match &dispatch {
             p::Dispatch::MessageCreate(m) | p::Dispatch::MessageUpdate(m) => edits_of([&**m]),
             _ => Edits::new(),
@@ -1451,6 +1453,9 @@ impl Inlet {
         // The thread panel, its composer, the thread list and the forum view were the
         // old account's (sign-out or a switch).
         self.threads.reset();
+        // The member list and the profiles were the old account's too.
+        self.members.reset();
+        self.profile.reset();
         self.account = None;
         self.chat.actions.clear();
         let compact = self.chat.view.compact;

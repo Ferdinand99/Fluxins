@@ -1,0 +1,10 @@
+# The profile popout of a moderator beside the member list: banner, avatar and status,
+# names and pronouns, the bio, member since, roles, the note and "View Full Profile".
+name = "profile-popout"
+window = [1280, 860]
+scale = 1.0
+theme = "dark"
+ignore = []
+scene = "profile-popout"
+guild = "g1"
+channel = "c-general"

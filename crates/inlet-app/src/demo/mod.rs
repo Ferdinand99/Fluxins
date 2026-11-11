@@ -20,6 +20,7 @@ mod guilds;
 pub mod inbox;
 mod markdown;
 pub mod media;
+mod members;
 mod messages;
 pub mod scene_file;
 pub mod scenes;

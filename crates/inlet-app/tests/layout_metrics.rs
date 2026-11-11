@@ -131,20 +131,7 @@ fn composer_min_height_is_58(cx: &mut TestAppContext) {
     );
 }
 
-/// Keeps `member_list_is_264` from staying ignored: it fails as soon as something
-/// carries the member list's selector. The task that builds the member list deletes
-/// this test and removes the `ignore` below.
 #[gpui::test]
-fn member_list_is_not_built_yet(cx: &mut TestAppContext) {
-    let cx = open(cx);
-    assert!(
-        cx.debug_bounds(selector::MEMBER_LIST).is_none(),
-        "the member list exists now: remove the ignore from member_list_is_264 and delete this test"
-    );
-}
-
-#[gpui::test]
-#[ignore = "the member list is not built yet; its task marks it with selector::MEMBER_LIST"]
 fn member_list_is_264(cx: &mut TestAppContext) {
     let cx = open(cx);
     let list = bounds(cx, selector::MEMBER_LIST);

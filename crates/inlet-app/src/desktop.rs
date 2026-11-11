@@ -916,6 +916,9 @@ impl Inlet {
         OpenLayers {
             link_prompt: self.overlays.link_prompt.is_some(),
             link_confirm: self.overlays.pending_link.is_some(),
+            user_menu: self.profile.menu.is_some(),
+            profile_popout: self.profile.popout.is_some(),
+            profile_modal: self.profile.full.is_some(),
             notification_settings: self.notifications.settings.is_some(),
             switcher: self.switcher_layer_open(),
             panel: self.inbox.open.is_some(),
@@ -946,7 +949,9 @@ impl Inlet {
                 .layer_focus
                 .get_or_insert_with(|| cx.focus_handle())
                 .clone();
-            if !handle.is_focused(window) {
+            // A field inside the topmost layer (the note in a profile) may keep the
+            // keyboard; anything outside the layer gives it back to the layer.
+            if !handle.contains_focused(window, cx) {
                 if !self.overlays.layer_had_focus {
                     // Where the keyboard was, to give it back when the layers close.
                     self.overlays.focus_before = window.focused(cx);
@@ -993,6 +998,9 @@ impl Inlet {
         match self.open_layers().topmost() {
             Some(Layer::LinkPrompt) => self.overlays.link_prompt = None,
             Some(Layer::LinkConfirm) => self.overlays.pending_link = None,
+            Some(Layer::UserMenu) => self.profile.menu = None,
+            Some(Layer::ProfilePopout) => self.profile.popout = None,
+            Some(Layer::ProfileModal) => self.profile.full = None,
             Some(Layer::NotificationSettings) => self.notifications.settings = None,
             Some(Layer::AccountSwitcher) => self.switcher.open = false,
             Some(Layer::Panel) => self.inbox.open = None,
@@ -1049,6 +1057,12 @@ impl Inlet {
 pub(crate) enum Layer {
     LinkPrompt,
     LinkConfirm,
+    /// The user menu (right click on a member).
+    UserMenu,
+    /// The profile popout beside the member list.
+    ProfilePopout,
+    /// The full profile.
+    ProfileModal,
     NotificationSettings,
     AccountSwitcher,
     /// The pinned messages or the inbox, under the channel header.
@@ -1058,13 +1072,17 @@ pub(crate) enum Layer {
 }
 
 /// Which layers are open. They are drawn bottom first (a panel, the image viewer, the
-/// settings view, the notification settings window, the account switcher, the link
-/// confirmation, the link prompt, see `ui/overlays`), and the topmost one has the
+/// settings view, the notification settings window, the account switcher, the full
+/// profile, the profile popout, the user menu, the link confirmation, the link prompt,
+/// see `ui/overlays`), and the topmost one has the
 /// keyboard: Escape closes it first.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct OpenLayers {
     pub link_prompt: bool,
     pub link_confirm: bool,
+    pub user_menu: bool,
+    pub profile_popout: bool,
+    pub profile_modal: bool,
     pub notification_settings: bool,
     pub switcher: bool,
     pub panel: bool,
@@ -1078,6 +1096,12 @@ impl OpenLayers {
             Some(Layer::LinkPrompt)
         } else if self.link_confirm {
             Some(Layer::LinkConfirm)
+        } else if self.user_menu {
+            Some(Layer::UserMenu)
+        } else if self.profile_popout {
+            Some(Layer::ProfilePopout)
+        } else if self.profile_modal {
+            Some(Layer::ProfileModal)
         } else if self.switcher {
             Some(Layer::AccountSwitcher)
         } else if self.notification_settings {
@@ -1099,6 +1123,9 @@ impl OpenLayers {
         match self.topmost() {
             Some(Layer::LinkPrompt) => self.link_prompt = false,
             Some(Layer::LinkConfirm) => self.link_confirm = false,
+            Some(Layer::UserMenu) => self.user_menu = false,
+            Some(Layer::ProfilePopout) => self.profile_popout = false,
+            Some(Layer::ProfileModal) => self.profile_modal = false,
             Some(Layer::NotificationSettings) => self.notification_settings = false,
             Some(Layer::AccountSwitcher) => self.switcher = false,
             Some(Layer::Panel) => self.panel = false,
@@ -1295,12 +1322,49 @@ mod tests {
         assert_eq!(layers.topmost(), Some(Layer::Settings));
     }
 
+    /// The profile layers: the user menu closes before the popout and the full
+    /// profile, a link confirmation (a link in a bio) before all of them, and nothing
+    /// is read behind them (`layer_open`).
+    #[test]
+    fn profile_layers_close_before_the_chat_layers() {
+        let mut layers = OpenLayers {
+            link_confirm: true,
+            user_menu: true,
+            profile_popout: true,
+            panel: true,
+            ..OpenLayers::default()
+        };
+        let mut order = Vec::new();
+        while let Some(top) = layers.topmost() {
+            order.push(top);
+            layers = layers.after_escape();
+        }
+        assert_eq!(
+            order,
+            [
+                Layer::LinkConfirm,
+                Layer::UserMenu,
+                Layer::ProfilePopout,
+                Layer::Panel
+            ]
+        );
+        let full = OpenLayers {
+            profile_modal: true,
+            ..OpenLayers::default()
+        };
+        assert_eq!(full.topmost(), Some(Layer::ProfileModal));
+        assert_eq!(full.after_escape().topmost(), None);
+    }
+
     /// Every layer closes before the one under it, in the order they are drawn.
     #[test]
     fn layers_close_from_the_top_down() {
         let mut layers = OpenLayers {
             link_prompt: true,
             link_confirm: true,
+            user_menu: true,
+            profile_popout: true,
+            profile_modal: true,
             notification_settings: true,
             switcher: true,
             panel: true,
@@ -1317,6 +1381,9 @@ mod tests {
             [
                 Layer::LinkPrompt,
                 Layer::LinkConfirm,
+                Layer::UserMenu,
+                Layer::ProfilePopout,
+                Layer::ProfileModal,
                 Layer::AccountSwitcher,
                 Layer::NotificationSettings,
                 Layer::Settings,

@@ -50,6 +50,9 @@ impl Inlet {
         if self.switcher_layer_open() {
             out.push(self.render_account_switcher(cx));
         }
+        // Profiles (the full profile, the popout, the user menu): over the switcher,
+        // under the link prompts, so a link in a bio is confirmed on top.
+        out.extend(self.render_profile_overlays(cx));
         if let Some(url) = self.overlays.pending_link.clone() {
             // A layer like the link prompt: it has the keyboard while it is topmost, and
             // Escape closes it.

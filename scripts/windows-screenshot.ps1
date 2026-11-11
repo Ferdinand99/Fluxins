@@ -161,6 +161,10 @@ Run-Demo "31-thread-list" @{ INLET_DEMO = "1"; INLET_DEMO_LIVE_SECS = "3600"; IN
 Run-Demo "32-forum" @{ INLET_DEMO = "1"; INLET_DEMO_LIVE_SECS = "3600"; INLET_DEMO_SCENE = "forum"; INLET_DEMO_GUILD = "g1"; INLET_DEMO_CHANNEL = "c-forum" } 10
 Run-Demo "33-media-channel" @{ INLET_DEMO = "1"; INLET_DEMO_LIVE_SECS = "3600"; INLET_DEMO_SCENE = "media-channel"; INLET_DEMO_GUILD = "g1"; INLET_DEMO_CHANNEL = "c-gallery" } 10
 
+# The member list beside the chat, and the profile popout of a member.
+Run-Demo "36-members" @{ INLET_DEMO = "1"; INLET_DEMO_LIVE_SECS = "3600"; INLET_DEMO_SCENE = "members"; INLET_DEMO_GUILD = "g1"; INLET_DEMO_CHANNEL = "c-general" } 10
+Run-Demo "37-profile-popout" @{ INLET_DEMO = "1"; INLET_DEMO_LIVE_SECS = "3600"; INLET_DEMO_SCENE = "profile-popout"; INLET_DEMO_GUILD = "g1"; INLET_DEMO_CHANNEL = "c-general" } 10
+
 # One scene file: the app opens in the state the file names, at its window size, and
 # the inside of the window is saved as visual/<name>.png.
 function Run-Scene([System.IO.FileInfo]$File) {

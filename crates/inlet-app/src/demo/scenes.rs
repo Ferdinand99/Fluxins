@@ -36,6 +36,9 @@
 //!   the thread list open.
 //! - `forum`, `media-channel`: the same data, for `c-forum` (posts with tags, unread
 //!   counts) and `c-gallery` (the grid).
+//! - `members`, `profile-popout`: for `#general`, the member list with its groups,
+//!   statuses, custom statuses, the owner's crown and offline members (see
+//!   `members.rs`); or with the profile popout of a moderator open beside it.
 //!
 //! `INLET_DEMO_SCENE` may also name a scene file of the visual checks
 //! (`tests/visual/scenes/*.toml`, see `scene_file.rs`): it then sets the scene, the guild,
@@ -86,6 +89,8 @@ pub enum Scene {
     ThreadList,
     Forum,
     MediaChannel,
+    Members,
+    ProfilePopout,
 }
 
 impl Scene {
@@ -118,6 +123,8 @@ impl Scene {
             "thread-list" => Scene::ThreadList,
             "forum" => Scene::Forum,
             "media-channel" => Scene::MediaChannel,
+            "members" => Scene::Members,
+            "profile-popout" => Scene::ProfilePopout,
             _ => return None,
         })
     }
@@ -279,9 +286,10 @@ fn ready(
                 "properties": {"id": g.id, "name": g.name, "owner_id": user_id(ME), "icon": icon, "banner": banner},
                 "channels": list,
                 "roles": [
-                    {"id": g.id, "name": "@everyone", "permissions": "2251799813685247", "position": 0},
-                    {"id": ROLE_MODERATORS, "name": "Moderators", "color": 0xE6_7E_22, "position": 2},
-                    {"id": ROLE_CONTRIBUTORS, "name": "Contributors", "color": 0x1A_BC_9C, "position": 1}
+                    // Everything below bit 51, and seeing the member list (`VIEW_CHANNEL_MEMBERS`).
+                    {"id": g.id, "name": "@everyone", "permissions": "20266198323167231", "position": 0},
+                    {"id": ROLE_MODERATORS, "name": "Moderators", "color": 0xE6_7E_22, "position": 2, "hoist": true},
+                    {"id": ROLE_CONTRIBUTORS, "name": "Contributors", "color": 0x1A_BC_9C, "position": 1, "hoist": true}
                 ],
                 "members": [{
                     "user": user(ME),
@@ -473,6 +481,8 @@ mod tests {
             "thread-list",
             "forum",
             "media-channel",
+            "members",
+            "profile-popout",
         ] {
             let scene = Scene::from_name(name).expect(name);
             let data = data(scene);

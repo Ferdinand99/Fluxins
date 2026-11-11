@@ -107,6 +107,32 @@ impl Inlet {
         ))
     }
 
+    /// A person's profile banner (`guild`: their profile there), `w` x `h` logical
+    /// pixels, once it has loaded.
+    pub(crate) fn profile_banner(
+        &self,
+        guild: Option<&str>,
+        user_id: &str,
+        hash: &str,
+        (w, h): (f32, f32),
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let setup = self.media.setup.as_ref()?;
+        let req =
+            requests::profile_banner(&setup.proxy, guild, user_id, hash, (w, h), self.media.scale)?;
+        let shown = self.image(&req, cx);
+        if !matches!(shown, Shown::Ready(_)) {
+            return None;
+        }
+        Some(super::image::picture_of(
+            shown,
+            (w, h),
+            0.,
+            ObjectFit::Cover,
+            &self.media.images.animator(Motion::Gif),
+        ))
+    }
+
     /// The signed-in account's avatar, for its messages on their way.
     pub(crate) fn my_avatar(&self, cx: &App) -> Option<UserAvatar> {
         let state = self.account.as_ref()?.read(cx);

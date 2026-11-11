@@ -16,8 +16,10 @@ impl Inlet {
         &mut self,
         event: backend::social::Ev,
         _window: &mut Window,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) {
-        match event {}
+        match event {
+            backend::social::Ev::Profile(ev) => self.on_profile_event(ev, cx),
+        }
     }
 }

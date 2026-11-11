@@ -140,7 +140,11 @@ scene 31-thread-list thread-list c-general
 scene 32-forum forum c-forum
 scene 33-media-channel media-channel c-gallery
 
-# 10. The scene files of the visual checks. Xvfb's pointer cannot be moved and sits in
+# 10. The member list beside the chat, and the profile popout of a member.
+scene 36-members members c-general
+scene 37-profile-popout profile-popout c-general
+
+# 11. The scene files of the visual checks. Xvfb's pointer cannot be moved and sits in
 #     the middle of the screen; the demo puts a scene's window in the top left corner,
 #     and the screen is more than twice its size, so the pointer is never over it (no
 #     hover states). The app reads each file itself.

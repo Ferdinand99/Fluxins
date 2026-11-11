@@ -39,7 +39,7 @@ pub mod selector {
     pub const MESSAGE_CONTENT: &str = "message-content";
     /// The composer's text box.
     pub const COMPOSER_BOX: &str = "composer-box";
-    /// The member list beside the chat (not built yet).
+    /// The member list beside the chat.
     pub const MEMBER_LIST: &str = "member-list";
 }
 
