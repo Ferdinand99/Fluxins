@@ -40,6 +40,9 @@ impl Inlet {
         if self.settings.view.is_some() {
             out.push(self.render_settings_overlay(cx));
         }
+        if self.notifications.settings.is_some() {
+            out.push(self.render_notification_settings(cx));
+        }
         if let Some(url) = self.overlays.pending_link.clone() {
             // A layer like the link prompt: it has the keyboard while it is topmost, and
             // Escape closes it.
@@ -49,9 +52,6 @@ impl Inlet {
             } else {
                 card.into_any_element()
             });
-        }
-        if self.notifications.settings.is_some() {
-            out.push(self.render_notification_settings(cx));
         }
         out.extend(self.render_message_overlays(cx));
         if let Some(prompt) = self.overlays.link_prompt.clone() {
