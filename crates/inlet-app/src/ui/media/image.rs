@@ -12,13 +12,19 @@
 //! or does not fit the budget shows its still (the first frame) instead
 //! ([`Inlet::moving`]). Only animations on screen are drawn, so only they play; how
 //! many move and when they stop is in `animation_budget.rs`.
+//!
+//! **Every load ends.** A load that has not answered after [`LOAD_TIMEOUT`] fails as
+//! timed out, so a placeholder never waits forever; a failure is drawn as an error
+//! tile (`failed.rs`) with a retry where one can help.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::future::Future;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use futures::future::{select, Either};
 use gpui::{div, img, prelude::*, px, AnyElement, Context, ObjectFit, RenderImage, Task};
 use inlet_media::{MediaError, MediaRequest};
 
@@ -26,6 +32,23 @@ use super::animation_budget::{animated, AnimationBudget, Motion, Stage};
 use super::MediaIcon;
 use crate::app::Inlet;
 use crate::theme;
+
+/// Longest time a view waits for one image: the client's fetch timeout (30 s) plus a
+/// wait for a fetch or decode slot and the decode itself. Past it the load is dropped
+/// and the image counts as timed out.
+pub(crate) const LOAD_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// `load`, unless `timeout` comes first: then the load is dropped (which cancels it
+/// when nothing else waits for it) and the answer is [`MediaError::FetchTimeout`].
+pub(crate) async fn bounded<T>(
+    load: impl Future<Output = Result<T, MediaError>>,
+    timeout: impl Future<Output = ()>,
+) -> Result<T, MediaError> {
+    match select(Box::pin(load), Box::pin(timeout)).await {
+        Either::Left((result, _)) => result,
+        Either::Right(((), _)) => Err(MediaError::FetchTimeout),
+    }
+}
 
 /// The decoded bytes of a gpui image (all its frames).
 pub(crate) fn decoded_bytes(image: &RenderImage) -> u64 {
@@ -184,8 +207,9 @@ impl Inlet {
         }
         let client = setup.client.clone();
         let key = req.clone();
+        let timeout = cx.background_executor().timer(LOAD_TIMEOUT);
         let task = cx.spawn(async move |this, cx| {
-            let result = client.load(key.clone()).await;
+            let result = bounded(client.load(key.clone()), timeout).await;
             let _ = this.update(cx, |this, cx| {
                 if this.media.images.finish(&key, result) {
                     cx.notify();
@@ -212,6 +236,29 @@ impl Inlet {
         still: Option<&MediaRequest>,
         cx: &mut Context<Self>,
     ) -> Shown {
+        self.moving_with(moving, still, false, cx)
+    }
+
+    /// [`Inlet::moving`] for the previews of attachments and embeds: while the
+    /// animation loads, the still loads too and shows first, so a slow or failing GIF
+    /// never leaves an empty box. Emoji, stickers, avatars, the pickers and the viewer
+    /// use [`Inlet::moving`], which only borrows a still that is already at hand.
+    pub(crate) fn moving_preview(
+        &self,
+        moving: Option<&MediaRequest>,
+        still: Option<&MediaRequest>,
+        cx: &mut Context<Self>,
+    ) -> Shown {
+        self.moving_with(moving, still, true, cx)
+    }
+
+    fn moving_with(
+        &self,
+        moving: Option<&MediaRequest>,
+        still: Option<&MediaRequest>,
+        load_still: bool,
+        cx: &mut Context<Self>,
+    ) -> Shown {
         // While the picker is the layer on top, only its own images may take a place in
         // the budget: the frozen chat under it shows stills and leaves the room to it.
         let may_move = self.media.images.animations.borrow().may_admit();
@@ -233,10 +280,17 @@ impl Inlet {
                         images.remove(anim);
                     }
                     Shown::Loading => {
-                        return match still.map(|s| self.cached_only(s)) {
-                            Some(Some(image)) => Shown::Ready(image),
-                            _ => Shown::Loading,
+                        // A preview's still loads alongside: it shows first, and it is
+                        // what stays if the animation fails or times out.
+                        let at_hand = match still {
+                            Some(s) if load_still => match self.image(s, cx) {
+                                Shown::Ready(image) => Some(image),
+                                _ => None,
+                            },
+                            Some(s) => self.cached_only(s),
+                            None => None,
                         };
+                        return at_hand.map_or(Shown::Loading, Shown::Ready);
                     }
                     // Too large, too many frames, or any other failure: the still.
                     Shown::Failed(_) | Shown::Unavailable => {}
@@ -259,6 +313,27 @@ impl Inlet {
             }
         }
         self.media.setup.as_ref()?.client.cached(req)
+    }
+
+    /// Whether `req` failed in a way asking again cannot help (too large, not an
+    /// image); a retry leaves it out.
+    pub(crate) fn failed_for_good(&self, req: &MediaRequest) -> bool {
+        matches!(
+            self.media.images.entries.borrow().get(req).map(|e| &e.slot),
+            Some(Slot::Failed(err)) if err.is_permanent()
+        )
+    }
+
+    /// Loads `requests` again from the start: what the views hold of them goes, and
+    /// the client forgets their failures (it would answer with them for a while).
+    pub(crate) fn retry_media(&self, requests: &[MediaRequest], cx: &mut Context<Self>) {
+        for req in requests {
+            self.media.images.remove(req);
+            if let Some(setup) = &self.media.setup {
+                setup.client.forget_failure(req);
+            }
+        }
+        cx.notify();
     }
 }
 
@@ -313,6 +388,27 @@ mod tests {
         let url =
             url::Url::parse(&format!("https://media.example.org/avatars/1/{n}.webp")).unwrap();
         MediaRequest::new(url, MediaKind::Avatar, Fit::square(40))
+    }
+
+    #[test]
+    fn a_load_that_never_answers_ends_as_timed_out() {
+        use futures::executor::block_on;
+        use futures::future::{pending, ready};
+        // No answer before the timer: a timeout, never an endless wait.
+        let never = pending::<Result<u32, MediaError>>();
+        assert_eq!(
+            block_on(bounded(never, ready(()))),
+            Err(MediaError::FetchTimeout)
+        );
+        // An answer in time is passed on, a success or a failure.
+        assert_eq!(block_on(bounded(ready(Ok(7)), pending())), Ok(7));
+        let refused = MediaError::HostNotAllowed("x.example".into());
+        assert_eq!(
+            block_on(bounded(ready(Err::<u32, _>(refused.clone())), pending())),
+            Err(refused)
+        );
+        // The bound covers the client's own fetch timeout and a wait for a slot.
+        assert!(LOAD_TIMEOUT > inlet_media::MediaConfig::default().fetch_timeout);
     }
 
     #[test]

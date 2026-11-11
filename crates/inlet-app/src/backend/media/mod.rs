@@ -643,20 +643,48 @@ pub fn to_attachment(a: &p::Attachment) -> Attachment {
     }
 }
 
+/// Whether embed media is a video: by its content type, else by the extension of its
+/// URL (the proxy URL ends like the original). GIF pages (`gifv`) send an MP4 or WebM
+/// as their `video`.
+pub fn is_video(content_type: Option<&str>, url: &str, proxy_url: Option<&str>) -> bool {
+    // The media type without parameters (`video/mp4; codecs=...`).
+    let essence = content_type
+        .and_then(|t| t.split(';').next())
+        .map(str::trim);
+    if let Some(t) = essence.filter(|t| !t.is_empty()) {
+        let t = t.to_ascii_lowercase();
+        return t.starts_with("video/") || t == "application/mp4";
+    }
+    let video_ext = |u: &str| {
+        let path = u.split(['?', '#']).next().unwrap_or_default();
+        matches!(
+            extension(path.rsplit('/').next().unwrap_or_default()).as_str(),
+            "mp4" | "webm" | "mov" | "m4v"
+        )
+    };
+    video_ext(url) || proxy_url.is_some_and(video_ext)
+}
+
 fn embed_media(m: &p::models::EmbedMedia, gifv: bool) -> Option<EmbedMedia> {
     let flags = m.flags.unwrap_or(0);
     let size = |v: Option<u64>| {
         v.filter(|v| *v > 0)
             .map(|v| v.min(u64::from(u32::MAX)) as u32)
     };
+    let url = url_field(Some(&m.url)).unwrap_or_default();
+    let proxy_url = url_field(m.proxy_url.as_deref());
+    let video = is_video(m.content_type.as_deref(), &url, proxy_url.as_deref());
     let media = EmbedMedia {
-        url: url_field(Some(&m.url)).unwrap_or_default(),
-        proxy_url: url_field(m.proxy_url.as_deref()),
+        // A video is never asked for as an animation: the proxy gives its first frame.
+        animated: !video
+            && (gifv
+                || flags & p::models::attachment_flags::IS_ANIMATED != 0
+                || m.content_type.as_deref() == Some("image/gif")),
+        url,
+        proxy_url,
         width: size(m.width),
         height: size(m.height),
-        animated: gifv
-            || flags & p::models::attachment_flags::IS_ANIMATED != 0
-            || m.content_type.as_deref() == Some("image/gif"),
+        video,
         explicit: flags & p::models::attachment_flags::CONTAINS_EXPLICIT_MEDIA != 0,
     };
     (!media.url.is_empty() || media.proxy_url.is_some()).then_some(media)
@@ -733,6 +761,41 @@ mod tests {
             let bytes = image.byte_size();
             (Arc::new(image), bytes)
         }
+    }
+
+    #[test]
+    fn gif_pages_keep_their_video_apart_from_their_picture() {
+        assert!(is_video(Some("video/mp4"), "https://x.example/a", None));
+        assert!(is_video(Some("VIDEO/WEBM"), "", None));
+        assert!(is_video(Some("application/mp4; codecs=avc1"), "", None));
+        assert!(!is_video(
+            Some("image/gif"),
+            "https://x.example/a.mp4",
+            None
+        ));
+        assert!(is_video(None, "https://x.example/loop.mp4?x=1", None));
+        assert!(is_video(
+            None,
+            "",
+            Some("https://m.example/external/s/https/x/loop.webm")
+        ));
+        assert!(!is_video(None, "https://x.example/dance.gif", None));
+
+        // A Tenor-style GIF page: an animated thumbnail and an MP4.
+        let v = serde_json::json!({
+            "type": "gifv",
+            "url": "https://tenor.example/view/dance",
+            "thumbnail": {"url": "https://media.tenor.example/a.webp", "content_type": "image/webp",
+                          "proxy_url": "https://media.example.org/external/s/https/media.tenor.example/a.webp"},
+            "video": {"url": "https://media.tenor.example/a.mp4", "content_type": "video/mp4",
+                      "proxy_url": "https://media.example.org/external/s/https/media.tenor.example/a.mp4"}
+        });
+        let mut e = Embed::default();
+        fill_embed(&v, &mut e);
+        let thumb = e.thumbnail.unwrap();
+        assert!(thumb.animated && !thumb.video);
+        let video = e.video.unwrap();
+        assert!(video.video && !video.animated);
     }
 
     #[tokio::test(flavor = "multi_thread")]
