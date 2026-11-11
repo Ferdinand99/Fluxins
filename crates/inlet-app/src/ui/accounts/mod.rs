@@ -263,7 +263,8 @@ impl Inlet {
     ) {
         // The account's drafts go now, before another account may take its place.
         self.composer.sign_out();
-        self.backend.send(Cmd::SignOut);
+        self.backend
+            .send(Cmd::SignOut(self.switcher.active.clone()));
         cx.notify();
     }
 

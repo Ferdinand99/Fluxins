@@ -317,8 +317,18 @@ enum Internal {
     },
     /// An account was signed out from the recovery screen; start again with the rest.
     Forgotten,
+    /// A stored account read again to start it in the background.
+    BackgroundLoaded(Option<accounts::Restored>),
     /// A stored account read again to make it the active one (`None`: not stored).
     ForegroundLoaded(Option<accounts::Restored>),
+    /// The move of an older entry found a newer token in the account's own entry: the
+    /// account goes on with that one, and the older session (`old`) is ended on the
+    /// server unless it was pasted.
+    NewerEntry {
+        key: AccountKey,
+        old: p::Session,
+        old_pasted: bool,
+    },
     HandoffDone {
         id: u64,
         result: Result<(p::Instance, p::SignedIn), String>,
@@ -444,6 +454,9 @@ struct Backend {
     store: Arc<tokio::sync::Mutex<Accounts>>,
     /// The last task on the store; the next one waits for it (see `store_job`).
     store_tail: Option<tokio::task::JoinHandle<()>>,
+    /// The account the UI last switched to (a stored account read again is started only
+    /// when it still is).
+    switch_target: Option<AccountKey>,
     attempt: u64,
     connecting: Option<(u64, AbortHandle, Mode)>,
     offline: Option<Offline>,
@@ -471,6 +484,7 @@ impl Backend {
             known: Vec::new(),
             store: Arc::new(tokio::sync::Mutex::new(store)),
             store_tail: None,
+            switch_target: None,
             attempt: 0,
             connecting: None,
             offline: None,
@@ -551,10 +565,30 @@ impl Backend {
     /// switch reached the backend, and running it would use the wrong session.
     fn command(&mut self, account: Option<AccountKey>, command: Command) {
         if !matches!(command, Command::Accounts(_)) && !self.acts_for(account.as_ref()) {
-            log::debug!("a command for an account that is not the active one was dropped");
-            return;
+            log::debug!("a command for an account that is not the active one was not run");
+            return self.answer_without_session(account, command);
         }
         self.handle(command);
+    }
+
+    /// Runs a command for an account that is not the active one as if no account were
+    /// signed in: every domain then answers "not connected" without using any token,
+    /// tagged with the command's account, so a caller that waits for an answer (a page,
+    /// a settings write, a send) never hangs. Nothing of the active account is touched.
+    fn answer_without_session(&mut self, account: Option<AccountKey>, command: Command) {
+        let answer_to = match account {
+            Some(k) => self.global.for_account(k),
+            None => self.global.clone(),
+        };
+        let active = self.active.take();
+        let events = std::mem::replace(&mut self.events, answer_to);
+        let open = (self.open_guild.take(), self.open_channel.take());
+        let older = std::mem::take(&mut self.older);
+        self.handle(command);
+        (self.open_guild, self.open_channel) = open;
+        self.older = older;
+        self.events = events;
+        self.active = active;
     }
 
     /// Whether a command sent for `account` may run now.

@@ -123,10 +123,31 @@ pub struct Legacy {
     pub pasted: bool,
 }
 
+/// What [`Accounts::migrate`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Migrated {
+    /// Not moved; the old entry stays for the next start.
+    No,
+    /// Moved and listed.
+    Yes,
+    /// Listed with the newer token the account's own entry already held; the older one
+    /// is to be ended (unless pasted) and the account reconnected with the newer one.
+    Newer,
+}
+
+impl Migrated {
+    /// Whether the account is listed now.
+    pub fn listed(self) -> bool {
+        self != Migrated::No
+    }
+}
+
 /// What `restore_all` read, before it is handed to the backend.
 struct Read {
-    /// `None`: `accounts.json` is there but could not be read (it was backed up).
+    /// `None`: `accounts.json` could not be read.
     list: Option<AccountList>,
+    /// The unreadable list was moved to `accounts.json.bad` (a new one may be written).
+    list_moved: bool,
     /// Each listed account still in the keychain; `None` when the keychain could not be
     /// read (the account stays listed and is tried at the next start).
     sessions: Vec<(AccountRecord, Option<StoredSession>)>,
@@ -157,8 +178,11 @@ pub struct Accounts {
     pasted: HashMap<AccountKey, bool>,
     /// Where notices after a sign-out go (`None` in tests).
     events: Option<Ui>,
-    /// The origin an older Inlet signed in to (its entry is named after it).
-    last_instance: fn() -> Option<String>,
+    /// The file naming the instance an older Inlet signed in to (its entry is named after
+    /// it); `add` writes it for the sign-in form.
+    last_instance_file: Option<PathBuf>,
+    /// The origin whose older entry still waits to be moved, kept in `accounts.json`.
+    legacy_pending: Option<String>,
 }
 
 impl Accounts {
@@ -178,14 +202,14 @@ impl Accounts {
             sessions: HashMap::new(),
             pasted: HashMap::new(),
             events,
-            last_instance: || None,
+            last_instance_file: None,
+            legacy_pending: None,
         }
     }
 
-    /// Where an older Inlet's entry is looked for (the system default reads the
-    /// last-instance file).
-    pub fn with_last_instance(mut self, f: fn() -> Option<String>) -> Self {
-        self.last_instance = f;
+    /// The last-instance file (the system default in the app, a temporary one in tests).
+    pub fn with_last_instance_file(mut self, path: Option<PathBuf>) -> Self {
+        self.last_instance_file = path;
         self
     }
 
@@ -196,7 +220,7 @@ impl Accounts {
             token_store::list_file(),
             Some(events),
         )
-        .with_last_instance(token_store::last_instance)
+        .with_last_instance_file(token_store::last_instance_file())
     }
 
     fn notice(&self, text: String) {
@@ -215,22 +239,30 @@ impl Accounts {
     pub async fn restore_all(&mut self) {
         let store = self.store.clone();
         let path = self.list_path.clone();
-        let last_instance = self.last_instance;
-        let read =
-            tokio::task::spawn_blocking(move || read_all(&*store, path.as_deref(), last_instance))
-                .await
-                .unwrap_or_else(|_| Read {
-                    list: None,
-                    sessions: Vec::new(),
-                    dropped: false,
-                    legacy: None,
-                    pinless_legacy: false,
-                });
+        let last = self.last_instance_file.clone();
+        let read = tokio::task::spawn_blocking(move || {
+            read_all(&*store, path.as_deref(), last.as_deref())
+        })
+        .await
+        .unwrap_or_else(|_| Read {
+            list: None,
+            list_moved: false,
+            sessions: Vec::new(),
+            dropped: false,
+            legacy: None,
+            pinless_legacy: false,
+        });
         self.list.clear();
         self.restored.clear();
-        self.list_broken = read.list.is_none();
-        if self.list_broken {
-            self.notice(t!("notice-account-list-unreadable"));
+        // A list moved away can be written fresh; one that stayed in place is never
+        // written over.
+        self.list_broken = read.list.is_none() && !read.list_moved;
+        if read.list.is_none() {
+            self.notice(if read.list_moved {
+                t!("notice-account-list-moved")
+            } else {
+                t!("notice-account-list-unreadable")
+            });
         }
         if read.pinless_legacy {
             self.notice(t!("notice-old-session-dropped"));
@@ -274,9 +306,13 @@ impl Accounts {
                 self.restored.insert(0, first);
             }
         }
+        let pending = read.legacy.as_ref().map(|l| l.origin.clone());
+        let pending_changed = read.list.as_ref().map(|l| &l.legacy_pending) != Some(&pending);
+        self.legacy_pending = pending;
         self.legacy = read.legacy;
-        if read.dropped {
-            // Some listed account could not be restored: write the list without it.
+        if read.dropped || pending_changed {
+            // Some listed account could not be restored, or an older entry now waits to
+            // be moved (or is gone): write the list.
             self.save().await;
         }
     }
@@ -359,13 +395,19 @@ impl Accounts {
             Some(existing) => *existing = info,
             None => list.push(info),
         }
-        let file = list_file_of(&list, Some(&key));
+        let file = list_file_of(&list, Some(&key), self.legacy_pending.as_deref());
         let token = s.session.token().clone();
         let pins = s.session.session_pins();
         let entry = key.entry();
         let store = self.store.clone();
         let path = self.list_path.clone();
         let broken = self.list_broken;
+        // While an older entry waits to be moved, its origin stays the last instance, so
+        // a build without the list's `legacy_pending` still finds it.
+        let last = self
+            .last_instance_file
+            .clone()
+            .filter(|_| self.legacy_pending.is_none());
         let old =
             tokio::task::spawn_blocking(move || -> Result<Option<(p::Token, p::SessionPins)>> {
                 let old = token_store::load_session(&*store, &entry)
@@ -375,7 +417,9 @@ impl Accounts {
                     .and_then(|o| Some((o.token, o.pins?)));
                 token_store::save_session(&*store, &entry, &token, &pins, pasted)?;
                 Self::write_list(path.as_deref(), broken, &file)?;
-                token_store::set_last_instance(&origin);
+                if let Some(last) = &last {
+                    token_store::write_last_instance(last, &origin);
+                }
                 Ok(old)
             })
             .await
@@ -447,7 +491,11 @@ impl Accounts {
         let store = self.store.clone();
         let path = self.list_path.clone();
         let broken = self.list_broken;
-        let file = list_file_of(&self.list, self.active.as_ref());
+        let file = list_file_of(
+            &self.list,
+            self.active.as_ref(),
+            self.legacy_pending.as_deref(),
+        );
         let deleted = tokio::task::spawn_blocking(move || {
             let deleted = token_store::delete_session(&*store, &entry).is_ok();
             if let Err(err) = Self::write_list(path.as_deref(), broken, &file) {
@@ -486,7 +534,11 @@ impl Accounts {
     pub async fn save(&self) {
         let path = self.list_path.clone();
         let broken = self.list_broken;
-        let file = list_file_of(&self.list, self.active.as_ref());
+        let file = list_file_of(
+            &self.list,
+            self.active.as_ref(),
+            self.legacy_pending.as_deref(),
+        );
         let saved =
             tokio::task::spawn_blocking(move || Self::write_list(path.as_deref(), broken, &file))
                 .await;
@@ -497,20 +549,21 @@ impl Accounts {
 
     /// Moves an older Inlet's entry for `origin` to the account's own entry and lists
     /// the account (see [`token_store::migrate_legacy`] for the order that keeps the
-    /// token and never orphans it). Returns whether the account is listed now; on
-    /// `false` the old entry is kept and the next start tries again.
+    /// token and never orphans it). [`Migrated::No`] keeps the old entry for the next
+    /// start.
     pub async fn migrate(
         &mut self,
         origin: &str,
         info: AccountInfo,
         session: p::Session,
         pasted: bool,
-    ) -> bool {
+    ) -> Migrated {
         self.remember_session(info.key.clone(), session, pasted);
         let mut list = self.list.clone();
         list.retain(|a| a.key != info.key);
         list.insert(0, info.clone());
-        let file = list_file_of(&list, Some(&info.key));
+        // Once moved, nothing waits any more.
+        let file = list_file_of(&list, Some(&info.key), None);
         let store = self.store.clone();
         let path = self.list_path.clone();
         let broken = self.list_broken;
@@ -526,19 +579,32 @@ impl Accounts {
         })
         .await;
         match moved {
-            Ok(Ok(token_store::Migration::Nothing)) => false,
+            Ok(Ok(token_store::Migration::Nothing)) => Migrated::No,
+            Ok(Ok(token_store::Migration::KeptNewer)) => {
+                // The account's own entry holds a newer token (a newer build signed in
+                // again). That one is kept and listed; the older token, which this run
+                // connected with, is ended on the server unless it was pasted, and the
+                // account goes on with the newer one (see `Internal::NewerEntry`).
+                self.list = list;
+                self.active = Some(info.key.clone());
+                self.legacy_pending = None;
+                self.sessions.remove(&info.key);
+                self.pasted.remove(&info.key);
+                Migrated::Newer
+            }
             Ok(Ok(_)) => {
                 // Listed on disk, so listed here too (also when the old entry could
                 // not be deleted yet; the next start deletes the copy).
                 self.list = list;
                 self.active = Some(info.key);
-                true
+                self.legacy_pending = None;
+                Migrated::Yes
             }
             Ok(Err(err)) => {
                 log::warn!("could not move the stored session to its account entry: {err:#}");
-                false
+                Migrated::No
             }
-            Err(_) => false,
+            Err(_) => Migrated::No,
         }
     }
 
@@ -578,6 +644,10 @@ impl Accounts {
         })
         .await
         .unwrap_or(false);
+        if deleted && self.legacy_pending.as_deref() == Some(origin) {
+            self.legacy_pending = None;
+            self.save().await;
+        }
         if let Some(events) = &self.events {
             if revoke && unreadable {
                 let _ = events.unbounded_send(Ev::Notice(t!("notice-keychain-unreadable")));
@@ -610,23 +680,30 @@ impl Accounts {
     }
 }
 
-fn list_file_of(list: &[AccountInfo], active: Option<&AccountKey>) -> AccountList {
+fn list_file_of(
+    list: &[AccountInfo],
+    active: Option<&AccountKey>,
+    legacy_pending: Option<&str>,
+) -> AccountList {
     AccountList {
         accounts: list.iter().map(AccountInfo::record).collect(),
         active: active.map(AccountKey::entry),
+        legacy_pending: legacy_pending.map(str::to_string),
     }
 }
 
 fn read_all(
     store: &dyn SecretStore,
     path: Option<&std::path::Path>,
-    last_instance: fn() -> Option<String>,
+    last_instance_file: Option<&std::path::Path>,
 ) -> Read {
+    let mut list_moved = false;
     let list = match path.map(token_store::load_list) {
         None => Some(AccountList::default()),
         Some(Ok(list)) => Some(list),
-        Some(Err(err)) => {
-            log::warn!("{err:#}");
+        Some(Err(bad)) => {
+            log::warn!("{:#}", bad.error);
+            list_moved = bad.moved;
             None
         }
     };
@@ -655,8 +732,20 @@ fn read_all(
         }
     }
     let mut pinless_legacy = false;
-    // An older Inlet's entry is looked for on every start until it is moved and gone.
-    let legacy = last_instance().and_then(|origin| {
+    // An older Inlet's entry is looked for on every start until it is moved and gone:
+    // under the origin the list says is still waiting, and under the last instance.
+    let mut candidates: Vec<String> = Vec::new();
+    for origin in list
+        .as_ref()
+        .and_then(|l| l.legacy_pending.clone())
+        .into_iter()
+        .chain(last_instance_file.and_then(token_store::read_last_instance))
+    {
+        if !candidates.contains(&origin) {
+            candidates.push(origin);
+        }
+    }
+    let legacy = candidates.into_iter().find_map(|origin| {
         let raw = match store.get(&origin) {
             Ok(Some(raw)) => raw,
             Ok(None) => return None,
@@ -701,6 +790,7 @@ fn read_all(
     });
     Read {
         list,
+        list_moved,
         sessions,
         dropped,
         legacy,

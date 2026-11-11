@@ -32,8 +32,14 @@ fn signed_in(session: p::Session, id: &str) -> SignedIn {
 
 const LEGACY_ORIGIN: &str = "https://fluxer.example";
 
-fn legacy_origin() -> Option<String> {
-    Some(LEGACY_ORIGIN.to_string())
+/// A last-instance file next to `list` that names the legacy origin, as an older
+/// Inlet left it.
+fn legacy_last_file(list: &std::path::Path) -> Option<std::path::PathBuf> {
+    let path = list.with_file_name("last-instance");
+    if !path.exists() {
+        token_store::write_last_instance(&path, LEGACY_ORIGIN);
+    }
+    Some(path)
 }
 
 fn pins() -> p::SessionPins {
@@ -51,8 +57,8 @@ async fn old_keyring_entry_is_migrated_once_and_deleted() {
     token_store::save_session(&*store, LEGACY_ORIGIN, &token, &pins(), true).unwrap();
     let raw = store.get(LEGACY_ORIGIN).unwrap().unwrap().to_string();
     let list = temp_list("migrate");
-    let mut accounts =
-        Accounts::new(store.clone(), Some(list.clone()), None).with_last_instance(legacy_origin);
+    let mut accounts = Accounts::new(store.clone(), Some(list.clone()), None)
+        .with_last_instance_file(legacy_last_file(&list));
 
     // First start: no list yet, so the old entry is picked up as it is.
     accounts.restore_all().await;
@@ -75,11 +81,10 @@ async fn old_keyring_entry_is_migrated_once_and_deleted() {
     let instance =
         p::Instance::from_cached(LEGACY_ORIGIN, doc, None, p::ClientInfo::default()).unwrap();
     let session = p::Session::from_token_unpinned(instance, token.clone());
-    assert!(
-        accounts
-            .migrate(LEGACY_ORIGIN, info.clone(), session.clone(), true)
-            .await
-    );
+    assert!(accounts
+        .migrate(LEGACY_ORIGIN, info.clone(), session.clone(), true)
+        .await
+        .listed());
     assert!(
         store.get(LEGACY_ORIGIN).unwrap().is_none(),
         "old entry deleted"
@@ -93,16 +98,15 @@ async fn old_keyring_entry_is_migrated_once_and_deleted() {
     assert_eq!(accounts.active(), Some(&key));
 
     // Only once: nothing left to move, and the new entry stays.
-    assert!(
-        !accounts
-            .migrate(LEGACY_ORIGIN, info.clone(), session, true)
-            .await
-    );
+    assert!(!accounts
+        .migrate(LEGACY_ORIGIN, info.clone(), session, true)
+        .await
+        .listed());
     assert_eq!(*store.get(&key.entry()).unwrap().unwrap(), raw);
 
     // The next start reads the list and the new entry; no old entry any more.
-    let mut again =
-        Accounts::new(store.clone(), Some(list.clone()), None).with_last_instance(legacy_origin);
+    let mut again = Accounts::new(store.clone(), Some(list.clone()), None)
+        .with_last_instance_file(legacy_last_file(&list));
     again.restore_all().await;
     let (restored, legacy) = again.take_restored();
     assert!(legacy.is_none());
@@ -731,8 +735,8 @@ async fn a_failed_delete_keeps_the_account_listed_and_the_next_start_cleans_up()
     let token = p::Token::new("legacy-del");
     token_store::save_session(&*store, LEGACY_ORIGIN, &token, &pins(), false).unwrap();
     let list = temp_list("delete-fails");
-    let mut accounts =
-        Accounts::new(store.clone(), Some(list.clone()), None).with_last_instance(legacy_origin);
+    let mut accounts = Accounts::new(store.clone(), Some(list.clone()), None)
+        .with_last_instance_file(legacy_last_file(&list));
     accounts.restore_all().await;
     let (_, legacy) = accounts.take_restored();
     assert!(legacy.is_some());
@@ -745,11 +749,10 @@ async fn a_failed_delete_keeps_the_account_listed_and_the_next_start_cleans_up()
     let session = legacy_session(&token);
     // The old entry cannot be deleted: the account is listed all the same.
     MemoryStore::refuse(&store.refuse_deletes, true);
-    assert!(
-        accounts
-            .migrate(LEGACY_ORIGIN, info.clone(), session, false)
-            .await
-    );
+    assert!(accounts
+        .migrate(LEGACY_ORIGIN, info.clone(), session, false)
+        .await
+        .listed());
     assert_eq!(accounts.list(), vec![info.clone()]);
     assert!(
         store.get(LEGACY_ORIGIN).unwrap().is_some(),
@@ -758,8 +761,8 @@ async fn a_failed_delete_keeps_the_account_listed_and_the_next_start_cleans_up()
     accounts.save().await;
     MemoryStore::refuse(&store.refuse_deletes, false);
     // Next start: the account comes from the list, and the copy is deleted.
-    let mut next =
-        Accounts::new(store.clone(), Some(list.clone()), None).with_last_instance(legacy_origin);
+    let mut next = Accounts::new(store.clone(), Some(list.clone()), None)
+        .with_last_instance_file(legacy_last_file(&list));
     next.restore_all().await;
     let (restored, legacy) = next.take_restored();
     assert!(legacy.is_none());
@@ -775,8 +778,8 @@ async fn an_entry_not_moved_is_found_on_every_start_even_with_other_accounts_lis
     let token = p::Token::new("legacy-keep");
     token_store::save_session(&*store, LEGACY_ORIGIN, &token, &pins(), false).unwrap();
     let list = temp_list("not-moved");
-    let mut accounts =
-        Accounts::new(store.clone(), Some(list.clone()), None).with_last_instance(legacy_origin);
+    let mut accounts = Accounts::new(store.clone(), Some(list.clone()), None)
+        .with_last_instance_file(legacy_last_file(&list));
     accounts.restore_all().await;
     let _ = accounts.take_restored();
     let key = AccountKey::new(LEGACY_ORIGIN, "42").unwrap();
@@ -787,11 +790,10 @@ async fn an_entry_not_moved_is_found_on_every_start_even_with_other_accounts_lis
     };
     // The copy fails (the keychain refuses writes): nothing moves, nothing is lost.
     MemoryStore::refuse(&store.refuse_writes, true);
-    assert!(
-        !accounts
-            .migrate(LEGACY_ORIGIN, info.clone(), legacy_session(&token), false)
-            .await
-    );
+    assert!(!accounts
+        .migrate(LEGACY_ORIGIN, info.clone(), legacy_session(&token), false)
+        .await
+        .listed());
     MemoryStore::refuse(&store.refuse_writes, false);
     // Another account is added meanwhile: the list is no longer empty.
     let (_server, instance) =
@@ -799,8 +801,8 @@ async fn an_entry_not_moved_is_found_on_every_start_even_with_other_accounts_lis
     let other = p::Session::from_token_unpinned(instance, p::Token::new("tok-other"));
     let kb = accounts.add(signed_in(other, "43"), true).await.unwrap();
     // Next start: the old entry is still found, and moves then.
-    let mut next =
-        Accounts::new(store.clone(), Some(list.clone()), None).with_last_instance(legacy_origin);
+    let mut next = Accounts::new(store.clone(), Some(list.clone()), None)
+        .with_last_instance_file(legacy_last_file(&list));
     next.restore_all().await;
     let (restored, legacy) = next.take_restored();
     assert_eq!(
@@ -809,10 +811,10 @@ async fn an_entry_not_moved_is_found_on_every_start_even_with_other_accounts_lis
     );
     let legacy = legacy.expect("the entry not moved is picked up again");
     assert_eq!(legacy.token.expose_secret(), "legacy-keep");
-    assert!(
-        next.migrate(LEGACY_ORIGIN, info, legacy_session(&token), false)
-            .await
-    );
+    assert!(next
+        .migrate(LEGACY_ORIGIN, info, legacy_session(&token), false)
+        .await
+        .listed());
     assert_eq!(next.list().len(), 2);
     assert!(store.get(LEGACY_ORIGIN).unwrap().is_none());
     assert!(store.get(&key.entry()).unwrap().is_some());
@@ -872,4 +874,146 @@ async fn signing_out_an_account_not_moved_yet_removes_the_old_entry() {
         }
     }
     assert!(removed);
+}
+
+/// The path the review found: a move that fails, then an account added on another
+/// instance. `add` writes the real last-instance file (no fixed function), which then
+/// names the other instance; the old entry must still be found at the next start.
+#[tokio::test]
+async fn an_entry_not_moved_survives_an_account_added_on_another_instance() {
+    let store = Arc::new(MemoryStore::default());
+    let token = p::Token::new("legacy-other-instance");
+    token_store::save_session(&*store, LEGACY_ORIGIN, &token, &pins(), false).unwrap();
+    let list = temp_list("other-instance");
+    let last = list.with_file_name("last-instance");
+    token_store::write_last_instance(&last, LEGACY_ORIGIN);
+    let mut accounts = Accounts::new(store.clone(), Some(list.clone()), None)
+        .with_last_instance_file(Some(last.clone()));
+    accounts.restore_all().await;
+    let (_, legacy) = accounts.take_restored();
+    assert!(legacy.is_some());
+    // The move fails.
+    MemoryStore::refuse(&store.refuse_writes, true);
+    let key = AccountKey::new(LEGACY_ORIGIN, "42").unwrap();
+    let info = AccountInfo {
+        key: key.clone(),
+        name: "Ada".into(),
+        handle: "ada".into(),
+    };
+    assert!(!accounts
+        .migrate(LEGACY_ORIGIN, info.clone(), legacy_session(&token), false)
+        .await
+        .listed());
+    MemoryStore::refuse(&store.refuse_writes, false);
+    // An account on another instance (the mock's origin) is added.
+    let (_server, instance) =
+        mock_instance("ws://127.0.0.1:1/gateway", &[("tok-elsewhere", "43")]).await;
+    let other_origin = instance.origin().to_string();
+    assert_ne!(other_origin, LEGACY_ORIGIN);
+    let other = p::Session::from_token_unpinned(instance, p::Token::new("tok-elsewhere"));
+    accounts.add(signed_in(other, "43"), true).await.unwrap();
+    // While the old entry waits, the last instance is not rewritten ...
+    assert_eq!(
+        token_store::read_last_instance(&last).as_deref(),
+        Some(LEGACY_ORIGIN)
+    );
+    // ... and even when something else rewrote it (an older build), the list keeps
+    // the origin that still waits.
+    token_store::write_last_instance(&last, &other_origin);
+    let mut next = Accounts::new(store.clone(), Some(list.clone()), None)
+        .with_last_instance_file(Some(last.clone()));
+    next.restore_all().await;
+    let (_, legacy) = next.take_restored();
+    let legacy = legacy.expect("the old entry is found again");
+    assert_eq!(legacy.origin, LEGACY_ORIGIN);
+    assert_eq!(legacy.token.expose_secret(), "legacy-other-instance");
+    // Moved at last: nothing waits any more.
+    assert!(next
+        .migrate(LEGACY_ORIGIN, info, legacy_session(&token), false)
+        .await
+        .listed());
+    let on_disk = token_store::load_list(&list).unwrap();
+    assert_eq!(on_disk.legacy_pending, None);
+    assert!(store.get(LEGACY_ORIGIN).unwrap().is_none());
+    let _ = std::fs::remove_dir_all(list.parent().unwrap());
+}
+
+/// A newer entry of the account is already there (a newer build signed in again): it
+/// is kept and listed, and the older token is to be ended (it was not pasted).
+#[tokio::test]
+async fn a_newer_entry_is_kept_when_the_old_one_moves() {
+    let store = Arc::new(MemoryStore::default());
+    let old = p::Token::new("legacy-older");
+    token_store::save_session(&*store, LEGACY_ORIGIN, &old, &pins(), false).unwrap();
+    let key = AccountKey::new(LEGACY_ORIGIN, "42").unwrap();
+    token_store::save_session(
+        &*store,
+        &key.entry(),
+        &p::Token::new("newer"),
+        &pins(),
+        false,
+    )
+    .unwrap();
+    let list = temp_list("newer");
+    let mut accounts = Accounts::new(store.clone(), Some(list.clone()), None)
+        .with_last_instance_file(legacy_last_file(&list));
+    accounts.restore_all().await;
+    let info = AccountInfo {
+        key: key.clone(),
+        name: "Ada".into(),
+        handle: "ada".into(),
+    };
+    assert_eq!(
+        accounts
+            .migrate(LEGACY_ORIGIN, info, legacy_session(&old), false)
+            .await,
+        Migrated::Newer
+    );
+    let kept = token_store::load_session(&*store, &key.entry())
+        .unwrap()
+        .unwrap();
+    assert_eq!(kept.token.expose_secret(), "newer");
+    assert!(store.get(LEGACY_ORIGIN).unwrap().is_none());
+    assert_eq!(accounts.list().len(), 1);
+    let _ = std::fs::remove_dir_all(list.parent().unwrap());
+}
+
+#[tokio::test]
+async fn a_command_that_is_not_run_still_gets_its_answer() {
+    let (_server, mut b, mut rx, _irx, ka, kb) = two_accounts().await;
+    handle(&mut b, Cmd::SwitchAccount(ka.clone()));
+    while rx.try_recv().is_ok() {}
+    // A page for B, sent before the backend switched: answered, tagged B, no request.
+    b.command(
+        Some(kb.clone()),
+        crate::backend::Command::Messages(crate::backend::messages::Cmd::OpenChannel {
+            channel_id: "701".into(),
+            request: 7,
+        }),
+    );
+    let mut answered = false;
+    for _ in 0..50 {
+        while let Ok(event) = rx.try_recv() {
+            if let Event::Tagged { account, event } = event {
+                if let Event::Messages(crate::backend::messages::Ev::PageFailed {
+                    request, ..
+                }) = *event
+                {
+                    assert_eq!(account, kb);
+                    answered |= request == 7;
+                }
+            }
+        }
+        if answered {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(answered, "the page request was answered");
+    // A is untouched and still active.
+    assert!(matches!(&b.active, Some(Active::Real(r)) if r.key == ka));
+    // Sign-out names its account: B is signed out as from the switcher, A stays.
+    handle(&mut b, Cmd::SignOut(Some(kb.clone())));
+    assert!(matches!(&b.active, Some(Active::Real(r)) if r.key == ka));
+    assert!(!b.background.iter().any(|r| r.key == kb));
 }

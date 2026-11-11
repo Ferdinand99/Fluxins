@@ -228,6 +228,11 @@ pub struct AccountList {
     /// The entry name of the account shown at start-up.
     #[serde(default)]
     pub active: Option<String>,
+    /// The origin whose older single entry is not moved yet. It is looked for under this
+    /// origin on every start until the move is done, whatever `last-instance` says by
+    /// then (adding an account on another instance rewrites that file).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_pending: Option<String>,
 }
 
 fn config_dir() -> Option<PathBuf> {
@@ -239,30 +244,36 @@ pub fn list_file() -> Option<PathBuf> {
     config_dir().map(|d| d.join("accounts.json"))
 }
 
-/// Reads the account list. A missing file is an empty list. A file that is there but
-/// cannot be read or parsed is an error: it is copied to `accounts.json.bad`, and the
-/// caller must not write a new list over it (the accounts it names would be lost
-/// from view; the keychain cannot be listed on every system).
-pub fn load_list(path: &Path) -> Result<AccountList> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(AccountList::default()),
-        Err(err) => {
-            backup_bad_list(path);
-            return Err(err).context("read the account list");
-        }
-    };
-    serde_json::from_str(&text).map_err(|err| {
-        backup_bad_list(path);
-        anyhow::anyhow!("the account list is not valid: {err}")
-    })
+/// An account list that could not be read.
+#[derive(Debug)]
+pub struct BadList {
+    /// It was moved to `accounts.json.bad` (the next list is written fresh). When the
+    /// move failed it is still in place, and must not be written over.
+    pub moved: bool,
+    pub error: anyhow::Error,
 }
 
-fn backup_bad_list(path: &Path) {
-    let bad = path.with_extension("json.bad");
-    if let Err(err) = std::fs::copy(path, &bad) {
-        log::warn!("the unreadable account list could not be backed up: {err}");
-    }
+/// Reads the account list. A missing file is an empty list. A file that is there but
+/// cannot be read or parsed is moved to `accounts.json.bad` (the accounts it names stay
+/// findable there; the keychain cannot be listed on every system), so the next start
+/// does not find it again and a new list can be written.
+pub fn load_list(path: &Path) -> std::result::Result<AccountList, BadList> {
+    let error = match std::fs::read_to_string(path) {
+        Ok(text) => match serde_json::from_str(&text) {
+            Ok(list) => return Ok(list),
+            Err(err) => anyhow::anyhow!("the account list is not valid: {err}"),
+        },
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(AccountList::default()),
+        Err(err) => anyhow::Error::new(err).context("read the account list"),
+    };
+    let moved = match std::fs::rename(path, path.with_extension("json.bad")) {
+        Ok(()) => true,
+        Err(err) => {
+            log::warn!("the unreadable account list could not be moved away: {err}");
+            false
+        }
+    };
+    Err(BadList { moved, error })
 }
 
 /// Writes the account list: to a temporary file, synced to disk, then renamed over the
@@ -290,23 +301,28 @@ pub fn save_list(path: &Path, list: &AccountList) -> Result<()> {
     Ok(())
 }
 
-fn state_file() -> Option<PathBuf> {
+/// The file that holds the address of the last instance.
+pub fn last_instance_file() -> Option<PathBuf> {
     config_dir().map(|d| d.join("last-instance"))
 }
 
 pub fn last_instance() -> Option<String> {
-    let s = std::fs::read_to_string(state_file()?).ok()?;
+    read_last_instance(&last_instance_file()?)
+}
+
+/// The instance named in `path`, if any.
+pub fn read_last_instance(path: &Path) -> Option<String> {
+    let s = std::fs::read_to_string(path).ok()?;
     let s = s.trim();
     (!s.is_empty()).then(|| s.to_string())
 }
 
-pub fn set_last_instance(instance: &str) {
-    if let Some(path) = state_file() {
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        let _ = std::fs::write(path, instance);
+/// Writes `instance` to `path`.
+pub fn write_last_instance(path: &Path, instance: &str) {
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
     }
+    let _ = std::fs::write(path, instance);
 }
 
 fn installation_id_file() -> Option<std::path::PathBuf> {
@@ -480,21 +496,25 @@ mod tests {
                 handle: "ada".into(),
             }],
             active: Some(entry_name("https://fluxer.example", "42")),
+            legacy_pending: None,
         };
         save_list(&path, &list).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(!text.contains("token"), "no secret in the list");
         assert_eq!(load_list(&path).unwrap(), list);
-        // A broken file is an error (never read as an empty list) and is backed up.
+        // A broken file is an error (never read as an empty list) and is moved away.
         std::fs::write(&path, "not json").unwrap();
-        assert!(load_list(&path).is_err());
+        let bad = load_list(&path).unwrap_err();
+        assert!(bad.moved);
         assert_eq!(
             std::fs::read_to_string(path.with_extension("json.bad")).unwrap(),
             "not json"
         );
-        // A missing file is an empty list.
-        std::fs::remove_file(&path).unwrap();
+        // So the next start does not find it again: an empty list, written fresh.
+        assert!(!path.exists());
         assert_eq!(load_list(&path).unwrap(), AccountList::default());
+        save_list(&path, &list).unwrap();
+        assert_eq!(load_list(&path).unwrap(), list);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

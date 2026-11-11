@@ -42,7 +42,9 @@ use super::{
     RealActive, Ui,
 };
 use crate::reconnect::{ReconnectPolicy, Stop};
-pub use store::{AccountInfo, AccountKey, Accounts, Legacy, Restored, SignedIn, MAX_ACCOUNTS};
+pub use store::{
+    AccountInfo, AccountKey, Accounts, Legacy, Migrated, Restored, SignedIn, MAX_ACCOUNTS,
+};
 
 /// Default instance shown on the sign-in screen.
 pub const DEFAULT_INSTANCE: &str = "fluxer.opland.net";
@@ -76,8 +78,9 @@ pub enum Cmd {
     ConfirmAccount,
     /// Wrong account: end the new token on the server and discard it.
     RejectAccount,
-    /// Sign the active account out.
-    SignOut,
+    /// Sign the account the UI shows out (`None`: whichever is starting or offline). An
+    /// account that is not the active one is signed out as from the switcher.
+    SignOut(Option<AccountKey>),
     /// Sign one account out (from the account switcher).
     RemoveAccount(AccountKey),
     /// Make another signed-in account the active one.
@@ -85,8 +88,9 @@ pub enum Cmd {
     /// From the recovery screen: end the active stored session on the server (best
     /// effort) and remove it from the keychain, without connecting first.
     ForgetStored,
-    /// The gateway stopped and is not retried automatically: try again now.
-    Reconnect,
+    /// The gateway stopped and is not retried automatically: try again now, if this is
+    /// still the active account.
+    Reconnect(Option<AccountKey>),
     /// The app is closing: end an unconfirmed browser sign-in, then answer.
     Shutdown(std::sync::mpsc::Sender<()>),
 }
@@ -274,12 +278,16 @@ pub(super) fn handle(b: &mut Backend, cmd: Cmd) {
                 });
             }
         }
-        Cmd::SignOut => b.sign_out(),
+        Cmd::SignOut(Some(key)) if !b.is_current(&key) => b.remove_account(key),
+        Cmd::SignOut(_) => b.sign_out(),
         Cmd::RemoveAccount(key) => b.remove_account(key),
         Cmd::SwitchAccount(key) => b.switch_account(key),
         Cmd::ForgetStored => b.forget_stored(),
-        Cmd::Reconnect => {
+        Cmd::Reconnect(key) => {
             if let Some(Active::Real(r)) = &mut b.active {
+                if key.as_ref().is_some_and(|k| k != &r.key) {
+                    return;
+                }
                 if let Some(t) = r.restart_timer.take() {
                     t.abort();
                 }
@@ -308,6 +316,17 @@ pub(super) fn handle(b: &mut Backend, cmd: Cmd) {
 }
 
 impl Backend {
+    /// Whether `key` is the account the backend is showing: the active one, or (with no
+    /// active account) one that is starting or offline rather than in the background.
+    fn is_current(&self, key: &AccountKey) -> bool {
+        match &self.active {
+            Some(Active::Real(r)) => &r.key == key,
+            #[cfg(feature = "demo")]
+            Some(Active::Demo(_)) => true,
+            None => !self.background.iter().any(|r| &r.key == key),
+        }
+    }
+
     /// Sends an untagged event of this domain (sign-in, the account list, the switch).
     pub(super) fn tell(&self, ev: Ev) {
         let _ = self.global.unbounded_send(ev);
@@ -583,12 +602,50 @@ impl Backend {
                 }
             }
             Internal::ForegroundLoaded(restored) => match restored {
-                Some(r) if self.active.is_none() && self.connecting.is_none() => {
+                // Only the account last switched to (a later switch wins).
+                Some(r)
+                    if self.active.is_none()
+                        && self.connecting.is_none()
+                        && self.switch_target.as_ref() == Some(&r.key) =>
+                {
                     self.start_foreground(r)
                 }
                 Some(_) => {}
                 None => self.tell(Ev::NeedsSignIn { instance: None }),
             },
+            Internal::NewerEntry {
+                key,
+                old,
+                old_pasted,
+            } => {
+                let was_active = matches!(&self.active, Some(Active::Real(r)) if r.key == key);
+                // Its gateway stops first, so ending the older token cannot read as the end
+                // of the account (that would remove the newer entry).
+                self.drop_engine(&key);
+                if should_revoke(old_pasted) {
+                    self.spawn_guarded("revoke older token", None, async move {
+                        session::revoke(&old).await;
+                    });
+                }
+                if was_active {
+                    self.switch_target = Some(key.clone());
+                }
+                let store = self.store.clone();
+                let internal = self.internal.clone();
+                self.store_job(async move {
+                    let restored = store.lock().await.load(&key).await;
+                    let _ = internal.send(if was_active {
+                        Internal::ForegroundLoaded(restored)
+                    } else {
+                        Internal::BackgroundLoaded(restored)
+                    });
+                });
+            }
+            Internal::BackgroundLoaded(restored) => {
+                if let Some(r) = restored {
+                    self.start_background(r, Duration::ZERO, 0);
+                }
+            }
             Internal::Forgotten => {
                 if self.known.is_empty() {
                     self.tell(Ev::NeedsSignIn { instance: None });
@@ -732,8 +789,18 @@ impl Backend {
                     name,
                     handle,
                 };
-                if accounts.migrate(&origin, info, session, pasted).await {
+                let migrated = accounts
+                    .migrate(&origin, info, session.clone(), pasted)
+                    .await;
+                if migrated.listed() {
                     let _ = internal.send(Internal::ListChanged(accounts.list()));
+                }
+                if migrated == Migrated::Newer {
+                    let _ = internal.send(Internal::NewerEntry {
+                        key: key.clone(),
+                        old: session,
+                        old_pasted: pasted,
+                    });
                 }
             } else {
                 accounts.remember_session(key.clone(), session, pasted);
@@ -1064,9 +1131,11 @@ impl Backend {
         });
         let restart = r.ignores_typing || r.down;
         let gen = r.gen;
-        // The same spacing as "Reconnect": a quick switch back and forth to an account
-        // whose gateway keeps failing does not identify on every click.
-        let wait = if restart {
+        // A gateway that is down waits the spacing of "Reconnect", so a quick switch back
+        // and forth to an account whose gateway keeps failing does not identify on every
+        // click. A healthy one started for the background starts again at once, only to
+        // get typing events (no status line, no spacing).
+        let wait = if r.down {
             r.policy.manual(Instant::now())
         } else {
             Duration::ZERO
@@ -1123,8 +1192,17 @@ impl Backend {
         }
         if self.connecting.is_some() {
             log::info!("account switch while connecting; ignored");
+            // The UI has switched already: tell it which account is really active.
+            if let Some(Active::Real(r)) = &self.active {
+                self.tell(Ev::SignedIn {
+                    key: r.key.clone(),
+                    username: r.name.clone(),
+                    instance: r.session.instance().origin().to_string(),
+                });
+            }
             return;
         }
+        self.switch_target = Some(key.clone());
         if self.promote(&key) {
             return;
         }

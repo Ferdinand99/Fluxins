@@ -99,3 +99,4 @@ error-account-mismatch = A stored session belongs to another account than Inlet 
 notice-keychain-unreadable = The system keychain could not be read, so Inlet only forgot the account here and did not end its session on the server. End it under Devices in Fluxer's settings.
 notice-account-list-unreadable = The list of accounts could not be read. It was kept as accounts.json.bad and is not written over; sign in again to use Inlet now.
 notice-old-session-dropped = A session saved by an older Inlet could not be used safely and was removed. Sign in again, and end the old session under Devices in Fluxer's settings.
+notice-account-list-moved = The list of accounts could not be read. It was moved to accounts.json.bad, where the accounts it names can still be found; sign in again to add them.
