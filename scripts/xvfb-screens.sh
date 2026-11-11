@@ -82,7 +82,6 @@ scene 18-image-viewer image-viewer c-attachments
 scene 19-chat-reactions chat-reactions c-general
 scene 20-chat-menu chat-menu c-general
 scene 21-chat-delete chat-delete c-general
-scene 22-composer-attachments composer-attachments c-general
 
 # 6. The Desktop settings tab, and the prompt a link from outside opens.
 INLET_DEMO=1 INLET_DEMO_LIVE_SECS=3600 INLET_DEMO_GUILD=g1 INLET_DEMO_CHANNEL=c-general INLET_DEMO_SETTINGS=desktop "$bin" >>"$out/demo.log" 2>&1 &
@@ -95,6 +94,14 @@ pid=$!
 sleep 6
 shot 15-link-prompt
 kill $pid; wait $pid 2>/dev/null
+
+# 7. Several accounts: the account switcher (two more accounts in the background, one
+#    on another instance) and the sign-in screen when adding one.
+scene 22-accounts accounts c-general
+scene 23-accounts-add accounts-add c-general
+
+# 8. The composer with files attached and an upload on its way.
+scene 24-composer-attachments composer-attachments c-general
 
 tail -n 20 "$out/signin.log" "$out/demo.log" >&2
 cat "$out/memory.txt" >&2

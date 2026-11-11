@@ -21,6 +21,9 @@
 //! - `chat-reactions`, `chat-menu`, `chat-delete`: for `#general`, reactions under a few
 //!   messages and an own message; the hover bar shown on one message, the context menu
 //!   open on the own message, or its delete confirmation (see `actions.rs`).
+//! - `accounts`: as `default`, with two more accounts in the background (one on the same
+//!   instance with mentions, one on another instance) and the account switcher open.
+//! - `accounts-add`: the same accounts, on the sign-in screen to add one more.
 //! - `composer-attachments`: for `#general`, three files in the composer's tray (a photo
 //!   with alt text, a spoiler, a document), an upload on its way above the box, and its
 //!   message pending in the list.
@@ -55,6 +58,8 @@ pub enum Scene {
     ChatReactions,
     ChatMenu,
     ChatDelete,
+    Accounts,
+    AccountsAdd,
     ComposerAttachments,
 }
 
@@ -76,6 +81,8 @@ impl Scene {
             "chat-reactions" => Scene::ChatReactions,
             "chat-menu" => Scene::ChatMenu,
             "chat-delete" => Scene::ChatDelete,
+            "accounts" => Scene::Accounts,
+            "accounts-add" => Scene::AccountsAdd,
             "composer-attachments" => Scene::ComposerAttachments,
             _ => return None,
         })
@@ -311,7 +318,7 @@ pub fn data(scene: Scene) -> Data {
         });
     }
     let mut guild_settings = Vec::new();
-    let unread_demo = scene == Scene::Default;
+    let unread_demo = matches!(scene, Scene::Default | Scene::Accounts | Scene::AccountsAdd);
     if unread_demo {
         // Unread messages, mentions and mutes in the sidebar and the rail.
         read_states.extend(unread::read_states());
@@ -356,6 +363,8 @@ mod tests {
             "chat-reactions",
             "chat-menu",
             "chat-delete",
+            "accounts",
+            "accounts-add",
             "composer-attachments",
         ] {
             let scene = Scene::from_name(name).expect(name);

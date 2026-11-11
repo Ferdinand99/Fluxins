@@ -30,7 +30,6 @@ sign-in-reopen = Open the page again
 sign-in-handoff-not-https = The instance gave a sign-in page that is not https. Inlet did not open it.
 sign-in-denied = The sign-in was denied in the browser.
 sign-in-code-expired = The code expired. Try again.
-sign-in-again-for-pins = Please sign in again once: Inlet now also stores which server addresses your session belongs to.
 
 ## Confirming a new sign-in
 
@@ -52,7 +51,6 @@ notice-pasted-forgotten = The pasted token was only forgotten here. The app it c
 notice-not-deleted = The token could not be removed from the system keychain.
 notice-sign-out-not-revoked = Signed out here, but the instance could not be told. End the session under Devices in Fluxer's settings.
 notice-reject-not-revoked = The instance could not be told to end that session. End it under Devices in Fluxer's settings.
-session-ended-not-deleted = { $message } The old token could not be removed from the system keychain.
 
 ## Connection status (the line at the right of the channel header)
 
@@ -84,3 +82,21 @@ error-bad-address = The instance address is not usable: { $reason }
 error-too-large = The instance sent more data than Inlet accepts.
 error-keychain-refused = Signed in, but the system keychain refused the token. You will have to sign in again next time.
 error-task-panicked = Part of Inlet stopped unexpectedly ({ $what }). Try again.
+
+## Several accounts (the account switcher)
+
+accounts-title = Accounts
+accounts-add = Add an account
+accounts-full = At most { $max } accounts can be signed in.
+accounts-active = Active
+accounts-close = Close
+accounts-handle-at = { $handle } on { $instance }
+accounts-ended = { $account }: { $message }
+sign-in-back = Back
+sign-in-too-many-accounts = At most { $max } accounts can be signed in at once. Sign one out first.
+error-account-id = The instance sent an account ID that Inlet cannot use.
+error-account-mismatch = A stored session belongs to another account than Inlet expected, so it was not used. Sign in again.
+notice-keychain-unreadable = The system keychain could not be read, so Inlet only forgot the account here and did not end its session on the server. End it under Devices in Fluxer's settings.
+notice-account-list-unreadable = The list of accounts could not be read. It was kept as accounts.json.bad and is not written over; sign in again to use Inlet now.
+notice-old-session-dropped = A session saved by an older Inlet could not be used safely and was removed. Sign in again, and end the old session under Devices in Fluxer's settings.
+notice-account-list-moved = The list of accounts could not be read. It was moved to accounts.json.bad, where the accounts it names can still be found; sign in again to add them.

@@ -1,13 +1,35 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! Accounts: restoring the stored session, signing in (browser handoff or a pasted
-//! token), confirming the account, signing out, and the session's life cycle
-//! (offline retries, the end of a session, gateway restarts). The token goes from the
-//! handoff or the paste field to the keychain and the protocol session, nowhere else.
+//! Accounts: restoring the stored accounts, signing in (browser handoff or a pasted
+//! token), confirming the account, switching between accounts, signing out, and each
+//! session's life cycle (offline retries, the end of a session, gateway restarts). The
+//! token goes from the handoff or the paste field to the keychain and the protocol
+//! session, nowhere else.
+//!
+//! Several accounts, on one instance or several, can be signed in at once (at most
+//! [`MAX_ACCOUNTS`]). Each has its own session, rate limiter, endpoint pins and gateway.
+//! The active account is fully live. The others run in the background and are passive:
+//! no active guild (no Lazy Request, op 14), no message windows, no typing events
+//! (`ignored_events`), and no REST call unless the person does something with them. Their
+//! gateway events still reach their account state in the UI, for unread counts.
+//!
+//! At start-up the active account connects first (with the token check and the guild
+//! list, as before); the others follow two seconds apart, each with discovery and its
+//! gateway only. Switching makes a background account active; its gateway starts again
+//! once with typing events (a background gateway never asked for them). The account it
+//! replaces stays connected in the background.
 
+mod store;
+#[cfg(test)]
+pub(crate) mod testkit;
+#[cfg(test)]
+mod tests;
+
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use inlet_protocol as p;
+use tokio::task::AbortHandle;
 
 use super::gateway::GatewayEnd;
 use super::messages::{
@@ -20,18 +42,27 @@ use super::{
     RealActive, Ui,
 };
 use crate::reconnect::{ReconnectPolicy, Stop};
-use crate::token_store;
+pub use store::{
+    AccountInfo, AccountKey, Accounts, Legacy, Migrated, Restored, SignedIn, MAX_ACCOUNTS,
+};
 
 /// Default instance shown on the sign-in screen.
 pub const DEFAULT_INSTANCE: &str = "fluxer.opland.net";
 
-/// Commands of the accounts domain: sign-in, sign-out and the session's connection.
+/// Gateway events a background account does not ask for.
+pub const BACKGROUND_IGNORED_EVENTS: &[&str] = &["TYPING_START"];
+
+/// Time between the starts of the stored accounts.
+pub const STARTUP_STAGGER: Duration = Duration::from_secs(2);
+
+/// Commands of the accounts domain: sign-in, sign-out, switching and the connection.
 pub enum Cmd {
-    /// Look for a saved session at start-up.
+    /// Look for the stored accounts at start-up.
     Restore,
     /// Offline: try to connect now instead of waiting for the next retry.
     RetryNow,
-    /// Stop connecting with the saved session and show sign-in. The token stays stored.
+    /// Stop connecting with the stored session and show sign-in (or another account
+    /// that is connected). The token stays stored.
     CancelStartup,
     SignInBrowser {
         instance: String,
@@ -43,21 +74,30 @@ pub enum Cmd {
     /// Stop a browser sign-in that is waiting. Also tells the server to drop the code.
     CancelSignIn,
     /// The account shown after sign-in is the right one: store the token and continue.
+    /// A new account is added next to the ones already signed in and becomes active.
     ConfirmAccount,
     /// Wrong account: end the new token on the server and discard it.
     RejectAccount,
-    SignOut,
-    /// From the recovery screen: end the stored session on the server (best effort) and
-    /// remove it from the keychain, without connecting first.
+    /// Sign the account the UI shows out (`None`: whichever is starting or offline). An
+    /// account that is not the active one is signed out as from the switcher.
+    SignOut(Option<AccountKey>),
+    /// Sign one account out (from the account switcher).
+    RemoveAccount(AccountKey),
+    /// Make another signed-in account the active one.
+    SwitchAccount(AccountKey),
+    /// From the recovery screen: end the active stored session on the server (best
+    /// effort) and remove it from the keychain, without connecting first.
     ForgetStored,
-    /// The gateway stopped and is not retried automatically: try again now.
-    Reconnect,
+    /// The gateway stopped and is not retried automatically: try again now, if this is
+    /// still the active account.
+    Reconnect(Option<AccountKey>),
     /// The app is closing: end an unconfirmed browser sign-in, then answer.
     Shutdown(std::sync::mpsc::Sender<()>),
 }
 
 /// Events of the accounts domain. `Status`, `Error` and `GatewayDown` are about the
-/// whole session, whatever part of it failed.
+/// whole session, whatever part of it failed. A background account's own events
+/// arrive tagged with it (`Event::Tagged`); the rest here are untagged.
 pub enum Ev {
     /// Connecting with a saved session.
     Starting {
@@ -92,19 +132,62 @@ pub enum Ev {
     GatewayDown(String),
     /// Something to tell the person on the sign-in screen (not an error).
     Notice(String),
+    /// `key` is now the active account (after sign-in, at start-up, or a switch).
     SignedIn {
+        key: AccountKey,
         username: String,
         instance: String,
     },
+    /// No account is signed in any more.
     SignedOut,
-    /// The session ended on the server side (token rejected or revoked); show sign-in.
+    /// The session ended on the server side (token rejected or revoked) and no other
+    /// account is signed in; show sign-in.
     SessionEnded(String),
+    /// The stored accounts, in order (after start-up, sign-in and sign-out).
+    Accounts(Vec<AccountInfo>),
+    /// An account is gone: signed out, or ended by the server (`message`).
+    AccountRemoved {
+        key: AccountKey,
+        message: Option<String>,
+    },
     /// The gateway identified again after a drop; reload what is on screen.
     Reconnected,
     /// Connection state for the status line ("Connected", "Reconnecting…").
     Status(String),
     /// Something failed that the user should see.
     Error(String),
+}
+
+/// Which stored session a restore is for.
+#[derive(Clone, Debug)]
+pub enum Restore {
+    /// An account from the list.
+    Account(AccountKey),
+    /// The single entry of an older Inlet, for this origin; moved once its user is known.
+    Legacy(String),
+}
+
+/// A background start that is waiting or running.
+pub struct PendingStart {
+    restored: Restored,
+    task: AbortHandle,
+    /// When the start is due.
+    #[cfg_attr(not(test), allow(dead_code))]
+    due: tokio::time::Instant,
+    /// Failed attempts so far (for the retry spacing).
+    failures: u32,
+}
+
+/// The start-up order: the active account at once (it is `restored[0]`), the others
+/// [`STARTUP_STAGGER`] apart after it.
+pub fn startup_plan(restored: Vec<Restored>) -> (Option<Restored>, Vec<(Restored, Duration)>) {
+    let mut rest = restored.into_iter();
+    let first = rest.next();
+    let later = rest
+        .enumerate()
+        .map(|(i, r)| (r, STARTUP_STAGGER * (i as u32 + 1)))
+        .collect();
+    (first, later)
 }
 
 pub(super) fn handle(b: &mut Backend, cmd: Cmd) {
@@ -115,8 +198,12 @@ pub(super) fn handle(b: &mut Backend, cmd: Cmd) {
                 if let Some(timer) = off.timer.take() {
                     timer.abort();
                 }
-                let (instance, credential) = (off.instance.clone(), off.credential.clone());
-                b.start_connect(instance, None, credential, Mode::Restore);
+                let (instance, credential, restore) = (
+                    off.instance.clone(),
+                    off.credential.clone(),
+                    off.restore.clone(),
+                );
+                b.start_connect(instance, None, credential, Mode::Restore, restore);
             }
         }
         Cmd::CancelStartup => {
@@ -131,22 +218,46 @@ pub(super) fn handle(b: &mut Backend, cmd: Cmd) {
                 }
                 o.instance
             });
-            b.emit(Ev::NeedsSignIn { instance });
+            if !b.promote_connected() {
+                b.tell(Ev::NeedsSignIn { instance });
+            }
         }
         Cmd::SignInBrowser { instance } => b.start_handoff(instance),
         Cmd::SignInToken { instance, token } => {
             b.offline = None;
-            b.start_connect(instance, None, Credential::Pasted(token), Mode::Fresh);
+            b.start_connect(instance, None, Credential::Pasted(token), Mode::Fresh, None);
         }
         Cmd::CancelSignIn => {
             if let Some((_, cancel)) = b.handoff.take() {
                 let _ = cancel.send(());
             }
-            b.stop_connecting();
+            if b.connecting
+                .as_ref()
+                .is_some_and(|(_, _, m)| *m == Mode::Fresh)
+            {
+                b.stop_connecting();
+            }
             b.drop_pending_confirm();
         }
         Cmd::ConfirmAccount => {
             if let Some(pending) = b.pending_confirm.take() {
+                let origin = pending.connected.session.instance().origin().to_string();
+                let key = AccountKey::new(&origin, &pending.connected.user_id);
+                let known = key
+                    .as_ref()
+                    .is_some_and(|k| b.known.iter().any(|a| &a.key == k));
+                if !known && b.known.len() >= MAX_ACCOUNTS {
+                    b.pending_confirm = Some(pending);
+                    b.drop_pending_confirm();
+                    b.tell(Ev::NeedsSignIn {
+                        instance: Some(origin),
+                    });
+                    b.tell(Ev::SignInFailed(t!(
+                        "sign-in-too-many-accounts",
+                        max = MAX_ACCOUNTS
+                    )));
+                    return;
+                }
                 b.install(pending.connected, true, !pending.from_handoff);
             }
         }
@@ -154,7 +265,7 @@ pub(super) fn handle(b: &mut Backend, cmd: Cmd) {
             if let Some(pending) = b.pending_confirm.take() {
                 let instance = pending.connected.session.instance().origin().to_string();
                 if pending.from_handoff {
-                    let events = b.events.clone();
+                    let events = b.global.clone();
                     b.spawn_guarded("reject account", None, async move {
                         if !session::revoke(&pending.connected.session).await {
                             let _ =
@@ -162,15 +273,21 @@ pub(super) fn handle(b: &mut Backend, cmd: Cmd) {
                         }
                     });
                 }
-                b.emit(Ev::NeedsSignIn {
+                b.tell(Ev::NeedsSignIn {
                     instance: Some(instance),
                 });
             }
         }
-        Cmd::SignOut => b.sign_out(),
+        Cmd::SignOut(Some(key)) if !b.is_current(&key) => b.remove_account(key),
+        Cmd::SignOut(_) => b.sign_out(),
+        Cmd::RemoveAccount(key) => b.remove_account(key),
+        Cmd::SwitchAccount(key) => b.switch_account(key),
         Cmd::ForgetStored => b.forget_stored(),
-        Cmd::Reconnect => {
+        Cmd::Reconnect(key) => {
             if let Some(Active::Real(r)) = &mut b.active {
+                if key.as_ref().is_some_and(|k| k != &r.key) {
+                    return;
+                }
                 if let Some(t) = r.restart_timer.take() {
                     t.abort();
                 }
@@ -199,6 +316,22 @@ pub(super) fn handle(b: &mut Backend, cmd: Cmd) {
 }
 
 impl Backend {
+    /// Whether `key` is the account the backend is showing: the active one, or (with no
+    /// active account) one that is starting or offline rather than in the background.
+    fn is_current(&self, key: &AccountKey) -> bool {
+        match &self.active {
+            Some(Active::Real(r)) => &r.key == key,
+            #[cfg(feature = "demo")]
+            Some(Active::Demo(_)) => true,
+            None => !self.background.iter().any(|r| &r.key == key),
+        }
+    }
+
+    /// Sends an untagged event of this domain (sign-in, the account list, the switch).
+    pub(super) fn tell(&self, ev: Ev) {
+        let _ = self.global.unbounded_send(ev);
+    }
+
     pub(super) fn restore(&mut self) {
         #[cfg(feature = "demo")]
         if std::env::var_os("INLET_DEMO").is_some() {
@@ -209,76 +342,107 @@ impl Backend {
                     .and_then(|c| crate::theme::parse_hex(&c)),
             );
             self.active = Some(Active::Demo(crate::demo::MockSession::start(
-                self.events.clone(),
+                self.global.clone(),
             )));
             super::media::demo_started(self);
             return;
         }
-        let events = self.events.clone();
+        let store = self.store.clone();
         let internal = self.internal.clone();
         self.attempt += 1;
         let attempt = self.attempt;
         let task = self.spawn_guarded("restore", None, async move {
-            let stored = tokio::task::spawn_blocking(|| {
-                let instance = token_store::last_instance()?;
-                match token_store::load_session(&instance) {
-                    Ok(stored) => Some((instance, stored)),
-                    Err(err) => {
-                        log::warn!("keychain read failed: {err:#}");
-                        Some((instance, None))
-                    }
-                }
-            })
-            .await
-            .ok()
-            .flatten();
-            match stored {
-                Some((instance, Some(token_store::StoredSession { pins: None, .. }))) => {
-                    // Written before endpoint pinning: never start without pins.
-                    let inst = instance.clone();
-                    let _ =
-                        tokio::task::spawn_blocking(move || token_store::delete_token(&inst)).await;
-                    let _ = events.unbounded_send(Ev::NeedsSignIn {
-                        instance: Some(instance),
-                    });
-                    let _ = events.unbounded_send(Ev::SignInFailed(t!("sign-in-again-for-pins")));
-                }
-                Some((
-                    instance,
-                    Some(token_store::StoredSession {
-                        token,
-                        pins: Some(pins),
-                        pasted,
-                    }),
-                )) => {
-                    let _ = events.unbounded_send(Ev::Starting {
-                        instance: instance.clone(),
-                    });
-                    let credential = Credential::Stored {
-                        token,
-                        pins,
-                        pasted,
-                    };
-                    let result = connect_task(&instance, None, credential.clone()).await;
-                    let _ = internal.send(Internal::Connected {
-                        attempt,
-                        mode: Mode::Restore,
-                        instance,
-                        credential,
-                        result,
-                    });
-                }
-                Some((instance, None)) => {
-                    let _ = events.unbounded_send(Ev::NeedsSignIn {
-                        instance: Some(instance),
-                    });
-                }
-                None => {
-                    let _ = events.unbounded_send(Ev::NeedsSignIn { instance: None });
-                }
-            }
+            let mut accounts = store.lock().await;
+            accounts.restore_all().await;
+            let list = accounts.list();
+            let (restored, legacy) = accounts.take_restored();
+            drop(accounts);
+            let last_instance = tokio::task::spawn_blocking(crate::token_store::last_instance)
+                .await
+                .ok()
+                .flatten();
+            let _ = internal.send(Internal::Restored {
+                attempt,
+                restored,
+                legacy,
+                list,
+                last_instance,
+            });
         });
         self.connecting = Some((attempt, task, Mode::Restore));
+    }
+
+    /// The stored accounts are read: the active one connects now, the others later.
+    fn on_restored(
+        &mut self,
+        restored: Vec<Restored>,
+        legacy: Option<Legacy>,
+        list: Vec<AccountInfo>,
+        last_instance: Option<String>,
+    ) {
+        self.connecting = None;
+        self.set_known(list);
+        // An older Inlet's entry that is not moved yet connects first: its user is only
+        // known after `me()`, and then it is moved. The listed accounts follow in the
+        // background.
+        let (first, later) = match &legacy {
+            Some(_) => (
+                None,
+                restored
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, r)| (r, STARTUP_STAGGER * (i as u32 + 1)))
+                    .collect(),
+            ),
+            None => startup_plan(restored),
+        };
+        for (r, delay) in later {
+            self.start_background(r, delay, 0);
+        }
+        match (first, legacy) {
+            // Already running (start-up asked for again): nothing to start.
+            (Some(r), _) if self.engine_of(&r.key).is_some() => {}
+            (Some(r), _) => {
+                let instance = r.key.origin.to_string();
+                let credential = Credential::Stored {
+                    token: r.token,
+                    pins: r.pins,
+                    pasted: r.pasted,
+                };
+                let restore = Some(Restore::Account(r.key));
+                self.start_connect(instance, None, credential, Mode::Restore, restore);
+            }
+            (None, Some(l)) => {
+                let credential = Credential::Stored {
+                    token: l.token,
+                    pins: l.pins,
+                    pasted: l.pasted,
+                };
+                let restore = Some(Restore::Legacy(l.origin.clone()));
+                self.start_connect(l.origin, None, credential, Mode::Restore, restore);
+            }
+            (None, None) => self.tell(Ev::NeedsSignIn {
+                instance: last_instance,
+            }),
+        }
+    }
+
+    fn set_known(&mut self, list: Vec<AccountInfo>) {
+        self.known = list.clone();
+        self.tell(Ev::Accounts(list));
+    }
+
+    /// Runs a task on the stored accounts after every store task started before it, so
+    /// keychain and list writes happen in the order the backend asked for them (a
+    /// sign-out after a restore removes what the restore stored, never the other way).
+    fn store_job(&mut self, job: impl std::future::Future<Output = ()> + Send + 'static) {
+        let previous = self.store_tail.take();
+        self.store_tail = Some(tokio::spawn(async move {
+            if let Some(previous) = previous {
+                let _ = previous.await;
+            }
+            job.await;
+        }));
     }
 
     /// Stops waiting for a connect. A restore is aborted. A new sign-in is left to finish
@@ -298,12 +462,13 @@ impl Backend {
         discovered: Option<p::Instance>,
         credential: Credential,
         mode: Mode,
+        restore: Option<Restore>,
     ) {
         self.stop_connecting();
         self.attempt += 1;
         let attempt = self.attempt;
         if mode == Mode::Restore {
-            self.emit(Ev::Starting {
+            self.tell(Ev::Starting {
                 instance: instance.clone(),
             });
         }
@@ -315,6 +480,7 @@ impl Backend {
                 mode,
                 instance,
                 credential,
+                restore,
                 result,
             });
         });
@@ -329,7 +495,7 @@ impl Backend {
         let id = self.handoff_seq;
         let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
         self.handoff = Some((id, cancel_tx));
-        let events = self.events.clone();
+        let events = self.global.clone();
         let internal = self.internal.clone();
         self.spawn_guarded("handoff", None, async move {
             let started = match session::discover(&instance).await {
@@ -361,11 +527,24 @@ impl Backend {
 
     pub(super) fn internal(&mut self, msg: Internal) {
         match msg {
+            Internal::Restored {
+                attempt,
+                restored,
+                legacy,
+                list,
+                last_instance,
+            } => {
+                if self.connecting.as_ref().map(|(a, _, _)| *a) == Some(attempt) {
+                    self.on_restored(restored, legacy, list, last_instance);
+                }
+            }
+            Internal::ListChanged(list) => self.set_known(list),
             Internal::Connected {
                 attempt,
                 mode,
                 instance,
                 credential,
+                restore,
                 result,
             } => {
                 if self.connecting.as_ref().map(|(a, _, _)| *a) != Some(attempt) {
@@ -384,7 +563,7 @@ impl Backend {
                 match result {
                     Ok(connected) if mode == Mode::Fresh => {
                         let from_handoff = matches!(credential, Credential::SignedIn(_));
-                        self.emit(Ev::ConfirmAccount {
+                        self.tell(Ev::ConfirmAccount {
                             display_name: connected.username.clone(),
                             account: connected.account.clone(),
                             instance: connected.session.instance().origin().to_string(),
@@ -395,24 +574,83 @@ impl Backend {
                             from_handoff,
                         });
                     }
-                    Ok(connected) => {
-                        let pasted = credential.is_pasted();
-                        // An entry stored before the media pin existed gets it now, right
-                        // after `me()` worked, so the media host is pinned from here on.
-                        let upgrade = match &credential {
-                            Credential::Stored { token, pins, .. } => {
-                                upgraded_pins(pins, &connected.session.session_pins())
-                                    .map(|pins| (token.clone(), pins))
-                            }
-                            _ => None,
-                        };
-                        let origin = connected.session.instance().origin().to_string();
-                        self.install(connected, false, pasted);
-                        if let Some((token, pins)) = upgrade {
-                            self.save_upgraded_pins(origin, token, pins, pasted);
-                        }
+                    Ok(connected) => self.restored_connected(connected, credential, restore),
+                    Err(failure) => {
+                        self.connect_failed(failure, mode, instance, credential, restore)
                     }
-                    Err(failure) => self.connect_failed(failure, mode, instance, credential),
+                }
+            }
+            Internal::BackgroundReady { key, result } => {
+                let Some(start) = self.starts.remove(&key) else {
+                    // Switched to, signed out or replaced meanwhile.
+                    return;
+                };
+                match result {
+                    Ok(session) => self.install_background(start.restored, session),
+                    Err(failure) if failure.kind == FailureKind::SessionEnded => {
+                        self.forget_account(key.clone(), false);
+                        self.tell(Ev::AccountRemoved {
+                            key,
+                            message: Some(failure.message),
+                        });
+                    }
+                    Err(_) => {
+                        let failures = start.failures + 1;
+                        let delay = Duration::from_secs(backoff_secs(failures));
+                        self.start_background(start.restored, delay, failures);
+                    }
+                }
+            }
+            Internal::ForegroundLoaded(restored) => match restored {
+                // Only the account last switched to (a later switch wins).
+                Some(r)
+                    if self.active.is_none()
+                        && self.connecting.is_none()
+                        && self.switch_target.as_ref() == Some(&r.key) =>
+                {
+                    self.start_foreground(r)
+                }
+                Some(_) => {}
+                None => self.tell(Ev::NeedsSignIn { instance: None }),
+            },
+            Internal::NewerEntry {
+                key,
+                old,
+                old_pasted,
+            } => {
+                let was_active = matches!(&self.active, Some(Active::Real(r)) if r.key == key);
+                // Its gateway stops first, so ending the older token cannot read as the end
+                // of the account (that would remove the newer entry).
+                self.drop_engine(&key);
+                if should_revoke(old_pasted) {
+                    self.spawn_guarded("revoke older token", None, async move {
+                        session::revoke(&old).await;
+                    });
+                }
+                if was_active {
+                    self.switch_target = Some(key.clone());
+                }
+                let store = self.store.clone();
+                let internal = self.internal.clone();
+                self.store_job(async move {
+                    let restored = store.lock().await.load(&key).await;
+                    let _ = internal.send(if was_active {
+                        Internal::ForegroundLoaded(restored)
+                    } else {
+                        Internal::BackgroundLoaded(restored)
+                    });
+                });
+            }
+            Internal::BackgroundLoaded(restored) => {
+                if let Some(r) = restored {
+                    self.start_background(r, Duration::ZERO, 0);
+                }
+            }
+            Internal::Forgotten => {
+                if self.known.is_empty() {
+                    self.tell(Ev::NeedsSignIn { instance: None });
+                } else {
+                    self.restore();
                 }
             }
             Internal::HandoffDone { id, result } => {
@@ -427,6 +665,7 @@ impl Backend {
                             Some(inst),
                             Credential::SignedIn(signed_in),
                             Mode::Fresh,
+                            None,
                         );
                     }
                     Ok((inst, signed_in)) => {
@@ -437,42 +676,19 @@ impl Backend {
                     }
                     Err(message) if current => {
                         self.handoff = None;
-                        self.emit(Ev::SignInFailed(message));
+                        self.tell(Ev::SignInFailed(message));
                     }
                     Err(_) => {}
                 }
             }
-            Internal::Ended { gen, message } => {
-                if !same_session(self.active_gen(), gen) {
-                    return;
-                }
-                if let Some(Active::Real(r)) = self.active.take() {
-                    self.teardown(&r);
-                    let instance = r.session.instance().origin().to_string();
-                    let events = self.events.clone();
-                    self.spawn_guarded("forget token", None, async move {
-                        let deleted = tokio::task::spawn_blocking(move || {
-                            token_store::delete_token(&instance)
-                        })
-                        .await
-                        .map(|r| r.is_ok())
-                        .unwrap_or(false);
-                        let message = if deleted {
-                            message
-                        } else {
-                            t!("session-ended-not-deleted", message = message)
-                        };
-                        let _ = events.unbounded_send(Ev::SessionEnded(message));
-                    });
-                }
-            }
+            Internal::Ended { gen, message } => self.session_ended(gen, message),
             Internal::GatewayEnded { gen, end } => {
-                if !same_session(self.active_gen(), gen) {
+                if self.engine(gen).is_none() {
                     return;
                 }
                 let stop = match end {
                     GatewayEnd::SessionEnded(message) => {
-                        return self.internal(Internal::Ended { gen, message });
+                        return self.session_ended(gen, message);
                     }
                     GatewayEnd::Terminal(message) if message.is_empty() => return,
                     GatewayEnd::Terminal(message) => Stop::Terminal(message),
@@ -481,38 +697,118 @@ impl Backend {
                 self.gateway_stopped(gen, stop);
             }
             Internal::GatewayConnected { gen } => {
-                if let Some(Active::Real(r)) = &mut self.active {
-                    if r.gen == gen {
-                        r.policy.connected();
-                    }
+                if let Some(r) = self.engine_mut(gen) {
+                    r.policy.connected();
                 }
             }
             Internal::GatewayRestart { gen } => {
-                if same_session(self.active_gen(), gen) {
-                    self.restart_gateway();
+                if self.engine(gen).is_some() {
+                    self.restart_gateway(gen);
                 }
             }
             Internal::Retry { attempt } => {
                 if let Some(off) = &self.offline {
                     if self.attempt == attempt {
-                        let (instance, credential) = (off.instance.clone(), off.credential.clone());
-                        self.start_connect(instance, None, credential, Mode::Restore);
+                        let (instance, credential, restore) = (
+                            off.instance.clone(),
+                            off.credential.clone(),
+                            off.restore.clone(),
+                        );
+                        self.start_connect(instance, None, credential, Mode::Restore, restore);
                     }
                 }
             }
             Internal::TaskPanicked { what, gateway_of } => {
-                self.emit(Ev::Error(t!("error-task-panicked", what = what)));
+                self.tell(Ev::Error(t!("error-task-panicked", what = what)));
                 if let Some(gen) = gateway_of {
-                    if same_session(self.active_gen(), gen) {
+                    if self.engine(gen).is_some() {
                         self.gateway_stopped(gen, Stop::Panicked);
                     }
                 }
                 if what == "connect" || what == "restore" {
                     self.connecting = None;
-                    self.emit(Ev::NeedsSignIn { instance: None });
+                    self.tell(Ev::NeedsSignIn { instance: None });
                 }
             }
         }
+    }
+
+    /// A stored session checked out: it becomes the active account. An older Inlet's
+    /// entry is moved to the account's own entry now that its user is known.
+    fn restored_connected(
+        &mut self,
+        connected: session::Connected,
+        credential: Credential,
+        restore: Option<Restore>,
+    ) {
+        let pasted = credential.is_pasted();
+        // An entry stored before the media pin existed gets it now, right after `me()`
+        // worked, so the media host is pinned from here on.
+        let upgrade = match &credential {
+            Credential::Stored { token, pins, .. } => {
+                upgraded_pins(pins, &connected.session.session_pins())
+                    .map(|pins| (token.clone(), pins))
+            }
+            _ => None,
+        };
+        let session = connected.session.clone();
+        let (name, handle) = (connected.username.clone(), connected.account.clone());
+        // A stored token must belong to the account its entry is named after. Otherwise
+        // it is not used (fail closed); the entry stays, nothing is stored under another
+        // name.
+        if let Some(Restore::Account(expected)) = &restore {
+            let origin = session.instance().origin().to_string();
+            if AccountKey::new(&origin, &connected.user_id).as_ref() != Some(expected) {
+                log::warn!("a stored token belongs to another account than its entry");
+                if !self.promote_next() {
+                    self.tell(Ev::NeedsSignIn {
+                        instance: Some(origin),
+                    });
+                    self.tell(Ev::SignInFailed(t!("error-account-mismatch")));
+                }
+                return;
+            }
+        }
+        let Some(key) = self.install(connected, false, pasted) else {
+            return;
+        };
+        if let Some(Restore::Legacy(origin)) = &restore {
+            // Until the move is done, signing this account out also removes the old
+            // entry.
+            if let Some(Active::Real(r)) = &mut self.active {
+                r.legacy = Some(origin.clone());
+            }
+        }
+        let store = self.store.clone();
+        let internal = self.internal.clone();
+        self.store_job(async move {
+            let mut accounts = store.lock().await;
+            if let Some(Restore::Legacy(origin)) = restore {
+                let info = AccountInfo {
+                    key: key.clone(),
+                    name,
+                    handle,
+                };
+                let migrated = accounts
+                    .migrate(&origin, info, session.clone(), pasted)
+                    .await;
+                if migrated.listed() {
+                    let _ = internal.send(Internal::ListChanged(accounts.list()));
+                }
+                if migrated == Migrated::Newer {
+                    let _ = internal.send(Internal::NewerEntry {
+                        key: key.clone(),
+                        old: session,
+                        old_pasted: pasted,
+                    });
+                }
+            } else {
+                accounts.remember_session(key.clone(), session, pasted);
+                if let Some((token, pins)) = upgrade {
+                    accounts.update_pins(&key, token, pins, pasted).await;
+                }
+            }
+        });
     }
 
     pub(super) fn connect_failed(
@@ -521,19 +817,34 @@ impl Backend {
         mode: Mode,
         instance: String,
         credential: Credential,
+        restore: Option<Restore>,
     ) {
         match (mode, failure.kind) {
             (Mode::Restore, FailureKind::SessionEnded) => {
                 self.offline = None;
-                let inst = instance.clone();
-                self.spawn_guarded("forget token", None, async move {
-                    let _ =
-                        tokio::task::spawn_blocking(move || token_store::delete_token(&inst)).await;
-                });
-                self.emit(Ev::NeedsSignIn {
+                match restore {
+                    Some(Restore::Account(key)) => {
+                        self.forget_account(key.clone(), false);
+                        if self.promote_next() {
+                            self.tell(Ev::AccountRemoved {
+                                key,
+                                message: Some(failure.message),
+                            });
+                            return;
+                        }
+                    }
+                    Some(Restore::Legacy(origin)) => {
+                        let store = self.store.clone();
+                        self.store_job(async move {
+                            store.lock().await.forget_legacy(&origin, false).await;
+                        });
+                    }
+                    None => {}
+                }
+                self.tell(Ev::NeedsSignIn {
                     instance: Some(instance),
                 });
-                self.emit(Ev::SignInFailed(failure.message));
+                self.tell(Ev::SignInFailed(failure.message));
             }
             (Mode::Restore, _) => {
                 // Not an auth failure: keep the token and try again later.
@@ -549,98 +860,112 @@ impl Backend {
                 self.offline = Some(Offline {
                     instance: instance.clone(),
                     credential,
+                    restore,
                     failures,
                     timer: Some(timer),
                 });
-                self.emit(Ev::Offline {
+                self.tell(Ev::Offline {
                     instance,
                     message: failure.message,
                     retry_in_secs: wait,
                 });
             }
-            (Mode::Fresh, _) => self.emit(Ev::SignInFailed(failure.message)),
+            (Mode::Fresh, _) => self.tell(Ev::SignInFailed(failure.message)),
         }
     }
 
-    /// Makes a checked session the active one: starts the gateway and, for a confirmed
-    /// new sign-in, stores the token with its endpoint pins, ending an older stored token
-    /// for the same instance.
-    pub(super) fn install(&mut self, connected: session::Connected, save: bool, pasted: bool) {
-        if let Some(Active::Real(old)) = self.active.take() {
-            self.teardown(&old);
-        }
+    /// Makes a checked session the active account: starts its gateway and, for a
+    /// confirmed new sign-in, stores the token with its endpoint pins (ending an older
+    /// stored token of the same account). The account that was active stays signed in,
+    /// in the background. Returns the account, or `None` when the server's user ID is
+    /// not usable.
+    pub(super) fn install(
+        &mut self,
+        connected: session::Connected,
+        save: bool,
+        pasted: bool,
+    ) -> Option<AccountKey> {
+        let session = connected.session;
+        let instance = session.instance().origin().to_string();
+        let Some(key) = AccountKey::new(&instance, &connected.user_id) else {
+            // Leaves the start-up or "Finishing" screen for the sign-in form.
+            self.tell(Ev::NeedsSignIn {
+                instance: Some(instance),
+            });
+            self.tell(Ev::SignInFailed(t!("error-account-id")));
+            return None;
+        };
+        // Signed in again to an account that is already here: its old session goes.
+        self.drop_engine(&key);
+        self.demote_active();
         self.offline = None;
         let gen = self.next_gen;
         self.next_gen += 1;
-        let session = connected.session;
-        let instance = session.instance().origin().to_string();
+        let events = self.global.for_account(key.clone());
+        let foreground = Arc::new(AtomicBool::new(true));
+        let composer = super::composer::State::default();
         let guilds = Arc::new(Mutex::new(connected.guilds.clone()));
         let cache: ChannelCache = Arc::default();
-        // Instance branding: its accent colour, as Fluxer's own client applies it.
-        let accent = session
-            .instance()
-            .discovery()
-            .app_public
-            .get("branding")
-            .and_then(|b| b.get("theme_color"))
-            .and_then(|c| c.as_str())
-            .and_then(crate::theme::parse_hex);
-        crate::theme::set_accent(accent);
         let names: SharedNames = Arc::default();
-        let (gateway, forward) = self.spawn_gateway(gen, &session, &guilds, &cache, &names);
-        let mut policy = ReconnectPolicy::default();
-        policy.started(Instant::now());
-
-        self.emit(Ev::SignedIn {
-            username: connected.username,
+        apply_accent(&session);
+        // The UI learns which account is active before any of its events.
+        self.tell(Ev::SignedIn {
+            key: key.clone(),
+            username: connected.username.clone(),
             instance: instance.clone(),
         });
-        self.emit(messages::Ev::Guilds(connected.guilds));
-        super::media::session_started(self, &session);
+        let (gateway, forward) = self.spawn_gateway(
+            gen,
+            &session,
+            &guilds,
+            &cache,
+            &names,
+            &events,
+            &foreground,
+            &composer,
+            false,
+        );
+        let mut policy = ReconnectPolicy::default();
+        policy.started(Instant::now());
+        let _ = events.unbounded_send(messages::Ev::Guilds(connected.guilds));
 
         if save {
-            let token = session.token().clone();
-            let pins = session.session_pins();
-            let old_instance = session.instance().clone();
-            let events = self.events.clone();
-            // Not guarded through spawn_guarded: sign-out needs the JoinHandle to wait on.
-            self.saving = Some(tokio::spawn(async move {
-                let inst = instance.clone();
-                let stored = tokio::task::spawn_blocking(move || {
-                    // An older pasted token is only forgotten (overwritten), never revoked.
-                    let old = token_store::load_session(&inst)
-                        .ok()
-                        .flatten()
-                        .filter(|s| should_revoke(s.pasted))
-                        .and_then(|s| Some((s.token, s.pins?)));
-                    let saved = token_store::save_session(&inst, &token, &pins, pasted);
-                    if saved.is_ok() {
-                        token_store::set_last_instance(&inst);
+            let signed_in = SignedIn {
+                session: session.clone(),
+                user_id: key.user_id,
+                name: connected.username.clone(),
+                handle: connected.account.clone(),
+            };
+            let store = self.store.clone();
+            let internal = self.internal.clone();
+            let global = self.global.clone();
+            // Through the store's lock: a sign-out right after waits for this write, so
+            // it cannot store a token that sign-out is about to end.
+            self.store_job(async move {
+                let mut accounts = store.lock().await;
+                match accounts.add(signed_in, pasted).await {
+                    Ok(_) => {
+                        let _ = internal.send(Internal::ListChanged(accounts.list()));
                     }
-                    (old.filter(|(o, _)| o != &token), saved)
-                })
-                .await;
-                match stored {
-                    Ok((old, Ok(()))) => {
-                        // An older token for this instance would otherwise live on forever.
-                        if let Some((old, old_pins)) = old {
-                            if let Ok(old_session) =
-                                p::Session::from_token_session_pinned(old_instance, old, &old_pins)
-                            {
-                                session::revoke(&old_session).await;
-                            }
-                        }
-                    }
-                    _ => {
-                        let _ = events.unbounded_send(Ev::Error(t!("error-keychain-refused")));
+                    Err(_) => {
+                        let _ = global.unbounded_send(Ev::Error(t!("error-keychain-refused")));
                     }
                 }
-            }));
+            });
         }
 
+        self.events = events.clone();
+        self.session_activated(&session);
         self.active = Some(Active::Real(RealActive {
             gen,
-            pasted,
+            key: key.clone(),
+            name: connected.username,
+            events,
+            foreground,
+            ignores_typing: false,
+            legacy: None,
+            down: false,
+            composer,
             session,
             gateway,
             forward,
@@ -652,11 +977,307 @@ impl Backend {
             restart_timer: None,
             settings_writes: Vec::new(),
         }));
+        Some(key)
     }
 
-    pub(super) fn teardown(&mut self, r: &RealActive) {
-        // Uploads never go on into another session.
-        self.uploads.cancel_all();
+    /// Starts a stored account in the background after `delay`: discovery, the session
+    /// with its stored pins, then its gateway (in [`Backend::install_background`]).
+    /// No REST call with the token.
+    pub(super) fn start_background(&mut self, restored: Restored, delay: Duration, failures: u32) {
+        let key = restored.key.clone();
+        if self.engine_of(&key).is_some() {
+            return;
+        }
+        let internal = self.internal.clone();
+        let origin = key.origin.to_string();
+        let (token, pins) = (restored.token.clone(), restored.pins.clone());
+        let task_key = key.clone();
+        let task = self.spawn_guarded("background start", None, async move {
+            tokio::time::sleep(delay).await;
+            let result = match session::discover(&origin).await {
+                Ok(inst) => {
+                    p::Session::from_token_session_pinned(inst, token, &pins).map_err(Failure::from)
+                }
+                Err(err) => Err(err),
+            };
+            let _ = internal.send(Internal::BackgroundReady {
+                key: task_key,
+                result,
+            });
+        });
+        if let Some(old) = self.starts.insert(
+            key,
+            PendingStart {
+                restored,
+                task,
+                due: tokio::time::Instant::now() + delay,
+                failures,
+            },
+        ) {
+            old.task.abort();
+        }
+    }
+
+    /// A background account's session is ready: its gateway starts, passive.
+    fn install_background(&mut self, restored: Restored, session: p::Session) {
+        let key = restored.key;
+        if self.engine_of(&key).is_some() {
+            return;
+        }
+        let gen = self.next_gen;
+        self.next_gen += 1;
+        let events = self.global.for_account(key.clone());
+        let foreground = Arc::new(AtomicBool::new(false));
+        let composer = super::composer::State::default();
+        let guilds = Arc::new(Mutex::new(Vec::new()));
+        let cache: ChannelCache = Arc::default();
+        let names: SharedNames = Arc::default();
+        let (gateway, forward) = self.spawn_gateway(
+            gen,
+            &session,
+            &guilds,
+            &cache,
+            &names,
+            &events,
+            &foreground,
+            &composer,
+            true,
+        );
+        let mut policy = ReconnectPolicy::default();
+        policy.started(Instant::now());
+        let name = self
+            .known
+            .iter()
+            .find(|a| a.key == key)
+            .map(|a| a.name.clone())
+            .unwrap_or_default();
+        let store = self.store.clone();
+        let (k, s, pasted) = (key.clone(), session.clone(), restored.pasted);
+        self.store_job(async move {
+            store.lock().await.remember_session(k, s, pasted);
+        });
+        self.background.push(RealActive {
+            gen,
+            key,
+            name,
+            events,
+            foreground,
+            ignores_typing: true,
+            legacy: None,
+            down: false,
+            composer,
+            session,
+            gateway,
+            forward,
+            guilds,
+            cache,
+            names,
+            active_guild: None,
+            policy,
+            restart_timer: None,
+            settings_writes: Vec::new(),
+        });
+    }
+
+    /// The account with this key that has a session (active or background).
+    fn engine_of(&self, key: &AccountKey) -> Option<&RealActive> {
+        match &self.active {
+            Some(Active::Real(r)) if &r.key == key => Some(r),
+            _ => self.background.iter().find(|r| &r.key == key),
+        }
+    }
+
+    /// The active account goes to the background: its open guild is made passive (the
+    /// one Lazy Request it sends, so a reconnect does not make it active again), the
+    /// requests of what was on screen stop, and its events are no longer rendered.
+    pub(super) fn demote_active(&mut self) {
+        match self.active.take() {
+            Some(Active::Real(mut r)) => {
+                r.foreground.store(false, Ordering::Relaxed);
+                if let Some(guild) = r.active_guild.take() {
+                    r.gateway.set_guild_active(&guild, false);
+                }
+                for t in r.settings_writes.drain(..) {
+                    t.abort();
+                }
+                self.stop_screen_tasks();
+                // Uploads never go on behind another account.
+                self.stop_uploads(&r);
+                self.background.push(r);
+            }
+            #[cfg(feature = "demo")]
+            Some(Active::Demo(m)) => {
+                self.active = Some(Active::Demo(m));
+                return;
+            }
+            None => {}
+        }
+        self.events = self.global.clone();
+    }
+
+    /// Makes a background account the active one. Its gateway starts again once with
+    /// typing events when it was started in the background (or is down).
+    fn promote(&mut self, key: &AccountKey) -> bool {
+        let Some(ix) = self.background.iter().position(|r| &r.key == key) else {
+            return false;
+        };
+        self.demote_active();
+        // `demote_active` pushed the old active account at the end: `ix` still holds.
+        let mut r = self.background.remove(ix);
+        r.foreground.store(true, Ordering::Relaxed);
+        apply_accent(&r.session);
+        self.tell(Ev::SignedIn {
+            key: r.key.clone(),
+            username: r.name.clone(),
+            instance: r.session.instance().origin().to_string(),
+        });
+        let restart = r.ignores_typing || r.down;
+        let gen = r.gen;
+        // A gateway that is down waits the spacing of "Reconnect", so a quick switch back
+        // and forth to an account whose gateway keeps failing does not identify on every
+        // click. A healthy one started for the background starts again at once, only to
+        // get typing events (no status line, no spacing).
+        let wait = if r.down {
+            r.policy.manual(Instant::now())
+        } else {
+            Duration::ZERO
+        };
+        let guilds = r.guilds.lock().unwrap().clone();
+        self.events = r.events.clone();
+        self.session_activated(&r.session);
+        self.active = Some(Active::Real(r));
+        if restart && wait.is_zero() {
+            self.restart_gateway(gen);
+        } else if restart {
+            let _ = self
+                .events
+                .unbounded_send(Ev::Status(t!("status-reconnecting")));
+            self.schedule_restart(gen, wait);
+        }
+        let _ = self.events.unbounded_send(messages::Ev::Guilds(guilds));
+        let store = self.store.clone();
+        let key = key.clone();
+        self.store_job(async move {
+            let mut accounts = store.lock().await;
+            accounts.set_active(&key);
+            accounts.save().await;
+        });
+        true
+    }
+
+    /// What every account needs when it becomes the active one, however it got there
+    /// (sign-in, start-up, switch): the image client for its own media endpoint, sent
+    /// with its tag so the UI never keeps the previous account's.
+    fn session_activated(&self, session: &p::Session) {
+        super::media::session_started(self, session);
+    }
+
+    /// Makes `key` the active account: a connected one at once, a stored one that is not
+    /// connected yet by connecting it now (start-up screens as for the first account).
+    pub(super) fn switch_account(&mut self, key: AccountKey) {
+        #[cfg(feature = "demo")]
+        if let Some(Active::Demo(m)) = &mut self.active {
+            m.switch(&key);
+            // The UI let go of its image client at the switch.
+            super::media::demo_started(self);
+            return;
+        }
+        if let Some(Active::Real(r)) = &self.active {
+            if r.key == key {
+                self.tell(Ev::SignedIn {
+                    key,
+                    username: r.name.clone(),
+                    instance: r.session.instance().origin().to_string(),
+                });
+                return;
+            }
+        }
+        if self.connecting.is_some() {
+            log::info!("account switch while connecting; ignored");
+            // The UI has switched already: tell it which account is really active.
+            if let Some(Active::Real(r)) = &self.active {
+                self.tell(Ev::SignedIn {
+                    key: r.key.clone(),
+                    username: r.name.clone(),
+                    instance: r.session.instance().origin().to_string(),
+                });
+            }
+            return;
+        }
+        self.switch_target = Some(key.clone());
+        if self.promote(&key) {
+            return;
+        }
+        if let Some(start) = self.starts.remove(&key) {
+            start.task.abort();
+            self.demote_active();
+            self.start_foreground(start.restored);
+            return;
+        }
+        if self.known.iter().any(|a| a.key == key) {
+            // Stored but not running (its start was cancelled): read it again.
+            self.demote_active();
+            let store = self.store.clone();
+            let internal = self.internal.clone();
+            self.store_job(async move {
+                let restored = store.lock().await.load(&key).await;
+                let _ = internal.send(Internal::ForegroundLoaded(restored));
+            });
+            return;
+        }
+        log::warn!("switch to an account that is not signed in");
+    }
+
+    fn start_foreground(&mut self, r: Restored) {
+        let instance = r.key.origin.to_string();
+        let credential = Credential::Stored {
+            token: r.token,
+            pins: r.pins,
+            pasted: r.pasted,
+        };
+        let restore = Some(Restore::Account(r.key));
+        self.start_connect(instance, None, credential, Mode::Restore, restore);
+    }
+
+    /// After the active account left: the first connected background account becomes
+    /// active. Returns whether there was one.
+    fn promote_connected(&mut self) -> bool {
+        match self.background.first().map(|r| r.key.clone()) {
+            Some(key) => self.promote(&key),
+            None => false,
+        }
+    }
+
+    /// Like [`Backend::promote_connected`], or else a stored account that is still
+    /// waiting for its background start, connected now.
+    fn promote_next(&mut self) -> bool {
+        if self.promote_connected() {
+            return true;
+        }
+        let Some(key) = self.starts.keys().min().cloned() else {
+            return false;
+        };
+        if let Some(start) = self.starts.remove(&key) {
+            start.task.abort();
+            self.start_foreground(start.restored);
+            return true;
+        }
+        false
+    }
+
+    /// Stops the requests for what the active account has on screen.
+    fn stop_screen_tasks(&mut self) {
+        for task in [self.open_guild.take(), self.open_channel.take()]
+            .into_iter()
+            .flatten()
+        {
+            task.abort();
+        }
+        self.older = Default::default();
+    }
+
+    /// Stops an account's gateway and its tasks.
+    fn close_engine(r: &RealActive) {
         r.gateway.close();
         r.forward.abort();
         if let Some(t) = &r.restart_timer {
@@ -665,11 +1286,81 @@ impl Backend {
         for t in &r.settings_writes {
             t.abort();
         }
-        for task in [self.open_guild.take(), self.open_channel.take()]
-            .into_iter()
-            .flatten()
-        {
-            task.abort();
+    }
+
+    /// Stops the active account (gateway, tasks and what is loading for the screen).
+    pub(super) fn teardown(&mut self, r: &RealActive) {
+        Self::close_engine(r);
+        self.stop_screen_tasks();
+        self.uploads.forget_gen(r.gen);
+    }
+
+    /// Stops an account wherever it runs or waits (active, background, waiting start).
+    fn drop_engine(&mut self, key: &AccountKey) {
+        if matches!(&self.active, Some(Active::Real(r)) if &r.key == key) {
+            if let Some(Active::Real(r)) = self.active.take() {
+                self.teardown(&r);
+            }
+            self.events = self.global.clone();
+        }
+        if let Some(ix) = self.background.iter().position(|r| &r.key == key) {
+            let r = self.background.remove(ix);
+            Self::close_engine(&r);
+            self.uploads.forget_gen(r.gen);
+        }
+        if let Some(start) = self.starts.remove(key) {
+            start.task.abort();
+        }
+    }
+
+    /// Removes an account from the store (ending its token on the server when `revoke`
+    /// is set and it was not pasted) and tells the UI the new list.
+    fn forget_account(&mut self, key: AccountKey, revoke: bool) {
+        let legacy = self.engine_of(&key).and_then(|r| r.legacy.clone());
+        self.forget_account_with(key, revoke, legacy);
+    }
+
+    /// [`Backend::forget_account`] for an account whose old entry (`legacy`, the
+    /// origin) is known.
+    fn forget_account_with(&mut self, key: AccountKey, revoke: bool, legacy: Option<String>) {
+        self.drop_engine(&key);
+        let store = self.store.clone();
+        let internal = self.internal.clone();
+        self.store_job(async move {
+            let mut accounts = store.lock().await;
+            accounts.remove(&key, revoke).await;
+            if let Some(origin) = legacy {
+                // The old entry of this account, not moved yet: it goes too (already
+                // ended with the live session above when that was allowed).
+                accounts.forget_legacy(&origin, false).await;
+            }
+            let _ = internal.send(Internal::ListChanged(accounts.list()));
+        });
+    }
+
+    /// The server ended session `gen` (token rejected or revoked).
+    fn session_ended(&mut self, gen: u64, message: String) {
+        let Some(r) = self.engine(gen) else {
+            return;
+        };
+        let key = r.key.clone();
+        let was_active = same_session(self.active_gen(), gen);
+        self.forget_account(key.clone(), false);
+        if !was_active {
+            self.tell(Ev::AccountRemoved {
+                key,
+                message: Some(message),
+            });
+            return;
+        }
+        if self.promote_next() {
+            self.tell(Ev::AccountRemoved {
+                key,
+                message: Some(message),
+            });
+        } else {
+            crate::theme::set_accent(None);
+            self.tell(Ev::SessionEnded(message));
         }
     }
 
@@ -685,57 +1376,29 @@ impl Backend {
         }
     }
 
-    /// Recovery-screen sign-out: no session is running. Ends the stored token on the
-    /// server if it can be reached within the timeouts, then removes it.
+    /// Recovery-screen sign-out: no session is running. Ends the active stored session on
+    /// the server if it can be reached within the timeouts, then removes it. The other
+    /// accounts start again afterwards.
     pub(super) fn forget_stored(&mut self) {
-        let events = self.events.clone();
-        self.spawn_guarded("forget stored", None, async move {
-            let stored = tokio::task::spawn_blocking(|| {
-                let instance = token_store::last_instance()?;
-                Some((
-                    instance.clone(),
-                    token_store::load_session(&instance).ok().flatten(),
-                ))
-            })
-            .await
-            .ok()
-            .flatten();
-            let Some((instance, stored)) = stored else {
-                let _ = events.unbounded_send(Ev::NeedsSignIn { instance: None });
-                return;
-            };
-            let mut told_server = false;
-            let mut forgotten_only = false;
-            if let Some(token_store::StoredSession { pasted: true, .. }) = &stored {
-                forgotten_only = true;
-            } else if let Some(token_store::StoredSession {
-                token,
-                pins: Some(pins),
-                ..
-            }) = stored
-            {
-                if let Ok(inst) = session::discover(&instance).await {
-                    if let Ok(session) = p::Session::from_token_session_pinned(inst, token, &pins) {
-                        told_server = session::revoke(&session).await;
-                    }
-                }
+        let store = self.store.clone();
+        let internal = self.internal.clone();
+        self.store_job(async move {
+            let mut accounts = store.lock().await;
+            accounts.restore_all().await;
+            let active = accounts.active().cloned();
+            let (_, legacy) = accounts.take_restored();
+            if let Some(key) = active {
+                accounts.remove(&key, true).await;
+            } else if let Some(legacy) = legacy {
+                accounts.forget_legacy(&legacy.origin, true).await;
             }
-            let inst = instance.clone();
-            let deleted = tokio::task::spawn_blocking(move || token_store::delete_token(&inst))
-                .await
-                .map(|r| r.is_ok())
-                .unwrap_or(false);
-            let _ = events.unbounded_send(Ev::NeedsSignIn {
-                instance: Some(instance),
-            });
-            if forgotten_only {
-                notice_forgotten(&events, deleted);
-            } else {
-                notice_sign_out(&events, told_server, deleted);
-            }
+            let _ = internal.send(Internal::ListChanged(accounts.list()));
+            let _ = internal.send(Internal::Forgotten);
         });
     }
 
+    /// Signs the active account out. Another signed-in account becomes active, or the
+    /// sign-in screen shows when there is none.
     pub(super) fn sign_out(&mut self) {
         self.stop_connecting();
         self.drop_pending_confirm();
@@ -747,91 +1410,65 @@ impl Backend {
             t.abort();
         }
         let active = self.active.take();
-        crate::theme::set_accent(None);
-        self.emit(Ev::SignedOut);
-        let events = self.events.clone();
-        // A keychain write still running must finish first, or it could store the token
-        // this sign-out is about to revoke.
-        let saving = self.saving.take();
-        match active {
+        self.events = self.global.clone();
+        let mut legacy = None;
+        let restore = match active {
             Some(Active::Real(r)) => {
                 // Close the gateway first, so the server's reaction to the revoked token
-                // cannot be read as "the session ended" (the generation also changed).
+                // cannot be read as "the session ended" (the session is gone as well).
                 self.teardown(&r);
-                let session = r.session.clone();
-                let pasted = r.pasted;
-                self.spawn_guarded("sign out", None, async move {
-                    if let Some(saving) = saving {
-                        let _ = saving.await;
-                    }
-                    if !should_revoke(pasted) {
-                        let instance = session.instance().origin().to_string();
-                        let deleted = tokio::task::spawn_blocking(move || {
-                            token_store::delete_token(&instance)
-                        })
-                        .await
-                        .map(|r| r.is_ok())
-                        .unwrap_or(false);
-                        notice_forgotten(&events, deleted);
-                        return;
-                    }
-                    let told_server = session::revoke(&session).await;
-                    let instance = session.instance().origin().to_string();
-                    let deleted =
-                        tokio::task::spawn_blocking(move || token_store::delete_token(&instance))
-                            .await
-                            .map(|r| r.is_ok())
-                            .unwrap_or(false);
-                    notice_sign_out(&events, told_server, deleted);
-                });
+                legacy = r.legacy.clone();
+                Some(Restore::Account(r.key.clone()))
             }
             #[cfg(feature = "demo")]
-            Some(Active::Demo(_)) => {}
-            None => {
-                if let Some(off) = offline {
-                    self.spawn_guarded("sign out", None, async move {
-                        if let Some(saving) = saving {
-                            let _ = saving.await;
-                        }
-                        let instance = off.instance.clone();
-                        if off.credential.is_pasted() {
-                            let deleted = tokio::task::spawn_blocking(move || {
-                                token_store::delete_token(&instance)
-                            })
-                            .await
-                            .map(|r| r.is_ok())
-                            .unwrap_or(false);
-                            notice_forgotten(&events, deleted);
-                            return;
-                        }
-                        let told_server = match session::discover(&off.instance).await {
-                            Ok(inst) => match &off.credential {
-                                Credential::Stored { token, pins, .. } => {
-                                    match p::Session::from_token_session_pinned(
-                                        inst,
-                                        token.clone(),
-                                        pins,
-                                    ) {
-                                        Ok(session) => session::revoke(&session).await,
-                                        Err(_) => false,
-                                    }
-                                }
-                                _ => false,
-                            },
-                            Err(_) => false,
-                        };
-                        let deleted = tokio::task::spawn_blocking(move || {
-                            token_store::delete_token(&instance)
-                        })
-                        .await
-                        .map(|r| r.is_ok())
-                        .unwrap_or(false);
-                        notice_sign_out(&events, told_server, deleted);
-                    });
-                }
+            Some(Active::Demo(_)) => None,
+            None => offline.and_then(|o| o.restore),
+        };
+        let gone = match restore {
+            Some(Restore::Account(key)) => {
+                self.forget_account_with(key.clone(), true, legacy);
+                Some(key)
             }
+            Some(Restore::Legacy(origin)) => {
+                let store = self.store.clone();
+                self.store_job(async move {
+                    store.lock().await.forget_legacy(&origin, true).await;
+                });
+                None
+            }
+            None => None,
+        };
+        if !self.promote_next() {
+            crate::theme::set_accent(None);
+            self.tell(Ev::SignedOut);
+        }
+        // Off the switcher and the tray at once, not only once the server was told.
+        if let Some(key) = gone {
+            self.tell(Ev::AccountRemoved { key, message: None });
         }
     }
+
+    /// Signs one account out from the account switcher.
+    fn remove_account(&mut self, key: AccountKey) {
+        if matches!(&self.active, Some(Active::Real(r)) if r.key == key) {
+            return self.sign_out();
+        }
+        self.forget_account(key.clone(), true);
+        self.tell(Ev::AccountRemoved { key, message: None });
+    }
+}
+
+/// The instance's accent colour (its branding), as Fluxer's own client applies it.
+fn apply_accent(session: &p::Session) {
+    let accent = session
+        .instance()
+        .discovery()
+        .app_public
+        .get("branding")
+        .and_then(|b| b.get("theme_color"))
+        .and_then(|c| c.as_str())
+        .and_then(crate::theme::parse_hex);
+    crate::theme::set_accent(accent);
 }
 
 /// The start-up checks for a token: discovery (unless done already), then `connect`.
@@ -855,39 +1492,13 @@ pub fn upgraded_pins(stored: &p::SessionPins, now: &p::SessionPins) -> Option<p:
     (stored.media.is_none() && now.media.is_some() && same_hosts).then(|| now.clone())
 }
 
-impl Backend {
-    /// Writes the upgraded pins of a restored session to its keychain entry. Runs as the
-    /// `saving` task, so a sign-out waits for it and cannot be undone by it.
-    fn save_upgraded_pins(
-        &mut self,
-        instance: String,
-        token: p::Token,
-        pins: p::SessionPins,
-        pasted: bool,
-    ) {
-        let previous = self.saving.take();
-        self.saving = Some(tokio::spawn(async move {
-            if let Some(previous) = previous {
-                let _ = previous.await;
-            }
-            let saved = tokio::task::spawn_blocking(move || {
-                token_store::save_session(&instance, &token, &pins, pasted)
-            })
-            .await;
-            if !matches!(saved, Ok(Ok(()))) {
-                log::warn!("could not store the media pin with the session");
-            }
-        }));
-    }
-}
-
 /// Whether signing out may end a token on the server. A pasted token belongs to another
 /// client and is only forgotten here.
 pub fn should_revoke(pasted: bool) -> bool {
     !pasted
 }
 
-fn notice_forgotten(events: &Ui, deleted: bool) {
+pub(super) fn notice_forgotten(events: &Ui, deleted: bool) {
     let mut text = t!("notice-pasted-forgotten");
     if !deleted {
         text.push(' ');
@@ -896,7 +1507,7 @@ fn notice_forgotten(events: &Ui, deleted: bool) {
     let _ = events.unbounded_send(Ev::Notice(text));
 }
 
-fn notice_sign_out(events: &Ui, told_server: bool, deleted: bool) {
+pub(super) fn notice_sign_out(events: &Ui, told_server: bool, deleted: bool) {
     let mut parts = Vec::new();
     if !told_server {
         parts.push(t!("notice-sign-out-not-revoked"));
@@ -906,59 +1517,5 @@ fn notice_sign_out(events: &Ui, told_server: bool, deleted: bool) {
     }
     if !parts.is_empty() {
         let _ = events.unbounded_send(Ev::Notice(parts.join(" ")));
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn restored_entries_without_a_media_pin_are_upgraded_once() {
-        let old = p::SessionPins {
-            api: "https://fluxer.example".into(),
-            gateway: "wss://fluxer.example".into(),
-            media: None,
-        };
-        let now = p::SessionPins {
-            media: Some("https://media.fluxer.example".into()),
-            ..old.clone()
-        };
-        // Old entry, instance has a media host: store the full pins.
-        assert_eq!(upgraded_pins(&old, &now), Some(now.clone()));
-        // Already pinned: nothing to write.
-        assert_eq!(upgraded_pins(&now, &now), None);
-        // The instance has no media host: nothing to pin.
-        assert_eq!(upgraded_pins(&old, &old), None);
-        // Other API or gateway host (cannot happen after a pinned connect): never.
-        let moved = p::SessionPins {
-            api: "https://elsewhere.example".into(),
-            ..now.clone()
-        };
-        assert_eq!(upgraded_pins(&old, &moved), None);
-    }
-
-    #[test]
-    fn pasted_tokens_are_never_revoked() {
-        assert!(!should_revoke(true));
-        assert!(should_revoke(false));
-        let pins = p::SessionPins {
-            api: "https://fluxer.example".into(),
-            gateway: "wss://fluxer.example".into(),
-            media: None,
-        };
-        let stored_pasted = Credential::Stored {
-            token: p::Token::new("t"),
-            pins: pins.clone(),
-            pasted: true,
-        };
-        let stored_issued = Credential::Stored {
-            token: p::Token::new("t"),
-            pins,
-            pasted: false,
-        };
-        assert!(stored_pasted.is_pasted());
-        assert!(!stored_issued.is_pasted());
-        assert!(Credential::Pasted(p::Token::new("t")).is_pasted());
     }
 }

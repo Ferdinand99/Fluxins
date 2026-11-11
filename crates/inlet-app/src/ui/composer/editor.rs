@@ -471,6 +471,18 @@ impl ComposerView {
         cx.notify();
     }
 
+    /// Another account becomes active: the open channel's text is kept as its draft and
+    /// saved with the old account's drafts, then the view forgets the old account as it
+    /// does after a sign-out (reply, edit, failed sends, autocomplete).
+    pub fn switch_account(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.store_draft(cx);
+        let write = self.shared.borrow_mut().drafts.switch_account();
+        if let Some(write) = write {
+            cx.background_spawn(async move { write.run() }).detach();
+        }
+        self.check_generation(window, cx);
+    }
+
     /// Keeps the text of the open channel as its draft.
     fn store_draft(&mut self, cx: &mut Context<Self>) {
         let Some(ch) = &self.channel else {

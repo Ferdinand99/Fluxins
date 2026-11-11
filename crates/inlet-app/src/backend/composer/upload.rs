@@ -44,7 +44,7 @@ use tokio::task::AbortHandle;
 use super::exif;
 use super::send::{failed, not_connected, report_failure, Ctx, Outgoing, SendError};
 use super::Ev;
-use crate::backend::{Backend, Ui};
+use crate::backend::{Backend, RealActive, Ui};
 
 const MIB: u64 = 1024 * 1024;
 /// Files kept for Retry may hold this much memory together.
@@ -363,7 +363,7 @@ impl Uploads {
         self.gauge.bytes()
     }
 
-    /// Takes an upload in for session `gen`. Uploads of older sessions are cancelled.
+    /// Takes an upload in for the account session `gen`.
     pub(super) fn take_in(&self, gen: u64, upload: Upload) -> Arc<Job> {
         let files = upload
             .files
@@ -384,13 +384,7 @@ impl Uploads {
             strip_exif: upload.strip_exif,
         });
         let mut book = self.book();
-        for e in book.entries.iter().filter(|e| e.gen < gen) {
-            if let Some(t) = &e.task {
-                t.abort();
-            }
-        }
-        book.entries
-            .retain(|e| e.gen >= gen && e.nonce != job.message.nonce);
+        book.entries.retain(|e| e.nonce != job.message.nonce);
         book.entries.push(Entry {
             nonce: job.message.nonce.clone(),
             gen,
@@ -402,13 +396,15 @@ impl Uploads {
         job
     }
 
-    /// The upload a Retry of `nonce` sends again, if `nonce` was an upload.
+    /// The upload a Retry of `nonce` sends again in session `gen`, if `nonce` was an
+    /// upload. An upload of another session is `Gone`: it is never sent from another
+    /// account, and never without its files.
     pub(super) fn retry_of(&self, gen: u64, nonce: &str) -> Option<Retry> {
         let mut book = self.book();
-        let e = book
-            .entries
-            .iter_mut()
-            .find(|e| e.nonce == nonce && e.gen == gen)?;
+        let e = book.entries.iter_mut().find(|e| e.nonce == nonce)?;
+        if e.gen != gen {
+            return Some(Retry::Gone(e.names.clone()));
+        }
         Some(match &e.kept {
             Kept::Job(job) => {
                 e.running = true;
@@ -454,14 +450,42 @@ impl Uploads {
         }
     }
 
-    /// The session ended or changed: every upload stops, nothing is kept.
-    pub fn cancel_all(&self) {
-        let entries = std::mem::take(&mut self.book().entries);
-        for e in &entries {
-            if let Some(t) = &e.task {
+    /// The account of session `gen` is no longer the active one: its running uploads
+    /// stop where they are (they never go on behind another account). Their files are
+    /// kept for Retry while the limits allow. Returns the stopped messages and their
+    /// file names, to show them as failed.
+    pub(super) fn stop_gen(&self, gen: u64) -> Vec<(Outgoing, Vec<String>)> {
+        let mut book = self.book();
+        let mut stopped = Vec::new();
+        for e in book
+            .entries
+            .iter_mut()
+            .filter(|e| e.gen == gen && e.running)
+        {
+            if let Some(t) = e.task.take() {
                 t.abort();
             }
+            e.running = false;
+            if let Kept::Job(job) = &e.kept {
+                stopped.push((job.message.clone(), e.names.clone()));
+            }
         }
+        trim(&mut book);
+        stopped
+    }
+
+    /// The session `gen` ended (sign-out, the token ended): its uploads stop and let go
+    /// of their files; a Retry of one asks to attach the files again.
+    pub fn forget_gen(&self, gen: u64) {
+        let mut book = self.book();
+        for e in book.entries.iter_mut().filter(|e| e.gen == gen) {
+            if let Some(t) = e.task.take() {
+                t.abort();
+            }
+            e.running = false;
+            e.kept = Kept::Gone;
+        }
+        trim(&mut book);
     }
 
     /// The upload ended. A sent one is forgotten; a failed one is kept for Retry while
@@ -476,44 +500,7 @@ impl Uploads {
             e.running = false;
             e.task = None;
         }
-        let mut kept = 0usize;
-        let mut bytes = 0u64;
-        for e in book.entries.iter_mut().rev() {
-            if e.running {
-                continue;
-            }
-            let Kept::Job(job) = &e.kept else {
-                continue;
-            };
-            kept += 1;
-            bytes += job
-                .files
-                .iter()
-                .map(|f| match &f.data {
-                    Data::Memory(h) => h.data().len() as u64,
-                    Data::Disk(_) => 0,
-                })
-                .sum::<u64>();
-            if kept > KEEP_UPLOADS || bytes > KEEP_BYTES {
-                e.kept = Kept::Gone;
-            }
-        }
-        // Rows whose files are gone are remembered a while longer, then forgotten.
-        let gone = book
-            .entries
-            .iter()
-            .filter(|e| matches!(e.kept, Kept::Gone))
-            .count();
-        if gone > KEEP_UPLOADS {
-            let mut extra = gone - KEEP_UPLOADS;
-            book.entries.retain(|e| {
-                let forget = extra > 0 && matches!(e.kept, Kept::Gone);
-                if forget {
-                    extra -= 1;
-                }
-                !forget
-            });
-        }
+        trim(&mut book);
     }
 
     /// The task of one upload: reports start, progress and the outcome.
@@ -823,6 +810,25 @@ impl Backend {
         });
     }
 
+    /// The account of `r` stops being the active one: its uploads stop where they are,
+    /// and their rows fail with Retry (which uploads them again once the account is
+    /// active again). A stopped upload may have been posting: Retry looks first when it
+    /// comes late.
+    pub(in crate::backend) fn stop_uploads(&self, r: &RealActive) {
+        let ctx = Ctx {
+            client: r.session.client().clone(),
+            events: r.events.clone(),
+            internal: self.internal.clone(),
+            gen: r.gen,
+            state: r.composer.clone(),
+        };
+        for (message, names) in self.uploads.stop_gen(r.gen) {
+            let mut e = local(t!("composer-upload-switched"));
+            e.ambiguous = true;
+            ctx.failed_with_files(&message, e, names);
+        }
+    }
+
     /// Cancel in the composer's upload list: the upload stops and its files are let go.
     pub(super) fn cancel_upload(&mut self, nonce: String) {
         self.uploads.cancel(&nonce);
@@ -860,6 +866,49 @@ impl Backend {
                 true
             }
         }
+    }
+}
+
+/// Failed uploads keep their files newest first, up to [`KEEP_UPLOADS`] and
+/// [`KEEP_BYTES`]; older ones keep only their names, and only so many of those.
+fn trim(book: &mut Book) {
+    let mut kept = 0usize;
+    let mut bytes = 0u64;
+    for e in book.entries.iter_mut().rev() {
+        if e.running {
+            continue;
+        }
+        let Kept::Job(job) = &e.kept else {
+            continue;
+        };
+        kept += 1;
+        bytes += job
+            .files
+            .iter()
+            .map(|f| match &f.data {
+                Data::Memory(h) => h.data().len() as u64,
+                Data::Disk(_) => 0,
+            })
+            .sum::<u64>();
+        if kept > KEEP_UPLOADS || bytes > KEEP_BYTES {
+            e.kept = Kept::Gone;
+        }
+    }
+    // Rows whose files are gone are remembered a while longer, then forgotten.
+    let gone = book
+        .entries
+        .iter()
+        .filter(|e| matches!(e.kept, Kept::Gone))
+        .count();
+    if gone > KEEP_UPLOADS {
+        let mut extra = gone - KEEP_UPLOADS;
+        book.entries.retain(|e| {
+            let forget = extra > 0 && matches!(e.kept, Kept::Gone);
+            if forget {
+                extra -= 1;
+            }
+            !forget
+        });
     }
 }
 
@@ -1176,8 +1225,12 @@ mod tests {
         let plan = ctx.retry_plan(CHANNEL.into(), "777".into(), "look".into(), Instant::now());
         assert!(plan.look_since_ms.is_none());
         assert_eq!(uploads.held_bytes(), 25 * MIB + 1, "kept for Retry");
-        uploads.cancel_all();
+        uploads.forget_gen(ctx.gen);
         assert_eq!(uploads.held_bytes(), 0, "the session's end lets go of it");
+        assert!(
+            matches!(uploads.retry_of(ctx.gen, "777"), Some(Retry::Gone(_))),
+            "a Retry asks for the files again"
+        );
     }
 
     #[tokio::test]
@@ -1511,5 +1564,62 @@ mod tests {
             .collect();
         assert!(api.is_empty(), "nothing uploaded or posted again: {api:?}");
         assert!(sent(&events(&mut rx)), "the row counts as sent");
+    }
+
+    #[tokio::test]
+    async fn switching_accounts_stops_the_upload_and_keeps_it_for_retry() {
+        let (server, ctx, _rx) = fixture_with(presigned()).await;
+        Mock::given(method("POST"))
+            .and(path(PLAN))
+            .respond_with(single_plan(&server, "k4", 3, "image/png"))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/storage/k4"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(60)))
+            .mount(&server)
+            .await;
+        let uploads = Uploads::default();
+        let job = uploads.take_in(
+            ctx.gen,
+            Upload {
+                message: message(),
+                files: vec![pasted("a.png", Bytes::from_static(b"abc"))],
+                strip_exif: false,
+            },
+        );
+        uploads.launch(ctx.clone(), job, None, |fut| {
+            tokio::spawn(fut).abort_handle()
+        });
+        let started = Instant::now();
+        while requests(&server, "PUT", "/storage/k4").await.is_empty() {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "the upload started"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // The account is switched away from: its upload stops and is reported.
+        let stopped = uploads.stop_gen(ctx.gen);
+        assert_eq!(stopped.len(), 1);
+        assert_eq!(stopped[0].0.nonce, "777");
+        assert_eq!(stopped[0].1, vec!["a.png".to_owned()]);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            requests(&server, "POST", POSTS).await.is_empty(),
+            "nothing posted"
+        );
+        // Back on that account Retry has the files; another account never sends them.
+        assert!(matches!(
+            uploads.retry_of(ctx.gen + 1, "777"),
+            Some(Retry::Gone(_))
+        ));
+        assert!(matches!(
+            uploads.retry_of(ctx.gen, "777"),
+            Some(Retry::Job(_))
+        ));
+        assert_eq!(uploads.held_bytes(), 3, "kept for Retry");
+        uploads.forget_gen(ctx.gen);
+        assert_eq!(uploads.held_bytes(), 0);
     }
 }

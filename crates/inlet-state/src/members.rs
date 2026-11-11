@@ -67,6 +67,13 @@ impl Members {
         self.others.pop_oldest().is_some()
     }
 
+    /// Drops every cached member but the account's own. Returns how many went.
+    pub(crate) fn clear_others(&mut self) -> usize {
+        let n = self.others.len();
+        while self.others.pop_oldest().is_some() {}
+        n
+    }
+
     /// Number of cached members other than the account.
     pub fn others_len(&self) -> usize {
         self.others.len()

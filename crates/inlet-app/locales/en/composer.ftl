@@ -77,3 +77,4 @@ composer-upload-gone = the files are no longer kept; attach them again
 composer-upload-progress = { $sent } of { $total }
 composer-upload-names-more = { $first } and { $more } more
 composer-upload-cancel = Cancel
+composer-upload-switched = stopped when you switched to another account
