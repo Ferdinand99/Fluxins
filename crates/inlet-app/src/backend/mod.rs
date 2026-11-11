@@ -336,6 +336,8 @@ struct Backend {
     composer: composer::State,
     /// The request for older messages of the open channel.
     older: messages::OlderPages,
+    /// Requests of the thread panel, thread lists and forums.
+    threads: messages::threads::State,
 }
 
 impl Backend {
@@ -357,6 +359,7 @@ impl Backend {
             open_channel: None,
             composer: Default::default(),
             older: Default::default(),
+            threads: Default::default(),
         }
     }
 

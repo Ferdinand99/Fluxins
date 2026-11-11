@@ -21,6 +21,11 @@
 //! - `chat-reactions`, `chat-menu`, `chat-delete`: for `#general`, reactions under a few
 //!   messages and an own message; the hover bar shown on one message, the context menu
 //!   open on the own message, or its delete confirmation (see `actions.rs`).
+//! - `thread-panel`, `thread-list`: for `#general`, with a thread, archived threads, a
+//!   forum and a media channel (see `threads.rs`); the thread open in the side panel, or
+//!   the thread list open.
+//! - `forum`, `media-channel`: the same data, for `c-forum` (posts with tags, unread
+//!   counts) and `c-gallery` (the grid).
 
 use std::collections::HashMap;
 
@@ -52,6 +57,10 @@ pub enum Scene {
     ChatReactions,
     ChatMenu,
     ChatDelete,
+    ThreadPanel,
+    ThreadList,
+    Forum,
+    MediaChannel,
 }
 
 impl Scene {
@@ -72,8 +81,22 @@ impl Scene {
             "chat-reactions" => Scene::ChatReactions,
             "chat-menu" => Scene::ChatMenu,
             "chat-delete" => Scene::ChatDelete,
+            "thread-panel" => Scene::ThreadPanel,
+            "thread-list" => Scene::ThreadList,
+            "forum" => Scene::Forum,
+            "media-channel" => Scene::MediaChannel,
             _ => return None,
         })
+    }
+}
+
+impl Scene {
+    /// The scenes with the demo's threads, forum and media channel.
+    pub fn has_threads(self) -> bool {
+        matches!(
+            self,
+            Scene::ThreadPanel | Scene::ThreadList | Scene::Forum | Scene::MediaChannel
+        )
     }
 }
 
@@ -109,6 +132,8 @@ fn channel_type(kind: ChannelKind) -> i64 {
         ChannelKind::GroupDm => 3,
         ChannelKind::Category => 4,
         ChannelKind::Announcement => 5,
+        ChannelKind::Forum => 15,
+        ChannelKind::Media => 16,
     }
 }
 
@@ -229,6 +254,10 @@ pub fn data(scene: Scene) -> Data {
         }
         _ => {}
     }
+    let threads = scene.has_threads();
+    if threads {
+        super::threads::add(&mut channels, &mut by_name);
+    }
 
     // Demo IDs become snowflakes everywhere.
     let guilds: Vec<Guild> = guilds::guilds()
@@ -296,7 +325,7 @@ pub fn data(scene: Scene) -> Data {
         read_states.extend(unread::read_states());
         guild_settings = unread::guild_settings();
     }
-    let ready = ready(
+    let mut ready = ready(
         &guilds,
         &channels,
         &messages,
@@ -304,6 +333,9 @@ pub fn data(scene: Scene) -> Data {
         guild_settings,
         unread_demo,
     );
+    if threads {
+        super::threads::decorate(&mut ready, &messages);
+    }
     Data {
         guilds,
         channels,
@@ -335,6 +367,10 @@ mod tests {
             "chat-reactions",
             "chat-menu",
             "chat-delete",
+            "thread-panel",
+            "thread-list",
+            "forum",
+            "media-channel",
         ] {
             let scene = Scene::from_name(name).expect(name);
             let data = data(scene);

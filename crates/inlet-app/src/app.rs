@@ -76,7 +76,6 @@ pub struct Inlet {
     pub search: ui::search::State,
     #[allow(dead_code)] // filled by the task that builds the domain
     pub inbox: ui::inbox::State,
-    #[allow(dead_code)] // filled by the task that builds the domain
     pub threads: ui::threads::State,
     #[allow(dead_code)] // filled by the task that builds the domain
     pub voice: ui::voice::State,
@@ -239,6 +238,7 @@ impl Inlet {
         self.selected_channel = None;
         self.reset_messages();
         self.media.reset();
+        self.threads.reset();
         self.notifications.clear();
         self.chat.status.clear();
         self.chat.error = None;

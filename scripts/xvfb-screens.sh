@@ -82,6 +82,10 @@ scene 18-image-viewer image-viewer c-attachments
 scene 19-chat-reactions chat-reactions c-general
 scene 20-chat-menu chat-menu c-general
 scene 21-chat-delete chat-delete c-general
+scene 22-thread-panel thread-panel c-general
+scene 23-thread-list thread-list c-general
+scene 24-forum forum c-forum
+scene 25-media-channel media-channel c-gallery
 
 # 6. The Desktop settings tab, and the prompt a link from outside opens.
 INLET_DEMO=1 INLET_DEMO_LIVE_SECS=3600 INLET_DEMO_GUILD=g1 INLET_DEMO_CHANNEL=c-general INLET_DEMO_SETTINGS=desktop "$bin" >>"$out/demo.log" 2>&1 &

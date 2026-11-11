@@ -74,6 +74,7 @@ impl Inlet {
     }
 
     pub(crate) fn select_guild(&mut self, guild_id: Option<String>, cx: &mut Context<Self>) {
+        self.threads_leave_channel(None, cx);
         self.selected_guild = guild_id.clone();
         self.selected_channel = None;
         self.channels.clear();
@@ -89,6 +90,11 @@ impl Inlet {
         cx: &mut Context<Self>,
     ) {
         self.selected_channel = Some(channel_id.clone());
+        // A forum opens the forum view; any other channel closes it.
+        if self.open_forum(&channel_id, window, cx) {
+            cx.notify();
+            return;
+        }
         self.composer_open_channel(&channel_id, window, cx);
         self.open_channel_messages(cx);
         cx.notify();

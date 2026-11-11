@@ -112,6 +112,8 @@ enum EscapeAction {
     CloseLayer,
     /// A message menu or dialog is open (without the focus): it closes.
     CloseMessageOverlay,
+    /// The thread list or the thread panel is open beside the chat: it closes.
+    CloseThreads,
     MarkChannel,
     MarkGuild,
     Nothing,
@@ -124,6 +126,7 @@ enum EscapeAction {
 fn escape_action(
     layer_open: bool,
     message_overlay_open: bool,
+    threads_open: bool,
     chat_visible: bool,
     shift: bool,
 ) -> EscapeAction {
@@ -131,6 +134,8 @@ fn escape_action(
         EscapeAction::CloseLayer
     } else if message_overlay_open {
         EscapeAction::CloseMessageOverlay
+    } else if threads_open {
+        EscapeAction::CloseThreads
     } else if !chat_visible {
         EscapeAction::Nothing
     } else if shift {
@@ -185,12 +190,14 @@ impl Inlet {
         let action = escape_action(
             self.layer_open(),
             self.chat.actions.overlay.is_some(),
+            self.threads_open(),
             self.chat_is_visible(),
             shift,
         );
         match action {
             EscapeAction::CloseLayer => self.close_top_layer(cx),
             EscapeAction::CloseMessageOverlay => self.close_overlay(window, cx),
+            EscapeAction::CloseThreads => self.close_threads_on_escape(window, cx),
             EscapeAction::MarkChannel => self.mark_channel_read(cx),
             EscapeAction::MarkGuild => self.mark_guild_read(cx),
             EscapeAction::Nothing => {}
@@ -245,15 +252,24 @@ mod tests {
     #[test]
     fn escape_marks_read_only_where_the_chat_is_seen() {
         use EscapeAction::*;
-        // (layer open, message overlay open, chat visible, shift)
-        assert_eq!(escape_action(false, false, true, false), MarkChannel);
-        assert_eq!(escape_action(false, false, true, true), MarkGuild);
+        // (layer open, message overlay open, threads open, chat visible, shift)
+        assert_eq!(escape_action(false, false, false, true, false), MarkChannel);
+        assert_eq!(escape_action(false, false, false, true, true), MarkGuild);
         // Under the About view: nothing, not the channel behind it.
-        assert_eq!(escape_action(false, false, false, false), Nothing);
-        assert_eq!(escape_action(false, false, false, true), Nothing);
+        assert_eq!(escape_action(false, false, false, false, false), Nothing);
+        assert_eq!(escape_action(false, false, false, false, true), Nothing);
         // A message menu or dialog closes, with or without Shift; nothing is read.
-        assert_eq!(escape_action(false, true, true, false), CloseMessageOverlay);
-        assert_eq!(escape_action(false, true, true, true), CloseMessageOverlay);
+        assert_eq!(
+            escape_action(false, true, false, true, false),
+            CloseMessageOverlay
+        );
+        assert_eq!(
+            escape_action(false, true, true, true, true),
+            CloseMessageOverlay
+        );
+        // The thread list or panel closes before anything is marked read.
+        assert_eq!(escape_action(false, false, true, true, false), CloseThreads);
+        assert_eq!(escape_action(false, false, true, true, true), CloseThreads);
     }
 
     /// Any open layer (the image viewer, the settings view, the notification settings,
@@ -265,7 +281,12 @@ mod tests {
         for shift in [false, true] {
             for overlay in [false, true] {
                 for visible in [false, true] {
-                    assert_eq!(escape_action(true, overlay, visible, shift), CloseLayer);
+                    for threads in [false, true] {
+                        assert_eq!(
+                            escape_action(true, overlay, threads, visible, shift),
+                            CloseLayer
+                        );
+                    }
                 }
             }
         }

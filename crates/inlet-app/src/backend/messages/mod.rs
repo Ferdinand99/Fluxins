@@ -16,7 +16,7 @@ mod inbox;
 pub(crate) mod outbox;
 pub mod parse;
 mod pins;
-mod threads;
+pub mod threads;
 
 pub(super) use fetch::OlderPages;
 
@@ -53,6 +53,8 @@ pub enum Cmd {
     },
     /// A message action: a reaction, delete, pin and the rest (see [`actions`]).
     Action(actions::Cmd),
+    /// Threads and forums (see [`threads`]).
+    Thread(threads::Cmd),
 }
 
 /// A message being sent, or one that could not be sent (a row with "Retry").
@@ -101,6 +103,8 @@ pub enum Ev {
     },
     /// The answer to a message action.
     Action(actions::Ev),
+    /// Thread pages, archived threads and forum posts.
+    Thread(threads::Ev),
 }
 
 pub(super) fn handle(backend: &mut Backend, cmd: Cmd) {
@@ -121,5 +125,6 @@ pub(super) fn handle(backend: &mut Backend, cmd: Cmd) {
             text,
         } => backend.resend(channel_id, nonce, text),
         Cmd::Action(cmd) => backend.message_action(cmd),
+        Cmd::Thread(cmd) => threads::handle(backend, cmd),
     }
 }

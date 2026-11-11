@@ -173,7 +173,8 @@ impl AccountState {
                 }
                 if let (Some(n), Some(t)) = (u.member_count, self.channels.get_mut(id)) {
                     if t.member_count() != Some(n.min(50)) {
-                        t.extra.insert("member_count".into(), Value::from(n.min(50)));
+                        t.extra
+                            .insert("member_count".into(), Value::from(n.min(50)));
                         c.channel(id);
                     }
                 }
@@ -279,7 +280,9 @@ impl AccountState {
             let count = u32::try_from(entry.count.unwrap_or(0)).unwrap_or(u32::MAX);
             match self.ack_of(id) {
                 Some(ack) if count > 0 && !entry.missing => {
-                    self.threads.post_unreads.insert(id, PostUnread { ack, count });
+                    self.threads
+                        .post_unreads
+                        .insert(id, PostUnread { ack, count });
                 }
                 _ => {
                     self.threads.post_unreads.remove(&id);
@@ -411,7 +414,11 @@ pub enum ForumSort {
 impl ForumSort {
     /// The forum's own default (`default_sort_order`).
     pub fn default_of(forum: &Channel) -> ForumSort {
-        match forum.extra.get("default_sort_order").and_then(Value::as_i64) {
+        match forum
+            .extra
+            .get("default_sort_order")
+            .and_then(Value::as_i64)
+        {
             Some(1) => ForumSort::CreationTime,
             _ => ForumSort::LatestActivity,
         }
@@ -447,7 +454,11 @@ pub enum TagMatch {
 impl TagMatch {
     /// The forum's own setting.
     pub fn default_of(forum: &Channel) -> TagMatch {
-        match forum.extra.get("default_tag_setting").and_then(Value::as_str) {
+        match forum
+            .extra
+            .get("default_tag_setting")
+            .and_then(Value::as_str)
+        {
             Some("match_all") => TagMatch::All,
             _ => TagMatch::Some,
         }
@@ -663,7 +674,7 @@ impl ThreadPages {
 
     /// The next page to ask for; `None` while one is on its way, when there
     /// are no more, or when the list is full.
-    pub fn next(&mut self) -> Option<PageRequest> {
+    pub fn next_page(&mut self) -> Option<PageRequest> {
         if self.in_flight.is_some() || !self.has_more {
             return None;
         }
@@ -822,62 +833,59 @@ mod tests {
         };
         let mut pages = ThreadPages::new(PageBy::ArchiveTime);
         assert!(!pages.is_loaded());
-        let first = pages.next().expect("the first page");
+        let first = pages.next_page().expect("the first page");
         assert_eq!(first.before, None);
-        assert!(pages.next().is_none(), "one page at a time");
+        assert!(pages.next_page().is_none(), "one page at a time");
         assert!(pages.is_loading());
         assert!(pages.on_page(
             first.request,
-            vec![
-                at(9, "2026-01-09T00:00:00Z"),
-                at(8, "2026-01-08T00:00:00Z")
-            ],
+            vec![at(9, "2026-01-09T00:00:00Z"), at(8, "2026-01-08T00:00:00Z")],
             true
         ));
         assert!(pages.is_loaded() && !pages.is_loading());
-        let second = pages.next().expect("more pages");
+        let second = pages.next_page().expect("more pages");
         assert_eq!(second.before.as_deref(), Some("2026-01-08T00:00:00Z"));
         // An answer to an old request changes nothing.
         assert!(!pages.on_page(first.request, vec![at(1, "2026-01-01T00:00:00Z")], true));
         // A failure frees the slot; the same page is asked for again.
         pages.on_failed(second.request);
-        let again = pages.next().expect("a retry");
+        let again = pages.next_page().expect("a retry");
         assert_eq!(again.before.as_deref(), Some("2026-01-08T00:00:00Z"));
         // A thread already listed is not listed twice.
         assert!(pages.on_page(
             again.request,
-            vec![
-                at(8, "2026-01-08T00:00:00Z"),
-                at(7, "2026-01-07T00:00:00Z")
-            ],
+            vec![at(8, "2026-01-08T00:00:00Z"), at(7, "2026-01-07T00:00:00Z")],
             false
         ));
         let listed: Vec<&str> = pages.threads().iter().map(|t| t.id.as_str()).collect();
         assert_eq!(listed, ["9", "8", "7"]);
-        assert!(!pages.has_more() && pages.next().is_none(), "the last page");
+        assert!(
+            !pages.has_more() && pages.next_page().is_none(),
+            "the last page"
+        );
 
         // A page that does not move the cursor ends the list, so it never loops.
         let mut stuck = ThreadPages::new(PageBy::ArchiveTime);
-        let r = stuck.next().unwrap();
+        let r = stuck.next_page().unwrap();
         stuck.on_page(r.request, vec![thread(3, None, &[], json!({}))], true);
-        assert!(stuck.next().is_none());
+        assert!(stuck.next_page().is_none());
 
         // Search pages go by offset; a reset drops the answer on its way.
         let mut search = ThreadPages::new(PageBy::Offset);
-        let r = search.next().unwrap();
+        let r = search.next_page().unwrap();
         assert_eq!(r.offset, 0);
         search.on_page(r.request, (1..=25).map(|i| at(i, "x")).collect(), true);
-        let r2 = search.next().unwrap();
+        let r2 = search.next_page().unwrap();
         assert_eq!(r2.offset, 25);
         search.reset();
         assert!(!search.on_page(r2.request, vec![at(99, "y")], true));
         assert!(search.threads().is_empty() && !search.is_loaded());
-        assert_eq!(search.next().unwrap().offset, 0);
+        assert_eq!(search.next_page().unwrap().offset, 0);
 
         // Bounded: never more than the cap, and no page past it.
         let mut big = ThreadPages::new(PageBy::Offset);
         let mut n = 0;
-        while let Some(r) = big.next() {
+        while let Some(r) = big.next_page() {
             let page = (0..100).map(|i| at(1_000 + n * 100 + i, "z")).collect();
             big.on_page(r.request, page, true);
             n += 1;

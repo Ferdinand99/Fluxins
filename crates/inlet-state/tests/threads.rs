@@ -57,7 +57,9 @@ fn private_threads_fail_closed_without_membership() {
     ));
     assert!(visible(&s, PRIVATE), "a rename keeps the membership");
     assert_eq!(
-        s.channel(ch(PRIVATE)).and_then(|t| t.name.clone()).as_deref(),
+        s.channel(ch(PRIVATE))
+            .and_then(|t| t.name.clone())
+            .as_deref(),
         Some("renamed")
     );
 
@@ -142,11 +144,23 @@ fn threads_need_a_known_parent_in_their_guild() {
     let mut s = state();
     // An unknown parent, a parent in another guild (a DM) and a thread under a
     // thread are dropped; so is a channel that is no thread.
-    s.apply(&d("THREAD_CREATE", thread_json("601", 11, "999", json!({}))));
+    s.apply(&d(
+        "THREAD_CREATE",
+        thread_json("601", 11, "999", json!({})),
+    ));
     s.apply(&d("THREAD_CREATE", thread_json("602", 11, DM, json!({}))));
-    s.apply(&d("THREAD_CREATE", thread_json("603", 11, GENERAL, json!({}))));
-    s.apply(&d("THREAD_CREATE", thread_json("604", 11, "603", json!({}))));
-    s.apply(&d("THREAD_CREATE", thread_json("605", 0, GENERAL, json!({}))));
+    s.apply(&d(
+        "THREAD_CREATE",
+        thread_json("603", 11, GENERAL, json!({})),
+    ));
+    s.apply(&d(
+        "THREAD_CREATE",
+        thread_json("604", 11, "603", json!({})),
+    ));
+    s.apply(&d(
+        "THREAD_CREATE",
+        thread_json("605", 0, GENERAL, json!({})),
+    ));
     // A thread never takes the place of a DM.
     s.apply(&d("THREAD_CREATE", thread_json(DM, 11, GENERAL, json!({}))));
     assert!(s.channel(ch("601")).is_none());
@@ -162,7 +176,10 @@ fn threads_are_capped_per_guild() {
     let mut s = state();
     for i in 0..(MAX_THREADS_PER_GUILD + 50) {
         let id = (10_000 + i).to_string();
-        s.apply(&d("THREAD_CREATE", thread_json(&id, 11, GENERAL, json!({}))));
+        s.apply(&d(
+            "THREAD_CREATE",
+            thread_json(&id, 11, GENERAL, json!({})),
+        ));
     }
     assert_eq!(listed(&s, GENERAL).len(), MAX_THREADS_PER_GUILD);
     // A known thread still takes its updates.
@@ -171,7 +188,9 @@ fn threads_are_capped_per_guild() {
         thread_json("10000", 11, GENERAL, json!({"name": "still here"})),
     ));
     assert_eq!(
-        s.channel(ch("10000")).and_then(|t| t.name.clone()).as_deref(),
+        s.channel(ch("10000"))
+            .and_then(|t| t.name.clone())
+            .as_deref(),
         Some("still here")
     );
 }
@@ -185,7 +204,12 @@ fn forum_state() -> AccountState {
         .unwrap()
         .push(channel(FORUM, 15, None, 5, json!([])));
     let mut threads = vec![
-        thread_json("401", 11, FORUM, json!({"last_message_id": mid(9, 0).to_string()})),
+        thread_json(
+            "401",
+            11,
+            FORUM,
+            json!({"last_message_id": mid(9, 0).to_string()}),
+        ),
         thread_json("402", 11, FORUM, json!({"member": member()})),
         thread_json("403", 11, FORUM, json!({})),
     ];
@@ -241,7 +265,9 @@ fn forum_unreads_use_op28_once_per_open() {
     op28.open(forum);
     let sent = op28.take(&s, forum, &all).expect("one request per opening");
     assert_eq!(sent.len(), MAX_FORUM_UNREAD_POSTS);
-    assert!(sent.iter().all(|r| r.thread_id != "402" && r.thread_id != "403"));
+    assert!(sent
+        .iter()
+        .all(|r| r.thread_id != "402" && r.thread_id != "403"));
     assert!(op28.take(&s, forum, &all).is_none());
 
     // The answer: counts for the posts, not for joined ones.
@@ -255,7 +281,11 @@ fn forum_unreads_use_op28_once_per_open() {
     ));
     let post = |s: &AccountState, id: &str| s.channel(ch(id)).cloned().unwrap();
     assert_eq!(s.forum_post_unread(&post(&s, "401")), 3);
-    assert_eq!(s.forum_post_unread(&post(&s, "402")), 0, "joined: its read state counts");
+    assert_eq!(
+        s.forum_post_unread(&post(&s, "402")),
+        0,
+        "joined: its read state counts"
+    );
     assert_eq!(s.forum_post_unread(&post(&s, "700")), 0);
     // Reading the post moves its ack: the old count no longer applies.
     s.mark_read(ch("401"), None, AckKind::Explicit);

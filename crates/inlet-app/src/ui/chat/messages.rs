@@ -911,6 +911,82 @@ impl MessageView {
         rows
     }
 
+    // --- a second list (the thread panel) uses the same view through these ---
+
+    /// Starts loading the newest page of `ch`; the returned request pairs its answer
+    /// ([`MessageView::accept_newest`], [`MessageView::newest_failed`]).
+    pub(crate) fn begin_newest(&mut self, ch: ChannelId) -> u64 {
+        self.conversions.touch(ch);
+        self.loaded = false;
+        self.detached_new = 0;
+        let request = self.request_id();
+        self.loading.insert(ch, request);
+        request
+    }
+
+    /// The newest page of the list's channel landed.
+    pub(crate) fn set_loaded(&mut self) {
+        self.loaded = true;
+    }
+
+    /// A newest-page request failed; whether it was the current one for `ch`.
+    pub(crate) fn newest_failed(&mut self, ch: ChannelId, request: u64) -> bool {
+        if self.loading.get(&ch) == Some(&request) {
+            self.loading.remove(&ch);
+            return true;
+        }
+        false
+    }
+
+    /// Keeps the converted messages of an event or page (after the state took it).
+    pub(crate) fn remember<'a>(
+        &mut self,
+        state: &AccountState,
+        raw: impl IntoIterator<Item = &'a p::Message>,
+        rendered: Vec<Message>,
+    ) {
+        self.conversions.remember(state, &edits_of(raw), rendered);
+    }
+
+    /// Drops conversions the state no longer needs.
+    pub(crate) fn prune(&mut self, state: &AccountState, changes: &Changes) {
+        self.conversions.prune(state, changes);
+    }
+
+    /// The request for the page before the oldest message of `ch`, within the
+    /// pager's budget: `(before, request)`.
+    pub(crate) fn older_request(
+        &mut self,
+        state: &AccountState,
+        ch: ChannelId,
+    ) -> Option<(MessageId, u64)> {
+        let (has_more, loading, oldest) = state
+            .messages(ch)
+            .map(|w| (w.has_more_before(), w.is_loading(), w.oldest_id()))
+            .unwrap_or((false, true, None));
+        let request = self.next_request + 1;
+        let before =
+            self.pager
+                .request(now_ms(), has_more && self.loaded, loading, oldest, request)?;
+        self.next_request = request;
+        Some((before, request))
+    }
+
+    /// The answer to an older page came.
+    pub(crate) fn older_done(&mut self, request: u64) {
+        self.pager.done(request);
+    }
+
+    /// Shows the spoilers of a message; whether they were hidden.
+    pub(crate) fn reveal(&mut self, id: MessageId) -> bool {
+        self.revealed.insert(id)
+    }
+
+    /// Whether a pending row of `nonce` is in this list.
+    pub(crate) fn has_pending(&self, nonce: &str) -> bool {
+        self.outbox.iter().any(|o| o.out.nonce == nonce)
+    }
+
     /// "Mark as unread": the "NEW" line goes above the first message after `after`.
     pub fn mark_unread_after(&mut self, ch: ChannelId, after: MessageId) {
         self.unread_after = Some((ch, after));
@@ -1018,16 +1094,21 @@ impl Inlet {
                 older,
             } => self.on_page_failed(channel_id, request, older, cx),
             Ev::Pending(out) => {
-                self.chat.view.upsert_pending(out);
-                self.refresh_rows(cx);
+                // A send from the thread panel's composer shows in the panel.
+                if let Some(out) = self.panel_pending(out, cx) {
+                    self.chat.view.upsert_pending(out);
+                    self.refresh_rows(cx);
+                }
             }
             Ev::Sent { nonce } => {
                 if self.chat.view.sent(&nonce) {
                     self.refresh_rows(cx);
                     cx.notify();
                 }
+                self.panel_sent(&nonce, cx);
             }
             Ev::Action(ev) => self.on_action_event(ev, cx),
+            Ev::Thread(ev) => self.on_thread_event(ev, window, cx),
         }
     }
 
@@ -1075,10 +1156,13 @@ impl Inlet {
             p::Dispatch::MessageCreate(m) | p::Dispatch::MessageUpdate(m) => edits_of([&**m]),
             _ => Edits::new(),
         };
+        // Messages of the thread in the side panel go to its list.
+        let rendered = self.panel_take_rendered(&dispatch, rendered, cx);
         self.chat
             .view
             .conversions
             .remember(account.read(cx), &edits, rendered);
+        self.panel_on_dispatch(&dispatch, window_active, &mut changes, cx);
         if let p::Dispatch::MessageCreate(m) = &dispatch {
             if let Some(nonce) = &m.nonce {
                 let before = self.chat.view.outbox.len();
@@ -1215,6 +1299,7 @@ impl Inlet {
         self.notifications
             .refresh_badges(account.read(cx), &changes);
         self.chat.view.conversions.prune(account.read(cx), &changes);
+        self.threads_after_changes(&changes, members, cx);
         let Some(ch) = self.open_channel_id() else {
             return;
         };
@@ -1440,6 +1525,7 @@ impl Inlet {
 
     fn tick_account(&mut self, cx: &mut Context<Self>) {
         self.tick_notifications(cx);
+        self.tick_thread_panel(cx);
         let Some(account) = self.account.clone() else {
             return;
         };
@@ -1520,6 +1606,7 @@ impl Inlet {
     /// Shows the spoilers of a message.
     pub(crate) fn reveal(&mut self, id: MessageId, cx: &mut Context<Self>) {
         self.chat.view.revealed.insert(id);
+        self.panel_reveal(id, cx);
         self.refresh_rows(cx);
         cx.notify();
     }
@@ -1545,6 +1632,9 @@ impl Inlet {
     /// Sends a failed message again, with the nonce it had: the row shows "sending"
     /// until the gateway's MESSAGE_CREATE with that nonce replaces it.
     pub(crate) fn retry_pending(&mut self, nonce: &str, cx: &mut Context<Self>) {
+        if self.panel_retry(nonce, cx) {
+            return;
+        }
         if let Some(cmd) = self.chat.view.retry(nonce) {
             if let Cmd::Resend { channel_id, .. } = &cmd {
                 let channel_id = channel_id.clone();

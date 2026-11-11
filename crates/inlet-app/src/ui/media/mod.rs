@@ -29,6 +29,7 @@ use crate::backend::media::{Ev, Setup};
 pub(crate) use attachment::cover_box;
 pub use attachment::Refresh;
 pub(crate) use image::Images;
+pub(crate) use image::{picture_of, placeholder};
 #[cfg(test)]
 pub(crate) use video_thumb::video_explicit;
 pub use viewer::Viewer;

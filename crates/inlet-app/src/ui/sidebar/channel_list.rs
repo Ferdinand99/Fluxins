@@ -17,6 +17,7 @@ pub fn channel_icon(kind: ChannelKind) -> Icon {
         ChannelKind::Announcement => Icon::Megaphone,
         ChannelKind::Voice => Icon::Speaker,
         ChannelKind::Dm | ChannelKind::GroupDm => Icon::At,
+        ChannelKind::Media => Icon::ImagesSquare,
         _ => Icon::Chats,
     }
 }
@@ -149,7 +150,8 @@ impl Inlet {
         active: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let messageable = c.is_messageable();
+        // Forums and media channels open the forum view.
+        let messageable = c.is_messageable() || c.is_forum();
         let id = c.id.clone();
         // Deviation: no hover actions (invite, channel settings) on rows; the bell in the
         // header and a right-click or the bell on a category open the notification settings.
