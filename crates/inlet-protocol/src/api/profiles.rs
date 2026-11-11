@@ -76,7 +76,8 @@ impl ImageData {
 }
 
 /// Changes to the account-wide profile ([`Client::edit_profile`]). `None`
-/// keeps a field; `Some(None)` (or an empty string) clears it.
+/// keeps a field; `Some(None)` (or an empty string) clears it; text of only
+/// whitespace is refused.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ProfileEdit {
     /// Display name (1-32 characters).
@@ -112,7 +113,8 @@ pub struct MemberProfileEdit {
 }
 
 /// Adds a text field: 1 to `max` characters, no control characters (line
-/// breaks allowed when `multiline`); blank text is sent as `null` (clear).
+/// breaks allowed when `multiline`); "" is sent as `null` (clear) and text
+/// of only whitespace is refused.
 fn put_text(
     body: &mut Map<String, Value>,
     key: &str,
@@ -121,8 +123,11 @@ fn put_text(
     multiline: bool,
 ) -> Result<()> {
     if let Some(v) = value {
-        let v = v.as_deref().filter(|s| !s.trim().is_empty());
+        let v = v.as_deref().filter(|s| !s.is_empty());
         if let Some(s) = v {
+            if s.trim().is_empty() {
+                return Err(Error::InvalidInput(format!("{key} is blank")));
+            }
             let bad = |c: char| c.is_control() && !(multiline && c == '\n');
             if s.chars().count() > max || s.chars().any(bad) {
                 return Err(Error::InvalidInput(format!(
@@ -258,6 +263,11 @@ mod tests {
             ..Default::default()
         };
         assert!(name.to_json().is_err());
+        let blank = ProfileEdit {
+            bio: Some(Some(" \n ".into())),
+            ..Default::default()
+        };
+        assert!(blank.to_json().is_err());
         assert!(ImageData::new("image/svg+xml", vec![1]).is_err());
         assert!(ImageData::new("image/png", Vec::new()).is_err());
         // Debug never prints the bytes.

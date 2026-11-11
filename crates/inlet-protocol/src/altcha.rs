@@ -165,6 +165,17 @@ fn solve_cancellable(challenge: &Value, timeout: Duration, cancel: &AtomicBool) 
 
 /// Async wrapper around [`solve_blocking`]. Dropping the future stops the work.
 pub async fn solve(challenge: Value, timeout: Duration) -> Result<String> {
+    solve_holding(challenge, timeout, ()).await
+}
+
+/// Like [`solve`], and keeps `guard` alive until the blocking work has really
+/// stopped (also when this future is dropped early), for example a permit
+/// that limits how many solves run at once.
+pub(crate) async fn solve_holding<G: Send + 'static>(
+    challenge: Value,
+    timeout: Duration,
+    guard: G,
+) -> Result<String> {
     struct CancelOnDrop(Arc<AtomicBool>);
     impl Drop for CancelOnDrop {
         fn drop(&mut self) {
@@ -173,9 +184,13 @@ pub async fn solve(challenge: Value, timeout: Duration) -> Result<String> {
     }
     let cancel = Arc::new(AtomicBool::new(false));
     let _guard = CancelOnDrop(cancel.clone());
-    tokio::task::spawn_blocking(move || solve_cancellable(&challenge, timeout, &cancel))
-        .await
-        .map_err(|e| Error::Captcha(e.to_string()))?
+    tokio::task::spawn_blocking(move || {
+        let result = solve_cancellable(&challenge, timeout, &cancel);
+        drop(guard);
+        result
+    })
+    .await
+    .map_err(|e| Error::Captcha(e.to_string()))?
 }
 
 /// Reads the challenge from a 400 `CAPTCHA_REQUIRED`/`INVALID_CAPTCHA` body.

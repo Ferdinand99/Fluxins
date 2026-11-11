@@ -13,7 +13,7 @@
 //! The pinned DM list is in READY ([`crate::Ready::pinned_dms`]) and
 //! USER_PINNED_DMS_UPDATE ([`crate::Dispatch::UserPinnedDmsUpdate`]).
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use reqwest::Method;
@@ -37,9 +37,9 @@ const MAX_SOLVES: usize = 2;
 
 /// One solve at a time in the whole process, so many clicks or accounts
 /// cannot take every core.
-fn solver_slot() -> &'static Semaphore {
-    static SLOT: OnceLock<Semaphore> = OnceLock::new();
-    SLOT.get_or_init(|| Semaphore::new(1))
+fn solver_slot() -> Arc<Semaphore> {
+    static SLOT: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    SLOT.get_or_init(|| Arc::new(Semaphore::new(1))).clone()
 }
 
 /// A recipient that could not be added to a new group DM.
@@ -76,7 +76,8 @@ pub enum GroupDmOutcome<T> {
 /// Changes to a group DM ([`Client::edit_group_dm`]). `None` keeps a field.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct GroupDmEdit {
-    /// Name (1-100 characters); `Some(None)` clears it.
+    /// Name (1-100 characters); `Some(None)` or an empty string clears it,
+    /// and a name of only spaces is refused.
     pub name: Option<Option<String>>,
     /// Icon; `Some(None)` clears it.
     pub icon: Option<Option<ImageData>>,
@@ -88,8 +89,13 @@ impl GroupDmEdit {
     fn to_json(&self) -> Result<Value> {
         let mut body = Map::new();
         if let Some(name) = &self.name {
-            let name = name.as_deref().filter(|n| !n.trim().is_empty());
+            // "" clears like `None`; a name of only spaces is refused, not
+            // taken as a clear.
+            let name = name.as_deref().filter(|n| !n.is_empty());
             if let Some(n) = name {
+                if n.trim().is_empty() {
+                    return Err(Error::InvalidInput("group DM name is blank".into()));
+                }
                 crate::api::text(n, 100, "group DM name")?;
             }
             body.insert("name".into(), json!(name));
@@ -112,21 +118,21 @@ impl GroupDmEdit {
     }
 }
 
-/// Solves a challenge on a blocking thread, one solve at a time, within the timeout.
+/// Solves a challenge on a blocking thread, one solve at a time, within the
+/// timeout. The slot is held by the blocking work itself, so it is only
+/// freed once that work has stopped, even when this future gives up first.
 async fn solve_bounded(challenge: Value) -> Result<String> {
     let started = tokio::time::Instant::now();
-    let permit = tokio::time::timeout(GROUP_DM_CAPTCHA_TIMEOUT, solver_slot().acquire())
+    let permit = tokio::time::timeout(GROUP_DM_CAPTCHA_TIMEOUT, solver_slot().acquire_owned())
         .await
         .map_err(|_| Error::Captcha("another CAPTCHA is being solved".into()))?
         .map_err(|_| Error::Captcha("solver closed".into()))?;
     let left = GROUP_DM_CAPTCHA_TIMEOUT.saturating_sub(started.elapsed());
-    // `solve` runs on `spawn_blocking` and stops when this future is dropped;
-    // the outer timeout covers the hand-off as well.
-    let result = tokio::time::timeout(left, crate::altcha::solve(challenge, left))
+    // The workers stop on their own after `left`; the outer timeout also covers
+    // the hand-off, and dropping the inner future cancels the workers.
+    tokio::time::timeout(left, crate::altcha::solve_holding(challenge, left, permit))
         .await
-        .unwrap_or_else(|_| Err(Error::Captcha("CAPTCHA timed out".into())));
-    drop(permit);
-    result
+        .unwrap_or_else(|_| Err(Error::Captcha("CAPTCHA timed out".into())))
 }
 
 impl Client {
@@ -329,6 +335,25 @@ impl Client {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn the_solver_slot_is_held_until_the_blocking_work_stops() {
+        // A challenge nothing can solve keeps the workers busy until cancelled.
+        let mut c = crate::altcha::make_test_challenge(1, 1);
+        c["parameters"]["keyPrefix"] = json!("0123456789abcdef0123456789abcdef");
+        let slot = Arc::new(Semaphore::new(1));
+        let permit = slot.clone().acquire_owned().await.unwrap();
+        let fut = crate::altcha::solve_holding(c, Duration::from_secs(600), permit);
+        // Give up early: the future is dropped while the workers still run.
+        assert!(tokio::time::timeout(Duration::from_millis(100), fut)
+            .await
+            .is_err());
+        // The slot comes back only once the blocking work has stopped.
+        let back = tokio::time::timeout(Duration::from_secs(10), slot.acquire())
+            .await
+            .expect("the cancelled solve released the slot");
+        drop(back);
+    }
+
     #[test]
     fn group_dm_edit_needs_a_change_and_valid_values() {
         assert!(GroupDmEdit::default().to_json().is_err());
@@ -337,8 +362,13 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(rename.to_json().unwrap(), json!({"name": "Trip"}));
-        let clear = GroupDmEdit {
+        let blank = GroupDmEdit {
             name: Some(Some("  ".into())),
+            ..Default::default()
+        };
+        assert!(blank.to_json().is_err());
+        let clear = GroupDmEdit {
+            name: Some(Some(String::new())),
             icon: Some(None),
             ..Default::default()
         };
