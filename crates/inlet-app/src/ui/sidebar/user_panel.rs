@@ -8,10 +8,16 @@ use crate::assets::Icon;
 use crate::model::Guild;
 use crate::theme;
 use crate::ui::notifications::badge::rail_badge;
+use crate::ui::social::presence::{avatar_status, custom_status_line, status_label};
 
 impl Inlet {
     /// The floating user panel under the rail and channel list.
     pub(crate) fn render_user_panel(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        // The status this session shows follows the account (a pick, a switch, READY).
+        self.sync_presence(cx);
+        #[cfg(feature = "demo")]
+        self.demo_status_picker(cx);
+        let status = self.shown_status(cx);
         let initials = Guild {
             id: String::new(),
             name: self.username.clone(),
@@ -45,7 +51,8 @@ impl Inlet {
                 .border_1()
                 .border_color(theme::ring())
                 .child(
-                    // Avatar and name open the account switcher, as in Fluxer.
+                    // Avatar and name open the status picker (Fluxer's user area menu),
+                    // which also leads to the account switcher.
                     div()
                         .id("user-area")
                         .flex_1()
@@ -55,10 +62,7 @@ impl Inlet {
                         .items_center()
                         .gap_2()
                         .cursor_pointer()
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.switcher.open = true;
-                            cx.notify();
-                        }))
+                        .on_click(cx.listener(|this, _, _, cx| this.open_status_picker(cx)))
                         .child(
                             div()
                                 .relative()
@@ -73,11 +77,12 @@ impl Inlet {
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(theme::text_strong())
                                 .child(initials)
+                                .child(avatar_status(status, theme::panel_bg()))
                                 .when(elsewhere > 0, |d| {
                                     d.child(rail_badge(elsewhere, theme::panel_bg()))
                                 }),
                         )
-                        .child(self.render_user_name()),
+                        .child(self.render_user_name(status, cx)),
                 )
                 .child(
                     icon_button("settings", Icon::Gear)
@@ -95,8 +100,17 @@ impl Inlet {
         )
     }
 
-    /// The name and instance in the user panel.
-    fn render_user_name(&self) -> impl IntoElement {
+    /// The name, and under it the custom status or the status, in the user panel.
+    fn render_user_name(&self, status: &str, cx: &mut Context<Self>) -> impl IntoElement {
+        let now = chrono::Utc::now().timestamp_millis();
+        let custom = self
+            .account
+            .as_ref()
+            .and_then(|a| a.read(cx).presences().own().custom_at(now).cloned());
+        let second = match custom {
+            Some(c) => custom_status_line(&c, 11.),
+            None => status_label(status).into_any_element(),
+        };
         div()
             .flex_1()
             .min_w_0()
@@ -120,7 +134,7 @@ impl Inlet {
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(theme::text_muted())
                     .text_ellipsis()
-                    .child(self.instance.clone()),
+                    .child(second),
             )
     }
 }

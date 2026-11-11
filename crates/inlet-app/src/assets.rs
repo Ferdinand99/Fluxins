@@ -66,6 +66,44 @@ impl Icon {
     }
 }
 
+// The four shapes of Fluxer's `StatusIndicator` (a disc, a moon, a disc with a bar, a
+// ring), drawn as masks in our own SVG; the caller fills them with the status colour.
+const ONLINE_SVG: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 12 12"><circle cx="6" cy="6" r="6"/></svg>"##;
+const IDLE_SVG: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 12 12"><mask id="m"><circle cx="6" cy="6" r="6" fill="#fff"/><circle cx="3" cy="3" r="4.5" fill="#000"/></mask><rect width="12" height="12" mask="url(#m)"/></svg>"##;
+const DND_SVG: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 12 12"><mask id="m"><circle cx="6" cy="6" r="6" fill="#fff"/><rect x="1.5" y="4.5" width="9" height="3" rx="1.5" fill="#000"/></mask><rect width="12" height="12" mask="url(#m)"/></svg>"##;
+const OFFLINE_SVG: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 12 12"><mask id="m"><circle cx="6" cy="6" r="6" fill="#fff"/><circle cx="6" cy="6" r="3" fill="#000"/></mask><rect width="12" height="12" mask="url(#m)"/></svg>"##;
+
+/// The drawing of a status dot: `online`, `idle`, `dnd`, else offline (a ring).
+pub fn status_svg(status: &str) -> &'static [u8] {
+    match status {
+        "online" => ONLINE_SVG,
+        "idle" => IDLE_SVG,
+        "dnd" => DND_SVG,
+        _ => OFFLINE_SVG,
+    }
+}
+
+/// Gives a bundled SVG without a size (Twemoji: a 36 x 36 view box) a size of `px`,
+/// so gpui rasterises it sharp at that size. One with a width stays as it is.
+pub fn sized_svg(svg: &[u8], px: u32) -> Vec<u8> {
+    let Some(at) = svg.windows(4).position(|w| w == b"<svg").map(|p| p + 4) else {
+        return svg.to_vec();
+    };
+    let head_end = svg[at..]
+        .iter()
+        .position(|b| *b == b'>')
+        .map_or(svg.len(), |p| p + at);
+    if svg[at..head_end].windows(5).any(|w| w == b"width") {
+        return svg.to_vec();
+    }
+    let attrs = format!(" width=\"{px}\" height=\"{px}\"");
+    let mut out = Vec::with_capacity(svg.len() + attrs.len());
+    out.extend_from_slice(&svg[..at]);
+    out.extend_from_slice(attrs.as_bytes());
+    out.extend_from_slice(&svg[at..]);
+    out
+}
+
 static FONTS: std::sync::OnceLock<(&'static str, &'static str)> = std::sync::OnceLock::new();
 
 /// The UI font family chosen at start-up.
@@ -116,5 +154,22 @@ fn choose_fonts(cx: &App) -> (&'static str, &'static str) {
                 ("DejaVu Sans", "DejaVu Sans Mono")
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn svg_drawings_get_a_size_once() {
+        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 36 36"><path/></svg>"#;
+        let sized = String::from_utf8(sized_svg(svg, 64)).unwrap();
+        assert!(
+            sized.starts_with(r#"<svg width="64" height="64" xmlns="#),
+            "{sized}"
+        );
+        assert_eq!(sized_svg(&sized_svg(svg, 64), 64), sized_svg(svg, 64));
+        assert_eq!(status_svg("busy"), status_svg("offline"));
     }
 }

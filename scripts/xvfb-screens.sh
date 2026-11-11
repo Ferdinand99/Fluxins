@@ -104,6 +104,8 @@ scene 24-chat-pins chat-pins c-general
 scene 25-inbox-unreads inbox-unreads c-general
 scene 26-inbox-saved inbox-saved c-general
 scene 27-inbox-mentions inbox-mentions c-general
+# Presence: the status picker open over the user panel, two people typing in #general.
+scene 28-status-picker status-picker c-general
 
 tail -n 20 "$out/signin.log" "$out/demo.log" >&2
 cat "$out/memory.txt" >&2

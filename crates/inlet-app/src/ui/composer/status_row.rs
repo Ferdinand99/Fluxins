@@ -6,9 +6,12 @@
 
 use gpui::{div, prelude::*, px, AnyElement, Context, Window};
 
+use inlet_state::ChannelId;
+
 use super::editor::ComposerView;
 use super::slowmode::clock;
 use crate::theme;
+use crate::ui::chat::typing::{typing_element, typing_line};
 
 /// Height of the row.
 pub const STATUS_ROW_HEIGHT: f32 = 24.;
@@ -16,9 +19,12 @@ pub const STATUS_ROW_HEIGHT: f32 = 24.;
 const COUNT_FROM: usize = 200;
 
 impl ComposerView {
-    /// Who is typing in the open channel. Empty until the typing indicator fills it.
-    fn typing_indicator(&self, _cx: &mut Context<Self>) -> Option<AnyElement> {
-        None
+    /// Who is typing in the open channel (see `ui/chat/typing.rs`).
+    fn typing_indicator(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let account = self.account.as_ref()?.upgrade()?;
+        let channel = ChannelId::parse(&self.channel.as_ref()?.channel_id)?;
+        let line = typing_line(account.read(cx), channel)?;
+        Some(typing_element(line))
     }
 
     pub(super) fn render_status_row(

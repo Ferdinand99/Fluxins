@@ -118,6 +118,9 @@ impl AccountState {
         for p in r.presences() {
             s.presences.upsert(&p);
         }
+        if let Some(settings) = r.user_settings() {
+            s.presences.set_own(&settings);
+        }
         s
     }
 
@@ -500,6 +503,9 @@ impl AccountState {
                 }
             }
             Dispatch::UserSettingsUpdate(_) | Dispatch::SessionsReplace(_) => {
+                if let Dispatch::UserSettingsUpdate(u) = d {
+                    c.presence |= self.presences.set_own(u);
+                }
                 c.merge(self.settings.apply(d));
             }
             Dispatch::VoiceStateUpdate(_) => c.merge(self.voice.apply(d)),
@@ -706,6 +712,20 @@ impl AccountState {
         c
     }
 
+    /// Shows a change of the account's own status or custom status at once, before the
+    /// server confirms it; its USER_SETTINGS_UPDATE replaces it. A `None` part stays;
+    /// `Some(None)` clears the custom status.
+    pub fn set_own_status(
+        &mut self,
+        status: Option<&str>,
+        custom: Option<Option<inlet_protocol::models::CustomStatus>>,
+    ) -> Changes {
+        Changes {
+            presence: self.presences.set_own_parts(status, custom),
+            ..Changes::default()
+        }
+    }
+
     /// Whether the account is in the background (see [`AccountState::set_passive`]).
     pub fn is_passive(&self) -> bool {
         self.passive
@@ -871,9 +891,11 @@ impl AccountState {
         &self.windows
     }
 
-    /// Users typing in a channel (never the account itself).
+    /// Users typing in a channel (never the account itself, nor anyone it blocked).
     pub fn typing(&self, ch: ChannelId) -> Vec<UserId> {
-        self.typing.users(ch, self.now_ms)
+        let mut users = self.typing.users(ch, self.now_ms);
+        users.retain(|u| !self.relationships.is_blocked(*u));
+        users
     }
 
     /// A channel's raw read state.

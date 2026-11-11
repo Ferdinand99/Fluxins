@@ -400,6 +400,8 @@ struct RealActive {
     /// The composer's state of this account: its ID and limit, sends that may be
     /// retried, open member searches. Kept per account, so switching back finds it.
     composer: composer::State,
+    /// This account's presence: the status it shows and its settings writes.
+    presence: Box<social::presence::Presence>,
     session: p::Session,
     gateway: p::GatewayHandle,
     forward: AbortHandle,

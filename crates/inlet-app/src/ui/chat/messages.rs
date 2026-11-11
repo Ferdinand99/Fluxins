@@ -1264,6 +1264,7 @@ impl Inlet {
         self.notifications
             .refresh_badges(account.read(cx), &changes);
         self.inbox.state_changed(&changes);
+        self.typing_changed(&changes, cx);
         self.chat.view.conversions.prune(account.read(cx), &changes);
         let Some(ch) = self.open_channel_id() else {
             return;

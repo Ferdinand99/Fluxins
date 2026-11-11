@@ -966,6 +966,7 @@ impl Backend {
             legacy: None,
             down: false,
             composer,
+            presence: Default::default(),
             session,
             gateway,
             forward,
@@ -1066,6 +1067,7 @@ impl Backend {
             legacy: None,
             down: false,
             composer,
+            presence: Default::default(),
             session,
             gateway,
             forward,
@@ -1097,6 +1099,7 @@ impl Backend {
                 if let Some(guild) = r.active_guild.take() {
                     r.gateway.set_guild_active(&guild, false);
                 }
+                r.presence.to_background(&r.gateway);
                 for t in r.settings_writes.drain(..) {
                     t.abort();
                 }

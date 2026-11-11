@@ -97,7 +97,7 @@ pub(crate) fn cap_member(m: &mut GuildMember, own: bool) {
     trim_extra(&mut m.extra, MAX_MEMBER_EXTRA_BYTES, &[]);
 }
 
-fn cap_custom_status(s: &mut CustomStatus) {
+pub(crate) fn cap_custom_status(s: &mut CustomStatus) {
     truncate_opt(&mut s.text, 512);
     truncate_opt(&mut s.emoji_name, 64);
     truncate_opt(&mut s.expires_at, 64);

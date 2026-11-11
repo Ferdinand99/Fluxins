@@ -27,6 +27,8 @@
 //! - `chat-pins`: for `#general`, the pinned messages panel open.
 //! - `inbox-unreads`, `inbox-saved`, `inbox-mentions`: for `#general`, the inbox open on
 //!   that tab (with the unread state of `default`; see `inbox.rs`).
+//! - `status-picker`: the account on "Do Not Disturb" with a custom status, the status
+//!   picker open, and two people typing in the open channel (see `social.rs`).
 
 use std::collections::HashMap;
 
@@ -64,6 +66,7 @@ pub enum Scene {
     InboxUnreads,
     InboxSaved,
     InboxMentions,
+    StatusPicker,
 }
 
 impl Scene {
@@ -90,6 +93,7 @@ impl Scene {
             "inbox-unreads" => Scene::InboxUnreads,
             "inbox-saved" => Scene::InboxSaved,
             "inbox-mentions" => Scene::InboxMentions,
+            "status-picker" => Scene::StatusPicker,
             _ => return None,
         })
     }
@@ -170,6 +174,7 @@ fn ready(
     read_states: Vec<Value>,
     guild_settings: Vec<Value>,
     unread_demo: bool,
+    user_settings: Value,
 ) -> p::Ready {
     let guilds: Vec<Value> = guilds
         .iter()
@@ -217,6 +222,8 @@ fn ready(
         "users": [],
         "read_states": read_states,
         "user_guild_settings": guild_settings,
+        "presences": social::presences(),
+        "user_settings": user_settings,
     }))
     .expect("the demo READY is valid")
 }
@@ -325,6 +332,7 @@ pub fn data(scene: Scene) -> Data {
         read_states,
         guild_settings,
         unread_demo,
+        social::user_settings(scene),
     );
     Data {
         guilds,
@@ -363,6 +371,7 @@ mod tests {
             "inbox-unreads",
             "inbox-saved",
             "inbox-mentions",
+            "status-picker",
         ] {
             let scene = Scene::from_name(name).expect(name);
             let data = data(scene);
