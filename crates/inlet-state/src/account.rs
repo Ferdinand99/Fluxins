@@ -51,17 +51,17 @@ enum MemberSource {
 pub struct AccountState {
     session_id: String,
     me: CurrentUser,
-    me_id: UserId,
-    guilds: BTreeMap<GuildId, GuildState>,
-    channels: Channels,
+    pub(crate) me_id: UserId,
+    pub(crate) guilds: BTreeMap<GuildId, GuildState>,
+    pub(crate) channels: Channels,
     users: Users,
     presences: Presences,
-    read_states: ReadStates,
+    pub(crate) read_states: ReadStates,
     guild_settings: GuildSettings,
     windows: MessageWindows,
     typing: Typing,
     relationships: Relationships,
-    threads: Threads,
+    pub(crate) threads: Threads,
     settings: Settings,
     voice: Voice,
     now_ms: i64,
@@ -503,6 +503,13 @@ impl AccountState {
                 c.merge(self.settings.apply(d));
             }
             Dispatch::VoiceStateUpdate(_) => c.merge(self.voice.apply(d)),
+            Dispatch::ThreadCreate(_)
+            | Dispatch::ThreadUpdate(_)
+            | Dispatch::ThreadDelete(_)
+            | Dispatch::ThreadListSync(_)
+            | Dispatch::ThreadMemberUpdate(_)
+            | Dispatch::ThreadMembersUpdate(_)
+            | Dispatch::ForumUnreads(_) => self.apply_thread(d, &mut c),
             Dispatch::Other { name, data } if name == "USER_GUILD_SETTINGS_UPDATE" => {
                 if self.guild_settings.update(data).is_some() {
                     c.settings = true;
@@ -1003,9 +1010,11 @@ impl AccountState {
             let Some(channel) = self.channels.get(*id) else {
                 continue;
             };
-            // Deviation: threads and forum posts are left out until thread
-            // membership is tracked (Fluxer counts joined threads).
-            if !is_guild_text_based(channel.kind) {
+            // Fluxer's `getChannelContribution`: text channels, forums and
+            // threads. A thread counts as unread only when the account joined
+            // it; its mentions always count.
+            let thread = channel.is_thread();
+            if !is_guild_text_based(channel.kind) && !thread && !channel.is_forum() {
                 continue;
             }
             // Fluxer's channel store only holds channels the gateway let the
@@ -1028,7 +1037,7 @@ impl AccountState {
                     || (level != Some(notifications::NO_MESSAGES)
                         && level != Some(notifications::ONLY_MENTIONS)
                         && !u.muted));
-            out.unread |= unread_allowed;
+            out.unread |= unread_allowed && (!thread || channel.is_thread_member());
             out.mentions = out.mentions.saturating_add(u.mentions);
         }
         out
@@ -1094,7 +1103,7 @@ impl AccountState {
     }
 
     /// Recomputes the listed channels of a guild (gone ones are dropped).
-    fn recompute_ids(&mut self, g: GuildId, ids: &[ChannelId], c: &mut Changes) {
+    pub(crate) fn recompute_ids(&mut self, g: GuildId, ids: &[ChannelId], c: &mut Changes) {
         let (me, channels, now) = (&self.me, &self.channels, self.now_ms);
         let Some(guild) = self.guilds.get_mut(&g) else {
             return;
@@ -1176,6 +1185,8 @@ impl AccountState {
             fresh.insert(cid);
             self.store_channel(cid, ch, Some(id), c);
         }
+        // Its active threads (with the account's memberships), after their parents.
+        self.ingest_threads(id, g.extra.get("threads"), &mut fresh, c);
         // Channels the guild no longer sends were hidden: keep their acks.
         for gone in old.difference(&fresh) {
             self.forget_channel(*gone, true, c);
@@ -1187,7 +1198,7 @@ impl AccountState {
     }
 
     /// Stores a channel and seeds its read state (restoring an archived ack).
-    fn store_channel(
+    pub(crate) fn store_channel(
         &mut self,
         cid: ChannelId,
         mut ch: Channel,
@@ -1286,7 +1297,7 @@ impl AccountState {
 
     /// Removes a channel with its window and typing. A DM keeps its read
     /// state; a guild channel's read state is archived (`keep_ack`) or dropped.
-    fn forget_channel(&mut self, id: ChannelId, keep_ack: bool, c: &mut Changes) {
+    pub(crate) fn forget_channel(&mut self, id: ChannelId, keep_ack: bool, c: &mut Changes) {
         let guild = self.channels.guild_of(id);
         if self.channels.remove(id).is_some() {
             c.channel(id);

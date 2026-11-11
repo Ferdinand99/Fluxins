@@ -179,6 +179,15 @@ impl ReadStates {
         self.by_channel.get(&ch)
     }
 
+    /// A channel's ack, from its entry or, for a channel not known right
+    /// now, from the archive.
+    pub fn ack_of(&self, ch: ChannelId) -> Option<MessageId> {
+        self.by_channel
+            .get(&ch)
+            .or_else(|| self.archived.get(&ch))
+            .and_then(|e| e.ack_message_id)
+    }
+
     /// The entry, created if there is room.
     pub(crate) fn ensure(
         &mut self,

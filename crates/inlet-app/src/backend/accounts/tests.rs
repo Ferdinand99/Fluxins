@@ -1017,3 +1017,78 @@ async fn a_command_that_is_not_run_still_gets_its_answer() {
     assert!(matches!(&b.active, Some(Active::Real(r)) if r.key == ka));
     assert!(!b.background.iter().any(|r| r.key == kb));
 }
+
+#[tokio::test]
+async fn thread_commands_for_another_account_are_answered_without_a_request() {
+    use crate::backend::messages::{threads, Cmd as MCmd, Ev as MEv};
+    let (server, mut b, mut rx, _irx, ka, kb) = two_accounts().await;
+    handle(&mut b, Cmd::SwitchAccount(ka.clone()));
+    while rx.try_recv().is_ok() {}
+    let thread = |cmd| crate::backend::Command::Messages(MCmd::Thread(cmd));
+    // Sent for B before the switch reached the backend: answered, tagged B, no request.
+    b.command(
+        Some(kb.clone()),
+        thread(threads::Cmd::OpenThread {
+            thread_id: "701".into(),
+            request: 9,
+        }),
+    );
+    b.command(
+        Some(kb.clone()),
+        thread(threads::Cmd::Archived {
+            channel_id: "702".into(),
+            before: None,
+            request: 3,
+        }),
+    );
+    b.command(
+        Some(kb.clone()),
+        thread(threads::Cmd::Subscribe {
+            guild_id: "703".into(),
+            member_lists: Vec::new(),
+        }),
+    );
+    let (mut page, mut archived) = (false, false);
+    for _ in 0..50 {
+        while let Ok(event) = rx.try_recv() {
+            if let Event::Tagged { account, event } = event {
+                match *event {
+                    Event::Messages(MEv::Thread(threads::Ev::PageFailed {
+                        request: 9, ..
+                    })) => {
+                        assert_eq!(account, kb);
+                        page = true;
+                    }
+                    Event::Messages(MEv::Thread(threads::Ev::Archived {
+                        request: 3,
+                        result: Err(_),
+                        ..
+                    })) => {
+                        assert_eq!(account, kb);
+                        archived = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if page && archived {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(page && archived, "both waiting requests were answered");
+    // For A, while A is active: runs with A's token.
+    b.command(
+        Some(ka.clone()),
+        thread(threads::Cmd::OpenThread {
+            thread_id: "800".into(),
+            request: 10,
+        }),
+    );
+    let r = wait_for_request(&server, "/api/v1/channels/800/messages").await;
+    assert_eq!(token_of(&r), "tok-a");
+    assert!(!requests(&server)
+        .await
+        .iter()
+        .any(|r| r.url.path().contains("/701/") || r.url.path().contains("/702/")));
+}

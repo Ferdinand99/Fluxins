@@ -49,6 +49,10 @@ pub enum ChannelKind {
     Category,
     Dm,
     GroupDm,
+    /// A forum: posts instead of messages.
+    Forum,
+    /// A media channel: a forum shown as a grid.
+    Media,
     Other,
 }
 
@@ -170,6 +174,11 @@ impl Channel {
             self.kind,
             ChannelKind::Text | ChannelKind::Announcement | ChannelKind::Dm | ChannelKind::GroupDm
         )
+    }
+
+    /// A forum or media channel: it opens the forum view instead of the chat.
+    pub fn is_forum(&self) -> bool {
+        matches!(self.kind, ChannelKind::Forum | ChannelKind::Media)
     }
 }
 

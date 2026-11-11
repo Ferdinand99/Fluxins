@@ -124,11 +124,18 @@ cpu_scene() {
 cpu_scene 28-custom-emoji custom-emoji
 cpu_scene 29-emoji-100 emoji-100
 
-# 9. The Notifications settings tab.
+# 9. Threads: the side panel with its own composer, the thread list, a forum and a
+#    media channel.
+scene 30-thread-panel thread-panel c-general
+scene 31-thread-list thread-list c-general
+scene 32-forum forum c-forum
+scene 33-media-channel media-channel c-gallery
+
+# 10. The Notifications settings tab.
 INLET_DEMO=1 INLET_DEMO_LIVE_SECS=3600 INLET_DEMO_GUILD=g1 INLET_DEMO_CHANNEL=c-general INLET_DEMO_SETTINGS=notifications "$bin" >>"$out/demo.log" 2>&1 &
 pid=$!
 sleep 6
-shot 30-settings-notifications
+shot 34-settings-notifications
 kill $pid; wait $pid 2>/dev/null
 
 tail -n 20 "$out/signin.log" "$out/demo.log" >&2

@@ -106,9 +106,15 @@ Run-Demo "27-custom-emoji" @{ INLET_DEMO = "1"; INLET_DEMO_LIVE_SECS = "3600"; I
 Run-Demo "28-emoji-100" @{ INLET_DEMO = "1"; INLET_DEMO_LIVE_SECS = "3600"; INLET_DEMO_SCENE = "emoji-100"; INLET_DEMO_GUILD = "g1"; INLET_DEMO_CHANNEL = "c-dev" } 10 10
 # The same with animated emoji switched off: every emoji shows its first frame.
 Run-Demo "29-emoji-100-still" @{ INLET_DEMO = "1"; INLET_DEMO_LIVE_SECS = "3600"; INLET_DEMO_SCENE = "emoji-100"; INLET_DEMO_GUILD = "g1"; INLET_DEMO_CHANNEL = "c-dev"; INLET_DEMO_ANIMATE_EMOJI = "0" } 10 10
+
+# Threads: the side panel with its own composer, the thread list, a forum and a media channel.
+Run-Demo "30-thread-panel" @{ INLET_DEMO = "1"; INLET_DEMO_LIVE_SECS = "3600"; INLET_DEMO_SCENE = "thread-panel"; INLET_DEMO_GUILD = "g1"; INLET_DEMO_CHANNEL = "c-general" } 10
+Run-Demo "31-thread-list" @{ INLET_DEMO = "1"; INLET_DEMO_LIVE_SECS = "3600"; INLET_DEMO_SCENE = "thread-list"; INLET_DEMO_GUILD = "g1"; INLET_DEMO_CHANNEL = "c-general" } 10
+Run-Demo "32-forum" @{ INLET_DEMO = "1"; INLET_DEMO_LIVE_SECS = "3600"; INLET_DEMO_SCENE = "forum"; INLET_DEMO_GUILD = "g1"; INLET_DEMO_CHANNEL = "c-forum" } 10
+Run-Demo "33-media-channel" @{ INLET_DEMO = "1"; INLET_DEMO_LIVE_SECS = "3600"; INLET_DEMO_SCENE = "media-channel"; INLET_DEMO_GUILD = "g1"; INLET_DEMO_CHANNEL = "c-gallery" } 10
 # The Notifications settings tab. The demo also posts a test notification; the runner's
 # session does not show toasts, so the toast itself is checked by hand.
-Run-Demo "30-settings-notifications" @{ INLET_DEMO = "1"; INLET_DEMO_LIVE_SECS = "3600"; INLET_DEMO_GUILD = "g1"; INLET_DEMO_CHANNEL = "c-general"; INLET_DEMO_SETTINGS = "notifications"; INLET_DEMO_NOTIFY = "1" } 10
+Run-Demo "34-settings-notifications" @{ INLET_DEMO = "1"; INLET_DEMO_LIVE_SECS = "3600"; INLET_DEMO_GUILD = "g1"; INLET_DEMO_CHANNEL = "c-general"; INLET_DEMO_SETTINGS = "notifications"; INLET_DEMO_NOTIFY = "1" } 10
 
 # A demo that quit before its screenshot crashed: fail the job, the pictures are not
 # worth checking.
