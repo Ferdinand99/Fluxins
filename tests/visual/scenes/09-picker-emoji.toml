@@ -1,0 +1,10 @@
+# The composer's picker on the emoji tab: favourite and frequently used emoji, the
+# guild's custom emoji (animated ones on their first frame) and the first category.
+name = "picker-emoji"
+window = [1280, 860]
+scale = 1.0
+theme = "dark"
+ignore = []
+scene = "picker-emoji"
+guild = "g1"
+channel = "c-general"

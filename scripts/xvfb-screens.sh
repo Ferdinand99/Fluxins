@@ -145,6 +145,9 @@ scene 35-status-picker status-picker c-general
 
 # The composer with files attached and an upload on its way.
 scene 36-composer-attachments composer-attachments c-general
+# The composer's picker on the emoji tab and on the GIF tab.
+scene 37-picker-emoji picker-emoji c-general
+scene 38-picker-gif picker-gif c-general
 
 # 10. The Notifications settings tab.
 INLET_DEMO=1 INLET_DEMO_LIVE_SECS=3600 INLET_DEMO_GUILD=g1 INLET_DEMO_CHANNEL=c-general INLET_DEMO_SETTINGS=notifications "$bin" >>"$out/demo.log" 2>&1 &

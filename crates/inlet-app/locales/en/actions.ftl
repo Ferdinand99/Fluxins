@@ -15,7 +15,6 @@ action-copy-id = Copy Message ID
 action-hide-embeds = Suppress Embeds
 action-show-embeds = Show Embeds
 action-delete = Delete Message
-action-picker-soon = More emoji arrive with the emoji picker.
 action-delete-title = Delete Message
 action-delete-body = Are you sure you want to delete this message? This cannot be undone.
 action-delete-shift-tip = Tip: hold Shift when you click Delete Message to skip this.

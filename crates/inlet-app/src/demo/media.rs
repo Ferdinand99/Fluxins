@@ -221,6 +221,26 @@ fn serve(path: &str, query: &str) -> Option<Vec<u8>> {
             "gif" => png_of(240, 240, bouncing(240, 1).remove(0)),
             "video" => png_of(1280, 720, landscape(1280, 720, 0.7)),
             "sky" => png_of(800, 450, bands(800, 450, [60, 120, 230], [220, 240, 255])),
+            // The pickers' GIFs, small as the proxy would make them: `pick-<n>` moves when
+            // asked for the animation, `pickstill-<n>` never does.
+            s if s.starts_with("pick-") || s.starts_with("pickstill-") => {
+                let (prefix, n) = s.split_once('-')?;
+                let n: u8 = n.parse().ok()?;
+                let animated = animated && prefix == "pick";
+                let hue = |k: u8| -> [u8; 3] {
+                    let t = f32::from(n.wrapping_add(k) % 8) / 8. * std::f32::consts::TAU;
+                    let c = |o: f32| (150. + 90. * (t + o).cos()) as u8;
+                    [c(0.), c(2.1), c(4.2)]
+                };
+                if animated {
+                    let frames: Vec<Vec<u8>> = (0..6)
+                        .map(|i| bands(192, 120, hue(i), hue(i + 3)))
+                        .collect();
+                    png::encode_apng(192, 120, &frames, 120)
+                } else {
+                    png_of(192, 120, bands(192, 120, hue(0), hue(3)))
+                }
+            }
             // A GIF page's video: like the real proxy, its first frame only when an image
             // format is asked for; otherwise the video itself, which is no image.
             "loop" if query.contains("format=webp") => {
@@ -278,7 +298,8 @@ pub fn attachment(channel: &str, id: u64, filename: &str, kind: &str, extra: Val
     v
 }
 
-fn external(name: &str) -> String {
+/// A picture of the demo proxy's external media (embeds, GIFs).
+pub(crate) fn external(name: &str) -> String {
     format!("{MEDIA_BASE}/external/demo-signature/https/media.example/{name}.png")
 }
 

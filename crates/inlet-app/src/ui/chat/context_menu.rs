@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! The message actions' overlays: the context menu (right click on a message, or "more"
-//! in the bar), the emoji list of "add reaction", who reacted, the delete confirmation
-//! and the forward picker. One is open at a time.
+//! in the bar), who reacted, the delete confirmation and the forward picker. One is open
+//! at a time. "Add reaction" opens the emoji picker (`ui/composer/pickers`), a layer.
 //!
 //! An open overlay takes the keyboard focus, so Escape and Shift+Escape close it before
 //! they can reach the app's "mark as read" (the composer, when it has focus, cancels
@@ -73,12 +73,6 @@ pub enum Overlay {
         id: MessageId,
         at: Point<Pixels>,
     },
-    /// The emoji list of "add reaction" (until the emoji picker arrives).
-    Picker {
-        ch: ChannelId,
-        id: MessageId,
-        at: Point<Pixels>,
-    },
     Reactors {
         ch: ChannelId,
         id: MessageId,
@@ -99,7 +93,6 @@ impl Overlay {
     fn target(&self) -> (ChannelId, MessageId) {
         match self {
             Overlay::Menu { ch, id, .. }
-            | Overlay::Picker { ch, id, .. }
             | Overlay::Reactors { ch, id, .. }
             | Overlay::ConfirmDelete { ch, id }
             | Overlay::Forward { ch, id } => (*ch, *id),
@@ -138,7 +131,7 @@ impl ActionsState {
             || self.shown_bar == Some(id)
             || matches!(
                 &self.overlay,
-                Some(Overlay::Menu { id: m, .. } | Overlay::Picker { id: m, .. }) if *m == id
+                Some(Overlay::Menu { id: m, .. }) if *m == id
             )
     }
 
@@ -478,10 +471,6 @@ impl Inlet {
                 let content = self.render_menu(ch, id, cx);
                 self.popover(&focus, at, content, cx)
             }
-            Overlay::Picker { at, .. } => {
-                let content = self.render_picker(ch, id, cx);
-                self.popover(&focus, at, content, cx)
-            }
             Overlay::Reactors { emoji, at, .. } => {
                 let content = self.render_reactors(ch, id, &emoji, cx);
                 self.popover(&focus, at, content, cx)
@@ -584,49 +573,6 @@ impl Inlet {
             );
         }
         menu.into_any_element()
-    }
-
-    /// "Add reaction": the common emoji, until the emoji picker arrives.
-    fn render_picker(
-        &mut self,
-        ch: ChannelId,
-        id: MessageId,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let mut grid = div().w(px(8. * 36.)).flex().flex_row().flex_wrap();
-        for (i, glyph) in reactions::PICKER.iter().enumerate() {
-            let emoji = p::Emoji::unicode(*glyph);
-            grid = grid.child(
-                div()
-                    .id(SharedString::from(format!("pick-{i}")))
-                    .size(px(36.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(6.))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(theme::floating_hover()))
-                    .child(reactions::emoji_el(&format!("pick-e-{i}"), &emoji, 14.))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.toggle_reaction(ch, id, emoji.clone(), cx);
-                        this.close_overlay(window, cx);
-                    })),
-            );
-        }
-        // Deviation: Fluxer opens its full emoji picker here; Inlet lists common emoji
-        // until the picker is built.
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(6.))
-            .child(grid)
-            .child(
-                div()
-                    .text_size(px(12.))
-                    .text_color(theme::text_tertiary())
-                    .child(t!("action-picker-soon")),
-            )
-            .into_any_element()
     }
 
     /// "Delete message?" with the message, Cancel and Delete. Enter deletes.

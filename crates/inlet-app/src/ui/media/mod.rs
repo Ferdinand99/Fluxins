@@ -18,9 +18,9 @@ mod avatar;
 pub(crate) mod embed;
 pub(crate) mod emoji;
 mod failed;
-mod image;
+pub(crate) mod image;
 pub mod requests;
-mod sticker;
+pub(crate) mod sticker;
 mod video_thumb;
 mod viewer;
 
@@ -218,6 +218,13 @@ impl Inlet {
             layer_open: self.layer_open(),
         };
         self.media.images.next_frame(stage);
+        // The picker on top: its images get the animation budget before the chat.
+        let picker_on_top = self.is_top_layer(crate::desktop::Layer::Picker);
+        self.media
+            .images
+            .animations()
+            .borrow_mut()
+            .set_top_layer_only(picker_on_top);
         self.release_evicted(Some(window), cx);
         emoji::release_twemoji(window, cx);
         #[cfg(feature = "demo")]
