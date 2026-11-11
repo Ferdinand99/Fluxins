@@ -51,6 +51,8 @@ Scripts started with `--exec` run in the repository root and find the cargo targ
 
 `scripts/docker-build.sh screenshot` builds the app with `--features demo` (set `INLET_PROFILE=release` for a release build), then runs `scripts/xvfb-screens.sh <binary>` under Xvfb with the lavapipe software renderer. Extra arguments are passed on to that script after the binary path.
 
+CI also compares fixed scenes with committed baselines on Windows, macOS and Linux. When a change alters how one looks, or you add a scene, see "Adding or updating a scene" in [`tests/visual/README.md`](../tests/visual/README.md).
+
 ### Checking the setup
 
 `scripts/docker-build.sh --self-test` starts three runs at once and checks that only two hold a slot at the same time, that the third waits, that the labels are present, and that no container is left behind. It occupies both slots for about 30 seconds.

@@ -39,12 +39,19 @@
 //! - `composer-attachments`: for `#general`, three files in the composer's tray (a photo
 //!   with alt text, a spoiler, a document), an upload on its way above the box, and its
 //!   message pending in the list.
+//!
+//! `INLET_DEMO_SCENE` may also name a scene file of the visual checks
+//! (`tests/visual/scenes/*.toml`, see `scene_file.rs`): it then sets the scene, the guild,
+//! the channel and the other demo variables, and the window size.
 
 use std::collections::HashMap;
+use std::path::Path;
+use std::sync::OnceLock;
 
 use inlet_protocol as p;
 use serde_json::{json, Value};
 
+use super::scene_file::SceneFile;
 use super::{
     emoji, guilds, markdown, media, messages, snowflake, social, unread, user, user_id, ME,
     ROLE_CONTRIBUTORS, ROLE_MODERATORS,
@@ -144,6 +151,57 @@ pub fn current() -> Scene {
 
 /// The nonce of the upload on its way in the `composer-attachments` scene.
 pub const DEMO_UPLOAD_NONCE: &str = "demo-upload";
+
+/// The window size a scene file asked for.
+static WINDOW: OnceLock<[u32; 2]> = OnceLock::new();
+
+/// When `INLET_DEMO_SCENE` names a scene file (`*.toml`), applies it: it sets the demo
+/// variables (and clears those it does not set) and the window size. Call it before
+/// anything reads them, while only one thread runs. A file that cannot be read or is
+/// not valid ends the process, so a check never shows another state by mistake.
+pub fn load_scene_file() {
+    let Some(path) = std::env::var("INLET_DEMO_SCENE")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| v.ends_with(".toml"))
+    else {
+        return;
+    };
+    let file = match SceneFile::load(Path::new(&path)) {
+        Ok(file) => file,
+        Err(err) => {
+            eprintln!("inlet: scene file {path}: {err}");
+            std::process::exit(2);
+        }
+    };
+    let scene = file.scene.clone().unwrap_or_else(|| "default".into());
+    if Scene::from_name(&scene).is_none() {
+        eprintln!("inlet: scene file {path}: unknown demo scene {scene:?}");
+        std::process::exit(2);
+    }
+    let set = |name: &str, value: Option<&str>| match value {
+        Some(v) => std::env::set_var(name, v),
+        None => std::env::remove_var(name),
+    };
+    set("INLET_DEMO", file.demo.then_some("1"));
+    set("INLET_DEMO_SCENE", Some(&scene));
+    set("INLET_DEMO_GUILD", file.guild.as_deref());
+    set("INLET_DEMO_CHANNEL", file.channel.as_deref());
+    set("INLET_DEMO_SETTINGS", file.settings.as_deref());
+    set("INLET_DEMO_DEEP_LINK", file.deep_link.as_deref());
+    set("INLET_DEMO_ACCENT", file.accent.as_deref());
+    // No live demo messages while the screenshot is taken, and animated emoji hold
+    // their first frame: a scene must look the same whenever it is taken.
+    set("INLET_DEMO_LIVE_SECS", Some("86400"));
+    set("INLET_DEMO_ANIMATE_EMOJI", Some("0"));
+    let _ = WINDOW.set(file.window);
+    log::info!("demo scene file {path}: {}", file.name);
+}
+
+/// The window's inner size from a scene file, in logical pixels.
+pub fn window_size() -> Option<(f32, f32)> {
+    WINDOW.get().map(|[w, h]| (*w as f32, *h as f32))
+}
 
 /// What a scene shows. All IDs are snowflakes.
 pub struct Data {

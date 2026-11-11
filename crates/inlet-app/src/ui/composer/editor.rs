@@ -45,6 +45,9 @@ actions!(inlet_composer, [AcceptCompletion, Cancel]);
 /// The key context of the composer, around the editor's own.
 pub const KEY_CONTEXT: &str = "inlet_composer";
 
+/// Height of the text box with one line (`--footer-box-height`).
+pub const BOX_MIN_HEIGHT: f32 = 58.;
+
 /// Guilds whose searched members are kept.
 const MAX_GUILDS: usize = 32;
 /// How often the UI tells the backend the person is typing (the protocol sends at most
@@ -987,6 +990,8 @@ impl Render for ComposerView {
 
 impl ComposerView {
     /// The text box: 58 px high at rest, 8 px corners, 6 px from the sides and bottom.
+    /// Fluxer's 1 px ring is drawn inside the box; here it is a border, so the padding
+    /// is 1 px less to keep the text 18 px from the edge and the box 58 px high.
     fn render_box(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let joined = self.reply.is_some() || self.has_attachments();
         // The plus button: a 22 px circle in a 32 px slot, 12 px before the text.
@@ -1016,12 +1021,13 @@ impl ComposerView {
             )
             .on_click(cx.listener(|this, _, _, cx| this.pick_files(cx)));
         div()
+            .debug_selector(|| "composer-box".into())
             .mx(px(6.))
             .mb(px(6.))
-            .min_h(px(58.))
+            .min_h(px(BOX_MIN_HEIGHT))
             .pl(px(8.))
             .pr_4()
-            .py(px(18.))
+            .py(px(17.))
             .flex()
             .items_center()
             .gap(px(12.))

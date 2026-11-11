@@ -11,6 +11,11 @@ use crate::model::{Channel, ChannelKind};
 use crate::theme;
 use crate::ui::notifications::badge::{mention_badge, RowMarks};
 
+/// Height of a channel row (20 px of text and 6 px above and below).
+pub const ROW_HEIGHT: f32 = 32.;
+/// Corner radius of a channel row (`--radius-md`).
+pub const ROW_RADIUS: f32 = 6.;
+
 pub fn channel_icon(kind: ChannelKind) -> Icon {
     match kind {
         ChannelKind::Text => Icon::Hash,
@@ -167,14 +172,15 @@ impl Inlet {
         };
         let row = div()
             .id(SharedString::from(format!("ch-{}", c.id)))
+            .debug_selector(|| "channel-row".into())
             // Rows must not shrink: a scrolling flex column shrinks its children
             // when the list is taller than the view, and `overflow_hidden` lets
             // a row shrink to nothing.
             .flex_none()
-            .h(px(32.))
+            .h(px(ROW_HEIGHT))
             .ml_2()
             .px_2()
-            .rounded(px(6.))
+            .rounded(px(ROW_RADIUS))
             .flex()
             .flex_row()
             .items_center()

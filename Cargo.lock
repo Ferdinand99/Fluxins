@@ -3040,6 +3040,7 @@ dependencies = [
  "sys-locale",
  "tokio",
  "tokio-tungstenite",
+ "toml 1.2.1+spec-1.1.0",
  "unic-langid",
  "unicode-segmentation",
  "url",
