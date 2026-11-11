@@ -12,7 +12,7 @@ use tokio::task::AbortHandle;
 use super::messages::parse::{
     remember_channels, remember_roles, to_channel, to_message, ChannelCache, SharedNames,
 };
-use super::{accounts, messages, Active, Backend, Internal, Ui};
+use super::{accounts, composer, messages, Active, Backend, Internal, Ui};
 use crate::model::{self, Channel, Guild};
 use crate::reconnect::{Decision, Stop};
 
@@ -29,6 +29,7 @@ impl Backend {
         let events = self.events.clone();
         let internal = self.internal.clone();
         let (guilds, cache, names) = (guilds.clone(), cache.clone(), names.clone());
+        let composer = self.composer.clone();
         let forward = self.spawn_guarded("gateway", Some(gen), async move {
             let on_connected = {
                 let internal = internal.clone();
@@ -36,7 +37,8 @@ impl Backend {
                     let _ = internal.send(Internal::GatewayConnected { gen });
                 }
             };
-            let end = forward_gateway(rx, events, guilds, cache, names, on_connected).await;
+            let end =
+                forward_gateway(rx, events, guilds, cache, names, composer, on_connected).await;
             let _ = internal.send(Internal::GatewayEnded { gen, end });
         });
         (gateway, forward)
@@ -155,6 +157,7 @@ pub async fn forward_gateway(
     guilds: Arc<Mutex<Vec<Guild>>>,
     cache: ChannelCache,
     names: SharedNames,
+    composer: composer::State,
     connected: impl Fn(),
 ) -> GatewayEnd {
     macro_rules! send {
@@ -273,6 +276,10 @@ pub async fn forward_gateway(
                                 guild_list = Some(list.clone());
                             }
                         }
+                    }
+                    p::Dispatch::GuildMembersChunk(chunk) => {
+                        // Answers to the composer's member searches.
+                        composer::members_chunk(&composer, &events, chunk);
                     }
                     p::Dispatch::GuildDelete(d) if !d.unavailable => {
                         cache.lock().unwrap().remove(&Some(d.id.clone()));

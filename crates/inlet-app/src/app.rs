@@ -229,6 +229,8 @@ impl Inlet {
         self.screen = Screen::SignIn;
         self.sign_in.busy = false;
         self.sign_in.handoff = None;
+        // A new session asks again for the account ID and limit.
+        self.composer.reset_session();
         self.overlays.pending_link = None;
         self.overlays.link_prompt = None;
         self.overlays.link_channel = None;
