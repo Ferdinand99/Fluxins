@@ -72,3 +72,4 @@ jobs:
         run: |
           sha256sum "$RUNNER_TEMP/twemoji.pack" crates/inlet-emoji/assets/twemoji.pack
           cmp "$RUNNER_TEMP/twemoji.pack" crates/inlet-emoji/assets/twemoji.pack
+# Scratch change to measure a warm run.
