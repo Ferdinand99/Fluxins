@@ -2,9 +2,9 @@ name: Build
 
 on:
   push:
-    branches: [v0, main]
+    branches: [v0, main, ci1-cache-base]
   pull_request:
-    branches: [v0, main]
+    branches: [v0, main, ci1-cache-base]
   workflow_dispatch:
     inputs:
       release:
@@ -114,7 +114,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: windows-ci-build
-          save-if: ${{ github.ref == 'refs/heads/v0' }}
+          save-if: ${{ github.ref == 'refs/heads/ci1-cache-base' }}
 
       - name: Build the release binary
         if: env.INLET_PROFILE == 'release'
@@ -209,7 +209,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: windows-ci-test
-          save-if: ${{ github.ref == 'refs/heads/v0' }}
+          save-if: ${{ github.ref == 'refs/heads/ci1-cache-base' }}
 
       - name: Test
         run: cargo test --workspace --profile ci --locked
@@ -359,7 +359,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: macos-ci
-          save-if: ${{ github.ref == 'refs/heads/v0' }}
+          save-if: ${{ github.ref == 'refs/heads/ci1-cache-base' }}
 
       - name: Build the release binary
         if: env.INLET_PROFILE == 'release'
@@ -566,7 +566,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: linux-ci-build
-          save-if: ${{ github.ref == 'refs/heads/v0' }}
+          save-if: ${{ github.ref == 'refs/heads/ci1-cache-base' }}
 
       # The extra test CA of inlet-protocol is for tests only. The crate also
       # refuses to compile it in release mode; this checks the feature graph.
@@ -674,7 +674,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: linux-ci-test
-          save-if: ${{ github.ref == 'refs/heads/v0' }}
+          save-if: ${{ github.ref == 'refs/heads/ci1-cache-base' }}
 
       - name: Test
         run: cargo test --workspace --profile ci --locked
@@ -851,7 +851,7 @@ jobs:
         with:
           prefix-key: v0-fuzz
           workspaces: crates/inlet-media/fuzz
-          save-if: ${{ github.ref == 'refs/heads/v0' }}
+          save-if: ${{ github.ref == 'refs/heads/ci1-cache-base' }}
 
       # Builds the target with libFuzzer and the sanitizer, and does not run it.
       - name: Build the fuzz target
