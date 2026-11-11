@@ -461,7 +461,11 @@ mod tests {
             }
             if let Some((tag, kind)) = pending.clone() {
                 field_text.push_str(t);
-                if t.ends_with(',') {
+                // A long type is split over lines: the field ends at a comma
+                // outside the angle brackets.
+                if t.ends_with(',')
+                    && field_text.matches('<').count() == field_text.matches('>').count()
+                {
                     let ty = field_text
                         .rsplit("Option<")
                         .next()
@@ -519,10 +523,39 @@ mod tests {
             assert_eq!(maps.as_slice(), sub.map_fields, "{ty}");
         }
         // Map values that are messages are flat (merged with Schema::FLAT).
-        for name in ["UsageStat", "ChannelFrecencyEntry"] {
-            assert!(structs[name]
-                .iter()
-                .all(|f| f.1 != "message" && !f.1.starts_with("map:")));
+        // Every such map of every generated struct is found from its field
+        // type, so a new one is checked without a change here.
+        let mut value_types = std::collections::BTreeSet::new();
+        for fields in structs.values() {
+            for (_, kind, ty) in fields {
+                if kind.starts_with("map:") && kind.ends_with(", message") {
+                    // `...BTreeMap<::prost::alloc::string::String, Value`, maybe
+                    // with the arguments on separate lines.
+                    let args = ty.split_once('<').map_or("", |(_, a)| a);
+                    let value = args
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|a| !a.is_empty())
+                        .nth(1)
+                        .unwrap_or_else(|| panic!("no map value type in {ty}"));
+                    value_types.insert(value.rsplit("::").next().unwrap_or(value).to_owned());
+                }
+            }
+        }
+        assert!(
+            value_types.contains("UsageStat") && value_types.contains("ChannelFrecencyEntry"),
+            "the map value types were not found: {value_types:?}"
+        );
+        for name in &value_types {
+            let fields = structs
+                .get(name)
+                .unwrap_or_else(|| panic!("map value {name} is not a generated struct"));
+            assert!(
+                fields
+                    .iter()
+                    .all(|f| f.1 != "message" && !f.1.starts_with("map:")),
+                "{name} is a map value but not flat; extend Schema"
+            );
         }
     }
 

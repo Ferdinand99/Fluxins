@@ -18,6 +18,9 @@
 //! - `image-viewer`: `attachments` with the image viewer open on the newest photo.
 //! - `markdown-inline`, `markdown-blocks`, `markdown-alerts`, `markdown-code`: for
 //!   `#development`, every kind of markdown node (see `markdown.rs`).
+//! - `chat-reactions`, `chat-menu`, `chat-delete`: for `#general`, reactions under a few
+//!   messages and an own message; the hover bar shown on one message, the context menu
+//!   open on the own message, or its delete confirmation (see `actions.rs`).
 //! - `custom-emoji`: for `#development`, still and animated custom emoji (inline, in a
 //!   quote, large) and stickers in PNG, APNG, GIF, WebP and animated WebP.
 //! - `emoji-100`: for `#development`, 100 different animated custom emoji at once (see
@@ -50,6 +53,9 @@ pub enum Scene {
     MarkdownBlocks,
     MarkdownAlerts,
     MarkdownCode,
+    ChatReactions,
+    ChatMenu,
+    ChatDelete,
     CustomEmoji,
     Emoji100,
 }
@@ -69,6 +75,9 @@ impl Scene {
             "markdown-blocks" => Scene::MarkdownBlocks,
             "markdown-alerts" => Scene::MarkdownAlerts,
             "markdown-code" => Scene::MarkdownCode,
+            "chat-reactions" => Scene::ChatReactions,
+            "chat-menu" => Scene::ChatMenu,
+            "chat-delete" => Scene::ChatDelete,
             "custom-emoji" => Scene::CustomEmoji,
             "emoji-100" => Scene::Emoji100,
             _ => return None,
@@ -223,6 +232,9 @@ pub fn data(scene: Scene) -> Data {
         Scene::MarkdownCode => {
             by_name.insert(markdown::SCENE_CHANNEL.into(), markdown::code());
         }
+        Scene::ChatReactions | Scene::ChatMenu | Scene::ChatDelete => {
+            super::actions::add(&mut by_name);
+        }
         Scene::CustomEmoji => {
             by_name.insert(markdown::SCENE_CHANNEL.into(), emoji::custom());
         }
@@ -334,6 +346,9 @@ mod tests {
             "markdown-blocks",
             "markdown-alerts",
             "markdown-code",
+            "chat-reactions",
+            "chat-menu",
+            "chat-delete",
             "custom-emoji",
             "emoji-100",
         ] {
@@ -359,6 +374,11 @@ mod tests {
                 !data.outgoing.is_empty(),
                 matches!(scene, Scene::ChatCozy | Scene::ChatCompact)
             );
+            // The action scenes open their overlay on a message that is there.
+            if let Some((ch, id)) = crate::demo::actions::target(scene) {
+                let list = &data.messages[&ch.to_string()];
+                assert!(list.iter().any(|m| m.id == id.to_string()), "{name}");
+            }
         }
         assert_eq!(Scene::from_name("nope"), None);
 

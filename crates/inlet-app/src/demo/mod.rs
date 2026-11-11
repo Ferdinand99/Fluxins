@@ -11,6 +11,7 @@
 //! One file per domain (`guilds`, `media`, `messages`, `markdown`, `social`); `scenes`
 //! picks what to show.
 
+pub mod actions;
 pub mod composer;
 mod emoji;
 mod guilds;

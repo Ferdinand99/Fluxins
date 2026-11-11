@@ -135,8 +135,7 @@ impl Inlet {
         })
     }
 
-    /// A custom emoji on its own, `size` logical pixels square (for reactions).
-    #[allow(dead_code)] // for the reaction bubbles
+    /// A custom emoji on its own, `size` logical pixels square (reaction bubbles).
     pub(crate) fn custom_emoji(
         &self,
         id: &str,
