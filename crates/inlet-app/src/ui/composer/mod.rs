@@ -5,9 +5,10 @@
 //! row above it, the reply bar, the edit box and the autocomplete list. This file connects
 //! it to the app: it opens channels in it, hands its requests to the backend and passes the
 //! backend's answers back. The pickers (emoji, GIF, stickers) and attachments have their
-//! own modules.
+//! own modules; a message with files goes the same way as any other send (one nonce, one
+//! pending row, Retry), as [`Cmd::Upload`].
 
-mod attachments;
+pub mod attachments;
 pub mod autocomplete;
 pub mod commands;
 pub mod drafts;
@@ -17,6 +18,7 @@ mod pickers;
 pub mod reply_bar;
 pub mod slowmode;
 mod status_row;
+pub mod upload_queue;
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -25,7 +27,7 @@ use gpui::{prelude::*, App, Context, Entity, Subscription, Window};
 use inlet_state::{AccountState, ChannelId};
 
 use crate::app::Inlet;
-use crate::backend::composer::{Cmd, Ev, Outgoing};
+use crate::backend::composer::{Cmd, Ev, Outgoing, Upload};
 use crate::backend::messages;
 use crate::ui::chat::messages::MessageView;
 use crate::ui::sidebar::channel_list::channel_label;
@@ -102,8 +104,18 @@ pub fn pending_of(message: &Outgoing) -> messages::Pending {
         nonce: message.nonce.clone(),
         text: message.content.clone(),
         reply_to: message.reply_to.clone(),
+        files: Vec::new(),
         failed: None,
     }
+}
+
+/// A message with files: the same pending row (with the file names) before the command
+/// goes out, so a failed upload shows Retry like any failed send.
+pub fn begin_upload(view: &mut MessageView, upload: Upload) -> Cmd {
+    let mut pending = pending_of(&upload.message);
+    pending.files = upload.files.iter().map(|f| f.name.clone()).collect();
+    view.upsert_pending(pending);
+    Cmd::Upload(upload)
 }
 
 /// Up in an empty composer: opens the account's newest message in `channel` for editing,
@@ -202,6 +214,20 @@ impl Inlet {
                 self.refresh_rows(cx);
                 self.backend.send(cmd);
             }
+            ComposerEvent::Upload(upload) => {
+                let cmd = begin_upload(&mut self.chat.view, upload);
+                self.refresh_rows(cx);
+                self.backend.send(cmd);
+            }
+            ComposerEvent::CancelUpload { nonce } => {
+                // The message is not sent: its pending row goes with the upload.
+                self.backend.send(Cmd::CancelUpload {
+                    nonce: nonce.clone(),
+                });
+                if self.chat.view.sent(&nonce) {
+                    self.refresh_rows(cx);
+                }
+            }
             ComposerEvent::Edit {
                 channel_id,
                 message_id,
@@ -267,6 +293,7 @@ impl Inlet {
                 token,
                 user_id,
                 max_message_length,
+                uploads,
             } => {
                 // An answer for an account that has signed out since is dropped.
                 if !self.composer.session_asked || token != self.composer.session_token {
@@ -277,7 +304,8 @@ impl Inlet {
                     .and_then(|dir| drafts::path_for(&dir, &self.instance, &user_id));
                 self.composer.user_id = Some(user_id);
                 view.update(cx, |v, cx| {
-                    v.set_session(max_message_length, file, window, cx)
+                    v.set_session(max_message_length, file, window, cx);
+                    v.set_upload_limits(uploads);
                 });
             }
             Ev::SlowmodeWait { channel_id, secs } => {
@@ -300,6 +328,18 @@ impl Inlet {
                 view.update(cx, |v, cx| v.on_members(guild_id, members, cx))
             }
             Ev::Notice(text) => self.chat.notice = Some(text),
+            Ev::UploadStarted {
+                nonce,
+                channel_id,
+                names,
+                total,
+            } => view.update(cx, |v, cx| {
+                v.on_upload_started(nonce, channel_id, names, total, cx)
+            }),
+            Ev::UploadProgress { nonce, sent, total } => {
+                view.update(cx, |v, cx| v.on_upload_progress(&nonce, sent, total, cx))
+            }
+            Ev::UploadDone { nonce } => view.update(cx, |v, cx| v.on_upload_done(&nonce, cx)),
         }
     }
 }

@@ -21,6 +21,9 @@
 //! - `chat-reactions`, `chat-menu`, `chat-delete`: for `#general`, reactions under a few
 //!   messages and an own message; the hover bar shown on one message, the context menu
 //!   open on the own message, or its delete confirmation (see `actions.rs`).
+//! - `composer-attachments`: for `#general`, three files in the composer's tray (a photo
+//!   with alt text, a spoiler, a document), an upload on its way above the box, and its
+//!   message pending in the list.
 
 use std::collections::HashMap;
 
@@ -52,6 +55,7 @@ pub enum Scene {
     ChatReactions,
     ChatMenu,
     ChatDelete,
+    ComposerAttachments,
 }
 
 impl Scene {
@@ -72,6 +76,7 @@ impl Scene {
             "chat-reactions" => Scene::ChatReactions,
             "chat-menu" => Scene::ChatMenu,
             "chat-delete" => Scene::ChatDelete,
+            "composer-attachments" => Scene::ComposerAttachments,
             _ => return None,
         })
     }
@@ -87,6 +92,9 @@ pub fn current() -> Scene {
         Err(_) => Scene::Default,
     }
 }
+
+/// The nonce of the upload on its way in the `composer-attachments` scene.
+pub const DEMO_UPLOAD_NONCE: &str = "demo-upload";
 
 /// What a scene shows. All IDs are snowflakes.
 pub struct Data {
@@ -279,6 +287,7 @@ pub fn data(scene: Scene) -> Data {
             nonce: "demo-sending".into(),
             text: "On its way \u{2026}".into(),
             reply_to: None,
+            files: Vec::new(),
             failed: None,
         });
         outgoing.push(Pending {
@@ -286,7 +295,19 @@ pub fn data(scene: Scene) -> Data {
             nonce: "demo-failed".into(),
             text: "This one did not go through.".into(),
             reply_to: None,
+            files: Vec::new(),
             failed: Some("the network is unreachable".into()),
+        });
+    }
+    if scene == Scene::ComposerAttachments {
+        // The message of the upload the composer shows on its way.
+        outgoing.push(Pending {
+            channel_id: general.clone(),
+            nonce: DEMO_UPLOAD_NONCE.into(),
+            text: "Clips from the trip".into(),
+            reply_to: None,
+            files: vec!["holiday-video.mp4".into()],
+            failed: None,
         });
     }
     let mut guild_settings = Vec::new();
@@ -335,6 +356,7 @@ mod tests {
             "chat-reactions",
             "chat-menu",
             "chat-delete",
+            "composer-attachments",
         ] {
             let scene = Scene::from_name(name).expect(name);
             let data = data(scene);
@@ -356,7 +378,10 @@ mod tests {
             }
             assert_eq!(
                 !data.outgoing.is_empty(),
-                matches!(scene, Scene::ChatCozy | Scene::ChatCompact)
+                matches!(
+                    scene,
+                    Scene::ChatCozy | Scene::ChatCompact | Scene::ComposerAttachments
+                )
             );
             // The action scenes open their overlay on a message that is there.
             if let Some((ch, id)) = crate::demo::actions::target(scene) {

@@ -334,6 +334,8 @@ struct Backend {
     open_channel: Option<AbortHandle>,
     /// The composer's cache: account ID, message length limit, autocomplete data.
     composer: composer::State,
+    /// Messages with files on their way, and failed ones kept for Retry.
+    uploads: composer::Uploads,
     /// The request for older messages of the open channel.
     older: messages::OlderPages,
 }
@@ -356,6 +358,7 @@ impl Backend {
             open_guild: None,
             open_channel: None,
             composer: Default::default(),
+            uploads: Default::default(),
             older: Default::default(),
         }
     }

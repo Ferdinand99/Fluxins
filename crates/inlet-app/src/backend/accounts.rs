@@ -655,6 +655,8 @@ impl Backend {
     }
 
     pub(super) fn teardown(&mut self, r: &RealActive) {
+        // Uploads never go on into another session.
+        self.uploads.cancel_all();
         r.gateway.close();
         r.forward.abort();
         if let Some(t) = &r.restart_timer {

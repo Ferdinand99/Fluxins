@@ -13,9 +13,8 @@
 //! Only the last path component of a file name is sent, so a full local path
 //! never shows up in the channel.
 //!
-//! Later work: `UploadFile::from_path` that streams from disk instead of
-//! holding the file in memory, and Fluxer's pre-signed uploads (parts of
-//! 10 MiB to storage) for large files.
+//! Fluxer's pre-signed uploads (each file straight to storage, large ones in
+//! parts) are in [`crate::presigned`].
 
 use std::convert::Infallible;
 use std::panic::AssertUnwindSafe;
@@ -91,13 +90,15 @@ pub struct UploadLimits {
     pub max_total_size: u64,
 }
 
-/// A file name safe inside a quoted `Content-Disposition` parameter: the
-/// last path component only (`/` and `\` both separate), with quotes and
-/// control characters replaced.
-fn safe_filename(name: &str) -> String {
+/// A file name safe to send: the last path component only (`/` and `\` both
+/// separate), with quotes and control characters replaced, at most 255
+/// characters, and `file` for a name with nothing left. Every upload path uses
+/// it, so a full local path never reaches the server.
+pub fn safe_filename(name: &str) -> String {
     let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
     let cleaned: String = base
         .chars()
+        .filter(|c| !is_invisible_format(*c))
         .map(|c| match c {
             '"' | '\\' | '/' => '_',
             c if c.is_control() => '_',
@@ -113,8 +114,21 @@ fn safe_filename(name: &str) -> String {
     }
 }
 
+/// Bidirectional controls and zero-width characters: they can make
+/// `photo\u{202e}gnp.exe` read as `photoexe.png`, so names never keep them.
+fn is_invisible_format(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061c}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{2069}'
+            | '\u{feff}'
+    )
+}
+
 /// A media type, or `application/octet-stream` when it is not a plain `type/subtype`.
-fn safe_content_type(ct: Option<&str>) -> String {
+pub fn safe_content_type(ct: Option<&str>) -> String {
     let ok = |s: &str| {
         let mut parts = s.split('/');
         let token = |t: &str| {
@@ -218,6 +232,21 @@ impl Multipart {
     }
 }
 
+/// A request body of one buffer that reports progress like [`Multipart::body`].
+pub(crate) fn single_body(data: Bytes, progress: Option<ProgressFn>) -> reqwest::Body {
+    let total = data.len() as u64;
+    let progress = progress.and_then(|cb| spawn_reporter(cb, total));
+    reqwest::Body::wrap(ProgressBody {
+        parts: Arc::from(vec![data]),
+        index: 0,
+        offset: 0,
+        sent: 0,
+        total,
+        reported: 0,
+        progress,
+    })
+}
+
 /// Size of one body chunk.
 const CHUNK: usize = 64 * 1024;
 
@@ -319,6 +348,9 @@ mod tests {
         assert_eq!(safe_filename("  "), "file");
         assert_eq!(safe_filename(".."), "file");
         assert_eq!(safe_filename(&"x".repeat(400)).len(), 255);
+        // Direction overrides and zero-width characters cannot disguise a name.
+        assert_eq!(safe_filename("photo\u{202e}gnp.exe"), "photognp.exe");
+        assert_eq!(safe_filename("a\u{200b}b\u{feff}.png"), "ab.png");
         assert_eq!(safe_content_type(Some("image/PNG")), "image/png");
         assert_eq!(
             safe_content_type(Some("image/png\r\nX: y")),

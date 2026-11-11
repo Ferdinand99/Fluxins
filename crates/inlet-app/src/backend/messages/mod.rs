@@ -64,6 +64,8 @@ pub struct Pending {
     pub text: String,
     /// The message it replies to.
     pub reply_to: Option<String>,
+    /// The names of its attachments.
+    pub files: Vec<String>,
     /// `None` while sending; the reason once sending failed.
     pub failed: Option<String>,
 }

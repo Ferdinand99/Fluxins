@@ -16,6 +16,7 @@ use reqwest::Method;
 use serde_json::{json, Value};
 
 use super::directory::RetryPlan;
+use super::upload::Limits;
 use super::Ev;
 use super::State;
 use crate::backend::messages;
@@ -143,7 +144,7 @@ pub struct SendError {
 
 /// What a failed request means for the UI, or `None` when the session has ended (the
 /// loop is told).
-fn failed(
+pub(super) fn failed(
     internal: &tokio::sync::mpsc::UnboundedSender<Internal>,
     gen: u64,
     err: p::Error,
@@ -173,8 +174,9 @@ fn failed(
 }
 
 /// A send failed: the message list's row shows why (with Retry), and a wait the server
-/// asked for goes to the composer's slowmode countdown.
-fn report_failure(events: &Ui, message: &Outgoing, e: SendError) {
+/// asked for goes to the composer's slowmode countdown. `files` are the names of the
+/// message's attachments.
+pub(super) fn report_failure(events: &Ui, message: &Outgoing, e: SendError, files: Vec<String>) {
     if let Some(secs) = e.retry_after_secs {
         let _ = events.unbounded_send(Ev::SlowmodeWait {
             channel_id: message.channel_id.clone(),
@@ -186,18 +188,19 @@ fn report_failure(events: &Ui, message: &Outgoing, e: SendError) {
         nonce: message.nonce.clone(),
         text: message.content.clone(),
         reply_to: message.reply_to.clone(),
+        files,
         failed: Some(e.reason),
     }));
 }
 
 /// The session's parts a send task needs.
 #[derive(Clone)]
-struct Ctx {
-    client: p::Client,
-    events: Ui,
-    internal: tokio::sync::mpsc::UnboundedSender<Internal>,
-    gen: u64,
-    state: State,
+pub(super) struct Ctx {
+    pub(super) client: p::Client,
+    pub(super) events: Ui,
+    pub(super) internal: tokio::sync::mpsc::UnboundedSender<Internal>,
+    pub(super) gen: u64,
+    pub(super) state: State,
 }
 
 impl Ctx {
@@ -216,15 +219,20 @@ impl Ctx {
     }
 
     /// The server took the message: its pending row goes.
-    fn sent(&self, nonce: String) {
+    pub(super) fn sent(&self, nonce: String) {
         self.state.forget_send(self.gen, &nonce);
         let _ = self.events.unbounded_send(messages::Ev::Sent { nonce });
     }
 
-    fn failed(&self, message: &Outgoing, e: SendError) {
+    pub(super) fn failed(&self, message: &Outgoing, e: SendError) {
+        self.failed_with_files(message, e, Vec::new());
+    }
+
+    /// A message with attachments failed; its row keeps the file names.
+    pub(super) fn failed_with_files(&self, message: &Outgoing, e: SendError, files: Vec<String>) {
         self.state
             .mark_failed(self.gen, &message.nonce, e.ambiguous);
-        report_failure(&self.events, message, e);
+        report_failure(&self.events, message, e, files);
     }
 
     /// Posts `message` and reports the outcome to the message list.
@@ -244,7 +252,7 @@ impl Ctx {
 
     /// How a Retry at `now` goes out: as the composer first sent it, or, for a message
     /// it did not send, with no mentions allowed.
-    fn retry_plan(
+    pub(super) fn retry_plan(
         &self,
         channel_id: String,
         nonce: String,
@@ -280,10 +288,16 @@ impl Ctx {
         }
     }
 
-    /// Whether a copy of `message`, first sent at `since_ms`, is among the channel's
-    /// messages since then. Lists carry no nonce, so it is matched on the author, the
-    /// wire text, the reply and the time ([`is_own_copy`]).
-    async fn already_sent(&self, message: &Outgoing, since_ms: u64) -> Result<bool, p::Error> {
+    /// Whether a copy of `message` with `attachments` files, first sent at `since_ms`,
+    /// is among the channel's messages since then. Lists carry no nonce, so it is
+    /// matched on the author, the wire text, the reply, the number of files and the
+    /// time ([`is_own_copy`]).
+    pub(super) async fn already_sent(
+        &self,
+        message: &Outgoing,
+        since_ms: u64,
+        attachments: usize,
+    ) -> Result<bool, p::Error> {
         let me = match self.state.session(self.gen) {
             Some((id, _)) => id,
             None => self.client.me().await?.id.clone(),
@@ -297,7 +311,7 @@ impl Ctx {
             me: &me,
             content: &message.content,
             reply_to: message.reply_to.as_deref(),
-            attachments: 0,
+            attachments,
             sent_ms: since_ms,
         };
         // A copy counts for one sent message only: two failed rows with the same text
@@ -312,7 +326,7 @@ impl Ctx {
     /// few minutes, so first look whether the message arrived; send it (same nonce)
     /// only if not.
     async fn send_unless_sent(&self, message: Outgoing, since_ms: u64) {
-        match self.already_sent(&message, since_ms).await {
+        match self.already_sent(&message, since_ms, 0).await {
             Ok(true) => self.sent(message.nonce),
             Ok(false) => self.post_and_report(message).await,
             Err(err) => {
@@ -327,7 +341,7 @@ impl Ctx {
 }
 
 /// Why a send, a Retry or an edit could not even start.
-fn not_connected() -> SendError {
+pub(super) fn not_connected() -> SendError {
     SendError {
         reason: t!("composer-not-connected"),
         retry_after_secs: None,
@@ -336,7 +350,7 @@ fn not_connected() -> SendError {
 }
 
 impl Backend {
-    fn send_ctx(&self) -> Option<Ctx> {
+    pub(super) fn send_ctx(&self) -> Option<Ctx> {
         match &self.active {
             Some(Active::Real(r)) => Some(Ctx {
                 client: r.session.client().clone(),
@@ -358,6 +372,7 @@ impl Backend {
                 token,
                 user_id: crate::demo::composer::demo_user_id(),
                 max_message_length: 2000,
+                uploads: Limits::default(),
             }),
             Some(Active::Real(r)) => {
                 if let Some((user_id, max)) = self.composer.session(r.gen) {
@@ -365,6 +380,7 @@ impl Backend {
                         token,
                         user_id,
                         max_message_length: max,
+                        uploads: Limits::of(r.session.client().upload_limits()),
                     });
                     return;
                 }
@@ -385,10 +401,13 @@ impl Backend {
                                 .unwrap_or(2000)
                                 .clamp(1, 100_000) as usize;
                             state.set_session(gen, me.id.clone(), max);
+                            // `me` gave the client the account's traits.
+                            let uploads = Limits::of(session.client().upload_limits());
                             let _ = events.unbounded_send(Ev::Session {
                                 token,
                                 user_id: me.id.clone(),
                                 max_message_length: max,
+                                uploads,
                             });
                         }
                         Err(err) => {
@@ -413,7 +432,7 @@ impl Backend {
             Some(ctx) => {
                 self.spawn_guarded("send", None, ctx.send(message));
             }
-            None => report_failure(&self.events, &message, not_connected()),
+            None => report_failure(&self.events, &message, not_connected(), Vec::new()),
         }
     }
 
@@ -440,9 +459,12 @@ impl Backend {
                 reply_to: None,
                 silent: false,
             };
-            report_failure(&self.events, &message, not_connected());
+            report_failure(&self.events, &message, not_connected(), Vec::new());
             return;
         };
+        if self.upload_resend(&ctx, &channel_id, &nonce, &text) {
+            return;
+        }
         let plan = ctx.retry_plan(channel_id, nonce, text, Instant::now());
         self.spawn_guarded("resend", None, ctx.resend(plan));
     }
@@ -615,7 +637,7 @@ fn nick_notice(nick: Option<&str>) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     fn outgoing(mentions: Mentions, reply_to: Option<&str>, silent: bool) -> Outgoing {
@@ -724,7 +746,7 @@ mod tests {
 
     /// The send path against a mock Fluxer: the app's wiring for a send and a Retry,
     /// and the look for a copy before a late Retry.
-    mod wire {
+    pub(in crate::backend::composer) mod wire {
         use std::time::{Duration, Instant};
 
         use futures::channel::mpsc::{unbounded, UnboundedReceiver};
@@ -762,11 +784,23 @@ mod tests {
 
         /// A mock instance and a send context for account `10` on it.
         async fn fixture() -> (MockServer, Ctx, UnboundedReceiver<Event>) {
+            fixture_with(json!({})).await
+        }
+
+        /// The same, with `features` added to the instance's discovery document.
+        pub(in crate::backend::composer) async fn fixture_with(
+            features: Value,
+        ) -> (MockServer, Ctx, UnboundedReceiver<Event>) {
             static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             let server = MockServer::start().await;
+            let mut doc = discovery(&server.uri());
+            if let (Some(have), Some(add)) = (doc["features"].as_object_mut(), features.as_object())
+            {
+                have.extend(add.clone());
+            }
             Mock::given(method("GET"))
                 .and(path("/.well-known/fluxer"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(discovery(&server.uri())))
+                .respond_with(ResponseTemplate::new(200).set_body_json(doc))
                 .mount(&server)
                 .await;
             let info = p::ClientInfo {

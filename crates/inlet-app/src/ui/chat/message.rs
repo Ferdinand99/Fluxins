@@ -379,12 +379,23 @@ impl Inlet {
                 .text_color(theme::text_strong())
                 .child(row.author.clone())
         };
+        // The files of a message with attachments, by name (the composer shows the
+        // progress).
+        let files = (!row.files.is_empty()).then(|| {
+            div()
+                .min_w_0()
+                .text_size(px(14.))
+                .text_color(theme::text_secondary())
+                .when(row.failed.is_none(), |d| d.opacity(0.5))
+                .child(t!("composer-pending-files", names = row.files.join(", ")))
+        });
         let body = div()
             .flex_1()
             .min_w_0()
             .flex()
             .flex_col()
             .child(text)
+            .children(files)
             .children(failed);
         let main = if compact {
             div()

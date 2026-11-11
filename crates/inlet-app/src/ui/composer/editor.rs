@@ -8,6 +8,11 @@
 //! autocomplete list is open, Up and Down move in it and Enter or Tab pick; Escape closes
 //! it, then cancels an edit or a reply. Up in an empty composer edits the account's last
 //! message. Nothing here acts while an input method is composing.
+//!
+//! Files: the plus button opens the file dialog, files dropped on the composer and
+//! images pasted into the box are attached (see `attachments`); Enter sends them with
+//! the text, even without text. Uploads on their way are listed above the box
+//! (`upload_queue`).
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -16,20 +21,23 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     actions, div, prelude::*, px, App, Context, Entity, EntityInputHandler, EventEmitter,
-    FocusHandle, Focusable, KeyBinding, Subscription, Task, WeakEntity, Window,
+    ExternalPaths, FocusHandle, Focusable, FontWeight, KeyBinding, Subscription, Task, WeakEntity,
+    Window,
 };
 use inlet_editor::actions::{Down, Submit, Up};
 use inlet_editor::{Editor, EditorEvent, EditorStyle, Trigger};
 use inlet_protocol as p;
 use inlet_state::{AccountState, ChannelId, GuildId};
 
+use super::attachments::Attachments;
 use super::autocomplete::{self, Candidate, Pick, Section, Sources};
 use super::commands::{self, Parsed};
 use super::drafts::{Draft, Drafts};
 use super::edit_inline::InlineEdit;
 use super::reply_bar::Reply;
 use super::slowmode::Slowmode;
-use crate::backend::composer::{Directory, Mentions, Outgoing, Person, Rights};
+use super::upload_queue::UploadQueue;
+use crate::backend::composer::{Directory, Mentions, Outgoing, Person, Rights, Upload};
 use crate::theme;
 
 actions!(inlet_composer, [AcceptCompletion, Cancel]);
@@ -79,6 +87,12 @@ pub struct ChannelContext {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ComposerEvent {
     Send(Outgoing),
+    /// A message with files (the person attached them).
+    Upload(Upload),
+    /// Cancel on an upload on its way.
+    CancelUpload {
+        nonce: String,
+    },
     Edit {
         channel_id: String,
         message_id: String,
@@ -161,6 +175,10 @@ pub struct ComposerView {
     quiet_text: Option<String>,
     /// The text of the last `/msg`, put back if it fails.
     dm_backup: Option<(String, Draft)>,
+    /// Files attached to the message being written, per channel.
+    pub(super) attachments: Attachments,
+    /// Messages with files on their way.
+    pub(super) uploads: UploadQueue,
     search_task: Option<Task<()>>,
     ticker: Option<Task<()>>,
     save_task: Option<Task<()>>,
@@ -229,6 +247,8 @@ impl ComposerView {
             last_search: None,
             quiet_text: None,
             dm_backup: None,
+            attachments: Attachments::default(),
+            uploads: UploadQueue::default(),
             search_task: None,
             ticker: None,
             save_task: None,
@@ -367,6 +387,9 @@ impl ComposerView {
         self.search_task = None;
         self.ticker = None;
         self.save_task = None;
+        // The old account's files and uploads (the backend stops those).
+        self.clear_attachments(window, cx);
+        self.uploads.clear();
         self.editor.update(cx, |e, cx| e.clear(window, cx));
     }
 
@@ -407,6 +430,8 @@ impl ComposerView {
         self.refresh_directory(cx);
         self.start_ticker(cx);
         window.focus(&self.editor.focus_handle(cx), cx);
+        #[cfg(feature = "demo")]
+        self.demo_attachments(cx);
         cx.notify();
     }
 
@@ -655,13 +680,20 @@ impl ComposerView {
             || self
                 .edit
                 .as_ref()
-                .is_some_and(|e| e.editor.read(cx).marked_range().is_some());
+                .is_some_and(|e| e.editor.read(cx).marked_range().is_some())
+            || self
+                .attachments
+                .alt
+                .as_ref()
+                .is_some_and(|a| a.editor.read(cx).marked_range().is_some());
         if composing {
             // The input method's key: nothing here acts on it.
             return;
         }
         if let Some(open) = self.autocomplete.take() {
             self.dismissed_at = Some(open.start);
+        } else if self.close_alt(window, cx) {
+            // The alt text field closed unsaved.
         } else if let Some(edit) = &self.edit {
             if edit.saving {
                 // A saved edit stays until the server answered, so its text is not lost.
@@ -694,7 +726,8 @@ impl ComposerView {
             )
         };
         let empty = text.trim().is_empty();
-        if empty {
+        let with_files = self.has_attachments();
+        if empty && !with_files {
             return;
         }
         if over {
@@ -747,7 +780,7 @@ impl ComposerView {
             Some(rest) => (rest.trim().to_owned(), true),
             None => (content.trim().to_owned(), false),
         };
-        if content.is_empty() {
+        if content.is_empty() && !with_files {
             return;
         }
         if self.slowmode_left() > 0 {
@@ -764,7 +797,16 @@ impl ComposerView {
             silent,
         };
         // The app shows it in the message list as pending (by its nonce) and sends it.
-        cx.emit(ComposerEvent::Send(outgoing));
+        if with_files {
+            let files = self.take_attachments(&ch.channel_id, window, cx);
+            cx.emit(ComposerEvent::Upload(Upload {
+                message: outgoing,
+                files,
+                strip_exif: self.attachments.strip_exif,
+            }));
+        } else {
+            cx.emit(ComposerEvent::Send(outgoing));
+        }
         self.count_send(&ch, cx);
         self.sent(window, cx);
     }
@@ -871,14 +913,21 @@ impl Render for ComposerView {
             .key_context(KEY_CONTEXT)
             .on_action(cx.listener(Self::on_tab))
             .on_action(cx.listener(Self::on_cancel))
+            // Files dropped on the composer are attached.
+            .on_drop(
+                cx.listener(|this, paths: &ExternalPaths, _, cx| this.on_drop_files(paths, cx)),
+            )
+            .drag_over::<ExternalPaths>(|style, _, _, _| style.bg(theme::hover_bg()))
             .flex_none()
             .flex()
             .flex_col()
             .children(self.render_autocomplete(cx))
+            .children(self.render_upload_queue(cx))
             .child(self.render_status_row(window, cx))
             .when(editing, |d| d.children(self.render_edit(cx)))
             .when(!editing, |d| {
                 d.children(self.render_reply_bar(cx))
+                    .children(self.render_attachments(cx))
                     .child(self.render_box(cx))
             })
     }
@@ -887,15 +936,43 @@ impl Render for ComposerView {
 impl ComposerView {
     /// The text box: 58 px high at rest, 8 px corners, 6 px from the sides and bottom.
     fn render_box(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let joined = self.reply.is_some();
+        let joined = self.reply.is_some() || self.has_attachments();
+        // The plus button: a 22 px circle in a 32 px slot, 12 px before the text.
+        let attach = div()
+            .id("composer-attach")
+            .flex_none()
+            .w(px(32.))
+            .h(px(22.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .child(
+                div()
+                    .size(px(22.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_full()
+                    .bg(theme::text_secondary())
+                    .hover(|s| s.bg(theme::text_strong()))
+                    .text_color(theme::bg_textarea())
+                    .text_size(px(18.))
+                    .line_height(px(22.))
+                    .font_weight(FontWeight::BOLD)
+                    .child(t!("composer-attach-plus")),
+            )
+            .on_click(cx.listener(|this, _, _, cx| this.pick_files(cx)));
         div()
             .mx(px(6.))
             .mb(px(6.))
             .min_h(px(58.))
-            .px_4()
+            .pl(px(8.))
+            .pr_4()
             .py(px(18.))
             .flex()
             .items_center()
+            .gap(px(12.))
             .when(joined, |d| d.rounded_b(px(8.)))
             .when(!joined, |d| d.rounded(px(8.)))
             .bg(theme::bg_textarea())
@@ -907,7 +984,9 @@ impl ComposerView {
             .capture_action(cx.listener(Self::on_up))
             .capture_action(cx.listener(Self::on_down))
             .capture_action(cx.listener(Self::on_submit_key))
-            .child(self.editor.clone())
+            .capture_action(cx.listener(Self::on_paste))
+            .child(attach)
+            .child(div().flex_1().min_w_0().child(self.editor.clone()))
     }
 }
 

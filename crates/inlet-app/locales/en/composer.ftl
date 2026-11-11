@@ -51,3 +51,29 @@ composer-edit-failed = Could not edit the message: { $error }
 composer-slowmode-on = Slowmode is on
 composer-slowmode-wait = Slowmode: { $time }
 composer-slowmode-immune = Slowmode does not apply to you
+
+## Attachments
+
+composer-attach-plus = +
+composer-attach-prompt = Attach
+composer-attach-remove = ✕
+composer-attach-spoiler = Spoiler
+composer-attach-spoiler-on = SPOILER
+composer-attach-alt = ALT
+composer-attach-alt-title = Alt text for { $name }
+composer-attach-alt-placeholder = Describe the file for people who cannot see it
+composer-attach-alt-hint = enter to save • escape to cancel
+composer-attach-check = ✓
+composer-attach-strip-exif = Remove photo location and camera data before upload
+composer-demo-alt = A blue rectangle
+composer-pending-files = 📎 { $names }
+composer-upload-too-many = A message can carry at most { $max } files.
+composer-upload-too-large = { $name } is larger than { $max }, the most this account can upload.
+composer-upload-too-much = These files are larger than { $max } together, the most one message can carry.
+composer-upload-not-a-file = { $name } is not a file and was not attached.
+composer-upload-unreadable = the file could not be read
+composer-upload-file-changed = the file changed or could not be read after it was attached
+composer-upload-gone = the files are no longer kept; attach them again
+composer-upload-progress = { $sent } of { $total }
+composer-upload-names-more = { $first } and { $more } more
+composer-upload-cancel = Cancel
