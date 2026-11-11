@@ -170,7 +170,7 @@ impl ActionsState {
             .is_some_and(|(_, saved)| *saved)
     }
 
-    fn set_saved(&mut self, id: MessageId, saved: bool) {
+    pub(crate) fn set_saved(&mut self, id: MessageId, saved: bool) {
         self.saved.retain(|(m, _)| *m != id);
         if self.saved.len() >= MAX_SAVED {
             self.saved.pop_front();

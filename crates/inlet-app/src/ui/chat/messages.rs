@@ -38,8 +38,9 @@ use crate::backend::messages::{Cmd, Ev, Pending};
 use crate::model::{self, Message, Names};
 use crate::ui::markdown::{self, Block};
 
-/// How long a message that was jumped to stays highlighted.
-const JUMP_HIGHLIGHT_MS: i64 = 2_000;
+/// How long a message that was jumped to stays highlighted (Fluxer's highlight
+/// transition, `--message-transition-highlight`).
+pub const JUMP_HIGHLIGHT_MS: i64 = 320;
 /// Shortest time between two requests for older messages from the UI.
 pub const OLDER_PAGE_INTERVAL_MS: i64 = 1_000;
 /// Shortest time between two reloads of the newest page that the person asks for
@@ -435,6 +436,8 @@ pub struct MessageView {
     /// Live messages that arrived while detached.
     pub detached_new: usize,
     ticker: Option<Task<()>>,
+    /// Ends the jump highlight on time.
+    jump_timer: Option<Task<()>>,
     scroll_hooked: bool,
     /// The person scrolled the "NEW" line out of view above (the banner shows).
     pub divider_above: bool,
@@ -785,6 +788,28 @@ impl MessageView {
         }
     }
 
+    /// Whether the open channel's newest page has landed.
+    pub fn is_loaded(&self) -> bool {
+        self.loaded
+    }
+
+    /// Highlights message `id` as jumped to from `now_ms` for [`JUMP_HIGHLIGHT_MS`].
+    pub fn highlight(&mut self, id: MessageId, now_ms: i64) {
+        self.jumped = Some((id, now_ms + JUMP_HIGHLIGHT_MS));
+    }
+
+    /// Keeps the converted messages of a page applied outside this view (the page
+    /// around a message that a jump loads), so the rows need no conversion here.
+    pub fn remember_page(
+        &mut self,
+        state: &AccountState,
+        messages: &[p::Message],
+        rendered: Vec<Message>,
+    ) {
+        self.conversions
+            .remember(state, &edits_of(messages), rendered);
+    }
+
     /// Whether channel `ch` may be marked read now: its newest page landed, its window
     /// has the newest messages, the list shows the bottom and the window has focus.
     pub fn may_mark_read(
@@ -1028,6 +1053,7 @@ impl Inlet {
                 }
             }
             Ev::Action(ev) => self.on_action_event(ev, cx),
+            Ev::Inbox(ev) => self.on_inbox_event(ev, cx),
         }
     }
 
@@ -1063,6 +1089,7 @@ impl Inlet {
             // missing or stale, so load its newest page.
             self.chat.view.newest_retries = 0;
             self.load_open_channel(cx);
+            self.inbox_on_dispatch(&dispatch, &[], cx);
             return;
         }
         let Some(account) = self.account.clone() else {
@@ -1071,6 +1098,7 @@ impl Inlet {
         let mut changes = account.update(cx, |s, _| s.apply(&dispatch));
         self.settings_applied(&dispatch, &mut changes, cx);
         self.note_saved(&dispatch);
+        self.inbox_on_dispatch(&dispatch, &rendered, cx);
         let edits = match &dispatch {
             p::Dispatch::MessageCreate(m) | p::Dispatch::MessageUpdate(m) => edits_of([&**m]),
             _ => Edits::new(),
@@ -1172,6 +1200,10 @@ impl Inlet {
             }
         }
         self.after_changes(changes, false, cx);
+        if !older && self.open_channel_id() == Some(ch) {
+            // A jump to a message waits for this page.
+            self.inbox_after_newest_page(cx);
+        }
     }
 
     fn on_page_failed(
@@ -1471,10 +1503,21 @@ impl Inlet {
             .position(|r| r.message_id() == Some(id))
         {
             Some(ix) => {
-                self.chat.view.jumped = Some((id, now_ms() + JUMP_HIGHLIGHT_MS));
+                self.chat.view.highlight(id, now_ms());
                 self.refresh_rows(cx);
                 self.chat.message_list.pause_following_tail();
                 self.chat.message_list.scroll_to_reveal_item(ix);
+                // The highlight ends on time, not at the next tick.
+                self.chat.view.jump_timer = Some(cx.spawn(async move |this, cx| {
+                    let ms = u64::try_from(JUMP_HIGHLIGHT_MS).unwrap_or(0);
+                    cx.background_executor()
+                        .timer(Duration::from_millis(ms))
+                        .await;
+                    let _ = this.update(cx, |this, cx| {
+                        this.refresh_rows(cx);
+                        cx.notify();
+                    });
+                }));
             }
             None => self.chat.notice = Some(t!("chat-reply-not-loaded")),
         }

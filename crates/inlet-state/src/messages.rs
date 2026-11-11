@@ -350,6 +350,45 @@ impl MessageWindow {
         true
     }
 
+    /// Replaces the window with a page around a message (a jump). Older
+    /// messages are always taken to exist; scrolling up finds out.
+    ///
+    /// When the page reaches the channel's newest message (`reaches_newest`),
+    /// the window keeps the newest messages: live messages newer than the
+    /// page (in the window, or buffered while it waited) stay. Otherwise the
+    /// window misses its newest messages ([`MessageWindow::has_newest`] is
+    /// `false`): live messages are buffered for the next newest page, as for a
+    /// window scrolled far back.
+    fn replace_around(&mut self, page: BTreeMap<MessageId, Message>, reaches_newest: bool) {
+        let fresh = self.has_newest;
+        let page_newest = page.keys().next_back().copied();
+        let mut old = std::mem::take(&mut self.messages);
+        let mut merged = page;
+        // The page carries the server's reactions; buffered ones are in it or
+        // belong to messages it does not have.
+        self.pending_reactions.clear();
+        self.loading = false;
+        self.stale = false;
+        if reaches_newest {
+            if let (true, Some(n)) = (fresh, page_newest) {
+                merged.extend(old.split_off(&MessageId(n.0.saturating_add(1))));
+            }
+            let overflow = std::mem::take(&mut self.pending_overflow);
+            for (id, m) in std::mem::take(&mut self.pending) {
+                if !overflow && !self.was_deleted(id) && page_newest.is_none_or(|n| id > n) {
+                    merged.insert(id, m);
+                }
+            }
+            self.has_newest = !overflow;
+        } else {
+            self.has_newest = false;
+        }
+        self.bytes = merged.values().map(approx_size).sum();
+        self.messages = merged;
+        self.has_more_before = true;
+        self.trim_oldest();
+    }
+
     /// A live MESSAGE_CREATE. Returns whether the visible messages changed.
     fn insert_live(&mut self, id: MessageId, m: &Message) -> bool {
         if self.was_deleted(id) {
@@ -695,6 +734,45 @@ impl MessageWindows {
             Some(b) => w.merge_older(b, map, reached_start),
         };
         (fits && *w != before, evicted)
+    }
+
+    /// Replaces the window with a page around a message (see
+    /// [`MessageWindow::replace_around`]), creating it if needed. A loading
+    /// window is left alone: the newest page on its way would replace the
+    /// jump. Returns whether the window changed, and a channel whose window
+    /// was evicted to make room.
+    pub(crate) fn apply_around(
+        &mut self,
+        channel: ChannelId,
+        messages: &[Message],
+        newest: Option<MessageId>,
+    ) -> (bool, Option<ChannelId>) {
+        let mut map = page_map(channel, messages);
+        if map.is_empty() || self.windows.get(&channel).is_some_and(|w| w.loading) {
+            return (false, None);
+        }
+        let mut evicted = None;
+        if self.windows.get(&channel).is_none() {
+            if self.windows.len() >= MAX_MESSAGE_WINDOWS {
+                if let Some(idle) = self.windows.oldest_where(|w| !w.loading) {
+                    self.windows.remove(&idle);
+                    evicted = Some(idle);
+                }
+            }
+            evicted = evicted.or(self.windows.insert(channel, MessageWindow::default()));
+        }
+        self.windows.touch(&channel);
+        let Some(w) = self.windows.get_mut(&channel) else {
+            return (false, evicted);
+        };
+        map.retain(|id, _| !w.was_deleted(*id));
+        let reaches_newest = match (newest, map.keys().next_back()) {
+            (Some(n), Some(last)) => *last >= n,
+            _ => false,
+        };
+        let before = w.clone();
+        w.replace_around(map, reaches_newest);
+        (*w != before, evicted)
     }
 
     pub(crate) fn insert_live(&mut self, channel: ChannelId, id: MessageId, m: &Message) -> bool {

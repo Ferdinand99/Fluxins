@@ -40,6 +40,8 @@ impl Inlet {
         if self.settings.view.is_some() {
             out.push(self.render_settings_overlay(cx));
         }
+        // The pins or the inbox, under the channel header.
+        out.extend(self.render_panels(cx));
         if self.notifications.settings.is_some() {
             out.push(self.render_notification_settings(cx));
         }

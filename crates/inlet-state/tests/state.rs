@@ -1380,3 +1380,57 @@ fn guild_record_changes_refresh_the_pill() {
     ));
     assert!(c.read_state_guilds.contains(&Some(g())));
 }
+
+#[test]
+fn a_page_around_a_message_replaces_the_window() {
+    let mut s = state();
+    let c = ch(GENERAL);
+    // The newest page: 50 … 59, and a live message 60.
+    let newest: Vec<_> = (50..60)
+        .rev()
+        .map(|i| message(mid(i, 0), GENERAL, OTHER))
+        .collect();
+    s.apply_messages(c, MessagesPage::latest(newest, 10));
+    s.apply(&create(mid(60, 0), GENERAL, OTHER, json!({})));
+    assert!(s.messages(c).unwrap().has_newest());
+
+    // A jump far back: 9 … 11 replace the window, which no longer has the newest
+    // messages, so live ones wait for the next newest page.
+    let around: Vec<_> = (9..12)
+        .rev()
+        .map(|i| message(mid(i, 0), GENERAL, OTHER))
+        .collect();
+    let changes = s.apply_around(c, &around);
+    assert!(changes.messages.contains(&c));
+    assert_eq!(ids(&s, c), vec![mid(9, 0), mid(10, 0), mid(11, 0)]);
+    let w = s.messages(c).unwrap();
+    assert!(!w.has_newest() && !w.is_loading() && w.has_more_before());
+    s.apply(&create(mid(61, 0), GENERAL, OTHER, json!({})));
+    assert_eq!(
+        ids(&s, c).len(),
+        3,
+        "a live message is not added below a gap"
+    );
+    assert_eq!(s.messages(c).unwrap().pending_len(), 1);
+
+    // A jump near the end: the page reaches the channel's newest message (61, known
+    // from the live event), so the window has its newest messages again.
+    let end: Vec<_> = (59..62)
+        .rev()
+        .map(|i| message(mid(i, 0), GENERAL, OTHER))
+        .collect();
+    s.apply_around(c, &end);
+    assert_eq!(ids(&s, c), vec![mid(59, 0), mid(60, 0), mid(61, 0)]);
+    let w = s.messages(c).unwrap();
+    assert!(w.has_newest() && w.pending_len() == 0);
+    // Live messages are added again.
+    s.apply(&create(mid(62, 0), GENERAL, OTHER, json!({})));
+    assert_eq!(ids(&s, c).len(), 4);
+
+    // A window loading its newest page is left alone, and an empty page or an
+    // unknown channel changes nothing.
+    s.begin_load(c);
+    assert!(s.apply_around(c, &around).is_empty());
+    assert!(s.apply_around(c, &[]).is_empty());
+    assert!(s.apply_around(ch("999"), &around).is_empty());
+}

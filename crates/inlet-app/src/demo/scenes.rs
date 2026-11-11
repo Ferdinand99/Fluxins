@@ -21,6 +21,9 @@
 //! - `chat-reactions`, `chat-menu`, `chat-delete`: for `#general`, reactions under a few
 //!   messages and an own message; the hover bar shown on one message, the context menu
 //!   open on the own message, or its delete confirmation (see `actions.rs`).
+//! - `chat-pins`: for `#general`, the pinned messages panel open.
+//! - `inbox-unreads`, `inbox-saved`, `inbox-mentions`: for `#general`, the inbox open on
+//!   that tab (with the unread state of `default`; see `inbox.rs`).
 
 use std::collections::HashMap;
 
@@ -52,6 +55,10 @@ pub enum Scene {
     ChatReactions,
     ChatMenu,
     ChatDelete,
+    ChatPins,
+    InboxUnreads,
+    InboxSaved,
+    InboxMentions,
 }
 
 impl Scene {
@@ -72,6 +79,10 @@ impl Scene {
             "chat-reactions" => Scene::ChatReactions,
             "chat-menu" => Scene::ChatMenu,
             "chat-delete" => Scene::ChatDelete,
+            "chat-pins" => Scene::ChatPins,
+            "inbox-unreads" => Scene::InboxUnreads,
+            "inbox-saved" => Scene::InboxSaved,
+            "inbox-mentions" => Scene::InboxMentions,
             _ => return None,
         })
     }
@@ -229,6 +240,7 @@ pub fn data(scene: Scene) -> Data {
         }
         _ => {}
     }
+    super::inbox::add(&mut by_name);
 
     // Demo IDs become snowflakes everywhere.
     let guilds: Vec<Guild> = guilds::guilds()
@@ -290,7 +302,7 @@ pub fn data(scene: Scene) -> Data {
         });
     }
     let mut guild_settings = Vec::new();
-    let unread_demo = scene == Scene::Default;
+    let unread_demo = matches!(scene, Scene::Default | Scene::InboxUnreads);
     if unread_demo {
         // Unread messages, mentions and mutes in the sidebar and the rail.
         read_states.extend(unread::read_states());
@@ -335,6 +347,10 @@ mod tests {
             "chat-reactions",
             "chat-menu",
             "chat-delete",
+            "chat-pins",
+            "inbox-unreads",
+            "inbox-saved",
+            "inbox-mentions",
         ] {
             let scene = Scene::from_name(name).expect(name);
             let data = data(scene);
@@ -365,6 +381,12 @@ mod tests {
             }
         }
         assert_eq!(Scene::from_name("nope"), None);
+        // The pins panel has pinned messages to show.
+        let pinned = data(Scene::ChatPins).messages[&snowflake("c-general")]
+            .iter()
+            .filter(|m| m.pinned)
+            .count();
+        assert!(pinned >= 3, "{pinned} pinned");
 
         // The media scenes have what they promise.
         let data = data(Scene::EmbedAllTypes);

@@ -11,6 +11,7 @@ pub mod header_buttons;
 mod jump;
 mod message;
 pub mod messages;
+pub mod pins;
 mod reactions;
 mod reactors;
 mod reply_preview;
