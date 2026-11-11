@@ -474,7 +474,10 @@ impl Inlet {
         if std::env::var_os("INLET_DEMO").is_none()
             || !matches!(
                 scene,
-                Scene::FriendsPending | Scene::GroupDmCaptcha | Scene::DmBlocked
+                Scene::FriendsPending
+                    | Scene::GroupDmCaptcha
+                    | Scene::DmBlocked
+                    | Scene::MediaErrors
             )
             || self.account.is_none()
             || self.screen != Screen::Main
@@ -497,6 +500,8 @@ impl Inlet {
                     w.message = Some(t!("social-group-dm-captcha"));
                 }
             }
+            // The DM list opens the friends page now: the media scene opens Ada's DM.
+            Scene::MediaErrors => self.select_channel(crate::demo::snowflake("dm-ada"), window, cx),
             _ => self.select_channel(crate::demo::snowflake("dm-group"), window, cx),
         }
         cx.notify();
