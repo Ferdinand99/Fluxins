@@ -266,7 +266,8 @@ pub fn attachment(channel: &str, id: u64, filename: &str, kind: &str, extra: Val
     v
 }
 
-fn external(name: &str) -> String {
+/// A picture of the demo proxy's external media (embeds, GIFs).
+pub(crate) fn external(name: &str) -> String {
     format!("{MEDIA_BASE}/external/demo-signature/https/media.example/{name}.png")
 }
 

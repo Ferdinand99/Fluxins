@@ -448,7 +448,9 @@ impl Inlet {
         let (channel_id, message_id) = (ch.to_string(), id.to_string());
         match action {
             Action::AddReaction => {
-                self.open_overlay(Overlay::Picker { ch, id, at }, window, cx);
+                // The emoji picker, a layer of its own.
+                self.close_overlay(window, cx);
+                self.open_reaction_picker(ch, id, at, window, cx);
                 return;
             }
             Action::Reply => {

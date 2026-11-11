@@ -15,9 +15,12 @@
 //! - autocomplete reads roles, channels, emoji and rights from the account state (no
 //!   request); member search goes over the gateway (op 8), which the protocol caps at 10
 //!   per 10 s.
+//!
+//! The pickers' requests (GIFs, preferences, memes, stickers) are in `gif`, with their
+//! own budget.
 
 mod directory;
-mod gif;
+pub mod gif;
 mod send;
 mod upload;
 
@@ -55,6 +58,8 @@ pub enum Cmd {
     },
     /// `/msg`: a direct message to `user_id`. `message.channel_id` is ignored.
     DirectMessage { user_id: String, message: Outgoing },
+    /// The emoji, GIF, sticker and meme pickers.
+    Pickers(gif::Cmd),
 }
 
 pub enum Ev {
@@ -80,6 +85,8 @@ pub enum Ev {
     },
     /// A sentence for the notice bar (a command finished or failed).
     Notice(String),
+    /// Answers for the pickers.
+    Pickers(gif::Ev),
 }
 
 pub(super) fn handle(backend: &mut Backend, cmd: Cmd) {
@@ -100,5 +107,6 @@ pub(super) fn handle(backend: &mut Backend, cmd: Cmd) {
         } => backend.search_members(guild_id, query, nonce),
         Cmd::SetNick { guild_id, nick } => backend.set_nick(guild_id, nick),
         Cmd::DirectMessage { user_id, message } => backend.direct_message(user_id, message),
+        Cmd::Pickers(cmd) => backend.pickers(cmd),
     }
 }

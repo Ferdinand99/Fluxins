@@ -220,6 +220,9 @@ pub struct AnimationBudget {
     /// Images admitted to the byte budget this frame: only these may move. A still that
     /// happens to decode with several frames shows its first.
     admitted: HashSet<ImageId>,
+    /// Images the topmost layer draws itself this frame (a picker's grid): they move
+    /// while the layer is open, and count against [`MAX_PLAYING`] like any other.
+    in_top_layer: HashSet<ImageId>,
     /// The animation of the open layer (the image viewer): it always moves, and takes
     /// one of the [`MAX_PLAYING`] places before the chat is drawn.
     reserved: Option<ImageId>,
@@ -256,6 +259,7 @@ impl AnimationBudget {
             used: 0,
             known: HashMap::new(),
             admitted: HashSet::new(),
+            in_top_layer: HashSet::new(),
             reserved: None,
             max_playing: MAX_PLAYING,
             playing: 0,
@@ -291,6 +295,7 @@ impl AnimationBudget {
         self.used = 0;
         self.playing = 0;
         self.admitted.clear();
+        self.in_top_layer.clear();
         self.reserved = None;
         self.wake = None;
         self.frame += 1;
@@ -320,6 +325,15 @@ impl AnimationBudget {
             self.admitted.insert(id);
         }
         fits
+    }
+
+    /// Marks the admitted image `id` as drawn by the topmost layer itself (a picker):
+    /// unlike what lies under the layer, it moves while the layer is open. Call it after
+    /// [`admit_image`](Self::admit_image) admitted it this frame.
+    pub fn in_top_layer(&mut self, id: ImageId) {
+        if self.admitted.contains(&id) {
+            self.in_top_layer.insert(id);
+        }
     }
 
     /// The open layer's animation (the image viewer): it moves whatever the chat under
@@ -371,7 +385,7 @@ impl AnimationBudget {
             if !self.admitted.contains(&id) {
                 return 0;
             }
-            if self.stage.layer_open {
+            if self.stage.layer_open && !self.in_top_layer.contains(&id) {
                 // Frozen under the layer: not counted, no redraw.
                 return self.players.get_mut(&id).map_or(0, |p| {
                     p.used = frame;
@@ -694,6 +708,64 @@ mod tests {
             .collect();
         assert_eq!(under, later, "frozen under the layer");
         assert_eq!(b.frame_to_draw(viewer, Motion::Gif, three), 0);
+    }
+
+    #[test]
+    fn a_picker_layer_moves_its_own_animations_and_freezes_the_chat_under_it() {
+        let t0 = Instant::now();
+        let open = Stage {
+            layer_open: true,
+            ..LIVE
+        };
+        let mut b = AnimationBudget::default();
+        // 40 chat animations (0..40) under the picker, 40 in the picker (100..140).
+        let all = || (0..40).chain(100..140);
+        let draw = |b: &mut AnimationBudget| -> (Vec<usize>, Vec<usize>) {
+            let chat = (0..40)
+                .map(|n| b.frame_to_draw(ImageId(n), Motion::Emoji, three))
+                .collect();
+            let picker = (100..140)
+                .map(|n| b.frame_to_draw(ImageId(n), Motion::Emoji, three))
+                .collect();
+            (chat, picker)
+        };
+        frame(&mut b, open, t0, all());
+        for n in 100..140 {
+            b.in_top_layer(ImageId(n));
+        }
+        // An image that was not admitted this frame cannot be marked.
+        b.in_top_layer(ImageId(999));
+        let (chat0, picker0) = draw(&mut b);
+        assert_eq!(
+            b.playing(),
+            MAX_PLAYING,
+            "the picker's own count, capped at 32"
+        );
+        assert!(b.wake().is_some(), "the picker asks for its next frame");
+        frame(&mut b, open, t0 + ms(110), all());
+        for n in 100..140 {
+            b.in_top_layer(ImageId(n));
+        }
+        let (chat1, picker1) = draw(&mut b);
+        assert_eq!(chat0, chat1, "the chat under the picker stands still");
+        assert!(chat1.iter().all(|f| *f == 0));
+        assert_eq!(&picker1[..MAX_PLAYING], &[1; MAX_PLAYING][..], "they move");
+        assert!(
+            picker1[MAX_PLAYING..].iter().all(|f| *f == 0),
+            "the 33rd does not"
+        );
+        assert_ne!(picker0, picker1);
+        // Reduced motion and an unfocused window stop the picker too.
+        let still = Stage {
+            reduce_motion: true,
+            ..open
+        };
+        frame(&mut b, still, t0 + ms(220), all());
+        for n in 100..140 {
+            b.in_top_layer(ImageId(n));
+        }
+        let (_, picker2) = draw(&mut b);
+        assert!(picker2.iter().all(|f| *f == 0));
     }
 
     #[test]

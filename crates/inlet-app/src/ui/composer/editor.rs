@@ -167,6 +167,9 @@ pub struct ComposerView {
     search_task: Option<Task<()>>,
     ticker: Option<Task<()>>,
     save_task: Option<Task<()>>,
+    /// The picker buttons at the right of the box; `None` in other composers (the
+    /// thread panel's).
+    pub(super) pickers: Option<super::pickers::PickerButtons>,
     _editor_events: Subscription,
 }
 
@@ -235,6 +238,7 @@ impl ComposerView {
             search_task: None,
             ticker: None,
             save_task: None,
+            pickers: None,
             _editor_events: sub,
         }
     }
@@ -926,6 +930,7 @@ impl ComposerView {
             .capture_action(cx.listener(Self::on_down))
             .capture_action(cx.listener(Self::on_submit_key))
             .child(self.editor.clone())
+            .children(self.render_picker_buttons(cx))
     }
 }
 

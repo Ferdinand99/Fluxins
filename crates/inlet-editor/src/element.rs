@@ -295,6 +295,30 @@ impl Editor {
         Ok(())
     }
 
+    /// Inserts a token at the caret, replacing the selection (a picker's custom emoji).
+    /// Returns false, and changes nothing, when the label is empty or the token does not
+    /// fit, or while an input method is composing.
+    pub fn insert_token(
+        &mut self,
+        token: Token,
+        label: &str,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.marked.is_some() {
+            return false;
+        }
+        if !self
+            .buffer
+            .replace_with_token(self.selection.range(), token, label)
+        {
+            return false;
+        }
+        self.selection = Selection::caret(self.buffer.cursor_hint());
+        self.after_edit(window, cx);
+        true
+    }
+
     /// Replaces the text of the trigger at the caret with a token. Returns false when there
     /// is no trigger or the token does not fit.
     pub fn complete_trigger(

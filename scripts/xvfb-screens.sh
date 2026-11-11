@@ -139,6 +139,9 @@ scene 30-thread-panel thread-panel c-general
 scene 31-thread-list thread-list c-general
 scene 32-forum forum c-forum
 scene 33-media-channel media-channel c-gallery
+# The composer's picker on the emoji tab and on the GIF tab.
+scene 34-picker-emoji picker-emoji c-general
+scene 35-picker-gif picker-gif c-general
 
 # 10. The scene files of the visual checks. Xvfb's pointer cannot be moved and sits in
 #     the middle of the screen; the demo puts a scene's window in the top left corner,

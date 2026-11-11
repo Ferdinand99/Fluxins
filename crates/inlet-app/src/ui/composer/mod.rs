@@ -4,8 +4,8 @@
 //! [`ComposerView`] (in `editor`) is its own entity: the text field with pills, the status
 //! row above it, the reply bar, the edit box and the autocomplete list. This file connects
 //! it to the app: it opens channels in it, hands its requests to the backend and passes the
-//! backend's answers back. The pickers (emoji, GIF, stickers) and attachments have their
-//! own modules.
+//! backend's answers back. The pickers (emoji, GIF, stickers, memes) and attachments have
+//! their own modules.
 
 mod attachments;
 pub mod autocomplete;
@@ -13,7 +13,7 @@ pub mod commands;
 pub mod drafts;
 pub mod edit_inline;
 pub mod editor;
-mod pickers;
+pub mod pickers;
 pub mod reply_bar;
 pub mod slowmode;
 mod status_row;
@@ -44,6 +44,8 @@ pub struct ComposerState {
     /// Tags each request for the account ID; answers with an older tag are dropped, so
     /// a slow answer for an account that signed out cannot pick the drafts file.
     session_token: u64,
+    /// The emoji, GIF, sticker and meme pickers.
+    pub pickers: pickers::PickersState,
 }
 
 impl ComposerState {
@@ -55,7 +57,12 @@ impl ComposerState {
         let shared: Rc<RefCell<Shared>> = Rc::default();
         let view = {
             let shared = shared.clone();
-            cx.new(|cx| ComposerView::new(shared, DEFAULT_MAX_LEN, window, cx))
+            cx.new(|cx| {
+                let mut view = ComposerView::new(shared, DEFAULT_MAX_LEN, window, cx);
+                // Only the main composer has the picker buttons.
+                view.pickers = Some(pickers::PickerButtons::default());
+                view
+            })
         };
         subscriptions.push(cx.subscribe_in(
             &view,
@@ -70,6 +77,7 @@ impl ComposerState {
             user_id: None,
             session_asked: false,
             session_token: 0,
+            pickers: pickers::PickersState::default(),
         }
     }
 
@@ -305,6 +313,7 @@ impl Inlet {
                 view.update(cx, |v, cx| v.on_members(guild_id, members, cx))
             }
             Ev::Notice(text) => self.chat.notice = Some(text),
+            Ev::Pickers(ev) => self.on_pickers_event(ev, cx),
         }
     }
 }

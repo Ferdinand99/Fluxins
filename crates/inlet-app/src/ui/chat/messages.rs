@@ -1220,6 +1220,7 @@ impl Inlet {
                 Some(account) => account.update(cx, |s, _| s.apply(&dispatch)),
             };
             self.settings_applied(&dispatch, &mut changes, cx);
+            self.pickers_on_dispatch(&dispatch, cx);
             self.after_changes(changes, false, cx);
             // A first READY, or a new one after a reconnect: the open channel's window is
             // missing or stale, so load its newest page.
@@ -1233,6 +1234,7 @@ impl Inlet {
         };
         let mut changes = account.update(cx, |s, _| s.apply(&dispatch));
         self.settings_applied(&dispatch, &mut changes, cx);
+        self.pickers_on_dispatch(&dispatch, cx);
         self.note_saved(&dispatch);
         self.inbox_on_dispatch(&dispatch, &rendered, cx);
         let edits = match &dispatch {

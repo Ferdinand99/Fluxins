@@ -920,6 +920,7 @@ impl Inlet {
             switcher: self.switcher_layer_open(),
             panel: self.inbox.open.is_some(),
             settings: self.settings.view.is_some(),
+            picker: self.composer.pickers.is_open(),
             viewer: self.media.viewer.is_some(),
         }
     }
@@ -941,11 +942,17 @@ impl Inlet {
     /// when the window is drawn.
     pub(crate) fn focus_layer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.layer_open() {
-            let handle = self
+            let layer = self
                 .overlays
                 .layer_focus
                 .get_or_insert_with(|| cx.focus_handle())
                 .clone();
+            // A layer with a field of its own (a picker's search) gives it the keyboard;
+            // the field lies inside the layer, so Escape still closes the layer.
+            let handle = match self.open_layers().topmost() {
+                Some(Layer::Picker) => self.composer.pickers.search_focus(cx).unwrap_or(layer),
+                _ => layer,
+            };
             if !handle.is_focused(window) {
                 if !self.overlays.layer_had_focus {
                     // Where the keyboard was, to give it back when the layers close.
@@ -997,6 +1004,7 @@ impl Inlet {
             Some(Layer::AccountSwitcher) => self.switcher.open = false,
             Some(Layer::Panel) => self.inbox.open = None,
             Some(Layer::Settings) => self.settings.view = None,
+            Some(Layer::Picker) => self.composer.pickers.close(),
             Some(Layer::Viewer) => self.media.viewer = None,
             None => {}
         }
@@ -1054,13 +1062,15 @@ pub(crate) enum Layer {
     /// The pinned messages or the inbox, under the channel header.
     Panel,
     Settings,
+    /// The emoji, GIF, sticker and meme picker.
+    Picker,
     Viewer,
 }
 
 /// Which layers are open. They are drawn bottom first (a panel, the image viewer, the
-/// settings view, the notification settings window, the account switcher, the link
-/// confirmation, the link prompt, see `ui/overlays`), and the topmost one has the
-/// keyboard: Escape closes it first.
+/// picker, the settings view, the notification settings window, the account switcher,
+/// the link confirmation, the link prompt, see `ui/overlays`), and the topmost one has
+/// the keyboard: Escape closes it first.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct OpenLayers {
     pub link_prompt: bool,
@@ -1069,6 +1079,7 @@ pub(crate) struct OpenLayers {
     pub switcher: bool,
     pub panel: bool,
     pub settings: bool,
+    pub picker: bool,
     pub viewer: bool,
 }
 
@@ -1084,6 +1095,8 @@ impl OpenLayers {
             Some(Layer::NotificationSettings)
         } else if self.settings {
             Some(Layer::Settings)
+        } else if self.picker {
+            Some(Layer::Picker)
         } else if self.viewer {
             Some(Layer::Viewer)
         } else if self.panel {
@@ -1103,6 +1116,7 @@ impl OpenLayers {
             Some(Layer::AccountSwitcher) => self.switcher = false,
             Some(Layer::Panel) => self.panel = false,
             Some(Layer::Settings) => self.settings = false,
+            Some(Layer::Picker) => self.picker = false,
             Some(Layer::Viewer) => self.viewer = false,
             None => {}
         }
@@ -1305,6 +1319,7 @@ mod tests {
             switcher: true,
             panel: true,
             settings: true,
+            picker: true,
             viewer: true,
         };
         let mut order = Vec::new();
@@ -1320,6 +1335,7 @@ mod tests {
                 Layer::AccountSwitcher,
                 Layer::NotificationSettings,
                 Layer::Settings,
+                Layer::Picker,
                 Layer::Viewer,
                 Layer::Panel
             ]

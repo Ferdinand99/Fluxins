@@ -40,6 +40,8 @@ impl Inlet {
         // first, see `desktop::OpenLayers`).
         out.extend(self.render_panels(cx));
         out.extend(self.render_image_viewer(cx));
+        // The emoji, GIF, sticker and meme picker: over the viewer, under the settings.
+        out.extend(self.render_picker(cx));
         if self.settings.view.is_some() {
             out.push(self.render_settings_overlay(cx));
         }
