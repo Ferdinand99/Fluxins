@@ -24,6 +24,7 @@ impl Inlet {
             .and_then(|c| c.topic.clone());
         let buttons = header_buttons::render(self, cx);
         div()
+            .debug_selector(|| "chat-header".into())
             .h(px(HEADER_HEIGHT))
             .flex_none()
             .px_4()

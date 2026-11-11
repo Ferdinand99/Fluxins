@@ -107,6 +107,24 @@ impl Inlet {
         cx: &mut Context<Self>,
         start: impl FnOnce(futures::channel::mpsc::UnboundedSender<Event>) -> BackendHandle,
     ) -> Self {
+        Self::build(window, cx, move |window, cx| {
+            Self::spawn_backend_with(0, true, window, cx, start).0
+        })
+    }
+
+    /// The view without a backend thread: commands go nowhere. The layout tests feed
+    /// it its events themselves.
+    #[cfg(feature = "demo")]
+    pub(crate) fn detached(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::build(window, cx, |_, _| BackendHandle::detached())
+    }
+
+    /// The view, with the backend `backend` gives once the domains' state exists.
+    fn build(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        backend: impl FnOnce(&mut Window, &mut Context<Self>) -> BackendHandle,
+    ) -> Self {
         let mut subscriptions = Vec::new();
         let sign_in = ui::accounts::SignInState::new(window, cx, &mut subscriptions);
         let composer = ui::composer::ComposerState::new(window, cx, &mut subscriptions);
@@ -126,7 +144,7 @@ impl Inlet {
         }));
 
         Self::watch_reduce_motion(cx);
-        let (backend, _) = Self::spawn_backend_with(0, true, window, cx, start);
+        let backend = backend(window, cx);
         let notifications = ui::notifications::State::new(window.is_window_active());
         Self {
             backend,

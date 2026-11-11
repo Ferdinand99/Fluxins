@@ -96,7 +96,7 @@ impl AccountState {
             guild_settings: GuildSettings::from_ready(&r.user_guild_settings()),
             windows: MessageWindows::default(),
             typing: Typing::default(),
-            relationships: Relationships::default(),
+            relationships: Relationships::from_ready(&r.relationships()),
             threads: Threads::default(),
             settings: Settings::default(),
             voice: Voice::default(),
@@ -522,6 +522,9 @@ impl AccountState {
                     c.read_all();
                 }
             }
+            Dispatch::RelationshipAdd(_)
+            | Dispatch::RelationshipUpdate(_)
+            | Dispatch::RelationshipRemove(_) => c.merge(self.relationships.apply(d)),
             Dispatch::Other { .. } => {
                 c.merge(self.relationships.apply(d));
                 c.merge(self.threads.apply(d));
@@ -972,6 +975,11 @@ impl AccountState {
         self.guilds
             .get(&g)
             .map_or(Permissions::NONE, |guild| Permissions(guild.guild_perms))
+    }
+
+    /// Whether the account blocked `user`.
+    pub fn is_blocked(&self, user: UserId) -> bool {
+        self.relationships.is_blocked(user)
     }
 
     /// Whether a channel is muted (guild, its category, or itself).

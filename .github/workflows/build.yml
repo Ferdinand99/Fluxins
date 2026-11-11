@@ -60,6 +60,11 @@ jobs:
             echo "target/release/inlet.exe contains the test CA variable"
             exit 1
           fi
+          # Demo data and scene files are for screenshots only.
+          if grep -aqF "demo scene file" target/release/inlet.exe; then
+            echo "target/release/inlet.exe contains demo code"
+            exit 1
+          fi
 
       - name: Test
         run: cargo test --workspace --locked
@@ -116,9 +121,15 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  windows-screenshot:
+  # Screenshots of the demo build: numbered runs to check by eye, and the scene files
+  # of tests/visual compared with the committed baselines (inlet-visual). The runner
+  # image is pinned so its fonts stay the same; the script sets the screen to
+  # 1920x1080 at 100 %. A difference fails the job; the artifact visual-<os> holds the
+  # screenshots, the differences and report.md. scripts/update-visual-baselines.sh
+  # takes a run's screenshots as the new baselines.
+  screenshots-windows:
     name: Windows screenshots (demo)
-    runs-on: windows-latest
+    runs-on: windows-2025
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -144,6 +155,23 @@ jobs:
         shell: pwsh
         run: ./scripts/windows-screenshot.ps1 -Exe target/release/inlet.exe -OutDir screenshots
 
+      - name: Compare with the baselines
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -o pipefail
+          target/release/inlet-visual.exe compare --scenes tests/visual/scenes \
+            --actual screenshots/visual --baseline tests/visual/baseline/windows \
+            --out visual-report | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ !cancelled() }}
+        with:
+          name: visual-windows
+          path: visual-report/
+          if-no-files-found: ignore
+          retention-days: 14
+
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         # Also when a demo crashed: the pictures show how far it got.
         if: always()
@@ -156,26 +184,31 @@ jobs:
       # COM used on a thread that never initialised it (as gpui's own jump list did),
       # or a shell call made while gpui's app is borrowed, shows only in these logs.
       - name: No COM or borrow errors in the demo logs
+        if: always()
         shell: pwsh
         run: |
           $patterns = @('CoInitialize has not been called', '0x800401F0', 'RefCell already borrowed', 'already mutably borrowed', 'jump list')
-          $bad = Select-String -Path screenshots/*.log -Pattern $patterns -SimpleMatch
+          $logs = Get-ChildItem -Recurse -Path screenshots -Filter *.log
+          $bad = $logs | Select-String -Pattern $patterns -SimpleMatch
           if ($bad) {
             $bad | ForEach-Object { Write-Host "::error::$($_.Filename): $($_.Line)" }
             exit 1
           }
-          # Every demo run must have left its log, or the check above saw too little.
+          # Every demo run and scene must have left its log, or the check above saw too
+          # little.
           $runs = (Select-String -Path scripts/windows-screenshot.ps1 -Pattern '^Run-Demo ').Count
-          $logs = (Get-ChildItem screenshots/*.log).Count
-          if ($logs -lt $runs) {
-            Write-Host "::error::only $logs demo logs for $runs demo runs"
+          $runs += (Get-ChildItem tests/visual/scenes/*.toml).Count
+          if ($logs.Count -lt $runs) {
+            Write-Host "::error::only $($logs.Count) demo logs for $runs demo runs"
             exit 1
           }
-          Write-Host "no COM or borrow errors in $logs logs ($runs demo runs)"
+          Write-Host "no COM or borrow errors in $($logs.Count) logs ($runs demo runs)"
 
+  # Pinned like screenshots-macos: the demo build made here is photographed there, and
+  # a new Xcode or Metal compiler could move pixels.
   macos:
     name: macOS (aarch64)
-    runs-on: macos-latest
+    runs-on: macos-15
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -213,6 +246,11 @@ jobs:
           fi
           if grep -aqF INLET_TEST_EXTRA_CA_FILE target/release/inlet; then
             echo "target/release/inlet contains the test CA variable"
+            exit 1
+          fi
+          # Demo data and scene files are for screenshots only.
+          if grep -aqF "demo scene file" target/release/inlet; then
+            echo "target/release/inlet contains demo code"
             exit 1
           fi
 
@@ -280,6 +318,63 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+      # Demo data only: never shipped. Built last, after the release binary is packaged,
+      # for the screenshots job. Only the app crate is compiled again.
+      - name: Build with demo data
+        run: |
+          cargo build --release --locked -p inlet --features demo
+          mkdir demo-build
+          cp target/release/inlet target/release/inlet-visual demo-build/
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: inlet-demo-macos
+          path: demo-build/
+          if-no-files-found: error
+          retention-days: 3
+
+  # See screenshots-windows. Uses the demo build of the macOS job; the script sets the
+  # screen to 1920x1080 at one pixel per point.
+  screenshots-macos:
+    name: macOS screenshots (demo)
+    needs: macos
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: inlet-demo-macos
+          path: demo-build
+
+      - name: Take screenshots
+        run: |
+          chmod +x demo-build/inlet demo-build/inlet-visual
+          scripts/macos-screenshot.sh demo-build/inlet screenshots
+
+      - name: Compare with the baselines
+        if: ${{ !cancelled() }}
+        run: |
+          set -o pipefail
+          demo-build/inlet-visual compare --scenes tests/visual/scenes \
+            --actual screenshots/visual --baseline tests/visual/baseline/macos \
+            --out visual-report --title-bar | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the logs with the report
+        if: ${{ !cancelled() }}
+        run: mkdir -p visual-report && cp screenshots/visual/*.log visual-report/ 2>/dev/null || true
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ !cancelled() }}
+        with:
+          name: visual-macos
+          path: visual-report/
+          if-no-files-found: ignore
+          retention-days: 14
+
   linux:
     name: Linux (x86_64)
     runs-on: ubuntu-24.04
@@ -326,6 +421,15 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      # The layout measures (rail, sidebar, headers, rows, message grid, composer) are
+      # taken from the real view with the demo data, so they need the demo feature; so
+      # do the demo's own tests and the screenshot comparison tool.
+      - name: Layout tests and demo tests
+        run: cargo test --locked -p inlet --features demo --lib --bins --test layout_metrics
+
+      - name: Clippy with demo data
+        run: cargo clippy --locked -p inlet --features demo --all-targets -- -D warnings
+
       # The tray test needs a session bus to register on. The gpui glue and the
       # demo are behind a feature, so they are linted here separately.
       - name: Platform tests with a session bus
@@ -353,6 +457,11 @@ jobs:
             echo "target/release/inlet contains the test CA variable"
             exit 1
           fi
+          # Demo data and scene files are for screenshots only.
+          if grep -aqF "demo scene file" target/release/inlet; then
+            echo "target/release/inlet contains demo code"
+            exit 1
+          fi
 
       - name: Package
         run: |
@@ -368,6 +477,84 @@ jobs:
           name: inlet-linux-x86_64
           path: dist/inlet-linux-x86_64.tar.gz
           if-no-files-found: error
+          retention-days: 7
+
+      # Demo data only: never shipped. Built last, after the release binary is packaged,
+      # for the screenshots job. Only the app crate is compiled again.
+      - name: Build with demo data
+        run: |
+          cargo build --release --locked -p inlet --features demo
+          mkdir demo-build
+          cp target/release/inlet target/release/inlet-visual demo-build/
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: inlet-demo-linux
+          path: demo-build/
+          if-no-files-found: error
+          retention-days: 3
+
+  # See screenshots-windows. Uses the demo build of the Linux job, under Xvfb with
+  # software Vulkan (lavapipe) at 96 DPI and a scale of 1.
+  screenshots-linux:
+    name: Linux screenshots (demo)
+    needs: linux
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Xvfb, software Vulkan and the capture tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            xvfb x11-utils imagemagick xdotool \
+            libvulkan1 mesa-vulkan-drivers libegl1 libgl1-mesa-dri \
+            libxkbcommon-x11-0 libxcb1 libx11-xcb1 libwayland-client0 libfontconfig1 \
+            libasound2t64 \
+            fonts-noto-cjk
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: inlet-demo-linux
+          path: demo-build
+
+      - name: Take screenshots
+        run: |
+          set -o pipefail
+          chmod +x demo-build/inlet demo-build/inlet-visual
+          mkdir screenshots
+          scripts/xvfb-screens.sh demo-build/inlet | tar -x -C screenshots
+
+      - name: Compare with the baselines
+        if: ${{ !cancelled() }}
+        run: |
+          set -o pipefail
+          demo-build/inlet-visual compare --scenes tests/visual/scenes \
+            --actual screenshots/visual --baseline tests/visual/baseline/linux \
+            --out visual-report | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the logs with the report
+        if: ${{ !cancelled() }}
+        run: mkdir -p visual-report && cp screenshots/visual/*.log visual-report/ 2>/dev/null || true
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ !cancelled() }}
+        with:
+          name: visual-linux
+          path: visual-report/
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        # Also when a demo crashed: the pictures show how far it got.
+        if: always()
+        with:
+          name: inlet-linux-screenshots
+          path: screenshots/
+          if-no-files-found: ignore
           retention-days: 7
 
   notices:

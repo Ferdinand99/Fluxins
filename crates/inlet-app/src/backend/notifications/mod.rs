@@ -16,6 +16,9 @@
 //!   tell an answer to the write it waits for from a late one. Signing out aborts the
 //!   writes still running (`Accounts::teardown`), so no answer reaches the next account.
 
+pub mod alerts;
+pub mod sound;
+
 use inlet_protocol as p;
 use inlet_state::GuildId;
 use serde_json::Value;

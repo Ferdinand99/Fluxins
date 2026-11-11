@@ -255,6 +255,17 @@ impl BackendHandle {
     pub fn set_account(&self, account: Option<AccountKey>) {
         *self.account.lock().unwrap_or_else(|e| e.into_inner()) = account;
     }
+
+    /// A handle with no backend behind it: commands go nowhere. For the layout tests,
+    /// which feed the view its events themselves.
+    #[cfg(feature = "demo")]
+    pub fn detached() -> Self {
+        let (tx, _rx) = unbounded_channel();
+        Self {
+            tx,
+            account: Arc::default(),
+        }
+    }
 }
 
 /// Starts the backend thread. Events arrive on `events`. When the thread ends (a panic in

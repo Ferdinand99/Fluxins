@@ -93,7 +93,7 @@ The code is on the `v0` branch (`git clone --branch v0 https://github.com/Ferdin
 cargo build --release -p inlet
 ```
 
-The binary is `target/release/inlet` (`inlet.exe` on Windows). [`docs/BUILDING.md`](https://github.com/Ferdinand99/Inlet/blob/v0/docs/BUILDING.md) describes a reproducible Docker-based build for builds, tests and checks on Linux.
+The binary is `target/release/inlet` (`inlet.exe` on Windows). On Linux the notification sound uses ALSA's `libasound.so.2` (package `libasound2`), loaded only when a sound plays: without it Inlet runs normally, without the sound. [`docs/BUILDING.md`](https://github.com/Ferdinand99/Inlet/blob/v0/docs/BUILDING.md) describes a reproducible Docker-based build for builds, tests and checks on Linux.
 
 ## Workspace layout
 

@@ -361,6 +361,23 @@ pub fn window_options(start: &Start, cx: &mut App) -> WindowOptions {
             None,
         ),
     };
+    // A scene file of the visual checks fixes the size, whatever was remembered. Under
+    // Xvfb the pointer cannot be moved and stays in the middle of the screen, so on
+    // Linux the window goes to the top left corner, clear of it (the script makes the
+    // screen more than twice the window's size); elsewhere the scripts park the pointer
+    // beside a centred window. Either way nothing shows a hover state.
+    #[cfg(feature = "demo")]
+    let (bounds, display_id) = match crate::demo::scenes::window_size() {
+        Some((w, h)) => {
+            let b = if cfg!(any(target_os = "linux", target_os = "freebsd")) {
+                Bounds::new(point(px(0.), px(0.)), size(px(w), px(h)))
+            } else {
+                Bounds::centered(None, size(px(w), px(h)), cx)
+            };
+            (WindowBounds::Windowed(b), None)
+        }
+        None => (bounds, display_id),
+    };
     let hidden = start.opens_hidden();
     WindowOptions {
         window_bounds: Some(bounds),
@@ -551,6 +568,15 @@ fn with_main_window(
 pub fn show_main_window(cx: &mut App) {
     with_main_window(cx, "show the window", |window, cx| {
         gpui_glue::show_window(window, cx)
+    });
+}
+
+/// Flashes the taskbar button (bounces the dock icon) while the window has no focus,
+/// for a new notification.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn flash_main_window(cx: &mut App) {
+    with_main_window(cx, "flash the window", |window, _| {
+        gpui_glue::flash_window(window)
     });
 }
 
@@ -823,6 +849,9 @@ impl Inlet {
             }
             Ev::Os(PlatformEvent::DeepLink(link)) => self.offer_deep_link(link, cx),
             Ev::Os(PlatformEvent::TrayMenu(id)) if id == TRAY_QUIT => quit(cx),
+            Ev::Os(PlatformEvent::NotificationClicked(tag)) => {
+                self.open_notification(&tag, window, cx)
+            }
             Ev::Os(_) => {}
         }
     }
@@ -831,7 +860,7 @@ impl Inlet {
     /// with several accounts, this is the one place that sums them.
     /// Every signed-in account counts: the active one from its state, the others from
     /// their marks in the account switcher.
-    fn desktop_unread(&self, cx: &App) -> DesktopUnread {
+    pub(crate) fn desktop_unread(&self, cx: &App) -> DesktopUnread {
         let active = self
             .account
             .as_ref()

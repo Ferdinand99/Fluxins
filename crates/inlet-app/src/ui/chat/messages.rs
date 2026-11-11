@@ -806,6 +806,12 @@ impl MessageView {
         }
     }
 
+    /// The request whose answer the newest page of `ch` must carry, while it loads.
+    #[cfg(feature = "demo")]
+    pub(crate) fn waiting_request(&self, ch: ChannelId) -> Option<u64> {
+        self.loading.get(&ch).copied()
+    }
+
     /// A view whose channel's newest page has landed, for tests of the read rules.
     #[cfg(test)]
     pub fn loaded_for_tests() -> Self {
@@ -1225,7 +1231,9 @@ impl Inlet {
         let Some(account) = self.account.clone() else {
             return;
         };
+        let alert = Self::alert_probe(&account, &dispatch, cx);
         let mut changes = account.update(cx, |s, _| s.apply(&dispatch));
+        self.alert_after(self.switcher.active.clone(), alert, &dispatch, &account, cx);
         self.settings_applied(&dispatch, &mut changes, cx);
         self.note_saved(&dispatch);
         self.inbox_on_dispatch(&dispatch, &rendered, cx);
