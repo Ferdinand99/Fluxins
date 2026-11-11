@@ -24,6 +24,9 @@
 //! - `accounts`: as `default`, with two more accounts in the background (one on the same
 //!   instance with mentions, one on another instance) and the account switcher open.
 //! - `accounts-add`: the same accounts, on the sign-in screen to add one more.
+//! - `chat-pins`: for `#general`, the pinned messages panel open.
+//! - `inbox-unreads`, `inbox-saved`, `inbox-mentions`: for `#general`, the inbox open on
+//!   that tab (with the unread state of `default`; see `inbox.rs`).
 
 use std::collections::HashMap;
 
@@ -57,6 +60,10 @@ pub enum Scene {
     ChatDelete,
     Accounts,
     AccountsAdd,
+    ChatPins,
+    InboxUnreads,
+    InboxSaved,
+    InboxMentions,
 }
 
 impl Scene {
@@ -79,6 +86,10 @@ impl Scene {
             "chat-delete" => Scene::ChatDelete,
             "accounts" => Scene::Accounts,
             "accounts-add" => Scene::AccountsAdd,
+            "chat-pins" => Scene::ChatPins,
+            "inbox-unreads" => Scene::InboxUnreads,
+            "inbox-saved" => Scene::InboxSaved,
+            "inbox-mentions" => Scene::InboxMentions,
             _ => return None,
         })
     }
@@ -236,6 +247,7 @@ pub fn data(scene: Scene) -> Data {
         }
         _ => {}
     }
+    super::inbox::add(&mut by_name);
 
     // Demo IDs become snowflakes everywhere.
     let guilds: Vec<Guild> = guilds::guilds()
@@ -297,7 +309,10 @@ pub fn data(scene: Scene) -> Data {
         });
     }
     let mut guild_settings = Vec::new();
-    let unread_demo = matches!(scene, Scene::Default | Scene::Accounts | Scene::AccountsAdd);
+    let unread_demo = matches!(
+        scene,
+        Scene::Default | Scene::Accounts | Scene::AccountsAdd | Scene::InboxUnreads
+    );
     if unread_demo {
         // Unread messages, mentions and mutes in the sidebar and the rail.
         read_states.extend(unread::read_states());
@@ -344,6 +359,10 @@ mod tests {
             "chat-delete",
             "accounts",
             "accounts-add",
+            "chat-pins",
+            "inbox-unreads",
+            "inbox-saved",
+            "inbox-mentions",
         ] {
             let scene = Scene::from_name(name).expect(name);
             let data = data(scene);
@@ -374,6 +393,12 @@ mod tests {
             }
         }
         assert_eq!(Scene::from_name("nope"), None);
+        // The pins panel has pinned messages to show.
+        let pinned = data(Scene::ChatPins).messages[&snowflake("c-general")]
+            .iter()
+            .filter(|m| m.pinned)
+            .count();
+        assert!(pinned >= 3, "{pinned} pinned");
 
         // The media scenes have what they promise.
         let data = data(Scene::EmbedAllTypes);

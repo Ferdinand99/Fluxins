@@ -38,8 +38,11 @@ use crate::backend::messages::{Cmd, Ev, Pending};
 use crate::model::{self, Message, Names};
 use crate::ui::markdown::{self, Block};
 
-/// How long a message that was jumped to stays highlighted.
-const JUMP_HIGHLIGHT_MS: i64 = 2_000;
+/// How long a message that was jumped to stays highlighted: Fluxer holds it for 2 s
+/// (`handleJumpHighlight` in `ChannelMessages.tsx`) and fades it in and out over
+/// 320 ms (`--message-transition-highlight`). Deviation: no fade; gpui rows have no
+/// colour transition here, so the highlight switches on and off.
+pub const JUMP_HIGHLIGHT_MS: i64 = 2_000;
 /// Shortest time between two requests for older messages from the UI.
 pub const OLDER_PAGE_INTERVAL_MS: i64 = 1_000;
 /// Shortest time between two reloads of the newest page that the person asks for
@@ -435,6 +438,8 @@ pub struct MessageView {
     /// Live messages that arrived while detached.
     pub detached_new: usize,
     ticker: Option<Task<()>>,
+    /// Ends the jump highlight on time.
+    jump_timer: Option<Task<()>>,
     scroll_hooked: bool,
     /// The person scrolled the "NEW" line out of view above (the banner shows).
     pub divider_above: bool,
@@ -791,6 +796,34 @@ impl MessageView {
         }
     }
 
+    /// Whether the open channel's newest page has landed.
+    pub fn is_loaded(&self) -> bool {
+        self.loaded
+    }
+
+    /// Highlights message `id` as jumped to from `now_ms` for [`JUMP_HIGHLIGHT_MS`].
+    pub fn highlight(&mut self, id: MessageId, now_ms: i64) {
+        self.jumped = Some((id, now_ms + JUMP_HIGHLIGHT_MS));
+    }
+
+    /// Whether message `id` is highlighted at `now_ms`.
+    pub fn is_highlighted(&self, id: MessageId, now_ms: i64) -> bool {
+        self.jumped
+            .is_some_and(|(j, until)| j == id && now_ms < until)
+    }
+
+    /// Keeps the converted messages of a page applied outside this view (the page
+    /// around a message that a jump loads), so the rows need no conversion here.
+    pub fn remember_page(
+        &mut self,
+        state: &AccountState,
+        messages: &[p::Message],
+        rendered: Vec<Message>,
+    ) {
+        self.conversions
+            .remember(state, &edits_of(messages), rendered);
+    }
+
     /// Whether channel `ch` may be marked read now: its newest page landed, its window
     /// has the newest messages, the list shows the bottom and the window has focus.
     pub fn may_mark_read(
@@ -819,7 +852,8 @@ impl MessageView {
         let mut rows = Vec::new();
         self.unread_count = 0;
         let mut unread_since_ms = 0;
-        if self.jumped.is_some_and(|(_, until)| until <= now_ms()) {
+        let now = now_ms();
+        if self.jumped.is_some_and(|(_, until)| until <= now) {
             self.jumped = None;
         }
         self.detached = is_detached(state, ch);
@@ -875,7 +909,7 @@ impl MessageView {
                     id,
                     grouped,
                     mention: mentions_me(state, ch, m),
-                    jumped: self.jumped.is_some_and(|(j, _)| j == id),
+                    jumped: self.is_highlighted(id, now),
                     revealed: self.revealed.contains(&id),
                     name_color: name_color(state, guild, m),
                     tag: tag(channel, m, &c.shown),
@@ -1034,6 +1068,7 @@ impl Inlet {
                 }
             }
             Ev::Action(ev) => self.on_action_event(ev, cx),
+            Ev::Inbox(ev) => self.on_inbox_event(ev, cx),
         }
     }
 
@@ -1069,6 +1104,7 @@ impl Inlet {
             // missing or stale, so load its newest page.
             self.chat.view.newest_retries = 0;
             self.load_open_channel(cx);
+            self.inbox_on_dispatch(&dispatch, &[], cx);
             return;
         }
         let Some(account) = self.account.clone() else {
@@ -1077,6 +1113,7 @@ impl Inlet {
         let mut changes = account.update(cx, |s, _| s.apply(&dispatch));
         self.settings_applied(&dispatch, &mut changes, cx);
         self.note_saved(&dispatch);
+        self.inbox_on_dispatch(&dispatch, &rendered, cx);
         let edits = match &dispatch {
             p::Dispatch::MessageCreate(m) | p::Dispatch::MessageUpdate(m) => edits_of([&**m]),
             _ => Edits::new(),
@@ -1178,6 +1215,10 @@ impl Inlet {
             }
         }
         self.after_changes(changes, false, cx);
+        if !older && self.open_channel_id() == Some(ch) {
+            // A jump to a message waits for this page.
+            self.inbox_after_newest_page(cx);
+        }
     }
 
     fn on_page_failed(
@@ -1203,6 +1244,8 @@ impl Inlet {
             account.update(cx, |s, _| s.cancel_load(ch));
             if self.open_channel_id() == Some(ch) {
                 self.refresh_rows(cx);
+                // A jump waiting for this page is given up.
+                self.inbox.jump.give_up_in(ch);
             }
         }
     }
@@ -1220,6 +1263,7 @@ impl Inlet {
         // The sidebar and the rail read their badges from the same state.
         self.notifications
             .refresh_badges(account.read(cx), &changes);
+        self.inbox.state_changed(&changes);
         self.chat.view.conversions.prune(account.read(cx), &changes);
         let Some(ch) = self.open_channel_id() else {
             return;
@@ -1261,6 +1305,8 @@ impl Inlet {
 
     /// Empties the list (another guild or channel is about to show).
     pub(crate) fn clear_messages(&mut self) {
+        // The pins panel belongs to the channel that is closing.
+        self.inbox.channel_changed(self.open_channel_id());
         let view = &mut self.chat.view;
         view.rows.clear();
         view.unread_after = None;
@@ -1418,6 +1464,9 @@ impl Inlet {
                         if at_top {
                             this.load_older(cx);
                         } else if this.chat.view.detached {
+                            // Deviation: Fluxer loads `?after=` pages below a window
+                            // that lost its newest messages (after a jump); Inlet loads
+                            // the newest page, which replaces the window.
                             this.reload_newest(cx);
                         }
                         // Back at the bottom with focus: the channel is read. The tick
@@ -1477,10 +1526,21 @@ impl Inlet {
             .position(|r| r.message_id() == Some(id))
         {
             Some(ix) => {
-                self.chat.view.jumped = Some((id, now_ms() + JUMP_HIGHLIGHT_MS));
+                self.chat.view.highlight(id, now_ms());
                 self.refresh_rows(cx);
                 self.chat.message_list.pause_following_tail();
                 self.chat.message_list.scroll_to_reveal_item(ix);
+                // The highlight ends on time, not at the next tick.
+                self.chat.view.jump_timer = Some(cx.spawn(async move |this, cx| {
+                    let ms = u64::try_from(JUMP_HIGHLIGHT_MS).unwrap_or(0);
+                    cx.background_executor()
+                        .timer(Duration::from_millis(ms))
+                        .await;
+                    let _ = this.update(cx, |this, cx| {
+                        this.refresh_rows(cx);
+                        cx.notify();
+                    });
+                }));
             }
             None => self.chat.notice = Some(t!("chat-reply-not-loaded")),
         }
@@ -1497,6 +1557,8 @@ impl Inlet {
         if action == JumpAction::LoadNewest {
             self.reload_newest(cx);
         }
+        // A jump still loading its page would pull the list back.
+        self.inbox.jump.cancel();
         self.chat.view.scrolled_away = false;
         self.chat.message_list.scroll_to_end();
         self.chat.message_list.set_follow_mode(FollowMode::Tail);
