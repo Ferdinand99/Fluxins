@@ -27,6 +27,19 @@ pub use bar::header_button;
 
 actions!(search, [ToggleQuickSwitcher, SwitcherUp, SwitcherDown]);
 
+/// The action of the "Quick switcher" bar at the top of the DM list (Fluxer's). It is
+/// in the sidebar's namespace because the sidebar sends it; this domain handles it. The
+/// DM list uses this definition rather than its own.
+pub mod sidebar_actions {
+    gpui::actions!(
+        sidebar,
+        [
+            /// Opens the quick switcher (never closes it).
+            OpenQuickSwitcher
+        ]
+    );
+}
+
 /// The key context of the quick switcher's window.
 pub const SWITCHER_CONTEXT: &str = "inlet_quick_switcher";
 
@@ -114,7 +127,8 @@ impl Inlet {
         }
     }
 
-    /// The window's handler of this domain (Ctrl+K), and the demo scenes.
+    /// The window's handlers of this domain (Ctrl+K, the DM list's quick switcher bar),
+    /// and the demo scenes.
     pub(crate) fn search_keys<E: InteractiveElement>(
         &mut self,
         el: E,
@@ -127,6 +141,13 @@ impl Inlet {
         el.on_action(cx.listener(|this, _: &ToggleQuickSwitcher, window, cx| {
             this.toggle_quick_switcher(window, cx)
         }))
+        .on_action(cx.listener(
+            |this, _: &sidebar_actions::OpenQuickSwitcher, window, cx| {
+                if !this.search.switcher.open {
+                    this.toggle_quick_switcher(window, cx)
+                }
+            },
+        ))
     }
 
     /// Events from the backend's search domain.

@@ -453,9 +453,9 @@ impl Inlet {
                     .text_color(theme::link())
                     .child(t!("search-jump")),
             )
-            .on_click(cx.listener(move |this, _, window, cx| {
-                this.open_result(&clicked, window, cx)
-            }))
+            .on_click(
+                cx.listener(move |this, _, window, cx| this.open_result(&clicked, window, cx)),
+            )
             .into_any_element()
     }
 }
