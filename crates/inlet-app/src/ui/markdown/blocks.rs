@@ -37,6 +37,20 @@ pub fn parse_embed_with(input: &str, names: &Names) -> Vec<Block> {
     parse_flags(input, names, ParserFlags::ALL & !ParserFlags::ALLOW_TABLES)
 }
 
+/// [`parse_with`] for a profile's bio, as Fluxer's `RESTRICTED_USER_BIO_FLAGS`: no
+/// headings, code blocks, role or `@everyone` mentions, subtext, tables or alerts
+/// (they stay plain text).
+pub fn parse_bio_with(input: &str, names: &Names) -> Vec<Block> {
+    let not = ParserFlags::ALLOW_HEADINGS
+        | ParserFlags::ALLOW_CODE_BLOCKS
+        | ParserFlags::ALLOW_ROLE_MENTIONS
+        | ParserFlags::ALLOW_EVERYONE_MENTIONS
+        | ParserFlags::ALLOW_SUBTEXT
+        | ParserFlags::ALLOW_TABLES
+        | ParserFlags::ALLOW_ALERTS;
+    parse_flags(input, names, ParserFlags::ALL & !not)
+}
+
 fn parse_flags(input: &str, names: &Names, flags: u32) -> Vec<Block> {
     NAMES.with(|n| *n.borrow_mut() = mentioned_users(input, names));
     let out = code::with_message_budget(|| parse_inner(input, flags));

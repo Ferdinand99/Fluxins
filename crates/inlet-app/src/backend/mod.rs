@@ -485,6 +485,8 @@ struct Backend {
     older: messages::OlderPages,
     /// Requests of the thread panel, thread lists and forums.
     threads: messages::threads::State,
+    /// The member list subscription and the profile fetch of the active account.
+    social: social::State,
 }
 
 impl Backend {
@@ -513,6 +515,7 @@ impl Backend {
             uploads: Default::default(),
             older: Default::default(),
             threads: Default::default(),
+            social: Default::default(),
         }
     }
 

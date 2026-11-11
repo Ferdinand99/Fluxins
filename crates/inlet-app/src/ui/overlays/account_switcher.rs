@@ -375,6 +375,8 @@ impl Inlet {
         if !self.switcher.is_active(&key) {
             // Reaction clicks still in their 500 ms window go out now, for this account.
             self.flush_all_reactions();
+            // A note being edited is saved for this account too.
+            self.save_note(cx);
             // The backend switches first, so the commands that open the new account's
             // place reach it with that account active.
             self.backend.send(Cmd::SwitchAccount(key.clone()));

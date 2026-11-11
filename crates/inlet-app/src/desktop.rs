@@ -929,6 +929,9 @@ impl Inlet {
             link_prompt: self.overlays.link_prompt.is_some(),
             link_confirm: self.overlays.pending_link.is_some(),
             quick_switcher: self.quick_switcher_open(),
+            user_menu: self.profile.menu.is_some(),
+            profile_popout: self.profile.popout.is_some(),
+            profile_modal: self.profile.full.is_some(),
             notification_settings: self.notifications.settings.is_some(),
             status_picker: self.status_picker_open(),
             switcher: self.switcher_layer_open(),
@@ -1036,6 +1039,9 @@ impl Inlet {
             Some(Layer::LinkPrompt) => self.overlays.link_prompt = None,
             Some(Layer::LinkConfirm) => self.overlays.pending_link = None,
             Some(layer @ (Layer::QuickSwitcher | Layer::Search)) => self.close_search_layer(layer),
+            Some(Layer::UserMenu) => self.profile.menu = None,
+            Some(Layer::ProfilePopout) => self.profile.popout = None,
+            Some(Layer::ProfileModal) => self.profile.full = None,
             Some(Layer::NotificationSettings) => self.notifications.settings = None,
             Some(Layer::StatusPicker) => self.social.picker = None,
             Some(Layer::AccountSwitcher) => self.switcher.open = false,
@@ -1099,8 +1105,8 @@ pub(crate) fn field_keeps_keyboard(top: Layer, field: Option<Layer>) -> bool {
 
 impl Inlet {
     /// The layer whose text field has the keyboard now, if one has: a picker's search,
-    /// the status picker's custom status, the quick switcher's field or the search
-    /// field.
+    /// the status picker's custom status, the note in the profile popout or the full
+    /// profile, the quick switcher's field or the search field.
     fn focused_layer_field(&self, window: &Window, cx: &App) -> Option<Layer> {
         if self
             .composer
@@ -1112,6 +1118,13 @@ impl Inlet {
         }
         if self.status_picker_field_focused(window, cx) {
             return Some(Layer::StatusPicker);
+        }
+        if self.profile_note_focused(window, cx) {
+            return Some(if self.profile.full.is_some() {
+                Layer::ProfileModal
+            } else {
+                Layer::ProfilePopout
+            });
         }
         if self.quick_switcher_field_focused(window, cx) {
             return Some(Layer::QuickSwitcher);
@@ -1130,6 +1143,12 @@ pub(crate) enum Layer {
     LinkConfirm,
     /// The quick switcher (Ctrl+K).
     QuickSwitcher,
+    /// The user menu (right click on a member).
+    UserMenu,
+    /// The profile popout beside the member list.
+    ProfilePopout,
+    /// The full profile.
+    ProfileModal,
     NotificationSettings,
     /// The status picker over the user panel.
     StatusPicker,
@@ -1146,14 +1165,17 @@ pub(crate) enum Layer {
 
 /// Which layers are open. They are drawn bottom first (the search column, a panel, the
 /// image viewer, the picker, the settings view, the notification settings window, the
-/// account switcher, the status picker, the quick switcher, the link confirmation, the
-/// link prompt, see `ui/overlays`), and the topmost one has the keyboard: Escape closes
-/// it first.
+/// account switcher, the full profile, the profile popout, the user menu, the status
+/// picker, the quick switcher, the link confirmation, the link prompt, see
+/// `ui/overlays`), and the topmost one has the keyboard: Escape closes it first.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct OpenLayers {
     pub link_prompt: bool,
     pub link_confirm: bool,
     pub quick_switcher: bool,
+    pub user_menu: bool,
+    pub profile_popout: bool,
+    pub profile_modal: bool,
     pub notification_settings: bool,
     pub status_picker: bool,
     pub switcher: bool,
@@ -1174,6 +1196,12 @@ impl OpenLayers {
             Some(Layer::QuickSwitcher)
         } else if self.status_picker {
             Some(Layer::StatusPicker)
+        } else if self.user_menu {
+            Some(Layer::UserMenu)
+        } else if self.profile_popout {
+            Some(Layer::ProfilePopout)
+        } else if self.profile_modal {
+            Some(Layer::ProfileModal)
         } else if self.switcher {
             Some(Layer::AccountSwitcher)
         } else if self.notification_settings {
@@ -1201,6 +1229,9 @@ impl OpenLayers {
             Some(Layer::LinkConfirm) => self.link_confirm = false,
             Some(Layer::QuickSwitcher) => self.quick_switcher = false,
             Some(Layer::Search) => self.search = false,
+            Some(Layer::UserMenu) => self.user_menu = false,
+            Some(Layer::ProfilePopout) => self.profile_popout = false,
+            Some(Layer::ProfileModal) => self.profile_modal = false,
             Some(Layer::NotificationSettings) => self.notification_settings = false,
             Some(Layer::StatusPicker) => self.status_picker = false,
             Some(Layer::AccountSwitcher) => self.switcher = false,
@@ -1400,10 +1431,100 @@ mod tests {
     }
 
     /// A field keeps the keyboard only while its layer is the topmost one; a layer that
+    /// opens over it (a link prompt over the status picker, the link confirmation over
+    /// a profile's note) takes the keyboard at once, in the same frame.
+    #[test]
+    fn a_field_keeps_the_keyboard_only_in_the_topmost_layer() {
+        let picker = OpenLayers {
+            status_picker: true,
+            ..OpenLayers::default()
+        };
+        let top = picker.topmost().unwrap();
+        assert!(field_keeps_keyboard(top, Some(Layer::StatusPicker)));
+        // An emoji or GIF picker keeps its search field's keyboard while it is on top.
+        let emoji = OpenLayers {
+            picker: true,
+            ..OpenLayers::default()
+        };
+        assert!(field_keeps_keyboard(
+            emoji.topmost().unwrap(),
+            Some(Layer::Picker)
+        ));
+        assert!(!field_keeps_keyboard(
+            emoji.topmost().unwrap(),
+            Some(Layer::StatusPicker)
+        ));
+        assert!(!field_keeps_keyboard(top, None));
+        // A link prompt opens over the picker: its field gives up the keyboard now.
+        let prompt = OpenLayers {
+            link_prompt: true,
+            ..picker
+        };
+        assert!(!field_keeps_keyboard(
+            prompt.topmost().unwrap(),
+            Some(Layer::StatusPicker)
+        ));
+        // The note of a profile popout; the link confirmation over it takes the keyboard.
+        let popout = OpenLayers {
+            profile_popout: true,
+            ..OpenLayers::default()
+        };
+        assert!(field_keeps_keyboard(
+            popout.topmost().unwrap(),
+            Some(Layer::ProfilePopout)
+        ));
+        let confirm = OpenLayers {
+            link_confirm: true,
+            ..popout
+        };
+        assert!(!field_keeps_keyboard(
+            confirm.topmost().unwrap(),
+            Some(Layer::ProfilePopout)
+        ));
+        // When the confirmation closes, the popout is on top again and its field may
+        // take the keyboard back.
+        assert_eq!(confirm.after_escape(), popout);
+    }
+
+    /// The profile layers: the user menu closes before the popout and the full
+    /// profile, a link confirmation (a link in a bio) before all of them, and nothing
+    /// is read behind them (`layer_open`).
+    #[test]
+    fn profile_layers_close_before_the_chat_layers() {
+        let mut layers = OpenLayers {
+            link_confirm: true,
+            user_menu: true,
+            profile_popout: true,
+            panel: true,
+            ..OpenLayers::default()
+        };
+        let mut order = Vec::new();
+        while let Some(top) = layers.topmost() {
+            order.push(top);
+            layers = layers.after_escape();
+        }
+        assert_eq!(
+            order,
+            [
+                Layer::LinkConfirm,
+                Layer::UserMenu,
+                Layer::ProfilePopout,
+                Layer::Panel
+            ]
+        );
+        let full = OpenLayers {
+            profile_modal: true,
+            ..OpenLayers::default()
+        };
+        assert_eq!(full.topmost(), Some(Layer::ProfileModal));
+        assert_eq!(full.after_escape().topmost(), None);
+    }
+
+    /// A field keeps the keyboard only while its layer is the topmost one; a layer that
     /// opens over it (the inbox over the search panel, a link prompt over the quick
     /// switcher) takes the keyboard at once, in the same frame.
     #[test]
-    fn a_field_keeps_the_keyboard_only_in_the_topmost_layer() {
+    fn a_search_field_keeps_the_keyboard_only_in_the_topmost_layer() {
         let search = OpenLayers {
             search: true,
             ..OpenLayers::default()
@@ -1454,6 +1575,9 @@ mod tests {
             link_prompt: true,
             link_confirm: true,
             quick_switcher: true,
+            user_menu: true,
+            profile_popout: true,
+            profile_modal: true,
             notification_settings: true,
             status_picker: true,
             switcher: true,
@@ -1475,6 +1599,9 @@ mod tests {
                 Layer::LinkConfirm,
                 Layer::QuickSwitcher,
                 Layer::StatusPicker,
+                Layer::UserMenu,
+                Layer::ProfilePopout,
+                Layer::ProfileModal,
                 Layer::AccountSwitcher,
                 Layer::NotificationSettings,
                 Layer::Settings,

@@ -53,6 +53,10 @@ impl Inlet {
         if self.switcher_layer_open() {
             out.push(self.render_account_switcher(cx));
         }
+        // Profiles (the full profile, the popout, the user menu): over the switcher,
+        // under the status picker and the link prompts, so a link in a bio is
+        // confirmed on top.
+        out.extend(self.render_profile_overlays(cx));
         // The status picker: over the account switcher, under the link prompts.
         if self.status_picker_open() {
             out.push(self.render_status_picker(cx));

@@ -149,8 +149,8 @@ scene 36-composer-attachments composer-attachments c-general
 scene 37-picker-emoji picker-emoji c-general
 scene 38-picker-gif picker-gif c-general
 # Message search: the search panel with results; the quick switcher over every account.
-scene 39-search-results search-results c-general
-scene 40-quick-switcher quick-switcher c-general
+scene 41-search-results search-results c-general
+scene 42-quick-switcher quick-switcher c-general
 
 # 10. The Notifications settings tab.
 INLET_DEMO=1 INLET_DEMO_LIVE_SECS=3600 INLET_DEMO_GUILD=g1 INLET_DEMO_CHANNEL=c-general INLET_DEMO_SETTINGS=notifications "$bin" >>"$out/demo.log" 2>&1 &
@@ -159,7 +159,11 @@ sleep 6
 shot 34-settings-notifications
 kill $pid; wait $pid 2>/dev/null
 
-# 11. The scene files of the visual checks. Xvfb's pointer cannot be moved and sits in
+# 11. The member list beside the chat, and the profile popout of a member.
+scene 39-members members c-general
+scene 40-profile-popout profile-popout c-general
+
+# 12. The scene files of the visual checks. Xvfb's pointer cannot be moved and sits in
 #     the middle of the screen; the demo puts a scene's window in the top left corner,
 #     and the screen is more than twice its size, so the pointer is never over it (no
 #     hover states). The app reads each file itself.

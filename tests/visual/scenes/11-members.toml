@@ -1,0 +1,11 @@
+# The member list beside the chat: hoisted roles, online and offline groups with their
+# counts, statuses and custom statuses, the owner's crown, a bot, offline members at
+# 30 % and a name too long for the row.
+name = "members"
+window = [1280, 860]
+scale = 1.0
+theme = "dark"
+ignore = []
+scene = "members"
+guild = "g1"
+channel = "c-general"
