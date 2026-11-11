@@ -16,6 +16,7 @@ use crate::app::Inlet;
 use crate::model::{self, EmbedField, EmbedKind};
 use crate::theme;
 use crate::ui::markdown::{self, RenderCtx};
+use crate::ui::media::embed::embed_origin;
 use crate::ui::media::requests;
 
 /// Card width without media (`EMBED_TEXT_OUTER_WIDTH`).
@@ -62,6 +63,22 @@ fn field_rows(fields: &[EmbedField], with_thumbnail: bool) -> Vec<Vec<&EmbedFiel
         }
     }
     rows
+}
+
+/// The "GIF" mark in the corner of a GIF page shown as a still.
+fn gif_badge() -> AnyElement {
+    div()
+        .absolute()
+        .bottom(px(6.))
+        .left(px(6.))
+        .px(px(6.))
+        .rounded(px(4.))
+        .bg(theme::media_overlay())
+        .text_size(px(12.))
+        .font_weight(FontWeight::BOLD)
+        .text_color(theme::text_strong())
+        .child(t!("media-gif-badge"))
+        .into_any_element()
 }
 
 /// Whether an embed belongs to a link hidden in a spoiler: its page or one of its media
@@ -116,6 +133,7 @@ pub(super) fn render_embed(
     if embed_spoilered(e, hidden) {
         return spoiler_card(this, id, e, ctx);
     }
+    let origin = embed_origin(e);
     let has_text = e.title.is_some()
         || e.author.is_some()
         || !e.description.is_empty()
@@ -128,17 +146,22 @@ pub(super) fn render_embed(
             .or(e.thumbnail.as_ref())
             .or(e.video.as_ref())
         {
+            let picture = this.embed_image(
+                id,
+                m,
+                requests::PREVIEW_MAX,
+                0.,
+                e.nsfw,
+                t!("embed-image"),
+                &origin,
+                cx,
+            );
+            // A GIF page that only has its video shows the first frame: the badge says
+            // it is a GIF, which plays on the site (no video player here).
+            let badge = (e.kind == EmbedKind::Gifv && m.video).then(gif_badge);
             return div()
                 .pt_1()
-                .child(this.embed_image(
-                    id,
-                    m,
-                    requests::PREVIEW_MAX,
-                    0.,
-                    e.nsfw,
-                    t!("embed-image"),
-                    cx,
-                ))
+                .child(div().relative().child(picture).children(badge))
                 .into_any_element();
         }
     }
@@ -261,6 +284,7 @@ pub(super) fn render_embed(
             0.,
             e.nsfw,
             e.title.clone().unwrap_or_else(|| t!("embed-thumbnail")),
+            &origin,
             cx,
         )));
     }
@@ -282,6 +306,7 @@ pub(super) fn render_embed(
             still,
             e.url.clone().filter(|u| markdown::openable(u).is_some()),
             e.nsfw,
+            &origin,
             cx,
         ));
     } else if let Some(i) = image {
@@ -292,6 +317,7 @@ pub(super) fn render_embed(
             crate::ui::media::EMBED_CHROME,
             e.nsfw,
             e.title.clone().unwrap_or_else(|| t!("embed-image")),
+            &origin,
             cx,
         ));
     }

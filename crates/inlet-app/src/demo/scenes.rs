@@ -44,6 +44,9 @@
 //! - `picker-emoji`, `picker-gif`: for `#general`, the composer's picker open on the
 //!   emoji tab (favourites, frequently used, the guild's custom emoji) or the GIF tab
 //!   (the featured search terms; see `pickers.rs`).
+//! - `media-errors`: the DM with Ada holds GIFs that cannot be shown (a proxy that does
+//!   not answer, a file that does not decode, a host Inlet does not load from), each as
+//!   a tile with its reason, and a GIF page that only has a video (see `media.rs`).
 //!
 //! `INLET_DEMO_SCENE` may also name a scene file of the visual checks
 //! (`tests/visual/scenes/*.toml`, see `scene_file.rs`): it then sets the scene, the guild,
@@ -98,6 +101,7 @@ pub enum Scene {
     ComposerAttachments,
     PickerEmoji,
     PickerGif,
+    MediaErrors,
 }
 
 impl Scene {
@@ -134,6 +138,7 @@ impl Scene {
             "composer-attachments" => Scene::ComposerAttachments,
             "picker-emoji" => Scene::PickerEmoji,
             "picker-gif" => Scene::PickerGif,
+            "media-errors" => Scene::MediaErrors,
             _ => return None,
         })
     }
@@ -372,6 +377,9 @@ pub fn data(scene: Scene) -> Data {
         Scene::Emoji100 => {
             by_name.insert(markdown::SCENE_CHANNEL.into(), emoji::hundred());
         }
+        Scene::MediaErrors => {
+            by_name.insert("dm-ada".into(), media::dm_errors());
+        }
         _ => {}
     }
     super::inbox::add(&mut by_name);
@@ -521,6 +529,7 @@ mod tests {
             "composer-attachments",
             "picker-emoji",
             "picker-gif",
+            "media-errors",
         ] {
             let scene = Scene::from_name(name).expect(name);
             let data = data(scene);
