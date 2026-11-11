@@ -215,6 +215,9 @@ foreach ($file in Get-ChildItem -Path $ScenesDir -Filter *.toml | Sort-Object Na
 # Presence: the status picker open over the user panel, two people typing in #general.
 Run-Demo "35-status-picker" @{ INLET_DEMO = "1"; INLET_DEMO_LIVE_SECS = "3600"; INLET_DEMO_SCENE = "status-picker"; INLET_DEMO_GUILD = "g1"; INLET_DEMO_CHANNEL = "c-general" } 10
 
+# The composer with files attached (previews, spoiler, alt text) and an upload on its way.
+Run-Demo "36-composer-attachments" @{ INLET_DEMO = "1"; INLET_DEMO_LIVE_SECS = "3600"; INLET_DEMO_SCENE = "composer-attachments"; INLET_DEMO_GUILD = "g1"; INLET_DEMO_CHANNEL = "c-general" } 10
+
 # A demo that quit before its screenshot crashed: fail the job, the pictures are not
 # worth checking.
 if ($script:Failed.Count -gt 0) {

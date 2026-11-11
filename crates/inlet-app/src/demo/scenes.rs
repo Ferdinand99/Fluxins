@@ -38,6 +38,9 @@
 //!   counts) and `c-gallery` (the grid).
 //! - `status-picker`: the account on "Do Not Disturb" with a custom status, the status
 //!   picker open, and two people typing in the open channel (see `social.rs`).
+//! - `composer-attachments`: for `#general`, three files in the composer's tray (a photo
+//!   with alt text, a spoiler, a document), an upload on its way above the box, and its
+//!   message pending in the list.
 //!
 //! `INLET_DEMO_SCENE` may also name a scene file of the visual checks
 //! (`tests/visual/scenes/*.toml`, see `scene_file.rs`): it then sets the scene, the guild,
@@ -89,6 +92,7 @@ pub enum Scene {
     Forum,
     MediaChannel,
     StatusPicker,
+    ComposerAttachments,
 }
 
 impl Scene {
@@ -122,6 +126,7 @@ impl Scene {
             "forum" => Scene::Forum,
             "media-channel" => Scene::MediaChannel,
             "status-picker" => Scene::StatusPicker,
+            "composer-attachments" => Scene::ComposerAttachments,
             _ => return None,
         })
     }
@@ -147,6 +152,9 @@ pub fn current() -> Scene {
         Err(_) => Scene::Default,
     }
 }
+
+/// The nonce of the upload on its way in the `composer-attachments` scene.
+pub const DEMO_UPLOAD_NONCE: &str = "demo-upload";
 
 /// The window size a scene file asked for.
 static WINDOW: OnceLock<[u32; 2]> = OnceLock::new();
@@ -406,6 +414,7 @@ pub fn data(scene: Scene) -> Data {
             nonce: "demo-sending".into(),
             text: "On its way \u{2026}".into(),
             reply_to: None,
+            files: Vec::new(),
             failed: None,
         });
         outgoing.push(Pending {
@@ -413,7 +422,19 @@ pub fn data(scene: Scene) -> Data {
             nonce: "demo-failed".into(),
             text: "This one did not go through.".into(),
             reply_to: None,
+            files: Vec::new(),
             failed: Some("the network is unreachable".into()),
+        });
+    }
+    if scene == Scene::ComposerAttachments {
+        // The message of the upload the composer shows on its way.
+        outgoing.push(Pending {
+            channel_id: general.clone(),
+            nonce: DEMO_UPLOAD_NONCE.into(),
+            text: "Clips from the trip".into(),
+            reply_to: None,
+            files: vec!["holiday-video.mp4".into()],
+            failed: None,
         });
     }
     let mut guild_settings = Vec::new();
@@ -482,6 +503,7 @@ mod tests {
             "forum",
             "media-channel",
             "status-picker",
+            "composer-attachments",
         ] {
             let scene = Scene::from_name(name).expect(name);
             let data = data(scene);
@@ -503,7 +525,10 @@ mod tests {
             }
             assert_eq!(
                 !data.outgoing.is_empty(),
-                matches!(scene, Scene::ChatCozy | Scene::ChatCompact)
+                matches!(
+                    scene,
+                    Scene::ChatCozy | Scene::ChatCompact | Scene::ComposerAttachments
+                )
             );
             // The action scenes open their overlay on a message that is there.
             if let Some((ch, id)) = crate::demo::actions::target(scene) {

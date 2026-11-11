@@ -1,0 +1,12 @@
+# The composer with files attached: a pasted photo with alt text, a spoiler and a
+# document in the tray, the metadata switch, an upload on its way above the box with
+# its progress, and the message pending in the list. The previews are small solid
+# images decoded right after start, and the upload row is fixed demo data.
+name = "composer-attachments"
+window = [1280, 860]
+scale = 1.0
+theme = "dark"
+ignore = []
+scene = "composer-attachments"
+guild = "g1"
+channel = "c-general"

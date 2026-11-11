@@ -8,6 +8,11 @@
 //! autocomplete list is open, Up and Down move in it and Enter or Tab pick; Escape closes
 //! it, then cancels an edit or a reply. Up in an empty composer edits the account's last
 //! message. Nothing here acts while an input method is composing.
+//!
+//! Files: the plus button opens the file dialog, files dropped on the composer and
+//! images pasted into the box are attached (see `attachments`); Enter sends them with
+//! the text, even without text. Uploads on their way are listed above the box
+//! (`upload_queue`).
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -16,20 +21,23 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     actions, div, prelude::*, px, App, Context, Entity, EntityInputHandler, EventEmitter,
-    FocusHandle, Focusable, KeyBinding, Subscription, Task, WeakEntity, Window,
+    ExternalPaths, FocusHandle, Focusable, FontWeight, KeyBinding, Subscription, Task, WeakEntity,
+    Window,
 };
 use inlet_editor::actions::{Down, Submit, Up};
 use inlet_editor::{Editor, EditorEvent, EditorStyle, Trigger};
 use inlet_protocol as p;
 use inlet_state::{AccountState, ChannelId, GuildId};
 
+use super::attachments::{Attachments, InFlight};
 use super::autocomplete::{self, Candidate, Pick, Section, Sources};
 use super::commands::{self, Parsed};
 use super::drafts::{Draft, Drafts};
 use super::edit_inline::InlineEdit;
 use super::reply_bar::Reply;
 use super::slowmode::Slowmode;
-use crate::backend::composer::{Directory, Mentions, Outgoing, Person, Rights};
+use super::upload_queue::UploadQueue;
+use crate::backend::composer::{Directory, Mentions, Outgoing, Person, Rights, Upload};
 use crate::theme;
 
 actions!(inlet_composer, [AcceptCompletion, Cancel]);
@@ -82,6 +90,12 @@ pub struct ChannelContext {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ComposerEvent {
     Send(Outgoing),
+    /// A message with files (the person attached them).
+    Upload(Upload),
+    /// Cancel on an upload on its way.
+    CancelUpload {
+        nonce: String,
+    },
     Edit {
         channel_id: String,
         message_id: String,
@@ -161,9 +175,13 @@ pub struct ComposerView {
     last_typing: Option<Instant>,
     last_search: Option<(String, String)>,
     /// Text the composer put in itself (a restored draft): not typing.
-    quiet_text: Option<String>,
+    pub(super) quiet_text: Option<String>,
     /// The text of the last `/msg`, put back if it fails.
     dm_backup: Option<(String, Draft)>,
+    /// Files attached to the message being written, per channel.
+    pub(super) attachments: Attachments,
+    /// Messages with files on their way.
+    pub(super) uploads: UploadQueue,
     search_task: Option<Task<()>>,
     ticker: Option<Task<()>>,
     save_task: Option<Task<()>>,
@@ -232,6 +250,8 @@ impl ComposerView {
             last_search: None,
             quiet_text: None,
             dm_backup: None,
+            attachments: Attachments::default(),
+            uploads: UploadQueue::default(),
             search_task: None,
             ticker: None,
             save_task: None,
@@ -274,6 +294,11 @@ impl ComposerView {
     pub(super) fn directory(&self) -> Option<&Directory> {
         let (channel, directory) = self.directory.as_ref()?;
         (Some(channel) == self.channel.as_ref().map(|c| &c.channel_id)).then_some(directory)
+    }
+
+    /// The account state, while it lives.
+    pub(super) fn account_state(&self) -> Option<Entity<AccountState>> {
+        self.account.as_ref().and_then(WeakEntity::upgrade)
     }
 
     /// The account state to read roles, channels, emoji and rights from.
@@ -370,6 +395,9 @@ impl ComposerView {
         self.search_task = None;
         self.ticker = None;
         self.save_task = None;
+        // The old account's files and uploads (the backend stops those).
+        self.clear_attachments(window, cx);
+        self.uploads.clear();
         self.editor.update(cx, |e, cx| e.clear(window, cx));
     }
 
@@ -395,8 +423,12 @@ impl ComposerView {
         self.autocomplete = None;
         self.dismissed_at = None;
         self.reply = None;
+        // The alt text field belongs to the channel that was open.
+        self.attachments.alt = None;
         self.edit = None;
         self.error = None;
+        // A message that came back as this draft and was sent after all goes again.
+        self.drop_sent_draft(&ctx.channel_id, cx);
         let draft = self.shared.borrow().drafts.get(&ctx.channel_id).cloned();
         self.editor.update(cx, |e, cx| {
             match &draft {
@@ -410,6 +442,8 @@ impl ComposerView {
         self.refresh_directory(cx);
         self.start_ticker(cx);
         window.focus(&self.editor.focus_handle(cx), cx);
+        #[cfg(feature = "demo")]
+        self.demo_attachments(cx);
         cx.notify();
     }
 
@@ -452,13 +486,19 @@ impl ComposerView {
     /// Another account becomes active: the open channel's text is kept as its draft and
     /// saved with the old account's drafts, then the view forgets the old account as it
     /// does after a sign-out (reply, edit, failed sends, autocomplete).
-    pub fn switch_account(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    ///
+    /// Messages with files that are not sent yet become drafts of their channels
+    /// again, with a line naming their files (the backend stops their uploads at
+    /// once). Returns whether there were any, for the notice.
+    pub fn switch_account(&mut self, window: &mut Window, cx: &mut Context<Self>) -> usize {
         self.store_draft(cx);
+        let restored = self.uploads_to_drafts();
         let write = self.shared.borrow_mut().drafts.switch_account();
         if let Some(write) = write {
             cx.background_spawn(async move { write.run() }).detach();
         }
         self.check_generation(window, cx);
+        restored
     }
 
     /// Keeps the text of the open channel as its draft.
@@ -670,13 +710,20 @@ impl ComposerView {
             || self
                 .edit
                 .as_ref()
-                .is_some_and(|e| e.editor.read(cx).marked_range().is_some());
+                .is_some_and(|e| e.editor.read(cx).marked_range().is_some())
+            || self
+                .attachments
+                .alt
+                .as_ref()
+                .is_some_and(|a| a.editor.read(cx).marked_range().is_some());
         if composing {
             // The input method's key: nothing here acts on it.
             return;
         }
         if let Some(open) = self.autocomplete.take() {
             self.dismissed_at = Some(open.start);
+        } else if self.close_alt(window, cx) {
+            // The alt text field closed unsaved.
         } else if let Some(edit) = &self.edit {
             if edit.saving {
                 // A saved edit stays until the server answered, so its text is not lost.
@@ -709,7 +756,8 @@ impl ComposerView {
             )
         };
         let empty = text.trim().is_empty();
-        if empty {
+        let with_files = self.has_attachments();
+        if empty && !with_files {
             return;
         }
         if over {
@@ -762,12 +810,27 @@ impl ComposerView {
             Some(rest) => (rest.trim().to_owned(), true),
             None => (content.trim().to_owned(), false),
         };
-        if content.is_empty() {
+        if content.is_empty() && !with_files {
             return;
         }
         if self.slowmode_left() > 0 {
             window.play_system_bell();
             return;
+        }
+        if with_files {
+            if !self.may_attach() {
+                self.error = Some(t!("composer-attach-no-permission"));
+                window.play_system_bell();
+                return;
+            }
+            if let Some(stuck) = self.attachments.stuck(&ch.channel_id) {
+                self.error = Some(t!(
+                    "composer-attach-metadata-blocked",
+                    name = stuck.file.name.clone()
+                ));
+                window.play_system_bell();
+                return;
+            }
         }
         let reply = self.reply.take();
         let outgoing = Outgoing {
@@ -779,7 +842,26 @@ impl ComposerView {
             silent,
         };
         // The app shows it in the message list as pending (by its nonce) and sends it.
-        cx.emit(ComposerEvent::Send(outgoing));
+        if with_files {
+            let files = self.take_attachments(&ch.channel_id, window, cx);
+            // Kept until it is sent, so an account switch can give the text back.
+            self.attachments.sending(InFlight {
+                nonce: outgoing.nonce.clone(),
+                channel_id: ch.channel_id.clone(),
+                draft: Draft::of(self.editor.read(cx).buffer()),
+                names: files.iter().map(|f| f.name.clone()).collect(),
+                content: outgoing.content.clone(),
+                queued_ms: crate::backend::composer::unix_ms(),
+                files: files.clone(),
+            });
+            cx.emit(ComposerEvent::Upload(Upload {
+                message: outgoing,
+                files,
+                strip_exif: self.attachments.strip_exif,
+            }));
+        } else {
+            cx.emit(ComposerEvent::Send(outgoing));
+        }
         self.count_send(&ch, cx);
         self.sent(window, cx);
     }
@@ -886,14 +968,21 @@ impl Render for ComposerView {
             .key_context(KEY_CONTEXT)
             .on_action(cx.listener(Self::on_tab))
             .on_action(cx.listener(Self::on_cancel))
+            // Files dropped on the composer are attached.
+            .on_drop(
+                cx.listener(|this, paths: &ExternalPaths, _, cx| this.on_drop_files(paths, cx)),
+            )
+            .drag_over::<ExternalPaths>(|style, _, _, _| style.bg(theme::hover_bg()))
             .flex_none()
             .flex()
             .flex_col()
             .children(self.render_autocomplete(cx))
+            .children(self.render_upload_queue(cx))
             .child(self.render_status_row(window, cx))
             .when(editing, |d| d.children(self.render_edit(cx)))
             .when(!editing, |d| {
                 d.children(self.render_reply_bar(cx))
+                    .children(self.render_attachments(cx))
                     .child(self.render_box(cx))
             })
     }
@@ -904,16 +993,44 @@ impl ComposerView {
     /// Fluxer's 1 px ring is drawn inside the box; here it is a border, so the padding
     /// is 1 px less to keep the text 18 px from the edge and the box 58 px high.
     fn render_box(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let joined = self.reply.is_some();
+        let joined = self.reply.is_some() || self.has_attachments();
+        // The plus button: a 22 px circle in a 32 px slot, 12 px before the text.
+        let attach = div()
+            .id("composer-attach")
+            .flex_none()
+            .w(px(32.))
+            .h(px(22.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .child(
+                div()
+                    .size(px(22.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_full()
+                    .bg(theme::text_secondary())
+                    .hover(|s| s.bg(theme::text_strong()))
+                    .text_color(theme::bg_textarea())
+                    .text_size(px(18.))
+                    .line_height(px(22.))
+                    .font_weight(FontWeight::BOLD)
+                    .child(t!("composer-attach-plus")),
+            )
+            .on_click(cx.listener(|this, _, _, cx| this.pick_files(cx)));
         div()
             .debug_selector(|| "composer-box".into())
             .mx(px(6.))
             .mb(px(6.))
             .min_h(px(BOX_MIN_HEIGHT))
-            .px_4()
+            .pl(px(8.))
+            .pr_4()
             .py(px(17.))
             .flex()
             .items_center()
+            .gap(px(12.))
             .when(joined, |d| d.rounded_b(px(8.)))
             .when(!joined, |d| d.rounded(px(8.)))
             .bg(theme::bg_textarea())
@@ -925,7 +1042,9 @@ impl ComposerView {
             .capture_action(cx.listener(Self::on_up))
             .capture_action(cx.listener(Self::on_down))
             .capture_action(cx.listener(Self::on_submit_key))
-            .child(self.editor.clone())
+            .capture_action(cx.listener(Self::on_paste))
+            .when(self.may_attach(), |d| d.child(attach))
+            .child(div().flex_1().min_w_0().child(self.editor.clone()))
     }
 }
 
@@ -1435,5 +1554,243 @@ mod tests {
         // Nothing left to cancel: Escape goes on to the app.
         cx.simulate_keystrokes("escape");
         assert_eq!(host.read_with(cx, |h, _| h.marked_read), 1);
+    }
+
+    /// A direct message channel: files may always be attached there.
+    fn open_dm(view: &Entity<ComposerView>, id: &str, cx: &mut VisualTestContext) {
+        view.update_in(cx, |v, window, cx| {
+            v.set_channel(
+                ChannelContext {
+                    channel_id: id.into(),
+                    guild_id: None,
+                    placeholder: format!("@{id}"),
+                    slowmode_secs: 0,
+                },
+                window,
+                cx,
+            )
+        });
+    }
+
+    fn staged(
+        view: &Entity<ComposerView>,
+        id: &str,
+        cx: &mut VisualTestContext,
+    ) -> Vec<(String, bool)> {
+        view.read_with(cx, |v, _| {
+            v.attachments
+                .staged(id)
+                .iter()
+                .map(|s| {
+                    (
+                        s.file.name.clone(),
+                        matches!(s.file.source, crate::backend::composer::Source::Memory(_)),
+                    )
+                })
+                .collect()
+        })
+    }
+
+    /// The editor's paste key on this platform.
+    const PASTE: &str = if cfg!(target_os = "macos") {
+        "cmd-v"
+    } else {
+        "ctrl-v"
+    };
+
+    #[gpui::test]
+    fn pasting_a_screenshot_attaches_a_png_that_stays_in_memory(cx: &mut TestAppContext) {
+        let (_host, view, cx) = host(cx);
+        open_dm(&view, "9", cx);
+        // Windows puts screenshots on the clipboard as a bitmap.
+        let screenshot = gpui::Image::from_bytes(
+            gpui::ImageFormat::Bmp,
+            super::super::attachments::tests::bmp(16, 9),
+        );
+        cx.write_to_clipboard(gpui::ClipboardItem {
+            entries: vec![gpui::ClipboardEntry::Image(screenshot)],
+        });
+        cx.simulate_keystrokes(PASTE);
+        cx.run_until_parked();
+        assert_eq!(staged(&view, "9", cx), [("image.png".to_owned(), true)]);
+        let text = view.read_with(cx, |v, cx| v.editor.read(cx).buffer().text().to_owned());
+        assert_eq!(text, "", "the image is no text");
+        // A kind of image that cannot be sent says so instead of doing nothing.
+        let svg = gpui::Image::from_bytes(gpui::ImageFormat::Svg, b"<svg/>".to_vec());
+        cx.write_to_clipboard(gpui::ClipboardItem {
+            entries: vec![gpui::ClipboardEntry::Image(svg)],
+        });
+        cx.simulate_keystrokes(PASTE);
+        assert!(view.read_with(cx, |v, _| v.error.is_some()));
+        assert_eq!(staged(&view, "9", cx).len(), 1);
+        // With text next to it, the text is still pasted.
+        let mut both = gpui::ClipboardItem::new_string("caption".into());
+        both.entries
+            .push(gpui::ClipboardEntry::Image(gpui::Image::from_bytes(
+                gpui::ImageFormat::Svg,
+                b"<svg/>".to_vec(),
+            )));
+        cx.write_to_clipboard(both);
+        cx.simulate_keystrokes(PASTE);
+        let text = view.read_with(cx, |v, cx| v.editor.read(cx).buffer().text().to_owned());
+        assert_eq!(text, "caption");
+        // Without the right to attach files in a guild channel, nothing is attached.
+        open(&view, "1", cx);
+        cx.simulate_keystrokes(PASTE);
+        assert!(staged(&view, "1", cx).is_empty());
+    }
+
+    #[gpui::test]
+    fn an_account_switch_keeps_an_upload_as_a_draft(cx: &mut TestAppContext) {
+        let (host, view, cx) = host(cx);
+        let dir = std::env::temp_dir().join(format!("inlet-upload-draft-{}", p::new_nonce()));
+        let file = super::super::drafts::path_for(&dir, "fluxer.example", "7").unwrap();
+        view.update_in(cx, |v, window, cx| {
+            v.set_session(2000, Some(file.clone()), window, cx)
+        });
+        open_dm(&view, "9", cx);
+        let photo = crate::backend::composer::FileToSend {
+            name: "beach.png".into(),
+            size: 3,
+            content_type: "image/png".into(),
+            spoiler: false,
+            description: None,
+            keep_metadata: false,
+            source: crate::backend::composer::Source::Memory(bytes::Bytes::from_static(b"abc")),
+        };
+        view.update(cx, |v, _| v.attachments.add("9", vec![photo]).map(|_| ()))
+            .unwrap();
+        type_text(&view, "from the trip", cx);
+        cx.simulate_keystrokes("enter");
+        let uploads = host.read_with(cx, |h, _| {
+            h.events
+                .iter()
+                .filter(|e| matches!(e, ComposerEvent::Upload(_)))
+                .count()
+        });
+        assert_eq!(uploads, 1, "the message went out with its file");
+        // The account is switched while it uploads: the text and the file's name come
+        // back as the old account's draft, and the app says so.
+        let stopped = view.update_in(cx, |v, window, cx| v.switch_account(window, cx));
+        assert_eq!(stopped, 1);
+        cx.run_until_parked();
+        let shared = view.read_with(cx, |v, _| v.shared.clone());
+        shared.borrow_mut().drafts.attach(file.clone());
+        let draft = shared.borrow().drafts.get("9").cloned().expect("a draft");
+        assert!(draft.wire.contains("from the trip"), "{}", draft.wire);
+        assert!(draft.wire.contains("beach.png"), "{}", draft.wire);
+        // Once a message is sent, a switch has nothing to give back.
+        assert_eq!(
+            view.update_in(cx, |v, window, cx| v.switch_account(window, cx)),
+            0
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn photo(name: &str) -> crate::backend::composer::FileToSend {
+        crate::backend::composer::FileToSend {
+            name: name.into(),
+            size: 3,
+            content_type: "image/png".into(),
+            spoiler: false,
+            description: None,
+            keep_metadata: false,
+            source: crate::backend::composer::Source::Memory(bytes::Bytes::from_static(b"abc")),
+        }
+    }
+
+    #[gpui::test]
+    fn an_upload_from_the_thread_panel_is_kept_as_a_draft_too(cx: &mut TestAppContext) {
+        let (_host, view, cx) = host(cx);
+        let dir = std::env::temp_dir().join(format!("inlet-panel-draft-{}", p::new_nonce()));
+        let file = super::super::drafts::path_for(&dir, "fluxer.example", "7").unwrap();
+        view.update_in(cx, |v, window, cx| {
+            v.set_session(2000, Some(file.clone()), window, cx)
+        });
+        // The thread panel's composer shares the chat composer's drafts.
+        let shared = view.read_with(cx, |v, _| v.shared.clone());
+        let panel = cx
+            .update(|window, cx| cx.new(|cx| ComposerView::new(shared.clone(), 2000, window, cx)));
+        open_dm(&panel, "77", cx);
+        panel
+            .update(cx, |v, _| {
+                v.attachments.add("77", vec![photo("plan.png")]).map(|_| ())
+            })
+            .unwrap();
+        type_text(&panel, "for the thread", cx);
+        panel.update_in(cx, |v, window, cx| v.submit(window, cx));
+        // What the account switcher does: the panel first (it goes with the messages),
+        // then the chat's composer, which writes the old account's drafts.
+        let from_panel = panel.update(cx, |v, _| v.uploads_to_drafts());
+        let from_chat = view.update_in(cx, |v, window, cx| v.switch_account(window, cx));
+        assert_eq!(from_panel + from_chat, 1, "the notice counts it");
+        cx.run_until_parked();
+        shared.borrow_mut().drafts.attach(file.clone());
+        let draft = shared.borrow().drafts.get("77").cloned().expect("a draft");
+        assert!(draft.wire.contains("for the thread"), "{}", draft.wire);
+        assert!(draft.wire.contains("plan.png"), "{}", draft.wire);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[gpui::test]
+    fn a_draft_of_a_message_that_was_sent_after_all_goes(cx: &mut TestAppContext) {
+        let (_host, view, cx) = host(cx);
+        let now = crate::backend::composer::unix_ms();
+        // The upload did reach the server: the channel has it (no nonce in a list).
+        let sent = serde_json::json!([{
+            "id": p::models::snowflake_at_ms(now + 1_000), "channel_id": "301", "type": 0,
+            "author": {"id": "10", "username": "me"}, "content": "from the trip",
+            "timestamp": "2026-11-10T10:00:00Z",
+            "attachments": [{"id": "5", "filename": "beach.png", "size": 3}]
+        }]);
+        let (state, _) = super::super::edit_inline::tests::state_with(sent);
+        let account = cx.update(|_, cx| cx.new(|_| state));
+        let restored = "from the trip
+(attach again: beach.png)";
+        let shared = view.read_with(cx, |v, _| v.shared.clone());
+        shared.borrow_mut().drafts.put(
+            "301",
+            Some(Draft {
+                wire: format!(
+                    "{restored}
+my other words"
+                ),
+                labels: Vec::new(),
+                seq: 0,
+                sent_check: Some(super::super::drafts::SentCheck {
+                    nonce: "999".into(),
+                    content: "from the trip".into(),
+                    files: 1,
+                    queued_ms: now,
+                    len: restored.len(),
+                }),
+            }),
+        );
+        // The channel opens before its messages are in: the draft shows as it is.
+        open(&view, "301", cx);
+        let text = |cx: &mut VisualTestContext| {
+            view.read_with(cx, |v, cx| v.editor.read(cx).buffer().text().to_owned())
+        };
+        assert!(text(cx).starts_with("from the trip"));
+        // The page arrives (the app calls this for the open channel).
+        view.update(cx, |v, cx| v.set_account(Some(account.downgrade()), cx));
+        view.update_in(cx, |v, window, cx| v.recheck_sent_draft(window, cx));
+        cx.run_until_parked();
+        assert_eq!(
+            text(cx),
+            "my other words",
+            "only the part already sent goes"
+        );
+        assert!(
+            view.read_with(cx, |v, _| v.error.is_some()),
+            "and it says so"
+        );
+        // Opened again with the messages in, the check at opening finds it too.
+        let shared = view.read_with(cx, |v, _| v.shared.clone());
+        assert!(shared
+            .borrow()
+            .drafts
+            .get("301")
+            .is_some_and(|d| d.sent_check.is_none()));
     }
 }

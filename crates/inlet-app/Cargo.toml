@@ -58,9 +58,10 @@ env_logger = "0.11"
 # The text catalogue (Project Fluent): `src/i18n.rs`, `locales/`.
 fluent-bundle = "0.16"
 futures = "0.3"
-# Decodes the built-in window icon (X11) and, in `inlet-visual`, the screenshots. gpui
-# and inlet-media already depend on image 0.25 on every platform.
-image = { version = "0.25", default-features = false, features = ["png"] }
+# Decodes the built-in window icon (X11) and, in `inlet-visual`, the screenshots, and
+# turns pasted BMP and TIFF screenshots into PNG in memory. gpui and inlet-media
+# already depend on image 0.25 with these formats on every platform.
+image = { version = "0.25", default-features = false, features = ["png", "bmp", "tiff", "jpeg"] }
 keyring = { version = "3.6", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust", "vendored"] }
 log = "0.4"
 # The media proxy client (images, saved files): no cookies, no token, no redirects.
@@ -97,6 +98,9 @@ tokio-tungstenite = { version = "0.26", default-features = false, features = ["h
 fluent-syntax = "0.12"
 # Writes WebP test pictures (stickers).
 image-webp = "0.2"
+# The upload tests run against a mock storage on 127.0.0.1 over plain http, which the
+# protocol accepts only in test builds (never in a release build).
+inlet-protocol = { path = "../inlet-protocol", features = ["test-extra-ca"] }
 
 # Plays the notification sound (Inlet's own, assets/sounds) on the default output
 # device: WASAPI and CoreAudio through cpal. On Linux, ALSA is loaded at run time

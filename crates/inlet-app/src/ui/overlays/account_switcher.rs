@@ -285,13 +285,24 @@ impl Inlet {
         // account's drafts, which are then forgotten here; the account ID is asked for
         // again, so the next account's drafts file is used), the panels and any open
         // window.
+        // The thread panel's messages with files on their way become drafts too,
+        // before the panel (and its composer) goes with the messages.
+        let panel_uploads = self
+            .threads
+            .composer
+            .clone()
+            .map_or(0, |v| v.update(cx, |v, _| v.uploads_to_drafts()));
         self.reset_messages();
         self.notifications.clear();
         // The panels' lists and a jump on its way (its answer is the old account's).
         self.inbox.clear();
-        self.composer
-            .view
-            .update(cx, |v, cx| v.switch_account(window, cx));
+        // Messages with files still on their way become drafts of the old account
+        // again (the backend stops their uploads); the notice below says so.
+        let uploads_stopped = panel_uploads
+            + self
+                .composer
+                .view
+                .update(cx, |v, cx| v.switch_account(window, cx));
         self.composer.reset_session();
         // The old account's image client is not used for the next one; the backend
         // sends the next account's own (its media endpoint) right after the switch.
@@ -311,7 +322,7 @@ impl Inlet {
         self.selected_channel = None;
         self.chat.status.clear();
         self.chat.error = None;
-        self.chat.notice = None;
+        self.chat.notice = (uploads_stopped > 0).then(|| t!("composer-upload-switched"));
         self.chat.gateway_down = None;
         if let Some(a) = self.switcher.accounts.iter().find(|a| a.key == key) {
             self.username = a.name.clone();

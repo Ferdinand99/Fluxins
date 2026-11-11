@@ -50,6 +50,8 @@ pub enum Cmd {
         channel_id: String,
         nonce: String,
         text: String,
+        /// The message had files: it is never sent again without them.
+        files: bool,
     },
     /// A message action: a reaction, delete, pin and the rest (see [`actions`]).
     Action(actions::Cmd),
@@ -68,6 +70,8 @@ pub struct Pending {
     pub text: String,
     /// The message it replies to.
     pub reply_to: Option<String>,
+    /// The names of its attachments.
+    pub files: Vec<String>,
     /// `None` while sending; the reason once sending failed.
     pub failed: Option<String>,
 }
@@ -127,7 +131,8 @@ pub(super) fn handle(backend: &mut Backend, cmd: Cmd) {
             channel_id,
             nonce,
             text,
-        } => backend.resend(channel_id, nonce, text),
+            files,
+        } => backend.resend(channel_id, nonce, text, files),
         Cmd::Action(cmd) => backend.message_action(cmd),
         Cmd::Inbox(cmd) => backend.inbox(cmd),
         Cmd::Thread(cmd) => threads::handle(backend, cmd),
