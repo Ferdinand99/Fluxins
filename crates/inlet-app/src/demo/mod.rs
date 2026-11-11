@@ -8,7 +8,8 @@
 //! instance. Demo IDs such as `c-general` are mapped to stable snowflakes
 //! ([`snowflake`]), and message IDs are made from the message's time.
 //!
-//! One file per domain (`guilds`, `media`, `messages`, `markdown`, `social`, `accounts`);
+//! One file per domain (`guilds`, `media`, `messages`, `markdown`, `social`, `accounts`,
+//! `search`);
 //! `scenes` picks what to show, also from the scene files of the visual checks
 //! (`scene_file`).
 
@@ -20,10 +21,12 @@ mod guilds;
 pub mod inbox;
 mod markdown;
 pub mod media;
+mod members;
 mod messages;
 pub mod pickers;
 pub mod scene_file;
 pub mod scenes;
+pub mod search;
 mod social;
 pub mod threads;
 mod unread;
@@ -362,7 +365,10 @@ impl MockSession {
         };
 
         // The account switcher scenes have two more accounts in the background.
-        if matches!(scene, scenes::Scene::Accounts | scenes::Scene::AccountsAdd) {
+        if matches!(
+            scene,
+            scenes::Scene::Accounts | scenes::Scene::AccountsAdd | scenes::Scene::QuickSwitcher
+        ) {
             accounts::start_background(&events);
         } else {
             let main = accounts::list().into_iter().take(1).collect();

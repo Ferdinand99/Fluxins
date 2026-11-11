@@ -135,7 +135,7 @@ impl Inlet {
         let focus = name
             .clone()
             .map_or_else(|| search.focus_handle(cx), |n| n.focus_handle(cx));
-        focus.focus(window, cx);
+        self.focus_layer_field(&focus, window, cx);
         self.social.dm_menu = None;
         self.social.group_dm = Some(GroupDmWindow {
             mode,

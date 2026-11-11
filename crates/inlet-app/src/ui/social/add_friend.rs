@@ -55,7 +55,8 @@ impl Inlet {
         let submit = cx.subscribe(&input, |this, _, _: &InputEvent, cx| {
             this.send_friend_request(cx)
         });
-        input.focus_handle(cx).focus(window, cx);
+        let field = input.focus_handle(cx);
+        self.focus_layer_field(&field, window, cx);
         self.social.add_friend = Some(AddFriend {
             input,
             result: None,

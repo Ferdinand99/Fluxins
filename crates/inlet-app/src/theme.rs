@@ -417,6 +417,13 @@ pub fn preview_card_divider() -> Hsla {
     h(rgba(0xffffff0d))
 }
 
+// ---- Member list ------------------------------------------------------------
+
+/// The guild owner's crown: `hsl(39,57%,64%)` (`MemberListItem` `.crownIcon`).
+pub fn crown() -> Hsla {
+    h(rgb(0xd8b36f))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1282,6 +1282,7 @@ impl Backend {
         }
         self.older = Default::default();
         self.threads.stop();
+        self.social.stop();
     }
 
     /// Stops an account's gateway and its tasks.

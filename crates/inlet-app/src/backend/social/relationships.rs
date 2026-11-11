@@ -62,6 +62,10 @@ pub enum Cmd {
         username: String,
         discriminator: Option<String>,
     },
+    /// A friend request to someone by their ID (the user menu).
+    SendRequest {
+        user_id: String,
+    },
     /// Accepts a friend request.
     Accept {
         user_id: String,
@@ -111,7 +115,10 @@ impl Cmd {
     pub fn key(&self) -> String {
         match self {
             Cmd::AddFriend { .. } => "add-friend".into(),
-            Cmd::Accept { user_id } | Cmd::Remove { user_id } | Cmd::Block { user_id } => {
+            Cmd::SendRequest { user_id }
+            | Cmd::Accept { user_id }
+            | Cmd::Remove { user_id }
+            | Cmd::Block { user_id } => {
                 format!("user:{user_id}")
             }
             Cmd::OpenDm { user_id } => format!("open:{user_id}"),
@@ -127,7 +134,7 @@ impl Cmd {
 
     fn budget(&self) -> Budget {
         match self {
-            Cmd::AddFriend { .. } => Budget::FriendRequest,
+            Cmd::AddFriend { .. } | Cmd::SendRequest { .. } => Budget::FriendRequest,
             Cmd::CreateGroupDm { .. } => Budget::GroupCreate,
             Cmd::AddRecipient { .. } => Budget::GroupAdd,
             _ => Budget::Write,
@@ -490,6 +497,9 @@ async fn run(
                 .map(drop),
             key,
         ),
+        Cmd::SendRequest { user_id } => {
+            done(client.send_friend_request(&user_id).await.map(drop), key)
+        }
         Cmd::Accept { user_id } => {
             done(client.accept_friend_request(&user_id).await.map(drop), key)
         }

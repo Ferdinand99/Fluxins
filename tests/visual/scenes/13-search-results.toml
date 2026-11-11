@@ -1,0 +1,10 @@
+# Message search: the search panel on the right with the results for "build" in the
+# guild of #general, each under its channel.
+name = "search-results"
+window = [1280, 860]
+scale = 1.0
+theme = "dark"
+ignore = []
+scene = "search-results"
+guild = "g1"
+channel = "c-general"

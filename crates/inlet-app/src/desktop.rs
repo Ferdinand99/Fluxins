@@ -925,10 +925,19 @@ impl Inlet {
 
     /// The layers over the chat that are open now.
     pub(crate) fn open_layers(&self) -> OpenLayers {
+        // The friend and DM windows show over the main screen only.
+        let main = self.screen == Screen::Main;
         OpenLayers {
             link_prompt: self.overlays.link_prompt.is_some(),
             link_confirm: self.overlays.pending_link.is_some(),
-            social: self.social.layer_open() && self.screen == Screen::Main,
+            quick_switcher: self.quick_switcher_open(),
+            social_confirm: main && self.social.confirm.is_some(),
+            dm_menu: main && self.social.dm_menu.is_some(),
+            group_dm: main && self.social.group_dm.is_some(),
+            add_friend: main && self.social.add_friend.is_some(),
+            user_menu: self.profile.menu.is_some(),
+            profile_popout: self.profile.popout.is_some(),
+            profile_modal: self.profile.full.is_some(),
             notification_settings: self.notifications.settings.is_some(),
             status_picker: self.status_picker_open(),
             switcher: self.switcher_layer_open(),
@@ -936,6 +945,7 @@ impl Inlet {
             settings: self.settings.view.is_some(),
             picker: self.composer.pickers.is_open(),
             viewer: self.media.viewer.is_some(),
+            search: self.search_panel_open(),
         }
     }
 
@@ -955,31 +965,25 @@ impl Inlet {
     /// behind it, and gives it back to the composer when the last layer closes. Called
     /// when the window is drawn.
     pub(crate) fn focus_layer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.layer_open() {
+        if let Some(top) = self.open_layers().topmost() {
             let layer = self
                 .overlays
                 .layer_focus
                 .get_or_insert_with(|| cx.focus_handle())
                 .clone();
-            // A layer with a field of its own gives the field the keyboard: a picker's
-            // search, or a social window's field; the field lies inside the layer, so
-            // Escape still closes the layer.
-            let handle = match self.open_layers().topmost() {
-                Some(Layer::Picker) => self
-                    .composer
-                    .pickers
-                    .search_focus(cx)
-                    .unwrap_or_else(|| layer.clone()),
-                Some(Layer::Social) => self.social_field(cx).unwrap_or_else(|| layer.clone()),
-                _ => layer.clone(),
+            // Where the keyboard goes when no field of the topmost layer has it: a
+            // picker's search field (it lies inside the layer, so Escape still closes
+            // the layer), else the layer itself.
+            let handle = match top {
+                Layer::Picker => self.composer.pickers.search_focus(cx).unwrap_or(layer),
+                Layer::AddFriend | Layer::GroupDm => self.social_field(cx).unwrap_or(layer),
+                _ => layer,
             };
-            // The status picker's field may keep the keyboard while it is the topmost
-            // layer, and so may any field inside the topmost social window: any layer
-            // that opens over them takes the keyboard in the same frame.
-            let field_keeps_it = (self.is_top_layer(Layer::StatusPicker)
-                && self.status_picker_field_focused(window, cx))
-                || (self.is_top_layer(Layer::Social) && layer.contains_focused(window, cx));
-            if !handle.is_focused(window) && !field_keeps_it {
+            // One rule, from this frame's state only: a text field keeps the keyboard
+            // while the layer it belongs to is the topmost one now. A layer that
+            // opens over it takes the keyboard in the same frame.
+            let field = self.focused_layer_field(window, cx);
+            if !handle.is_focused(window) && !field_keeps_keyboard(top, field) {
                 if !self.overlays.layer_had_focus {
                     // Where the keyboard was, to give it back when the layers close.
                     self.overlays.focus_before = window.focused(cx);
@@ -1006,6 +1010,21 @@ impl Inlet {
         }
     }
 
+    /// Gives the keyboard to a field of a layer that opens now (the search field, the
+    /// quick switcher's), noting where it was so it goes back when the layers close.
+    pub(crate) fn focus_layer_field(
+        &mut self,
+        field: &gpui::FocusHandle,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.overlays.layer_had_focus {
+            self.overlays.focus_before = window.focused(cx);
+            self.overlays.layer_had_focus = true;
+        }
+        field.focus(window, cx);
+    }
+
     /// Adds the layer's focus, key context and Escape to the topmost layer's element.
     pub(crate) fn layer_keys<E: InteractiveElement>(
         &self,
@@ -1026,7 +1045,14 @@ impl Inlet {
         match self.open_layers().topmost() {
             Some(Layer::LinkPrompt) => self.overlays.link_prompt = None,
             Some(Layer::LinkConfirm) => self.overlays.pending_link = None,
-            Some(Layer::Social) => self.social.close_top(),
+            Some(layer @ (Layer::QuickSwitcher | Layer::Search)) => self.close_search_layer(layer),
+            Some(Layer::SocialConfirm) => self.social.confirm = None,
+            Some(Layer::DmMenu) => self.social.dm_menu = None,
+            Some(Layer::GroupDm) => self.social.group_dm = None,
+            Some(Layer::AddFriend) => self.social.add_friend = None,
+            Some(Layer::UserMenu) => self.profile.menu = None,
+            Some(Layer::ProfilePopout) => self.profile.popout = None,
+            Some(Layer::ProfileModal) => self.profile.full = None,
             Some(Layer::NotificationSettings) => self.notifications.settings = None,
             Some(Layer::StatusPicker) => self.social.picker = None,
             Some(Layer::AccountSwitcher) => self.switcher.open = false,
@@ -1080,13 +1106,71 @@ impl Inlet {
     }
 }
 
+/// Whether a text field of layer `field` (the layer whose field has the keyboard, if
+/// one has) keeps the keyboard while `top` is the topmost layer: only a field of the
+/// topmost layer does. Every window and dialog is its own layer, so a confirmation
+/// over a window takes the keyboard from the window's field.
+pub(crate) fn field_keeps_keyboard(top: Layer, field: Option<Layer>) -> bool {
+    field == Some(top)
+}
+
+impl Inlet {
+    /// The layer whose text field has the keyboard now, if one has: a picker's search,
+    /// the status picker's custom status, the note in the profile popout or the full
+    /// profile, the quick switcher's field or the search field.
+    fn focused_layer_field(&self, window: &Window, cx: &App) -> Option<Layer> {
+        if self
+            .composer
+            .pickers
+            .search_focus(cx)
+            .is_some_and(|h| h.is_focused(window))
+        {
+            return Some(Layer::Picker);
+        }
+        if self.status_picker_field_focused(window, cx) {
+            return Some(Layer::StatusPicker);
+        }
+        if self.profile_note_focused(window, cx) {
+            return Some(if self.profile.full.is_some() {
+                Layer::ProfileModal
+            } else {
+                Layer::ProfilePopout
+            });
+        }
+        if self.quick_switcher_field_focused(window, cx) {
+            return Some(Layer::QuickSwitcher);
+        }
+        if let Some(layer) = self.social_field_focused(window, cx) {
+            return Some(layer);
+        }
+        if self.search_field_focused(window, cx) {
+            return Some(Layer::Search);
+        }
+        None
+    }
+}
+
 /// A layer drawn over the chat that takes the keyboard.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Layer {
     LinkPrompt,
     LinkConfirm,
-    /// The add-friend and group DM windows, the DM menu and their confirmations.
-    Social,
+    /// The quick switcher (Ctrl+K).
+    QuickSwitcher,
+    /// A question before removing a friend, blocking or leaving a group.
+    SocialConfirm,
+    /// The menu of a DM row.
+    DmMenu,
+    /// The group DM window (new DM or group, add a friend, group settings).
+    GroupDm,
+    /// The add-friend window.
+    AddFriend,
+    /// The user menu (right click on a member).
+    UserMenu,
+    /// The profile popout beside the member list.
+    ProfilePopout,
+    /// The full profile.
+    ProfileModal,
     NotificationSettings,
     /// The status picker over the user panel.
     StatusPicker,
@@ -1097,17 +1181,27 @@ pub(crate) enum Layer {
     /// The emoji, GIF, sticker and meme picker.
     Picker,
     Viewer,
+    /// The search panel, docked on the right under the channel header.
+    Search,
 }
 
-/// Which layers are open. They are drawn bottom first (a panel, the image viewer, the
-/// picker, the settings view, the notification settings window, the account switcher,
-/// the status picker, the link confirmation, the link prompt, see `ui/overlays`), and
-/// the topmost one has the keyboard: Escape closes it first.
+/// Which layers are open. They are drawn bottom first (the search column, a panel, the
+/// image viewer, the picker, the settings view, the notification settings window, the
+/// account switcher, the full profile, the profile popout, the user menu, the status
+/// picker, the quick switcher, the link confirmation, the link prompt, see
+/// `ui/overlays`), and the topmost one has the keyboard: Escape closes it first.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct OpenLayers {
     pub link_prompt: bool,
     pub link_confirm: bool,
-    pub social: bool,
+    pub quick_switcher: bool,
+    pub social_confirm: bool,
+    pub dm_menu: bool,
+    pub group_dm: bool,
+    pub add_friend: bool,
+    pub user_menu: bool,
+    pub profile_popout: bool,
+    pub profile_modal: bool,
     pub notification_settings: bool,
     pub status_picker: bool,
     pub switcher: bool,
@@ -1115,6 +1209,7 @@ pub(crate) struct OpenLayers {
     pub settings: bool,
     pub picker: bool,
     pub viewer: bool,
+    pub search: bool,
 }
 
 impl OpenLayers {
@@ -1123,10 +1218,24 @@ impl OpenLayers {
             Some(Layer::LinkPrompt)
         } else if self.link_confirm {
             Some(Layer::LinkConfirm)
-        } else if self.social {
-            Some(Layer::Social)
+        } else if self.quick_switcher {
+            Some(Layer::QuickSwitcher)
+        } else if self.social_confirm {
+            Some(Layer::SocialConfirm)
+        } else if self.dm_menu {
+            Some(Layer::DmMenu)
+        } else if self.group_dm {
+            Some(Layer::GroupDm)
+        } else if self.add_friend {
+            Some(Layer::AddFriend)
         } else if self.status_picker {
             Some(Layer::StatusPicker)
+        } else if self.user_menu {
+            Some(Layer::UserMenu)
+        } else if self.profile_popout {
+            Some(Layer::ProfilePopout)
+        } else if self.profile_modal {
+            Some(Layer::ProfileModal)
         } else if self.switcher {
             Some(Layer::AccountSwitcher)
         } else if self.notification_settings {
@@ -1139,6 +1248,8 @@ impl OpenLayers {
             Some(Layer::Viewer)
         } else if self.panel {
             Some(Layer::Panel)
+        } else if self.search {
+            Some(Layer::Search)
         } else {
             None
         }
@@ -1150,7 +1261,15 @@ impl OpenLayers {
         match self.topmost() {
             Some(Layer::LinkPrompt) => self.link_prompt = false,
             Some(Layer::LinkConfirm) => self.link_confirm = false,
-            Some(Layer::Social) => self.social = false,
+            Some(Layer::QuickSwitcher) => self.quick_switcher = false,
+            Some(Layer::SocialConfirm) => self.social_confirm = false,
+            Some(Layer::DmMenu) => self.dm_menu = false,
+            Some(Layer::GroupDm) => self.group_dm = false,
+            Some(Layer::AddFriend) => self.add_friend = false,
+            Some(Layer::Search) => self.search = false,
+            Some(Layer::UserMenu) => self.user_menu = false,
+            Some(Layer::ProfilePopout) => self.profile_popout = false,
+            Some(Layer::ProfileModal) => self.profile_modal = false,
             Some(Layer::NotificationSettings) => self.notification_settings = false,
             Some(Layer::StatusPicker) => self.status_picker = false,
             Some(Layer::AccountSwitcher) => self.switcher = false,
@@ -1349,13 +1468,185 @@ mod tests {
         assert_eq!(layers.topmost(), Some(Layer::Settings));
     }
 
+    /// A field keeps the keyboard only while its layer is the topmost one; a layer that
+    /// opens over it (a link prompt over the status picker, the link confirmation over
+    /// a profile's note) takes the keyboard at once, in the same frame.
+    #[test]
+    fn a_field_keeps_the_keyboard_only_in_the_topmost_layer() {
+        let picker = OpenLayers {
+            status_picker: true,
+            ..OpenLayers::default()
+        };
+        let top = picker.topmost().unwrap();
+        assert!(field_keeps_keyboard(top, Some(Layer::StatusPicker)));
+        // An emoji or GIF picker keeps its search field's keyboard while it is on top.
+        let emoji = OpenLayers {
+            picker: true,
+            ..OpenLayers::default()
+        };
+        assert!(field_keeps_keyboard(
+            emoji.topmost().unwrap(),
+            Some(Layer::Picker)
+        ));
+        assert!(!field_keeps_keyboard(
+            emoji.topmost().unwrap(),
+            Some(Layer::StatusPicker)
+        ));
+        assert!(!field_keeps_keyboard(top, None));
+        // A link prompt opens over the picker: its field gives up the keyboard now.
+        let prompt = OpenLayers {
+            link_prompt: true,
+            ..picker
+        };
+        assert!(!field_keeps_keyboard(
+            prompt.topmost().unwrap(),
+            Some(Layer::StatusPicker)
+        ));
+        // The note of a profile popout; the link confirmation over it takes the keyboard.
+        let popout = OpenLayers {
+            profile_popout: true,
+            ..OpenLayers::default()
+        };
+        assert!(field_keeps_keyboard(
+            popout.topmost().unwrap(),
+            Some(Layer::ProfilePopout)
+        ));
+        let confirm = OpenLayers {
+            link_confirm: true,
+            ..popout
+        };
+        assert!(!field_keeps_keyboard(
+            confirm.topmost().unwrap(),
+            Some(Layer::ProfilePopout)
+        ));
+        // When the confirmation closes, the popout is on top again and its field may
+        // take the keyboard back.
+        assert_eq!(confirm.after_escape(), popout);
+    }
+
+    /// The profile layers: the user menu closes before the popout and the full
+    /// profile, a link confirmation (a link in a bio) before all of them, and nothing
+    /// is read behind them (`layer_open`).
+    #[test]
+    fn profile_layers_close_before_the_chat_layers() {
+        let mut layers = OpenLayers {
+            link_confirm: true,
+            user_menu: true,
+            profile_popout: true,
+            panel: true,
+            ..OpenLayers::default()
+        };
+        let mut order = Vec::new();
+        while let Some(top) = layers.topmost() {
+            order.push(top);
+            layers = layers.after_escape();
+        }
+        assert_eq!(
+            order,
+            [
+                Layer::LinkConfirm,
+                Layer::UserMenu,
+                Layer::ProfilePopout,
+                Layer::Panel
+            ]
+        );
+        let full = OpenLayers {
+            profile_modal: true,
+            ..OpenLayers::default()
+        };
+        assert_eq!(full.topmost(), Some(Layer::ProfileModal));
+        assert_eq!(full.after_escape().topmost(), None);
+    }
+
+    /// A field keeps the keyboard only while its layer is the topmost one; a layer that
+    /// opens over it (the inbox over the search panel, a link prompt over the quick
+    /// switcher) takes the keyboard at once, in the same frame.
+    #[test]
+    fn a_search_field_keeps_the_keyboard_only_in_the_topmost_layer() {
+        let search = OpenLayers {
+            search: true,
+            ..OpenLayers::default()
+        };
+        assert!(field_keeps_keyboard(
+            search.topmost().unwrap(),
+            Some(Layer::Search)
+        ));
+        let inbox = OpenLayers {
+            panel: true,
+            ..search
+        };
+        assert!(!field_keeps_keyboard(
+            inbox.topmost().unwrap(),
+            Some(Layer::Search)
+        ));
+        let switcher = OpenLayers {
+            quick_switcher: true,
+            ..OpenLayers::default()
+        };
+        assert!(field_keeps_keyboard(
+            switcher.topmost().unwrap(),
+            Some(Layer::QuickSwitcher)
+        ));
+        let prompt = OpenLayers {
+            link_prompt: true,
+            ..switcher
+        };
+        assert!(!field_keeps_keyboard(
+            prompt.topmost().unwrap(),
+            Some(Layer::QuickSwitcher)
+        ));
+        let status = OpenLayers {
+            status_picker: true,
+            ..OpenLayers::default()
+        };
+        assert!(field_keeps_keyboard(
+            status.topmost().unwrap(),
+            Some(Layer::StatusPicker)
+        ));
+        assert!(!field_keeps_keyboard(status.topmost().unwrap(), None));
+    }
+
+    /// The friend and DM windows are layers of their own: a confirmation over the
+    /// group DM window is the topmost layer, so the window's field loses the keyboard
+    /// in the same frame, and Escape closes the confirmation first.
+    #[test]
+    fn a_confirmation_over_the_group_dm_window_takes_the_keyboard() {
+        let layers = OpenLayers {
+            social_confirm: true,
+            group_dm: true,
+            ..OpenLayers::default()
+        };
+        let top = layers.topmost().unwrap();
+        assert_eq!(top, Layer::SocialConfirm);
+        assert!(!field_keeps_keyboard(top, Some(Layer::GroupDm)));
+        let under = layers.after_escape();
+        assert_eq!(under.topmost(), Some(Layer::GroupDm));
+        assert!(field_keeps_keyboard(Layer::GroupDm, Some(Layer::GroupDm)));
+        // The add-friend window keeps its field while it is the topmost layer.
+        let add = OpenLayers {
+            add_friend: true,
+            ..OpenLayers::default()
+        };
+        assert!(field_keeps_keyboard(
+            add.topmost().unwrap(),
+            Some(Layer::AddFriend)
+        ));
+    }
+
     /// Every layer closes before the one under it, in the order they are drawn.
     #[test]
     fn layers_close_from_the_top_down() {
         let mut layers = OpenLayers {
             link_prompt: true,
             link_confirm: true,
-            social: true,
+            quick_switcher: true,
+            social_confirm: true,
+            dm_menu: true,
+            group_dm: true,
+            add_friend: true,
+            user_menu: true,
+            profile_popout: true,
+            profile_modal: true,
             notification_settings: true,
             status_picker: true,
             switcher: true,
@@ -1363,6 +1654,7 @@ mod tests {
             settings: true,
             picker: true,
             viewer: true,
+            search: true,
         };
         let mut order = Vec::new();
         while let Some(top) = layers.topmost() {
@@ -1374,14 +1666,22 @@ mod tests {
             [
                 Layer::LinkPrompt,
                 Layer::LinkConfirm,
-                Layer::Social,
+                Layer::QuickSwitcher,
+                Layer::SocialConfirm,
+                Layer::DmMenu,
+                Layer::GroupDm,
+                Layer::AddFriend,
                 Layer::StatusPicker,
+                Layer::UserMenu,
+                Layer::ProfilePopout,
+                Layer::ProfileModal,
                 Layer::AccountSwitcher,
                 Layer::NotificationSettings,
                 Layer::Settings,
                 Layer::Picker,
                 Layer::Viewer,
-                Layer::Panel
+                Layer::Panel,
+                Layer::Search
             ]
         );
     }

@@ -28,6 +28,10 @@ social-empty-blocked = You have not blocked anyone.
 social-incoming-request = Incoming friend request
 social-outgoing-request = Outgoing friend request
 social-blocked = Blocked
+social-message = Message
+social-accept-request = Accept Friend Request
+social-cancel-request = Cancel Friend Request
+social-unblock = Unblock
 
 ## Adding a friend
 

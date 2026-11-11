@@ -829,7 +829,12 @@ impl Inlet {
         Some(match target {
             Target::Composer | Target::Panel => div()
                 .absolute()
-                .right(px(COMPOSER_RIGHT))
+                // Above the composer: left of the member list when it shows beside the
+                // chat (the thread panel and the list never show together).
+                .right(px(COMPOSER_RIGHT
+                    + self
+                        .member_list_shown()
+                        .map_or(0., |_| crate::ui::members::WIDTH)))
                 .bottom(px(COMPOSER_BOTTOM))
                 .child(frame)
                 .into_any_element(),

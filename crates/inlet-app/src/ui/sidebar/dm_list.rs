@@ -11,7 +11,7 @@
 // Deviation: Fluxer's list is virtualised; Inlet draws the first `MAX_DM_ROWS` rows.
 
 use gpui::{
-    actions, anchored, deferred, div, point, prelude::*, px, AnyElement, Context, FontWeight, Hsla,
+    anchored, deferred, div, point, prelude::*, px, AnyElement, Context, FontWeight, Hsla,
     MouseButton, MouseDownEvent, SharedString,
 };
 use inlet_protocol::models::channel_type;
@@ -22,18 +22,11 @@ use crate::backend::social::relationships::Cmd;
 use crate::model::{Channel, ChannelKind};
 use crate::theme;
 use crate::ui::notifications::badge::{mention_badge, RowMarks};
+use crate::ui::search::sidebar_actions::OpenQuickSwitcher;
 use crate::ui::social::group_dm::{group_name, Mode};
 use crate::ui::social::presence::avatar_status;
 use crate::ui::social::{person_status, user_tag, Confirm, DmMenu, SocialIcon};
 use crate::ui::HEADER_HEIGHT;
-
-actions!(
-    sidebar,
-    [
-        /// Opens the quick switcher (the search domain handles it).
-        OpenQuickSwitcher
-    ]
-);
 
 /// Height of a DM row, and of the Friends and Personal notes rows.
 pub const DM_ROW_HEIGHT: f32 = 42.;

@@ -13,6 +13,8 @@ impl Render for Inlet {
         self.take_channel_jump(window, cx);
         self.threads_frame(window, cx);
         self.social_frame(window, cx);
+        self.members_frame(window, cx);
+        self.profile_frame(window, cx);
         self.focus_layer(window, cx);
         self.focus_message_overlay(window, cx);
         let root = div()
@@ -32,6 +34,7 @@ impl Render for Inlet {
             .font_family(assets::ui_font());
         let root = self.notification_keys(root, cx);
         let root = self.picker_keys(root, cx);
+        let root = self.search_keys(root, window, cx);
         if self.show_about {
             return root
                 .child(about::render(self.show_licences, cx))

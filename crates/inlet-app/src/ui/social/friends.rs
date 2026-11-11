@@ -9,7 +9,8 @@
 // Deviation: Fluxer keeps the blocked list in its privacy settings; here it is a tab of
 // the friends page, so blocks can be undone where they are listed.
 // Deviation: Fluxer's friend row opens the profile on a click and has a menu (⋯) for
-// remove and block; here the click opens the DM, and remove and block are buttons.
+// remove and block; here the click opens the DM, remove and block are buttons, and a
+// right click opens the user menu (profile, message, friend and block items).
 
 use gpui::{div, prelude::*, px, AnyElement, Context, Entity, FontWeight, SharedString};
 use inlet_state::relationships::Kind;
@@ -362,6 +363,13 @@ impl Inlet {
             .items_center()
             .gap(px(12.))
             .hover(|s| s.bg(theme::hover_bg()))
+            // Right click: the user menu (profile, message, friend and block items).
+            .on_mouse_down(
+                gpui::MouseButton::Right,
+                cx.listener(move |this, e: &gpui::MouseDownEvent, _, cx| {
+                    this.open_user_menu(user, None, e.position, cx)
+                }),
+            )
             .when(row.kind == Kind::Friend, |d| {
                 d.cursor_pointer().on_click(
                     cx.listener(move |this, _, window, cx| this.open_dm_with(user, window, cx)),

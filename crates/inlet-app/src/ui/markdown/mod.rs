@@ -31,7 +31,9 @@ use std::ops::Range;
 use fluxer_markdown_parser::ast::TimestampStyle;
 use gpui::SharedString;
 
-pub use blocks::{mark_edited, parse, parse_embed_with, parse_with, render, RenderCtx};
+pub use blocks::{
+    mark_edited, parse, parse_bio_with, parse_embed_with, parse_with, render, RenderCtx,
+};
 pub use code::{with_message_budget, OffThread};
 pub use mention::MentionNames;
 pub use timestamp::refresh_due;

@@ -193,6 +193,8 @@ impl Inlet {
             )
             .children(self.render_thread_panel(cx))
             .children(self.render_thread_list(cx))
+            // The search column, beside the chat (see `ui/search/bar.rs`).
+            .children(self.render_search_panel(cx))
     }
 
     /// Whether the thread list or the thread panel is open (Escape closes them).

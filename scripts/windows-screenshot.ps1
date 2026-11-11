@@ -164,6 +164,10 @@ Run-Demo "33-media-channel" @{ INLET_DEMO = "1"; INLET_DEMO_LIVE_SECS = "3600"; 
 # session does not show toasts, so the toast itself is checked by hand.
 Run-Demo "34-settings-notifications" @{ INLET_DEMO = "1"; INLET_DEMO_LIVE_SECS = "3600"; INLET_DEMO_GUILD = "g1"; INLET_DEMO_CHANNEL = "c-general"; INLET_DEMO_SETTINGS = "notifications"; INLET_DEMO_NOTIFY = "1" } 10
 
+# The member list beside the chat, and the profile popout of a member.
+Run-Demo "39-members" @{ INLET_DEMO = "1"; INLET_DEMO_LIVE_SECS = "3600"; INLET_DEMO_SCENE = "members"; INLET_DEMO_GUILD = "g1"; INLET_DEMO_CHANNEL = "c-general" } 10
+Run-Demo "40-profile-popout" @{ INLET_DEMO = "1"; INLET_DEMO_LIVE_SECS = "3600"; INLET_DEMO_SCENE = "profile-popout"; INLET_DEMO_GUILD = "g1"; INLET_DEMO_CHANNEL = "c-general" } 10
+
 # One scene file: the app opens in the state the file names, at its window size, and
 # the inside of the window is saved as visual/<name>.png.
 function Run-Scene([System.IO.FileInfo]$File) {
@@ -220,6 +224,9 @@ Run-Demo "36-composer-attachments" @{ INLET_DEMO = "1"; INLET_DEMO_LIVE_SECS = "
 # The composer's picker on the emoji tab and on the GIF tab.
 Run-Demo "37-picker-emoji" @{ INLET_DEMO = "1"; INLET_DEMO_LIVE_SECS = "3600"; INLET_DEMO_SCENE = "picker-emoji"; INLET_DEMO_GUILD = "g1"; INLET_DEMO_CHANNEL = "c-general" } 10
 Run-Demo "38-picker-gif" @{ INLET_DEMO = "1"; INLET_DEMO_LIVE_SECS = "3600"; INLET_DEMO_SCENE = "picker-gif"; INLET_DEMO_GUILD = "g1"; INLET_DEMO_CHANNEL = "c-general" } 10
+# Message search: the search panel with results; the quick switcher over every account.
+Run-Demo "41-search-results" @{ INLET_DEMO = "1"; INLET_DEMO_LIVE_SECS = "3600"; INLET_DEMO_SCENE = "search-results"; INLET_DEMO_GUILD = "g1"; INLET_DEMO_CHANNEL = "c-general" } 10
+Run-Demo "42-quick-switcher" @{ INLET_DEMO = "1"; INLET_DEMO_LIVE_SECS = "3600"; INLET_DEMO_SCENE = "quick-switcher"; INLET_DEMO_GUILD = "g1"; INLET_DEMO_CHANNEL = "c-general" } 10
 
 # A demo that quit before its screenshot crashed: fail the job, the pictures are not
 # worth checking.

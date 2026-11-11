@@ -130,6 +130,14 @@ impl Switcher {
             .map(|(_, s)| *s)
     }
 
+    /// The passive states of the accounts in the background (guilds, channels and read
+    /// states; no members), for the quick switcher.
+    pub fn background_states(
+        &self,
+    ) -> impl Iterator<Item = (&AccountKey, &Entity<AccountState>)> + '_ {
+        self.background.iter().filter(|(k, _)| !self.is_active(k))
+    }
+
     fn summary_of(&self, k: &AccountKey) -> Summary {
         self.summaries.get(k).copied().unwrap_or_default()
     }
@@ -298,6 +306,7 @@ impl Inlet {
         self.inbox.clear();
         // The friend and DM windows and their calls were the old account's.
         self.social.close_windows();
+        self.reset_search(false);
         // Messages with files still on their way become drafts of the old account
         // again (the backend stops their uploads); the notice below says so.
         let uploads_stopped = panel_uploads
@@ -368,6 +377,8 @@ impl Inlet {
         if !self.switcher.is_active(&key) {
             // Reaction clicks still in their 500 ms window go out now, for this account.
             self.flush_all_reactions();
+            // A note being edited is saved for this account too.
+            self.save_note(cx);
             // The backend switches first, so the commands that open the new account's
             // place reach it with that account active.
             self.backend.send(Cmd::SwitchAccount(key.clone()));
@@ -451,6 +462,7 @@ impl Inlet {
         self.switcher.background.remove(key);
         self.switcher.summaries.remove(key);
         self.switcher.places.forget(key);
+        self.search.switcher.visits.forget(key);
         let path = dirs::data_local_dir().and_then(|dir| {
             crate::ui::composer::drafts::path_for(
                 &dir,

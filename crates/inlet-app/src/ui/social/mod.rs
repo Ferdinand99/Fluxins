@@ -4,8 +4,9 @@
 //! (`notes`). The DM list itself is in `ui/sidebar/dm_list.rs`.
 //!
 //! The add-friend window, the group DM window, the DM menu and the confirmations are
-//! layers (`desktop::Layer::Social`): the topmost has the keyboard, Escape closes it,
-//! and typing never reaches the composer behind it.
+//! layers of their own (`desktop::Layer::{AddFriend, GroupDm, DmMenu, SocialConfirm}`):
+//! the topmost has the keyboard, Escape closes it, and typing never reaches the
+//! composer behind it.
 
 pub mod add_friend;
 pub mod blocked;
@@ -111,25 +112,6 @@ impl State {
         self.group_dm = None;
         self.dm_menu = None;
         self.confirm = None;
-    }
-
-    /// Whether a social window is open (it is a layer).
-    pub fn layer_open(&self) -> bool {
-        self.confirm.is_some()
-            || self.dm_menu.is_some()
-            || self.group_dm.is_some()
-            || self.add_friend.is_some()
-    }
-
-    /// Escape: the topmost social window closes.
-    pub fn close_top(&mut self) {
-        if self.confirm.take().is_some() || self.dm_menu.take().is_some() {
-            return;
-        }
-        if self.group_dm.take().is_some() {
-            return;
-        }
-        self.add_friend = None;
     }
 }
 
@@ -291,6 +273,101 @@ impl Inlet {
         cx.notify();
     }
 
+    /// The relationship items of the user menu for `user`, as Fluxer's: message, then
+    /// add, accept, cancel or remove the friend, then block or unblock. None for the
+    /// account itself.
+    pub(crate) fn relationship_actions(
+        &self,
+        user: UserId,
+        cx: &gpui::App,
+    ) -> Vec<(&'static str, String, RelationshipAction)> {
+        use inlet_state::relationships::Kind;
+        let Some(state) = self.account.as_ref().map(|a| a.read(cx)) else {
+            return Vec::new();
+        };
+        if user == state.me_id() {
+            return Vec::new();
+        }
+        let kind = state.relationships().kind(user);
+        let mut out = Vec::new();
+        if kind != Some(Kind::Blocked) {
+            out.push((
+                "user-menu-message",
+                t!("social-message"),
+                RelationshipAction::Message,
+            ));
+        }
+        match kind {
+            None => out.push((
+                "user-menu-add-friend",
+                t!("social-add-friend"),
+                RelationshipAction::AddFriend,
+            )),
+            Some(Kind::Incoming) => out.push((
+                "user-menu-accept",
+                t!("social-accept-request"),
+                RelationshipAction::Accept,
+            )),
+            Some(Kind::Outgoing) => out.push((
+                "user-menu-cancel",
+                t!("social-cancel-request"),
+                RelationshipAction::CancelRequest,
+            )),
+            Some(Kind::Friend) => out.push((
+                "user-menu-remove-friend",
+                t!("social-remove-friend"),
+                RelationshipAction::RemoveFriend,
+            )),
+            Some(Kind::Blocked) => {}
+        }
+        out.push(if kind == Some(Kind::Blocked) {
+            (
+                "user-menu-unblock",
+                t!("social-unblock"),
+                RelationshipAction::Unblock,
+            )
+        } else {
+            (
+                "user-menu-block",
+                t!("social-block"),
+                RelationshipAction::Block,
+            )
+        });
+        out
+    }
+
+    /// Runs a relationship item of the user menu; removing a friend and blocking ask
+    /// first.
+    pub(crate) fn run_relationship_action(
+        &mut self,
+        action: RelationshipAction,
+        user: UserId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let name = self
+            .account
+            .as_ref()
+            .map(|a| person_name(a.read(cx), user))
+            .unwrap_or_default();
+        let user_id = user.to_string();
+        match action {
+            RelationshipAction::Message => self.open_dm_with(user, window, cx),
+            RelationshipAction::AddFriend => {
+                self.social_action(rel::Cmd::SendRequest { user_id }, cx)
+            }
+            RelationshipAction::Accept => self.social_action(rel::Cmd::Accept { user_id }, cx),
+            RelationshipAction::CancelRequest | RelationshipAction::Unblock => {
+                self.social_action(rel::Cmd::Remove { user_id }, cx)
+            }
+            RelationshipAction::RemoveFriend => {
+                self.social.confirm = Some(Confirm::RemoveFriend { user, name })
+            }
+            RelationshipAction::Block => self.social.confirm = Some(Confirm::Block { user, name }),
+        }
+        cx.notify();
+    }
+
     /// The channel as the account state knows it (the server's own type and data).
     pub(crate) fn state_channel(
         &self,
@@ -438,6 +515,8 @@ impl Inlet {
                 self.status_saved(&settings, cx)
             }
             backend::social::Ev::Relationships(ev) => self.on_relationships_event(ev, window, cx),
+            backend::social::Ev::Members(ev) => self.on_members_event(ev, cx),
+            backend::social::Ev::Profile(ev) => self.on_profile_event(ev, cx),
         }
     }
 
@@ -599,23 +678,39 @@ impl Inlet {
         out
     }
 
-    /// Whether `part` is the topmost social window (it then has the keyboard).
+    /// Whether `part` is the topmost layer (it then has the keyboard and Escape).
     fn social_top(&self, part: SocialPart) -> bool {
         use crate::desktop::Layer;
-        if !self.is_top_layer(Layer::Social) {
-            return false;
+        self.is_top_layer(match part {
+            SocialPart::Confirm => Layer::SocialConfirm,
+            SocialPart::Menu => Layer::DmMenu,
+            SocialPart::GroupDm => Layer::GroupDm,
+            SocialPart::AddFriend => Layer::AddFriend,
+        })
+    }
+
+    /// The social window whose text field has the keyboard now, if one has.
+    pub(crate) fn social_field_focused(
+        &self,
+        window: &Window,
+        cx: &gpui::App,
+    ) -> Option<crate::desktop::Layer> {
+        use crate::desktop::Layer;
+        use gpui::Focusable;
+        if let Some(w) = &self.social.group_dm {
+            let name = w
+                .name
+                .as_ref()
+                .is_some_and(|n| n.focus_handle(cx).is_focused(window));
+            if name || w.search.focus_handle(cx).is_focused(window) {
+                return Some(Layer::GroupDm);
+            }
         }
-        let s = &self.social;
-        let top = if s.confirm.is_some() {
-            SocialPart::Confirm
-        } else if s.dm_menu.is_some() {
-            SocialPart::Menu
-        } else if s.group_dm.is_some() {
-            SocialPart::GroupDm
-        } else {
-            SocialPart::AddFriend
-        };
-        top == part
+        self.social
+            .add_friend
+            .as_ref()
+            .filter(|w| w.input.focus_handle(cx).is_focused(window))
+            .map(|_| Layer::AddFriend)
     }
 
     /// The layer's keys on the DM menu while it is the topmost social window.
@@ -732,6 +827,18 @@ impl Inlet {
         self.social_keys(SocialPart::Confirm, card, cx)
             .into_any_element()
     }
+}
+
+/// What the user menu offers about a person (see `relationship_actions`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RelationshipAction {
+    Message,
+    AddFriend,
+    Accept,
+    RemoveFriend,
+    CancelRequest,
+    Block,
+    Unblock,
 }
 
 /// The social windows, for the keyboard.

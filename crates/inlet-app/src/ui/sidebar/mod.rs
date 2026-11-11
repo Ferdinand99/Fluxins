@@ -120,6 +120,7 @@ impl Inlet {
         if self.selected_guild.is_none() {
             self.social.last_dm = Some(channel_id.clone());
         }
+        self.note_channel_visit(&channel_id);
         // A forum opens the forum view; any other channel closes it.
         if self.open_forum(&channel_id, window, cx) {
             cx.notify();
