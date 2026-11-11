@@ -296,6 +296,8 @@ impl Inlet {
         self.notifications.clear();
         // The panels' lists and a jump on its way (its answer is the old account's).
         self.inbox.clear();
+        // The friend and DM windows and their calls were the old account's.
+        self.social.close_windows();
         // Messages with files still on their way become drafts of the old account
         // again (the backend stops their uploads); the notice below says so.
         let uploads_stopped = panel_uploads

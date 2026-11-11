@@ -57,6 +57,11 @@ impl Inlet {
             Row::System(s) => system_message::render(&s, compact),
             Row::Message(m) => self.render_message(&m, compact, cx),
             Row::Pending(o) => self.render_pending(&o, compact, cx),
+            Row::Blocked {
+                first,
+                count,
+                revealed,
+            } => self.render_blocked_run(first, count, revealed, cx),
         }
     }
 

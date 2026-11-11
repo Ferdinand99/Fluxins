@@ -55,6 +55,9 @@ impl Inlet {
         if self.status_picker_open() {
             out.push(self.render_status_picker(cx));
         }
+        // The social windows (add friend, group DM, the DM menu, confirmations): over
+        // the status picker, under the link prompts.
+        out.extend(self.render_social_overlays(cx));
         if let Some(url) = self.overlays.pending_link.clone() {
             // A layer like the link prompt: it has the keyboard while it is topmost, and
             // Escape closes it.

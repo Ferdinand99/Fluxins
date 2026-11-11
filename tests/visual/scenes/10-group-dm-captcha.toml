@@ -1,0 +1,8 @@
+# The new group DM window over the friends page: two friends picked, and the lasting
+# message after a CAPTCHA Inlet could not pass.
+name = "group-dm-captcha"
+window = [1280, 860]
+scale = 1.0
+theme = "dark"
+ignore = []
+scene = "group-dm-captcha"

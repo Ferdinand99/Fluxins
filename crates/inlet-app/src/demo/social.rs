@@ -27,11 +27,41 @@ pub fn dm_channels(channels: &mut HashMap<Option<String>, Vec<Channel>>) {
                 None,
                 2,
             ),
+            channel("dm-sylo", "Sylo", ChannelKind::Dm, None, 3),
+            channel("dm-system", "System", ChannelKind::Dm, None, 4),
         ],
     );
 }
 
-/// Adds the messages of the DMs.
+/// The demo account's relationships: three friends (online, idle, do not disturb), a
+/// bot friend, a request each way and a blocked account, with their users.
+pub fn relationships() -> Value {
+    let rel = |name: &str, kind: u64| {
+        json!({"id": user_id(name), "type": kind, "since": "2026-01-01T00:00:00.000Z",
+               "user": super::user(name)})
+    };
+    json!([
+        rel("ada", 1),
+        rel("linus", 1),
+        rel("grace", 1),
+        rel("Sylo", 1),
+        rel("kim", 3),
+        rel("rob", 4),
+        rel("spam", 2),
+    ])
+}
+
+/// The pinned DMs: the one with Linus.
+pub fn pinned_dms() -> Value {
+    json!([snowflake("dm-linus")])
+}
+
+/// The DMs whose messages count as read in every scene.
+pub const READ_DMS: [&str; 4] = ["dm-linus", "dm-sylo", "dm-system", "dm-group"];
+
+/// Adds the messages of the DMs. Their times give the DM list's order: the group
+/// first, then Ada, Sylo, System (Linus is pinned on top). In the group, a blocked
+/// account's two messages fold into one line.
 pub fn dm_messages(messages: &mut HashMap<String, Vec<p::Message>>) {
     messages.insert(
         "dm-ada".into(),
@@ -42,6 +72,45 @@ pub fn dm_messages(messages: &mut HashMap<String, Vec<p::Message>>) {
             "10:01",
             "Hi! This is a direct message.",
         )],
+    );
+    messages.insert(
+        "dm-linus".into(),
+        vec![msg(
+            21,
+            "dm-linus",
+            "linus",
+            "08:00",
+            "Pinned, so always on top.",
+        )],
+    );
+    messages.insert(
+        "dm-sylo".into(),
+        vec![msg(22, "dm-sylo", "Sylo", "09:40", "Your reminder is set.")],
+    );
+    messages.insert(
+        "dm-system".into(),
+        vec![msg(
+            23,
+            "dm-system",
+            "System",
+            "09:00",
+            "Welcome to the instance.",
+        )],
+    );
+    messages.insert(
+        "dm-group".into(),
+        vec![
+            msg(24, "dm-group", "grace", "10:20", "Standup in five minutes."),
+            msg(
+                25,
+                "dm-group",
+                "spam",
+                "10:21",
+                "Cheap followers, click here!",
+            ),
+            msg(26, "dm-group", "spam", "10:22", "Last chance!"),
+            msg(27, "dm-group", "linus", "10:30", "On my way."),
+        ],
     );
 }
 

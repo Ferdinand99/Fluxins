@@ -10,6 +10,10 @@ use crate::ui::HEADER_HEIGHT;
 
 impl Inlet {
     pub(super) fn render_guild_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        // The DM list's header is the quick switcher bar (see `dm_list`).
+        if self.selected_guild.is_none() {
+            return div().flex_none().child(self.render_dm_header(cx));
+        }
         let title = match &self.selected_guild {
             None => t!("sidebar-direct-messages"),
             Some(id) => self

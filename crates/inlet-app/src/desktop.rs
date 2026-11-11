@@ -928,6 +928,7 @@ impl Inlet {
         OpenLayers {
             link_prompt: self.overlays.link_prompt.is_some(),
             link_confirm: self.overlays.pending_link.is_some(),
+            social: self.social.layer_open() && self.screen == Screen::Main,
             notification_settings: self.notifications.settings.is_some(),
             status_picker: self.status_picker_open(),
             switcher: self.switcher_layer_open(),
@@ -954,16 +955,23 @@ impl Inlet {
     /// when the window is drawn.
     pub(crate) fn focus_layer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.layer_open() {
-            let handle = self
+            let layer = self
                 .overlays
                 .layer_focus
                 .get_or_insert_with(|| cx.focus_handle())
                 .clone();
-            // Only the status picker has a field that may keep the keyboard, and only
-            // while it is the topmost layer: any layer that opens over it takes the
-            // keyboard in the same frame.
-            let field_keeps_it = self.is_top_layer(Layer::StatusPicker)
-                && self.status_picker_field_focused(window, cx);
+            // A social window with a field gives the field the keyboard; any field
+            // inside the topmost layer may keep it (only the topmost layer carries the
+            // layer's handle, so a field under a layer that opens over it loses it).
+            let handle = match self.open_layers().topmost() {
+                Some(Layer::Social) => self.social_field(cx).unwrap_or_else(|| layer.clone()),
+                _ => layer.clone(),
+            };
+            // The status picker's field may keep the keyboard while it is the topmost
+            // layer: any layer that opens over it takes the keyboard in the same frame.
+            let field_keeps_it = (self.is_top_layer(Layer::StatusPicker)
+                && self.status_picker_field_focused(window, cx))
+                || (self.is_top_layer(Layer::Social) && layer.contains_focused(window, cx));
             if !handle.is_focused(window) && !field_keeps_it {
                 if !self.overlays.layer_had_focus {
                     // Where the keyboard was, to give it back when the layers close.
@@ -1011,6 +1019,7 @@ impl Inlet {
         match self.open_layers().topmost() {
             Some(Layer::LinkPrompt) => self.overlays.link_prompt = None,
             Some(Layer::LinkConfirm) => self.overlays.pending_link = None,
+            Some(Layer::Social) => self.social.close_top(),
             Some(Layer::NotificationSettings) => self.notifications.settings = None,
             Some(Layer::StatusPicker) => self.social.picker = None,
             Some(Layer::AccountSwitcher) => self.switcher.open = false,
@@ -1068,6 +1077,8 @@ impl Inlet {
 pub(crate) enum Layer {
     LinkPrompt,
     LinkConfirm,
+    /// The add-friend and group DM windows, the DM menu and their confirmations.
+    Social,
     NotificationSettings,
     /// The status picker over the user panel.
     StatusPicker,
@@ -1086,6 +1097,7 @@ pub(crate) enum Layer {
 pub(crate) struct OpenLayers {
     pub link_prompt: bool,
     pub link_confirm: bool,
+    pub social: bool,
     pub notification_settings: bool,
     pub status_picker: bool,
     pub switcher: bool,
@@ -1100,6 +1112,8 @@ impl OpenLayers {
             Some(Layer::LinkPrompt)
         } else if self.link_confirm {
             Some(Layer::LinkConfirm)
+        } else if self.social {
+            Some(Layer::Social)
         } else if self.status_picker {
             Some(Layer::StatusPicker)
         } else if self.switcher {
@@ -1123,6 +1137,7 @@ impl OpenLayers {
         match self.topmost() {
             Some(Layer::LinkPrompt) => self.link_prompt = false,
             Some(Layer::LinkConfirm) => self.link_confirm = false,
+            Some(Layer::Social) => self.social = false,
             Some(Layer::NotificationSettings) => self.notification_settings = false,
             Some(Layer::StatusPicker) => self.status_picker = false,
             Some(Layer::AccountSwitcher) => self.switcher = false,
@@ -1326,6 +1341,7 @@ mod tests {
         let mut layers = OpenLayers {
             link_prompt: true,
             link_confirm: true,
+            social: true,
             notification_settings: true,
             status_picker: true,
             switcher: true,
@@ -1343,6 +1359,7 @@ mod tests {
             [
                 Layer::LinkPrompt,
                 Layer::LinkConfirm,
+                Layer::Social,
                 Layer::StatusPicker,
                 Layer::AccountSwitcher,
                 Layer::NotificationSettings,

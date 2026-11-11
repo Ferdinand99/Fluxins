@@ -1,4 +1,4 @@
-# Direct messages: the start view with the DM list and the first conversation.
+# Direct messages: the start view, the DM list and the friends page (Online).
 name = "dm-list"
 window = [1280, 860]
 scale = 1.0

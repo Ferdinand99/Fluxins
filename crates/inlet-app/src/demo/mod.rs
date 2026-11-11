@@ -96,6 +96,7 @@ pub fn user(name: &str) -> Value {
         "username": name.to_lowercase(),
         "global_name": name,
         "bot": name == "Sylo",
+        "system": name == "System",
         "avatar": media::avatar_hash(name),
     })
 }

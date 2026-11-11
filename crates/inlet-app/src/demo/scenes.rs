@@ -41,6 +41,10 @@
 //! - `composer-attachments`: for `#general`, three files in the composer's tray (a photo
 //!   with alt text, a spoiler, a document), an upload on its way above the box, and its
 //!   message pending in the list.
+//! - `friends-pending`: the DM list with the friends page on its Pending tab.
+//! - `group-dm-captcha`: the new group DM window with two friends picked and the
+//!   message for a CAPTCHA Inlet could not pass.
+//! - `dm-blocked`: the group DM open, with a blocked account's messages folded.
 //!
 //! `INLET_DEMO_SCENE` may also name a scene file of the visual checks
 //! (`tests/visual/scenes/*.toml`, see `scene_file.rs`): it then sets the scene, the guild,
@@ -93,6 +97,9 @@ pub enum Scene {
     MediaChannel,
     StatusPicker,
     ComposerAttachments,
+    FriendsPending,
+    GroupDmCaptcha,
+    DmBlocked,
 }
 
 impl Scene {
@@ -127,6 +134,9 @@ impl Scene {
             "media-channel" => Scene::MediaChannel,
             "status-picker" => Scene::StatusPicker,
             "composer-attachments" => Scene::ComposerAttachments,
+            "friends-pending" => Scene::FriendsPending,
+            "group-dm-captcha" => Scene::GroupDmCaptcha,
+            "dm-blocked" => Scene::DmBlocked,
             _ => return None,
         })
     }
@@ -322,6 +332,8 @@ fn ready(
         "read_states": read_states,
         "user_guild_settings": guild_settings,
         "presences": social::presences(),
+        "relationships": social::relationships(),
+        "pinned_dms": social::pinned_dms(),
         "user_settings": user_settings,
     }))
     .expect("the demo READY is valid")
@@ -394,6 +406,13 @@ pub fn data(scene: Scene) -> Data {
 
     let general = snowflake("c-general");
     let mut read_states = Vec::new();
+    // The DMs added for the DM list are read, so the rail looks the same in every scene.
+    for dm in social::READ_DMS {
+        let id = snowflake(dm);
+        if let Some(last) = newest_id(&messages, &id) {
+            read_states.push(json!({"id": id, "last_message_id": last}));
+        }
+    }
     let mut outgoing = Vec::new();
     if matches!(scene, Scene::ChatCozy | Scene::ChatCompact) {
         // Read up to the fourth-newest message: the last three are new.
@@ -504,6 +523,9 @@ mod tests {
             "media-channel",
             "status-picker",
             "composer-attachments",
+            "friends-pending",
+            "group-dm-captcha",
+            "dm-blocked",
         ] {
             let scene = Scene::from_name(name).expect(name);
             let data = data(scene);

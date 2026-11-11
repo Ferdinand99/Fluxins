@@ -264,6 +264,8 @@ pub struct Changes {
     pub users: bool,
     /// Notification settings (mutes, levels).
     pub settings: bool,
+    /// Relationships (friends, requests, blocks) or the pinned DMs.
+    pub relationships: bool,
 }
 
 impl Changes {
@@ -282,6 +284,7 @@ impl Changes {
         self.permissions |= other.permissions;
         self.users |= other.users;
         self.settings |= other.settings;
+        self.relationships |= other.relationships;
         self.channels.merge(other.channels);
         self.messages.merge(other.messages);
         self.member_guilds.merge(other.member_guilds);

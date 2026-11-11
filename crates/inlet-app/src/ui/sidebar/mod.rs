@@ -2,7 +2,7 @@
 //! The column next to the guild rail: guild header, channel or DM list, user panel.
 
 pub mod channel_list;
-mod dm_list;
+pub mod dm_list;
 pub mod favorites;
 mod guild_header;
 mod user_panel;
@@ -45,6 +45,8 @@ impl Inlet {
     ) {
         if guild_id == self.selected_guild {
             self.channels = model::sidebar_order(&channels);
+            // The DM list keeps the personal notes channel (it is not in the REST list).
+            self.keep_personal_notes(cx);
             let open_still_exists = self
                 .selected_channel
                 .as_ref()
@@ -70,10 +72,12 @@ impl Inlet {
             }
             // A channel a confirmed link asked for (see `desktop`).
             self.take_link_channel(window, cx);
+            // A guild opens its first channel; the DM list opens the friends page, as
+            // in Fluxer.
             if self.selected_channel.is_none() {
                 match self.channels.iter().find(|c| c.is_messageable()).cloned() {
-                    Some(first) => self.select_channel(first.id, window, cx),
-                    None => self.clear_messages(),
+                    Some(first) if guild_id.is_some() => self.select_channel(first.id, window, cx),
+                    _ => self.clear_messages(),
                 }
             }
         }
