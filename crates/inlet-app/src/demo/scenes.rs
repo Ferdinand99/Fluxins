@@ -16,6 +16,8 @@
 //! - `embed-all-types`: for `#embeds`, every embed type (rich, link, article, image, gifv,
 //!   video, bluesky) and an embed without a colour.
 //! - `image-viewer`: `attachments` with the image viewer open on the newest photo.
+//! - `markdown-inline`, `markdown-blocks`, `markdown-alerts`, `markdown-code`: for
+//!   `#development`, every kind of markdown node (see `markdown.rs`).
 
 use std::collections::HashMap;
 
@@ -23,8 +25,8 @@ use inlet_protocol as p;
 use serde_json::{json, Value};
 
 use super::{
-    guilds, media, messages, snowflake, social, unread, user, user_id, ME, ROLE_CONTRIBUTORS,
-    ROLE_MODERATORS,
+    guilds, markdown, media, messages, snowflake, social, unread, user, user_id, ME,
+    ROLE_CONTRIBUTORS, ROLE_MODERATORS,
 };
 use crate::backend::messages::Pending;
 use crate::model::{Channel, ChannelKind, Guild};
@@ -40,6 +42,10 @@ pub enum Scene {
     Attachments,
     EmbedAllTypes,
     ImageViewer,
+    MarkdownInline,
+    MarkdownBlocks,
+    MarkdownAlerts,
+    MarkdownCode,
 }
 
 impl Scene {
@@ -53,6 +59,10 @@ impl Scene {
             "attachments" => Scene::Attachments,
             "embed-all-types" => Scene::EmbedAllTypes,
             "image-viewer" => Scene::ImageViewer,
+            "markdown-inline" => Scene::MarkdownInline,
+            "markdown-blocks" => Scene::MarkdownBlocks,
+            "markdown-alerts" => Scene::MarkdownAlerts,
+            "markdown-code" => Scene::MarkdownCode,
             _ => return None,
         })
     }
@@ -192,6 +202,21 @@ pub fn data(scene: Scene) -> Data {
     messages::messages(&mut by_name);
     media::messages(&mut by_name);
     social::dm_messages(&mut by_name);
+    match scene {
+        Scene::MarkdownInline => {
+            by_name.insert(markdown::SCENE_CHANNEL.into(), markdown::inline());
+        }
+        Scene::MarkdownBlocks => {
+            by_name.insert(markdown::SCENE_CHANNEL.into(), markdown::blocks());
+        }
+        Scene::MarkdownAlerts => {
+            by_name.insert(markdown::SCENE_CHANNEL.into(), markdown::alerts());
+        }
+        Scene::MarkdownCode => {
+            by_name.insert(markdown::SCENE_CHANNEL.into(), markdown::code());
+        }
+        _ => {}
+    }
 
     // Demo IDs become snowflakes everywhere.
     let guilds: Vec<Guild> = guilds::guilds()
@@ -291,6 +316,10 @@ mod tests {
             "attachments",
             "embed-all-types",
             "image-viewer",
+            "markdown-inline",
+            "markdown-blocks",
+            "markdown-alerts",
+            "markdown-code",
         ] {
             let scene = Scene::from_name(name).expect(name);
             let data = data(scene);

@@ -256,6 +256,100 @@ pub fn viewer_backdrop() -> Hsla {
     h(rgba(0x000000d9))
 }
 
+// ---- Markdown ---------------------------------------------------------------
+
+/// Code block border: 90 % `--border-color`, 10 % `--text-code` (`--code-block-border`).
+pub fn code_border() -> Hsla {
+    h(rgba(0xa19bad47))
+}
+/// Table borders (`--border-color`, `hsla(258,10%,50%,0.2)`).
+pub fn table_border() -> Hsla {
+    h(rgba(0x7a738c33))
+}
+/// Table header row (`--bg-table-header`).
+pub fn table_header_bg() -> Hsla {
+    h(rgb(0x2a2730))
+}
+/// Odd table rows (`--bg-table-row-odd`).
+pub fn table_row_odd() -> Hsla {
+    h(rgb(0x0c0b0e))
+}
+/// Even table rows (`--bg-table-row-even`).
+pub fn table_row_even() -> Hsla {
+    h(rgb(0x1a181e))
+}
+/// A hidden spoiler: the text colour at 16 % (`--markup-spoiler-hidden-bg`).
+pub fn spoiler_hidden() -> Hsla {
+    let mut c = text();
+    c.a = 0.16;
+    c
+}
+/// A revealed spoiler (`--background-modifier-accent`).
+pub fn spoiler_revealed() -> Hsla {
+    accent_border()
+}
+/// A mention nobody can resolve: muted text on a muted fill.
+pub fn mention_neutral_text() -> Hsla {
+    text_muted()
+}
+/// Fill of a mention nobody can resolve.
+pub fn mention_neutral_fill() -> Hsla {
+    let mut c = text_muted();
+    c.a = 0.16;
+    c
+}
+/// `> [!NOTE]` (`--alert-note-color`, `hsl(198,92%,70%)`).
+pub fn alert_note() -> Hsla {
+    h(rgb(0x6ccff9))
+}
+/// `> [!TIP]` (`hsl(152,72%,45%)`).
+pub fn alert_tip() -> Hsla {
+    h(rgb(0x20c578))
+}
+/// `> [!IMPORTANT]` (`hsl(278,85%,65%)`).
+pub fn alert_important() -> Hsla {
+    h(rgb(0xba5af2))
+}
+/// `> [!WARNING]` (`hsl(45,93%,55%)`).
+pub fn alert_warning() -> Hsla {
+    h(rgb(0xf7c222))
+}
+/// `> [!CAUTION]` (`hsl(359,75%,60%)`).
+pub fn alert_caution() -> Hsla {
+    h(rgb(0xe54c4f))
+}
+
+// Code highlighting: the GitHub Dark colours Fluxer's code blocks use.
+
+/// Keywords.
+pub fn syntax_keyword() -> Hsla {
+    h(rgb(0xff7b72))
+}
+/// Strings.
+pub fn syntax_string() -> Hsla {
+    h(rgb(0xa5d6ff))
+}
+/// Comments.
+pub fn syntax_comment() -> Hsla {
+    h(rgb(0x8b949e))
+}
+/// Numbers and other constants, attributes.
+pub fn syntax_constant() -> Hsla {
+    h(rgb(0x79c0ff))
+}
+/// Function names.
+pub fn syntax_function() -> Hsla {
+    h(rgb(0xd2a8ff))
+}
+/// Type names and parameters.
+pub fn syntax_type() -> Hsla {
+    h(rgb(0xffa657))
+}
+/// Markup tags, inserted lines.
+pub fn syntax_tag() -> Hsla {
+    h(rgb(0x7ee787))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

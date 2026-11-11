@@ -102,6 +102,11 @@ pub fn render(show_licences: bool, cx: &mut Context<Inlet>) -> impl IntoElement 
         )
         .child(
             div()
+                .text_color(theme::text_muted())
+                .child(t!("about-twemoji")),
+        )
+        .child(
+            div()
                 .flex()
                 .flex_row()
                 .gap_2()

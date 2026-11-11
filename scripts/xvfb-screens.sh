@@ -72,9 +72,13 @@ scene 06-chat-cozy chat-cozy c-general
 scene 07-chat-compact chat-compact c-general
 scene 08-chat-system chat-system c-system
 scene 09-chat-replies chat-replies c-replies
-scene 10-attachments attachments c-attachments
-scene 11-embed-all-types embed-all-types c-embeds
-scene 12-image-viewer image-viewer c-attachments
+scene 10-markdown-inline markdown-inline c-dev
+scene 11-markdown-blocks markdown-blocks c-dev
+scene 12-markdown-alerts markdown-alerts c-dev
+scene 13-markdown-code markdown-code c-dev
+scene 14-attachments attachments c-attachments
+scene 15-embed-all-types embed-all-types c-embeds
+scene 16-image-viewer image-viewer c-attachments
 
 tail -n 20 "$out/signin.log" "$out/demo.log" >&2
 cat "$out/memory.txt" >&2

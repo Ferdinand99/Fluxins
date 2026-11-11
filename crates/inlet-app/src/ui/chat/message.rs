@@ -10,7 +10,7 @@ use std::rc::Rc;
 
 use gpui::{div, prelude::*, px, AnyElement, Context, FontWeight, Hsla, SharedString};
 
-use super::embed::{render_embed, spoiler_urls};
+use super::embed::render_embed;
 use super::messages::{MessageRow, PendingRow, Row, Tag};
 use super::{divider, reply_preview, system_message, welcome};
 use crate::app::Inlet;
@@ -47,6 +47,9 @@ impl Inlet {
         let id = row.id;
         RenderCtx {
             revealed: row.revealed,
+            names: self.mention_names(&row.message, cx),
+            jumbo: !self.chat.view.compact,
+            off_thread: Some(self.markdown_off_thread(cx)),
             on_link: Rc::new({
                 let weak = weak.clone();
                 move |url, masked, _window, cx| {
@@ -86,9 +89,9 @@ impl Inlet {
         let hidden = if row.revealed || m.embeds.is_empty() {
             Vec::new()
         } else if m.truncated {
-            spoiler_urls(&markdown::parse(&m.content))
+            markdown::spoilered_links(&markdown::parse(&m.content))
         } else {
-            spoiler_urls(&m.blocks)
+            markdown::spoilered_links(&m.blocks)
         };
         for (i, e) in m.embeds.iter().enumerate() {
             let id = format!("m{}-e{i}", m.id);
@@ -321,6 +324,9 @@ impl Inlet {
         let weak = cx.entity().downgrade();
         let ctx = RenderCtx {
             revealed: true,
+            names: self.mention_names_in_open_channel(&row.blocks, cx),
+            jumbo: !compact,
+            off_thread: Some(self.markdown_off_thread(cx)),
             on_link: Rc::new(move |url, masked, _window, cx| {
                 let url = url.to_string();
                 let _ = weak.update(cx, |this, cx| this.open_link(&url, masked, cx));

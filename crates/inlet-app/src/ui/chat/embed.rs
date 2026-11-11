@@ -15,7 +15,7 @@ use gpui::{div, prelude::*, px, rgb, AnyElement, Context, FontWeight, Hsla, Shar
 use crate::app::Inlet;
 use crate::model::{self, EmbedField, EmbedKind};
 use crate::theme;
-use crate::ui::markdown::{self, Block, Inline, RenderCtx, Style};
+use crate::ui::markdown::{self, RenderCtx};
 use crate::ui::media::requests;
 
 /// Card width without media (`EMBED_TEXT_OUTER_WIDTH`).
@@ -62,33 +62,6 @@ fn field_rows(fields: &[EmbedField], with_thumbnail: bool) -> Vec<Vec<&EmbedFiel
         }
     }
     rows
-}
-
-/// The URLs of the links a message's text hides in spoilers.
-pub(super) fn spoiler_urls(blocks: &[Block]) -> Vec<String> {
-    fn inline(i: &Inline, out: &mut Vec<String>) {
-        for link in &i.links {
-            let hidden = i.highlights.iter().any(|(r, style)| {
-                *style == Style::Spoiler && r.start <= link.range.start && link.range.end <= r.end
-            });
-            if hidden {
-                out.push(link.url.clone());
-            }
-        }
-    }
-    fn walk(blocks: &[Block], out: &mut Vec<String>) {
-        for b in blocks {
-            match b {
-                Block::Text(i) | Block::Heading(_, i) | Block::Subtext(i) => inline(i, out),
-                Block::Quote(inner) | Block::Alert(_, inner) => walk(inner, out),
-                Block::List(items) => items.iter().for_each(|(_, inner)| walk(inner, out)),
-                Block::Code { .. } => {}
-            }
-        }
-    }
-    let mut out = Vec::new();
-    walk(blocks, &mut out);
-    out
 }
 
 /// Whether an embed belongs to a link hidden in a spoiler: its page or one of its media
@@ -377,7 +350,7 @@ mod tests {
     #[test]
     fn embeds_of_spoilered_links_are_covered() {
         let blocks = markdown::parse("look ||https://x.example/a.png|| and https://open.example/");
-        let hidden = spoiler_urls(&blocks);
+        let hidden = markdown::spoilered_links(&blocks);
         assert_eq!(hidden, vec!["https://x.example/a.png".to_string()]);
         let image = model::Embed {
             kind: EmbedKind::Image,
@@ -399,7 +372,13 @@ mod tests {
         assert!(!embed_spoilered(&image, &[]));
         // Inside a quote too.
         let quoted = markdown::parse("> ||https://x.example/a.png||");
-        assert_eq!(spoiler_urls(&quoted), hidden);
+        assert_eq!(markdown::spoilered_links(&quoted), hidden);
+        // A spoiler around whole blocks hides every link in it.
+        let block = markdown::parse(
+            "||line one
+https://x.example/a.png||",
+        );
+        assert!(markdown::spoilered_links(&block).contains(&hidden[0]));
     }
 
     #[test]

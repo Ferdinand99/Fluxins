@@ -101,8 +101,12 @@ pub fn to_channel(c: &p::Channel) -> Channel {
 }
 
 /// Converts and parses a message. Runs on the backend thread, so markdown parsing never
-/// blocks the UI.
+/// blocks the UI. The text and all embeds share one code highlighting budget.
 pub fn to_message(m: &p::Message, names: &SharedNames) -> Message {
+    crate::ui::markdown::with_message_budget(|| convert_message(m, names))
+}
+
+fn convert_message(m: &p::Message, names: &SharedNames) -> Message {
     let (timestamp_ms, timestamp) = model::timestamp(&m.timestamp);
     let reply = m.extra.get("referenced_message").and_then(to_reply);
     let snapshot = {
@@ -155,12 +159,41 @@ fn to_reply(v: &serde_json::Value) -> Option<Reply> {
     let snippet = if content.trim().is_empty() {
         t!("reply-no-text")
     } else {
-        model::snippet(content, 90)
+        model::snippet(&hide_spoilers(content), 90)
     };
     Some(Reply {
         author: model::clean_name(name),
         snippet,
     })
+}
+
+/// What a spoiler's letters show as in a reply preview.
+const SPOILER_COVER: char = '\u{2588}';
+
+/// The preview above a reply is plain text: spoilers (`||text||`) are covered there,
+/// letter by letter, so their text cannot be read before it is revealed.
+fn hide_spoilers(content: &str) -> String {
+    let mut out = String::with_capacity(content.len());
+    let mut rest = content;
+    while let Some(open) = rest.find("||") {
+        let after = &rest[open + 2..];
+        let Some(close) = after.find("||") else {
+            break;
+        };
+        out.push_str(&rest[..open]);
+        out.extend(after[..close].chars().map(
+            |c| {
+                if c.is_whitespace() {
+                    c
+                } else {
+                    SPOILER_COVER
+                }
+            },
+        ));
+        rest = &after[close + 2..];
+    }
+    out.push_str(rest);
+    out
 }
 
 fn str_at<'a>(v: &'a serde_json::Value, path: &[&str]) -> Option<&'a str> {
@@ -196,7 +229,7 @@ pub fn to_embed(v: &serde_json::Value, names: &Names) -> Option<Embed> {
         title: str_at(v, &["title"]).map(|t| model::snippet(t, 256)),
         url: str_at(v, &["url"]).map(str::to_string),
         description: str_at(v, &["description"])
-            .map(|d| crate::ui::markdown::parse_with(capped(d), names))
+            .map(|d| crate::ui::markdown::parse_embed_with(capped(d), names))
             .unwrap_or_default(),
         fields: Vec::new(),
         footer: str_at(v, &["footer", "text"]).map(|t| model::snippet(t, 256)),
@@ -208,7 +241,7 @@ pub fn to_embed(v: &serde_json::Value, names: &Names) -> Option<Embed> {
                 .map(|n| model::snippet(n, 256))
                 .unwrap_or_default();
             let value = str_at(f, &["value"])
-                .map(|t| crate::ui::markdown::parse_with(capped(t), names))
+                .map(|t| crate::ui::markdown::parse_embed_with(capped(t), names))
                 .unwrap_or_default();
             let inline = f.get("inline").and_then(|i| i.as_bool()).unwrap_or(false);
             embed.fields.push(EmbedField {
@@ -237,7 +270,7 @@ mod tests {
     fn embeds_become_cards() {
         let v = serde_json::json!({
             "title": "Welcome to IWGamin's Pack!",
-            "description": "React in <#100> to unlock the server.",
+            "description": "Ask <@100> to unlock the server.",
             "color": 0xF1C40F,
             "author": {"name": "Sylo"},
             "fields": [{"name": "Rules", "value": "**Be kind**", "inline": false}],
@@ -245,14 +278,14 @@ mod tests {
             "image": {"url": "https://example.com/banner.png"}
         });
         let mut names = Names::default();
-        names.channels.insert("100".into(), "verify".into());
+        names.users.insert("100".into(), "ada".into());
         let e = to_embed(&v, &names).expect("embed");
         assert_eq!(e.title.as_deref(), Some("Welcome to IWGamin's Pack!"));
         assert_eq!(e.color, Some(0xF1C40F));
         assert_eq!(e.fields.len(), 1);
         assert!(e.image.is_some());
         match &e.description[0] {
-            crate::ui::markdown::Block::Text(i) => assert!(i.text.contains("#verify")),
+            crate::ui::markdown::Block::Text(i) => assert!(i.text.contains("@ada")),
             other => panic!("{other:?}"),
         }
         assert!(to_embed(&serde_json::json!({}), &names).is_none());
@@ -281,5 +314,17 @@ mod tests {
         let r = to_reply(&v).unwrap();
         assert_eq!(r.author, "Ferdinand99");
         assert!(r.snippet.starts_with("Hi! I can't see"));
+    }
+
+    #[test]
+    fn reply_preview_covers_spoilers() {
+        let v = serde_json::json!({"author": {"username": "ana"},
+                                   "content": "the end: ||Bruce is dead|| ok ||x"});
+        let r = to_reply(&v).unwrap();
+        assert_eq!(
+            r.snippet,
+            "the end: \u{2588}\u{2588}\u{2588}\u{2588}\u{2588} \u{2588}\u{2588} \u{2588}\u{2588}\u{2588}\u{2588} ok ||x"
+        );
+        assert!(!r.snippet.contains("dead"));
     }
 }
