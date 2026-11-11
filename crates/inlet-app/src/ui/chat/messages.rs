@@ -1232,7 +1232,9 @@ impl Inlet {
         let Some(account) = self.account.clone() else {
             return;
         };
+        let alert = Self::alert_probe(&account, &dispatch, cx);
         let mut changes = account.update(cx, |s, _| s.apply(&dispatch));
+        self.alert_after(self.switcher.active.clone(), alert, &dispatch, &account, cx);
         self.settings_applied(&dispatch, &mut changes, cx);
         self.pickers_on_dispatch(&dispatch, cx);
         self.note_saved(&dispatch);

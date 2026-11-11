@@ -1,0 +1,11 @@
+The sounds in this folder (message.wav) and the script that makes them
+(make_sounds.py) were made for Inlet by its authors. They are synthesised from
+plain sine tones and contain no recording or sample from any other source,
+including Fluxer.
+
+To the extent possible under law, the authors of Inlet have waived all copyright
+and related or neighboring rights to these sounds and this script, under the
+Creative Commons CC0 1.0 Universal Public Domain Dedication:
+https://creativecommons.org/publicdomain/zero/1.0/legalcode
+
+SPDX-License-Identifier: CC0-1.0

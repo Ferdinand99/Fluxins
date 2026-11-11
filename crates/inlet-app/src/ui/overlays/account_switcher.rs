@@ -157,6 +157,7 @@ impl Inlet {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.alerts_note_status(&account, &event, cx);
         if self.switcher.is_active(&account) {
             return self.handle_event(event, window, cx);
         }
@@ -182,14 +183,21 @@ impl Inlet {
                 c.reset = true;
                 c
             }
-            (_, Some(state)) => state.update(cx, |s, _| {
-                let mut c = s.apply(&dispatch);
-                // Nothing on screen: a window the state opened is not kept.
-                if !c.messages.is_empty() {
-                    c.merge(s.drop_message_windows());
-                }
+            (_, Some(state)) => {
+                let state = state.clone();
+                let alert = Self::alert_probe(&state, &dispatch, cx);
+                let c = state.update(cx, |s, _| {
+                    let mut c = s.apply(&dispatch);
+                    // Nothing on screen: a window the state opened is not kept.
+                    if !c.messages.is_empty() {
+                        c.merge(s.drop_message_windows());
+                    }
+                    c
+                });
+                // A mention (or, by its level, any message) notifies from here too.
+                self.alert_after(Some(account.clone()), alert, &dispatch, &state, cx);
                 c
-            }),
+            }
             // Events before READY: nothing to apply them to yet.
             (_, None) => return,
         };
