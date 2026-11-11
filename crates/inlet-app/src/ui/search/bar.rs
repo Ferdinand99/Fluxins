@@ -34,6 +34,8 @@ use crate::ui::HEADER_HEIGHT;
 /// Fluxer's search field in the header.
 pub const FIELD_WIDTH: f32 = 244.;
 pub const FIELD_HEIGHT: f32 = 36.;
+/// The narrowest the header field gets in a narrow chat.
+const FIELD_MIN_WIDTH: f32 = 120.;
 /// Fluxer's results column.
 pub const PANEL_WIDTH: f32 = 420.;
 /// The narrowest the column gets in a small window.
@@ -205,7 +207,10 @@ pub fn header_button(this: &Inlet, cx: &mut Context<Inlet>) -> Option<AnyElement
     Some(
         div()
             .id("header-search")
-            .flex_none()
+            // Fluxer's width; it gives way first when the chat narrows (the search
+            // column open beside it), so the channel's name stays in sight.
+            .flex_shrink(1.)
+            .min_w(px(FIELD_MIN_WIDTH))
             .ml(px(8.))
             .w(px(FIELD_WIDTH))
             .h(px(FIELD_HEIGHT))
