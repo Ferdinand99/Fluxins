@@ -151,6 +151,10 @@ pub struct State {
     /// The last fetch that failed, and why.
     failed: Option<(Key, String)>,
     pub note: Option<NoteEditor>,
+    /// Notes saved here, per person: the text written and the text before it. A
+    /// profile fetched while the save was on its way shows the written text; a failed
+    /// save puts the text before it back. At most [`MAX_CACHED`].
+    written: VecDeque<(UserId, String, String)>,
     /// The window's width at the last frame, to place a popout beside the list.
     pub window_width: f32,
     #[cfg(feature = "demo")]
@@ -181,6 +185,7 @@ impl State {
         self.in_flight = None;
         self.failed = None;
         self.note = None;
+        self.written.clear();
     }
 
     /// Whether `key` must be fetched now: no fresh copy, and not on its way already.
@@ -266,7 +271,13 @@ impl Inlet {
                 }
                 self.profile.in_flight = None;
                 match result {
-                    Ok(profile) => {
+                    Ok(mut profile) => {
+                        // A note saved here wins over the one the answer may still have.
+                        if let Some((_, text, _)) =
+                            self.profile.written.iter().find(|(u, ..)| *u == user)
+                        {
+                            profile.note = text.clone();
+                        }
                         self.profile
                             .cache
                             .insert((user, guild), *profile, Instant::now())
@@ -276,9 +287,15 @@ impl Inlet {
             }
             Ev::NoteFailed { user_id, reason } => {
                 if let Some(user) = UserId::parse(&user_id) {
-                    // The text counts as not saved, so it is sent again on the next try.
-                    if let Some(n) = self.profile.note.as_mut().filter(|n| n.user == user) {
-                        n.saved = String::new();
+                    // The text before the save is the one on the server: the cache shows
+                    // it again, and the field's text counts as not saved (it is sent
+                    // again on the next try).
+                    let at = self.profile.written.iter().position(|(u, ..)| *u == user);
+                    if let Some((_, _, before)) = at.and_then(|i| self.profile.written.remove(i)) {
+                        self.profile.cache.set_note(user, &before);
+                        if let Some(n) = self.profile.note.as_mut().filter(|n| n.user == user) {
+                            n.saved = before;
+                        }
                     }
                 }
                 self.chat.error = Some(t!("profile-note-failed", reason = reason));
@@ -350,8 +367,18 @@ impl Inlet {
         if text.trim() == n.saved.trim() {
             return;
         }
-        n.saved = text.clone();
+        let before = std::mem::replace(&mut n.saved, text.clone());
         let user = n.user;
+        let w = &mut self.profile.written;
+        // The text before the first unsaved write is the one the server has.
+        let before = match w.iter().position(|(u, ..)| *u == user) {
+            Some(i) => w.remove(i).map_or(before, |(_, _, b)| b),
+            None => before,
+        };
+        if w.len() >= MAX_CACHED {
+            w.pop_front();
+        }
+        w.push_back((user, text.clone(), before));
         self.profile.cache.set_note(user, &text);
         self.backend.send(Cmd::SetNote {
             user_id: user.to_string(),

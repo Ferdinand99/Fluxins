@@ -21,6 +21,8 @@ mod row;
 
 mod search;
 
+pub use search::bind_keys;
+
 use std::ops::Range;
 
 use gpui::{
@@ -31,7 +33,7 @@ use inlet_protocol as p;
 use inlet_state::{ChannelId, GuildId};
 
 use crate::app::{Inlet, Screen};
-use crate::backend::social::members::Cmd;
+use crate::backend::social::members::{Cmd, Ev as MembersEv};
 use crate::model::ChannelKind;
 use crate::theme;
 use list::MemberList;
@@ -42,6 +44,38 @@ pub const WIDTH: f32 = 264.;
 pub const ROW_HEIGHT: f32 = 44.;
 /// Height of a group header (12 px above the text, 4 px below).
 pub const HEADER_HEIGHT: f32 = 32.;
+/// Narrowest window that shows the member list (Fluxer's `MEMBER_LIST_FIT_QUERY`,
+/// `(min-width: 1024px)`).
+pub const MIN_WINDOW_WIDTH: f32 = 1024.;
+/// Key of the member list settings in `settings.json`.
+const SETTINGS_KEY: &str = "members";
+
+/// The member list settings kept in `settings.json`: whether it shows (Fluxer's
+/// `MemberList.isMembersOpen`, global and saved).
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct MemberPrefs {
+    pub shown: bool,
+}
+
+impl Default for MemberPrefs {
+    fn default() -> Self {
+        MemberPrefs { shown: true }
+    }
+}
+
+impl MemberPrefs {
+    /// The saved settings; the defaults in tests and demo runs.
+    fn current() -> Self {
+        let demo = cfg!(feature = "demo") && std::env::var_os("INLET_DEMO").is_some();
+        if cfg!(test) || demo {
+            return Self::default();
+        }
+        crate::backend::platform::prefs::settings_path()
+            .map(|p| crate::backend::platform::prefs::load_section(&p, SETTINGS_KEY))
+            .unwrap_or_default()
+    }
+}
 
 /// Icons of this domain (Phosphor, fill).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -88,18 +122,24 @@ pub struct State {
     scroll_hooked: bool,
     /// What was asked last (`None`: nothing yet, ask now).
     sent: Option<Wish>,
+    /// The list was built again and has no rows: the next window asks for all of it.
+    fresh: bool,
+    /// The window's width at the last frame (0 before the first).
+    pub window_width: f32,
     pub search: search::Search,
 }
 
 impl Default for State {
     fn default() -> Self {
         State {
-            hidden: false,
+            hidden: !MemberPrefs::current().shown,
             list: None,
             list_state: ListState::new(0, ListAlignment::Top, px(ROW_HEIGHT * 10.)),
             visible: 0..0,
             scroll_hooked: false,
             sent: None,
+            fresh: false,
+            window_width: 0.,
             search: Default::default(),
         }
     }
@@ -118,12 +158,12 @@ impl State {
     }
 }
 
-/// The members button in the channel header: shows and hides the list.
-// Deviation: Fluxer remembers the choice per channel (and hides the list in voice
-// channels by default); here one choice holds for every channel until Inlet restarts.
+/// The members button in the channel header: shows and hides the list. The choice is
+/// global and saved, as Fluxer's (Fluxer's voice channels keep their own choice;
+/// Inlet shows no member list there).
 pub fn header_button(this: &Inlet, cx: &mut Context<Inlet>) -> Option<AnyElement> {
     this.member_list_channel()?;
-    let shown = !this.members.hidden && this.threads.panel.is_none();
+    let shown = this.member_list_shown().is_some();
     let color = if shown {
         theme::text_strong()
     } else {
@@ -141,6 +181,23 @@ pub fn header_button(this: &Inlet, cx: &mut Context<Inlet>) -> Option<AnyElement
             .child(MemberIcon::Users.el(px(24.), color))
             .on_click(cx.listener(|this, _, _, cx| {
                 this.members.hidden = !this.members.hidden;
+                let prefs = MemberPrefs {
+                    shown: !this.members.hidden,
+                };
+                // Saved off the UI thread; a failed write only loses the choice.
+                cx.background_executor()
+                    .spawn(async move {
+                        if let Some(path) = crate::backend::platform::prefs::settings_path() {
+                            if let Err(e) = crate::backend::platform::prefs::save_section(
+                                &path,
+                                SETTINGS_KEY,
+                                &prefs,
+                            ) {
+                                log::warn!("could not save the member list setting: {e}");
+                            }
+                        }
+                    })
+                    .detach();
                 cx.notify();
             }))
             .into_any_element(),
@@ -163,10 +220,12 @@ impl Inlet {
         Some((guild, ChannelId::parse(id)?))
     }
 
-    /// The member list on screen, if one shows: not hidden, and not giving way to the
-    /// thread panel.
+    /// The member list on screen, if one shows: not hidden, not giving way to the
+    /// thread panel, and the window at least [`MIN_WINDOW_WIDTH`] wide (as Fluxer).
     pub(crate) fn member_list_shown(&self) -> Option<(GuildId, ChannelId)> {
-        if self.members.hidden || self.threads.panel.is_some() {
+        let width = self.members.window_width;
+        let narrow = width > 0. && width < MIN_WINDOW_WIDTH;
+        if self.members.hidden || self.threads.panel.is_some() || narrow {
             return None;
         }
         self.member_list_channel()
@@ -174,7 +233,7 @@ impl Inlet {
 
     /// Whether the account may see the members of a channel. Fails closed: nothing
     /// until the account state has the roles.
-    fn may_list_members(&self, g: GuildId, ch: ChannelId, cx: &App) -> bool {
+    pub(crate) fn may_list_members(&self, g: GuildId, ch: ChannelId, cx: &App) -> bool {
         let Some(account) = &self.account else {
             return false;
         };
@@ -186,7 +245,8 @@ impl Inlet {
 
     /// Once per frame: the list follows the channel on screen, and the backend is
     /// told when the rows to ask for change.
-    pub(crate) fn members_frame(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn members_frame(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.members.window_width = f32::from(window.viewport_size().width);
         let shown = self.member_list_shown();
         let same = match (&self.members.list, shown) {
             (Some(l), Some((g, ch))) => l.guild == g && l.channel == ch,
@@ -197,6 +257,7 @@ impl Inlet {
             self.members.list = shown.map(|(g, ch)| MemberList::new(g, ch));
             self.members.visible = 0..0;
             self.members.search.clear();
+            self.members.fresh = true;
             let n = self.members.list_state.item_count();
             self.members.list_state.splice(0..n, 0);
         }
@@ -217,13 +278,16 @@ impl Inlet {
         if self.members.sent.as_ref() != Some(&wish) {
             match &wish {
                 Some((guild_id, channel_id, ranges)) => {
+                    // Rows of these ranges are taken from now on; rows are dropped only
+                    // when the backend says what it really subscribed to (`Ev::Sent`).
                     if let Some(l) = self.members.list.as_mut() {
-                        l.set_ranges(ranges);
+                        l.extend_ranges(ranges);
                     }
                     self.backend.send(Cmd::Window {
                         guild_id: guild_id.clone(),
                         channel_id: channel_id.clone(),
                         ranges: ranges.clone(),
+                        fresh: std::mem::take(&mut self.members.fresh),
                     });
                 }
                 None => self.backend.send(Cmd::Close),
@@ -276,6 +340,25 @@ impl Inlet {
         }
     }
 
+    /// What the backend subscribed to: the list keeps only those rows.
+    pub(crate) fn on_members_event(&mut self, event: MembersEv, cx: &mut Context<Self>) {
+        match event {
+            MembersEv::Sent {
+                guild_id,
+                channel_id,
+                ranges,
+            } => {
+                let Some(l) = self.members.list.as_mut() else {
+                    return;
+                };
+                if l.guild.to_string() == guild_id && l.channel.to_string() == channel_id {
+                    l.set_ranges(&ranges);
+                    cx.notify();
+                }
+            }
+        }
+    }
+
     fn hook_member_scroll(&mut self, cx: &mut Context<Self>) {
         if self.members.scroll_hooked {
             return;
@@ -298,9 +381,19 @@ impl Inlet {
 
     /// The member list column, when one shows.
     pub(crate) fn render_member_list(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let (g, _) = self.member_list_shown()?;
+        let (g, ch) = self.member_list_shown()?;
         self.hook_member_scroll(cx);
-        let body = if self.members.search.active() {
+        let allowed = self.may_list_members(g, ch, cx);
+        let body = if !allowed {
+            // As Fluxer's `MemberListUnavailableFallback` (`permission_denied`).
+            div()
+                .px(px(8.))
+                .py(px(16.))
+                .text_size(px(14.))
+                .text_color(theme::text_tertiary())
+                .child(t!("members-no-permission"))
+                .into_any_element()
+        } else if self.members.search.active() {
             self.render_member_search_results(g, cx)
         } else {
             list_view(
@@ -321,7 +414,7 @@ impl Inlet {
                 .flex()
                 .flex_col()
                 .bg(theme::bg_chat())
-                .child(self.render_member_search(cx))
+                .children(allowed.then(|| self.render_member_search(cx)))
                 .child(
                     div()
                         .flex_1()

@@ -38,9 +38,15 @@ impl Inlet {
         let mine = self.account.as_ref().map(|a| a.read(cx).me_id()) == Some(f.user);
         let mut tabs = vec![(Tab::About, t!("profile-tab-about"))];
         if !mine {
-            let (g, fr) = profile
-                .as_ref()
-                .map_or((0, 0), |p| (p.mutual_guilds.len(), p.mutual_friends.len()));
+            let (g, fr) = profile.as_ref().map_or((0, 0), |p| {
+                // Only the guilds the account knows are listed, so only they count.
+                let known = p
+                    .mutual_guilds
+                    .iter()
+                    .filter(|(id, _)| self.guilds.iter().any(|g| &g.id == id))
+                    .count();
+                (known, p.mutual_friends.len())
+            });
             tabs.push((Tab::Guilds, t!("profile-tab-guilds", count = g)));
             tabs.push((Tab::Friends, t!("profile-tab-friends", count = fr)));
         }

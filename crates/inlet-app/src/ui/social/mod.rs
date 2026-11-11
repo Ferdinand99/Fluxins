@@ -56,6 +56,7 @@ impl Inlet {
             backend::social::Ev::Presence(PresenceEv::Saved(settings)) => {
                 self.status_saved(&settings, cx)
             }
+            backend::social::Ev::Members(ev) => self.on_members_event(ev, cx),
             backend::social::Ev::Profile(ev) => self.on_profile_event(ev, cx),
         }
     }

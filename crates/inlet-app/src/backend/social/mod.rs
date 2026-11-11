@@ -25,6 +25,8 @@ pub enum Cmd {
 pub enum Ev {
     /// Presence and status (see [`presence`]).
     Presence(presence::Ev),
+    /// What the member list subscribed to (see [`members`]).
+    Members(members::Ev),
     /// Profiles and notes (see [`profile`]).
     Profile(profile::Ev),
 }

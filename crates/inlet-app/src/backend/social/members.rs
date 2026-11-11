@@ -24,7 +24,7 @@ use inlet_protocol as p;
 use tokio::task::AbortHandle;
 use tokio::time::Instant;
 
-use crate::backend::{Active, Backend};
+use crate::backend::{Active, Backend, Ui};
 
 /// Shortest time between two member list subscriptions (op 14 is coalesced over
 /// 300 ms).
@@ -36,11 +36,14 @@ pub const SEARCH_LIMIT: u8 = 25;
 #[derive(Clone, Debug, PartialEq)]
 pub enum Cmd {
     /// Show these rows of `channel_id`'s member list (`ranges` inclusive, each at
-    /// most 100 rows). Replaces the list shown before.
+    /// most 100 rows). Replaces the list shown before. `fresh`: the UI has no rows of
+    /// this list (it was just built again), so the server must send every range, not
+    /// only the ones it did not have.
     Window {
         guild_id: String,
         channel_id: String,
         ranges: Vec<[u32; 2]>,
+        fresh: bool,
     },
     /// No member list on screen any more.
     Close,
@@ -53,6 +56,18 @@ pub enum Cmd {
     },
 }
 
+/// Member list events.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Ev {
+    /// The gateway was told to subscribe to these ranges of the list: the server
+    /// has them now, and the UI keeps only their rows.
+    Sent {
+        guild_id: String,
+        channel_id: String,
+        ranges: Vec<[u32; 2]>,
+    },
+}
+
 /// One subscription on one gateway.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Sub<G> {
@@ -60,6 +75,8 @@ pub struct Sub<G> {
     pub guild: String,
     pub channel: String,
     pub ranges: Vec<[u32; 2]>,
+    /// The UI has no rows of the list: send every range again.
+    pub fresh: bool,
 }
 
 /// What to send.
@@ -74,7 +91,6 @@ pub enum Op<G> {
 }
 
 /// The coalescing of member list wishes, without a clock of its own.
-#[derive(Debug)]
 pub struct Pacer<G> {
     /// What the gateway was last told.
     sent: Option<Sub<G>>,
@@ -97,9 +113,14 @@ impl<G> Default for Pacer<G> {
 }
 
 impl<G: Clone> Pacer<G> {
-    /// A new wish: it replaces any wish not sent yet. Returns when it may go out
-    /// (`now` or later).
-    pub fn want(&mut self, wish: Option<Sub<G>>, now: Instant) -> Instant {
+    /// A new wish: it replaces any wish not sent yet (a wish for a fresh list stays
+    /// fresh until it is sent). Returns when it may go out (`now` or later).
+    pub fn want(&mut self, mut wish: Option<Sub<G>>, now: Instant) -> Instant {
+        if let (Some(Some(before)), Some(new)) = (&self.wanted, wish.as_mut()) {
+            if before.fresh && before.guild == new.guild && before.channel == new.channel {
+                new.fresh = true;
+            }
+        }
         self.wanted = Some(wish);
         match self.last_sent {
             Some(at) if at + COALESCE > now => at + COALESCE,
@@ -108,6 +129,10 @@ impl<G: Clone> Pacer<G> {
     }
 
     /// The ops for the newest wish when its time has come (nothing before).
+    ///
+    /// Fluxer keeps one list per guild and, when the ranges change, syncs only the
+    /// ranges it did not have. So another guild's list is dropped first, and a fresh
+    /// list of the same channel is dropped and subscribed again, so every range comes.
     pub fn flush(&mut self, now: Instant) -> Vec<Op<G>> {
         if self.last_sent.is_some_and(|at| at + COALESCE > now) {
             return Vec::new();
@@ -118,7 +143,8 @@ impl<G: Clone> Pacer<G> {
         let mut ops = Vec::new();
         match (self.sent.take(), wish) {
             (Some(old), Some(new)) => {
-                if old.guild != new.guild {
+                let same_list = old.guild == new.guild && old.channel == new.channel;
+                if old.guild != new.guild || (new.fresh && same_list) {
                     ops.push(unsubscribe(old));
                 }
                 ops.push(Op::Subscribe(new.clone()));
@@ -153,27 +179,46 @@ fn unsubscribe<G>(s: Sub<G>) -> Op<G> {
     }
 }
 
+/// An account's gateway, and its event sender to tell the UI what was sent.
+#[derive(Clone)]
+pub struct Link {
+    gateway: p::GatewayHandle,
+    events: Ui,
+}
+
 /// The member list part of the backend.
 #[derive(Default)]
 pub struct State {
-    pacer: Arc<Mutex<Pacer<p::GatewayHandle>>>,
+    pacer: Arc<Mutex<Pacer<Link>>>,
     timer: Option<AbortHandle>,
 }
 
 /// Sends the ops. Called with the pacer locked: gateway commands only go into the
-/// gateway's queue (they never wait), and the lock keeps sends in pacer order.
-fn run(ops: Vec<Op<p::GatewayHandle>>) {
+/// gateway's queue (they never wait), and the lock keeps sends in pacer order. Every
+/// subscription is reported to the UI before the server can answer it.
+fn run(ops: Vec<Op<Link>>) {
     for op in ops {
         match op {
             Op::Subscribe(s) => {
-                s.gateway
-                    .subscribe_member_list(&s.guild, &s.channel, &s.ranges);
+                if s.gateway
+                    .gateway
+                    .subscribe_member_list(&s.guild, &s.channel, &s.ranges)
+                {
+                    let _ = s
+                        .gateway
+                        .events
+                        .unbounded_send(super::Ev::Members(Ev::Sent {
+                            guild_id: s.guild,
+                            channel_id: s.channel,
+                            ranges: s.ranges,
+                        }));
+                }
             }
             Op::Unsubscribe {
                 gateway,
                 guild,
                 channel,
-            } => gateway.unsubscribe_member_list(&guild, &channel),
+            } => gateway.gateway.unsubscribe_member_list(&guild, &channel),
         }
     }
 }
@@ -228,11 +273,16 @@ pub(super) fn handle(backend: &mut Backend, cmd: Cmd) {
             guild_id,
             channel_id,
             ranges,
+            fresh,
         } => Some(Sub {
-            gateway,
+            gateway: Link {
+                gateway,
+                events: backend.events.clone(),
+            },
             guild: guild_id,
             channel: channel_id,
             ranges,
+            fresh,
         }),
         Cmd::Close => None,
     };
@@ -271,7 +321,47 @@ mod tests {
             guild: guild.into(),
             channel: channel.into(),
             ranges: vec![[0, 99], [page * 100, page * 100 + 99]],
+            fresh: false,
         })
+    }
+
+    fn fresh(s: Option<Sub<u8>>) -> Option<Sub<u8>> {
+        s.map(|s| Sub { fresh: true, ..s })
+    }
+
+    /// The list hidden and shown again within 300 ms is built empty. Fluxer would
+    /// send nothing for ranges it already has, so the list is dropped and subscribed
+    /// again, and every range comes. A list scrolled as usual is never dropped.
+    #[test]
+    fn a_list_built_again_is_subscribed_from_scratch() {
+        let mut p = Pacer::<u8>::default();
+        let t0 = Instant::now();
+        p.want(sub("1", "2", 5), t0);
+        assert_eq!(p.flush(t0).len(), 1);
+        // Hidden, then shown again (fresh) before 300 ms have passed.
+        let t1 = t0 + Duration::from_millis(50);
+        p.want(None, t1);
+        p.want(fresh(sub("1", "2", 0)), t1 + Duration::from_millis(50));
+        // A scroll right after keeps the wish fresh.
+        let due = p.want(sub("1", "2", 0), t1 + Duration::from_millis(100));
+        assert_eq!(
+            p.flush(due),
+            vec![
+                Op::Unsubscribe {
+                    gateway: 1,
+                    guild: "1".into(),
+                    channel: "2".into()
+                },
+                Op::Subscribe(fresh(sub("1", "2", 0)).unwrap()),
+            ]
+        );
+        // From then on, windows are plain subscriptions.
+        let due = p.want(sub("1", "2", 1), due);
+        assert_eq!(p.flush(due), vec![Op::Subscribe(sub("1", "2", 1).unwrap())]);
+        // A fresh list in another channel of the guild needs no unsubscribe (the
+        // server replaces the guild's list and syncs it whole).
+        let due = p.want(fresh(sub("1", "3", 0)), due);
+        assert_eq!(p.flush(due).len(), 1);
     }
 
     /// Scrolling through a long list for two seconds (a new window every frame) sends

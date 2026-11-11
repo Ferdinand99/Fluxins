@@ -13,8 +13,12 @@ use inlet::layout_probe::{selector, Probe, CHANNEL_ROW_RADIUS};
 const WINDOW: (f32, f32) = (1280., 860.);
 
 fn open(cx: &mut TestAppContext) -> &mut VisualTestContext {
+    open_at(cx, WINDOW)
+}
+
+fn open_at(cx: &mut TestAppContext, window: (f32, f32)) -> &mut VisualTestContext {
     let (_probe, cx) = cx.add_window_view(Probe::new);
-    cx.simulate_resize(size(px(WINDOW.0), px(WINDOW.1)));
+    cx.simulate_resize(size(px(window.0), px(window.1)));
     cx.run_until_parked();
     // Drawn twice: some views size themselves from the previous frame's bounds.
     cx.update(|window, _| window.refresh());
@@ -140,5 +144,16 @@ fn member_list_is_264(cx: &mut TestAppContext) {
         list.origin.x + list.size.width,
         WINDOW.0,
         "member list right edge",
+    );
+}
+
+/// Fluxer shows the member list only in windows at least 1024 px wide
+/// (`MEMBER_LIST_FIT_QUERY`); a narrower window gives the chat the room.
+#[gpui::test]
+fn member_list_hides_below_1024(cx: &mut TestAppContext) {
+    let cx = open_at(cx, (1000., WINDOW.1));
+    assert!(
+        cx.debug_bounds(selector::MEMBER_LIST).is_none(),
+        "no member list in a 1000 px window"
     );
 }

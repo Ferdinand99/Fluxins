@@ -9,7 +9,9 @@
 
 use std::time::{Duration, Instant};
 
-use gpui::{div, prelude::*, px, AnyElement, Context, Entity, FontWeight, Task};
+use gpui::{
+    actions, div, prelude::*, px, AnyElement, App, Context, Entity, FontWeight, KeyBinding, Task,
+};
 use inlet_protocol as p;
 use inlet_state::GuildId;
 
@@ -19,6 +21,20 @@ use crate::app::Inlet;
 use crate::backend::social::members::Cmd;
 use crate::text_input::TextInput;
 use crate::theme;
+
+actions!(inlet_member_search, [ClearMemberSearch]);
+
+/// The key context of the search field.
+pub const KEY_CONTEXT: &str = "inlet_member_search";
+
+/// Escape empties the search field.
+pub fn bind_keys(cx: &mut App) {
+    cx.bind_keys([KeyBinding::new(
+        "escape",
+        ClearMemberSearch,
+        Some(KEY_CONTEXT),
+    )]);
+}
 
 /// Pause in typing before the server is asked.
 pub const PAUSE: Duration = Duration::from_millis(400);
@@ -127,7 +143,11 @@ impl Inlet {
         if q.is_empty() || !paused || s.asked.as_ref().is_some_and(|(a, _)| *a == q) {
             return;
         }
-        let Some((guild, _)) = self.member_list_shown() else {
+        // Without the right to see the channel's members, no search goes out.
+        let Some((guild, _)) = self
+            .member_list_shown()
+            .filter(|(g, ch)| self.may_list_members(*g, *ch, cx))
+        else {
             return;
         };
         let s = &mut self.members.search;
@@ -158,6 +178,16 @@ impl Inlet {
             .px(px(8.))
             .pt(px(8.))
             .pb(px(4.))
+            // Escape in the field empties it; it never reaches the window (where it
+            // would mark the channel read).
+            .key_context(KEY_CONTEXT)
+            .on_action(cx.listener(|this, _: &ClearMemberSearch, window, cx| {
+                if let Some(input) = this.members.search.input.clone() {
+                    input.update(cx, |i, cx| i.clear(cx));
+                }
+                let _ = window;
+                cx.notify();
+            }))
             .child(
                 div().relative().flex().items_center().child(input).child(
                     div()

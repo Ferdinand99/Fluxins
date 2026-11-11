@@ -7,8 +7,8 @@
 use std::rc::Rc;
 
 use gpui::{
-    anchored, deferred, div, point, prelude::*, px, Anchor, AnyElement, App, Context, FontWeight,
-    Hsla, MouseDownEvent, SharedString,
+    anchored, div, point, prelude::*, px, Anchor, AnyElement, App, Context, FontWeight, Hsla,
+    MouseDownEvent, SharedString,
 };
 use inlet_state::UserId;
 
@@ -97,7 +97,7 @@ impl Inlet {
         };
         if state.me_id() == user {
             // The account itself: the status this session shows.
-            return (self.shown_status(cx), None);
+            return (self.shown_status(cx), self.own_custom_text(cx));
         }
         let presence = state.presences().get(user);
         let status = normalize_status(presence.map_or("", |p| p.status.as_str()));
@@ -426,15 +426,15 @@ impl Inlet {
                 Anchor::TopRight,
             ),
         };
-        deferred(
-            anchored()
-                .position(at)
-                .anchor(corner)
-                .snap_to_window_with_margin(px(8.))
-                .child(card),
-        )
-        .with_priority(1)
-        .into_any_element()
+        // Not deferred: the overlays are drawn in layer order (`render_overlays`), so a
+        // layer over this one (the link confirmation, the link prompt, the status
+        // picker) covers it and takes the clicks.
+        anchored()
+            .position(at)
+            .anchor(corner)
+            .snap_to_window_with_margin(px(8.))
+            .child(card)
+            .into_any_element()
     }
 
     /// When the account was made, and when it joined the guild ("1 Jan 2026").

@@ -956,6 +956,8 @@ impl Inlet {
     /// behind it, and gives it back to the composer when the last layer closes. Called
     /// when the window is drawn.
     pub(crate) fn focus_layer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let top = self.open_layers().topmost();
+        let same_top = std::mem::replace(&mut self.overlays.last_top, top) == top;
         if self.layer_open() {
             let handle = self
                 .overlays
@@ -964,10 +966,14 @@ impl Inlet {
                 .clone();
             // One rule for fields in layers: a field inside the topmost layer (the
             // status picker's custom status, the note in a profile) may keep the
-            // keyboard, because only the topmost layer carries this focus handle.
-            // Anything else gives it back to the layer; a layer that opens over
-            // another takes the handle, so a field under it loses the keyboard at once.
-            if !handle.contains_focused(window, cx) {
+            // keyboard. `contains_focused` reads the last frame's element tree, where
+            // the handle was on the layer that was topmost then; so a field keeps the
+            // keyboard only while the same layer stays topmost. A layer that opens
+            // over another takes the keyboard in that frame, and a field under it can
+            // never keep it.
+            let keeps =
+                handle.is_focused(window) || (same_top && handle.contains_focused(window, cx));
+            if !keeps {
                 if !self.overlays.layer_had_focus {
                     // Where the keyboard was, to give it back when the layers close.
                     self.overlays.focus_before = window.focused(cx);

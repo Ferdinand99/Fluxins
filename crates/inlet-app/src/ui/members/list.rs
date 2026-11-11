@@ -26,6 +26,8 @@ pub const MAX_RANGES: usize = 3;
 /// Rows above and below the screen that count as visible, so the next page is asked
 /// for a little before it scrolls in.
 pub const BUFFER_ROWS: u32 = 20;
+/// Ranges whose rows are kept while subscriptions are on their way.
+const MAX_KEPT_RANGES: usize = 10;
 /// Groups kept from one update (hoisted roles plus online and offline).
 const MAX_GROUPS: usize = 256;
 /// Roles kept per member (for the name colour and the profile).
@@ -194,7 +196,29 @@ impl MemberList {
         false
     }
 
-    /// New subscribed ranges: rows outside them are dropped.
+    /// Ranges the UI asked for and the backend may send soon: their rows are taken
+    /// from now on, and nothing is dropped. Rows are dropped only when the backend
+    /// says what it really subscribed to ([`MemberList::set_ranges`]): Fluxer syncs
+    /// only the ranges it did not have, so a page dropped here for a wish that was
+    /// never sent would not come back.
+    pub fn extend_ranges(&mut self, ranges: &[[u32; 2]]) {
+        for r in ranges {
+            if !self.ranges.contains(r) {
+                self.ranges.push(*r);
+            }
+        }
+        // Bounded: the newest ranges stay (at most 10, as a subscription may have).
+        if self.ranges.len() > MAX_KEPT_RANGES {
+            let cut = self.ranges.len() - MAX_KEPT_RANGES;
+            self.ranges.drain(..cut);
+            let keep = self.ranges.clone();
+            self.rows
+                .retain(|ix, _| keep.iter().any(|[s, e]| s <= ix && ix <= e));
+        }
+    }
+
+    /// The ranges the server has now (what the backend last subscribed to): rows
+    /// outside them are dropped.
     pub fn set_ranges(&mut self, ranges: &[[u32; 2]]) {
         self.ranges = ranges.to_vec();
         let keep: Vec<[u32; 2]> = self.ranges.clone();
@@ -375,6 +399,66 @@ mod tests {
             GuildId::parse("100").unwrap(),
             ChannelId::parse("200").unwrap(),
         )
+    }
+
+    /// A SYNC of whole pages: row `i` is member `i + 1` (row 0 the group header).
+    fn sync_pages(pages: &[u32]) -> p::GuildMemberListUpdate {
+        let ops: Vec<Value> = pages
+            .iter()
+            .map(|p| {
+                let (s, e) = (p * PAGE, p * PAGE + PAGE - 1);
+                let items: Vec<Value> = (s..=e)
+                    .map(|i| {
+                        if i == 0 {
+                            json!({"group": {"id": "online", "count": 399}})
+                        } else {
+                            member(u64::from(i) + 1, &format!("m{i}"), "online")
+                        }
+                    })
+                    .collect();
+                json!({"op": "SYNC", "range": [s, e], "items": items})
+            })
+            .collect();
+        update(json!(ops), json!([{"id": "online", "count": 399}]))
+    }
+
+    fn loaded(l: &MemberList, page: u32) -> bool {
+        (page * PAGE..page * PAGE + PAGE).all(|i| l.row(i).is_some())
+    }
+
+    /// Fluxer syncs only the ranges it did not have. A page the UI stopped wanting
+    /// for a moment (a wish the backend never sent, 300 ms coalescing) keeps its rows,
+    /// so when the person scrolls back over a page edge nothing stays a placeholder.
+    #[test]
+    fn rows_stay_until_the_backend_really_unsubscribes_them() {
+        let mut l = list();
+        // Sent {0, 2}; the server synced both pages.
+        l.set_ranges(&[[0, 99], [200, 299]]);
+        assert!(l.apply(&sync_pages(&[0, 2])));
+        assert!(loaded(&l, 0) && loaded(&l, 2));
+        // Within 300 ms: {0, 2, 3}, then {0, 3} (page 2 off the screen), then {0, 2, 3}
+        // again (scrolled back up over the edge). Only the last one is sent.
+        let b = [[0, 99], [200, 299], [300, 399]];
+        l.extend_ranges(&b);
+        l.extend_ranges(&[[0, 99], [300, 399]]);
+        l.extend_ranges(&b);
+        assert!(loaded(&l, 2), "page 2 is not dropped for a wish never sent");
+        l.set_ranges(&b);
+        // The server had {0, 2}: it syncs only page 3.
+        assert!(l.apply(&sync_pages(&[3])));
+        for page in 0..4 {
+            if page != 1 {
+                assert!(loaded(&l, page), "page {page}");
+            }
+        }
+        // When the backend really sends {0, 3}, page 2 goes (the server dropped it).
+        l.set_ranges(&[[0, 99], [300, 399]]);
+        assert!(!loaded(&l, 2) && loaded(&l, 3));
+        // Many wishes before a send keep at most 10 ranges.
+        for p in 4..20 {
+            l.extend_ranges(&[[p * PAGE, p * PAGE + PAGE - 1]]);
+        }
+        assert!(l.ranges.len() <= MAX_KEPT_RANGES);
     }
 
     fn names(l: &MemberList) -> Vec<(u32, String)> {

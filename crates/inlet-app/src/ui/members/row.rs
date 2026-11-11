@@ -90,6 +90,14 @@ impl Inlet {
             .unwrap_or(fallback)
     }
 
+    /// The custom status the account shows (not expired), cleaned.
+    pub(crate) fn own_custom_text(&self, cx: &App) -> Option<String> {
+        let state = self.account.as_ref()?.read(cx);
+        let now = chrono::Utc::now().timestamp_millis();
+        let text = state.presences().own().custom_at(now)?.text.as_deref()?;
+        crate::model::clean_text(text).map(|t| t.chars().take(128).collect())
+    }
+
     /// The colour of a member's highest role that has one.
     pub(crate) fn role_color(&self, guild: GuildId, roles: &[RoleId], cx: &App) -> Option<Hsla> {
         let state = self.account.as_ref()?.read(cx);
@@ -123,6 +131,13 @@ impl Inlet {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let status = self.member_status(m.user_id, m.status, cx);
+        // The account itself shows the custom status it chose here.
+        let mine = self.account.as_ref().map(|a| a.read(cx).me_id()) == Some(m.user_id);
+        let custom = if mine {
+            self.own_custom_text(cx)
+        } else {
+            m.custom_status.clone()
+        };
         let offline = status == "offline";
         let open = self.profile.shows(m.user_id);
         let name_color = self
@@ -159,7 +174,7 @@ impl Inlet {
             .flex()
             .flex_col()
             .child(name_line)
-            .children(m.custom_status.clone().map(|s| {
+            .children(custom.map(|s| {
                 div()
                     .min_w_0()
                     .truncate()

@@ -3,7 +3,7 @@
 //! layer like the popout: Escape or a click outside closes it.
 
 use gpui::{
-    anchored, deferred, div, point, prelude::*, px, AnyElement, ClipboardItem, Context, FontWeight,
+    anchored, div, point, prelude::*, px, AnyElement, ClipboardItem, Context, FontWeight,
     MouseDownEvent, Pixels, Point, SharedString,
 };
 use inlet_state::{GuildId, UserId};
@@ -125,13 +125,13 @@ impl Inlet {
         } else {
             card.into_any_element()
         };
-        deferred(
-            anchored()
-                .position(m.at)
-                .snap_to_window_with_margin(px(8.))
-                .child(card),
-        )
-        .with_priority(2)
-        .into_any_element()
+        // Not deferred: the overlays are drawn in layer order (`render_overlays`), so a
+        // layer over this one (the link confirmation, the link prompt, the status
+        // picker) covers it and takes the clicks.
+        anchored()
+            .position(m.at)
+            .snap_to_window_with_margin(px(8.))
+            .child(card)
+            .into_any_element()
     }
 }

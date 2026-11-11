@@ -164,7 +164,7 @@ impl Profile {
             bio: if bio.trim().is_empty() {
                 Vec::new()
             } else {
-                markdown::parse_embed_with(&bio, &model::Names::default())
+                markdown::parse_bio_with(&bio, &model::Names::default())
             },
             created_ms: p::models::snowflake_timestamp_ms(&user.id).map(|t| t as i64),
             joined_ms: member
@@ -376,6 +376,34 @@ fn reason(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_bio_follows_fluxers_restricted_bio_rules() {
+        let full: p::FullUserProfile = serde_json::from_value(json!({
+            "user": {"id": "175928847299117063", "username": "ada"},
+            "user_profile": {"bio": "# Big\n```rust\nfn x() {}\n```\n-# small\n@everyone and <@&7>\n> [!NOTE]\n> alert\n**bold** ||secret||"}
+        }))
+        .unwrap();
+        let bio = Profile::of(&full, None, None).bio;
+        assert!(!bio.is_empty());
+        for b in &bio {
+            assert!(
+                !matches!(
+                    b,
+                    Block::Heading(..)
+                        | Block::Code(_)
+                        | Block::Subtext(_)
+                        | Block::Alert(..)
+                        | Block::Table(_)
+                ),
+                "{b:?}"
+            );
+        }
+        let text = format!("{bio:?}");
+        assert!(!text.contains("Mention"), "{text}");
+        // What a bio may have stays: bold and spoilers.
+        assert!(text.contains("Bold") && text.contains("Spoiler"), "{text}");
+    }
 
     #[test]
     fn the_guild_profile_wins_and_texts_are_cleaned() {

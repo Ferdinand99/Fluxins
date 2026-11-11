@@ -30,6 +30,8 @@ pub struct OverlayState {
     pub layer_had_focus: bool,
     /// What had the focus before the first layer took it.
     pub focus_before: Option<FocusHandle>,
+    /// The topmost layer at the last frame (see `desktop::focus_layer`).
+    pub last_top: Option<crate::desktop::Layer>,
 }
 
 impl Inlet {
