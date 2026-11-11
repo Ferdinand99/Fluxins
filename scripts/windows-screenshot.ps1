@@ -22,11 +22,20 @@ function Save-Screen([string]$Name) {
     Write-Host "saved $path ($($bounds.Width)x$($bounds.Height))"
 }
 
-function Run-Demo([string]$Name, [hashtable]$Env, [int]$Seconds) {
+function Run-Demo([string]$Name, [hashtable]$Env, [int]$Seconds, [int]$CpuSeconds = 0) {
     foreach ($k in $Env.Keys) { Set-Item -Path "Env:$k" -Value $Env[$k] }
     $log = Join-Path $OutDir "$Name.log"
     $p = Start-Process -FilePath $Exe -PassThru -RedirectStandardError $log
     Start-Sleep -Seconds $Seconds
+    # What the app costs while it shows the scene: CPU time over a few seconds, as a
+    # share of one core.
+    if ($CpuSeconds -gt 0 -and -not $p.HasExited) {
+        $p.Refresh(); $cpu0 = $p.TotalProcessorTime; $t0 = Get-Date
+        Start-Sleep -Seconds $CpuSeconds
+        $p.Refresh(); $cpu1 = $p.TotalProcessorTime; $t1 = Get-Date
+        $share = ($cpu1 - $cpu0).TotalMilliseconds / ($t1 - $t0).TotalMilliseconds * 100
+        Write-Host ("cpu {0}: {1:N1} % of one core over {2} s" -f $Name, $share, $CpuSeconds)
+    }
     if ($p.HasExited) {
         Write-Host "inlet.exe exited early with code $($p.ExitCode)"
         Get-Content $log | Select-Object -Last 40
@@ -76,6 +85,12 @@ Run-Demo "15-embed-all-types" @{ INLET_DEMO = "1"; INLET_DEMO_LIVE_SECS = "3600"
 Run-Demo "16-image-viewer" @{ INLET_DEMO = "1"; INLET_DEMO_LIVE_SECS = "3600"; INLET_DEMO_SCENE = "image-viewer"; INLET_DEMO_GUILD = "g1"; INLET_DEMO_CHANNEL = "c-attachments" } 10
 # A prompt over a chat full of Twemoji: the dimmed backdrop must cover the emoji too.
 Run-Demo "17-overlay-over-emoji" @{ INLET_DEMO = "1"; INLET_DEMO_LIVE_SECS = "3600"; INLET_DEMO_SCENE = "markdown-inline"; INLET_DEMO_GUILD = "g1"; INLET_DEMO_CHANNEL = "c-dev"; INLET_DEMO_DEEP_LINK = "inlet://invite/abc123" } 10
+# Custom emoji (still, animated, large) and stickers in every format; then 100 animated
+# custom emoji at once, with the CPU they cost (at most 32 move).
+Run-Demo "18-custom-emoji" @{ INLET_DEMO = "1"; INLET_DEMO_LIVE_SECS = "3600"; INLET_DEMO_SCENE = "custom-emoji"; INLET_DEMO_GUILD = "g1"; INLET_DEMO_CHANNEL = "c-dev" } 10
+Run-Demo "19-emoji-100" @{ INLET_DEMO = "1"; INLET_DEMO_LIVE_SECS = "3600"; INLET_DEMO_SCENE = "emoji-100"; INLET_DEMO_GUILD = "g1"; INLET_DEMO_CHANNEL = "c-dev" } 10 10
+# The same with animated emoji switched off: every emoji shows its first frame.
+Run-Demo "20-emoji-100-still" @{ INLET_DEMO = "1"; INLET_DEMO_LIVE_SECS = "3600"; INLET_DEMO_SCENE = "emoji-100"; INLET_DEMO_GUILD = "g1"; INLET_DEMO_CHANNEL = "c-dev"; INLET_DEMO_ANIMATE_EMOJI = "0" } 10 10
 
 # A demo that quit before its screenshot crashed: fail the job, the pictures are not
 # worth checking.

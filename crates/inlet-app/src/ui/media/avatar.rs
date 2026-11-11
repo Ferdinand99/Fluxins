@@ -5,6 +5,7 @@
 
 use gpui::{div, img, prelude::*, px, AnyElement, App, Context, FontWeight, Img, ObjectFit};
 
+use super::animation_budget::{animated, Motion};
 use super::image::Shown;
 use super::requests;
 use crate::app::Inlet;
@@ -45,6 +46,14 @@ impl Inlet {
             },
         };
         match shown {
+            Shown::Ready(image) if image.frame_count() > 1 => animated(
+                image,
+                (size, size),
+                size / 2.,
+                ObjectFit::Cover,
+                Motion::Avatar,
+                self.media.images.animations().clone(),
+            ),
             Shown::Ready(image) => img(image)
                 .size(px(size))
                 .flex_none()
@@ -100,6 +109,7 @@ impl Inlet {
             (width, BANNER_HEIGHT),
             0.,
             ObjectFit::Cover,
+            &self.media.images.animator(Motion::Gif),
         ))
     }
 

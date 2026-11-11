@@ -18,6 +18,10 @@
 //! - `image-viewer`: `attachments` with the image viewer open on the newest photo.
 //! - `markdown-inline`, `markdown-blocks`, `markdown-alerts`, `markdown-code`: for
 //!   `#development`, every kind of markdown node (see `markdown.rs`).
+//! - `custom-emoji`: for `#development`, still and animated custom emoji (inline, in a
+//!   quote, large) and stickers in PNG, APNG, GIF, WebP and animated WebP.
+//! - `emoji-100`: for `#development`, 100 different animated custom emoji at once (see
+//!   `emoji.rs`).
 
 use std::collections::HashMap;
 
@@ -25,7 +29,7 @@ use inlet_protocol as p;
 use serde_json::{json, Value};
 
 use super::{
-    guilds, markdown, media, messages, snowflake, social, unread, user, user_id, ME,
+    emoji, guilds, markdown, media, messages, snowflake, social, unread, user, user_id, ME,
     ROLE_CONTRIBUTORS, ROLE_MODERATORS,
 };
 use crate::backend::messages::Pending;
@@ -46,6 +50,8 @@ pub enum Scene {
     MarkdownBlocks,
     MarkdownAlerts,
     MarkdownCode,
+    CustomEmoji,
+    Emoji100,
 }
 
 impl Scene {
@@ -63,6 +69,8 @@ impl Scene {
             "markdown-blocks" => Scene::MarkdownBlocks,
             "markdown-alerts" => Scene::MarkdownAlerts,
             "markdown-code" => Scene::MarkdownCode,
+            "custom-emoji" => Scene::CustomEmoji,
+            "emoji-100" => Scene::Emoji100,
             _ => return None,
         })
     }
@@ -215,6 +223,12 @@ pub fn data(scene: Scene) -> Data {
         Scene::MarkdownCode => {
             by_name.insert(markdown::SCENE_CHANNEL.into(), markdown::code());
         }
+        Scene::CustomEmoji => {
+            by_name.insert(markdown::SCENE_CHANNEL.into(), emoji::custom());
+        }
+        Scene::Emoji100 => {
+            by_name.insert(markdown::SCENE_CHANNEL.into(), emoji::hundred());
+        }
         _ => {}
     }
 
@@ -320,6 +334,8 @@ mod tests {
             "markdown-blocks",
             "markdown-alerts",
             "markdown-code",
+            "custom-emoji",
+            "emoji-100",
         ] {
             let scene = Scene::from_name(name).expect(name);
             let data = data(scene);

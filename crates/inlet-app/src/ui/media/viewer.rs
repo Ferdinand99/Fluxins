@@ -12,6 +12,7 @@ use gpui::{div, prelude::*, px, AnyElement, ClipboardItem, Context, FontWeight, 
 use inlet_media::MediaRequest;
 use url::Url;
 
+use super::animation_budget::Motion;
 use super::attachment::icon_button;
 use super::image::picture_of;
 use super::{requests, MediaIcon};
@@ -126,7 +127,13 @@ impl Inlet {
         let zoom = viewer.zoom.unwrap_or_else(|| viewer.fit_zoom(viewport));
         let shown = (viewer.size.0 * zoom, viewer.size.1 * zoom);
         let image = self.moving(viewer.moving.as_ref(), viewer.request.as_ref(), cx);
-        let picture = picture_of(image, shown, 0., ObjectFit::Contain);
+        let picture = picture_of(
+            image,
+            shown,
+            0.,
+            ObjectFit::Contain,
+            &self.media.images.animator(Motion::Gif),
+        );
         let image = div()
             .id("viewer-image")
             .max_w(px((viewport.0 - 2. * MARGIN).max(64.)))

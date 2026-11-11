@@ -110,6 +110,8 @@ impl Inlet {
                 let at_bottom = this.chat.message_list.is_following_tail();
                 this.read_if_watched(true, at_bottom, cx);
             }
+            // Animations stop without the focus and go on with it: draw once now.
+            cx.notify();
         }));
 
         let (backend, _) = Self::spawn_backend(0, true, window, cx);
@@ -133,7 +135,7 @@ impl Inlet {
             chat: ui::chat::ChatState::new(),
             composer,
             overlays: Default::default(),
-            media: Default::default(),
+            media: ui::media::State::with_settings(),
             members: Default::default(),
             profile: Default::default(),
             social: Default::default(),

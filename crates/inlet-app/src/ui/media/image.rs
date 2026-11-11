@@ -8,27 +8,24 @@
 //!
 //! **Animations** keep every frame decoded, so they are counted. Each is capped by
 //! the client (`ANIMATION_MAX_BYTES`, see `backend::media`), and the animations one
-//! frame draws share [`ANIMATION_BUDGET_BYTES`]. One that is too large, failed, or
-//! does not fit the budget shows its still (the first frame) instead ([`Inlet::moving`]).
-//! Only animations on screen are drawn, so only they play.
+//! frame draws share one budget ([`AnimationBudget`]). One that is too large, failed,
+//! or does not fit the budget shows its still (the first frame) instead
+//! ([`Inlet::moving`]). Only animations on screen are drawn, so only they play; how
+//! many move and when they stop is in `animation_budget.rs`.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Instant;
 
 use gpui::{div, img, prelude::*, px, AnyElement, Context, ObjectFit, RenderImage, Task};
 use inlet_media::{MediaError, MediaRequest};
 
+use super::animation_budget::{animated, AnimationBudget, Motion};
 use super::MediaIcon;
 use crate::app::Inlet;
 use crate::theme;
-
-/// Decoded bytes the animations drawn in one frame may hold together (the GPU copies
-/// of the frames they have shown come on top).
-pub const ANIMATION_BUDGET_BYTES: u64 = 32 * 1024 * 1024;
-/// Animations whose decoded size is remembered, so one over the budget is not loaded
-/// again every frame.
-const MAX_KNOWN_ANIMATIONS: usize = 512;
 
 /// The decoded bytes of a gpui image (all its frames).
 pub(crate) fn decoded_bytes(image: &RenderImage) -> u64 {
@@ -37,58 +34,11 @@ pub(crate) fn decoded_bytes(image: &RenderImage) -> u64 {
         .sum()
 }
 
-/// The animations of one frame against [`ANIMATION_BUDGET_BYTES`].
-#[derive(Default)]
-pub struct AnimationBudget {
-    budget: u64,
-    used: u64,
-    /// Decoded sizes of animations seen, by request.
-    known: HashMap<MediaRequest, u64>,
-}
-
-impl AnimationBudget {
-    pub fn new(budget: u64) -> Self {
-        Self {
-            budget,
-            ..Self::default()
-        }
-    }
-
-    /// A new frame: nothing plays yet.
-    pub fn next_frame(&mut self) {
-        self.used = 0;
-    }
-
-    /// Whether an animation of `bytes` still fits this frame.
-    pub fn fits(&self, bytes: u64) -> bool {
-        self.used.saturating_add(bytes) <= self.budget
-    }
-
-    /// Counts a playing animation of `bytes` if it fits; `false` when it does not.
-    pub fn admit(&mut self, bytes: u64) -> bool {
-        if !self.fits(bytes) {
-            return false;
-        }
-        self.used = self.used.saturating_add(bytes);
-        true
-    }
-
-    /// Bytes of the animations playing this frame.
-    #[cfg(test)]
-    pub fn used(&self) -> u64 {
-        self.used
-    }
-
-    fn known(&self, req: &MediaRequest) -> Option<u64> {
-        self.known.get(req).copied()
-    }
-
-    fn remember(&mut self, req: &MediaRequest, bytes: u64) {
-        if self.known.len() >= MAX_KNOWN_ANIMATIONS && !self.known.contains_key(req) {
-            self.known.clear();
-        }
-        self.known.insert(req.clone(), bytes);
-    }
+/// How an animated image is drawn: its kind (for the settings) and the shared budget.
+#[derive(Clone)]
+pub(crate) struct Animator {
+    pub motion: Motion,
+    pub budget: Rc<RefCell<AnimationBudget>>,
 }
 
 /// What a view can draw for an image this frame.
@@ -116,7 +66,8 @@ struct Entry {
 pub struct Images {
     entries: RefCell<HashMap<MediaRequest, Entry>>,
     frame: Cell<u64>,
-    animations: RefCell<AnimationBudget>,
+    /// The one animation budget, shared with the elements that draw animations.
+    animations: Rc<RefCell<AnimationBudget>>,
 }
 
 impl Default for Images {
@@ -124,17 +75,20 @@ impl Default for Images {
         Self {
             entries: RefCell::default(),
             frame: Cell::default(),
-            animations: RefCell::new(AnimationBudget::new(ANIMATION_BUDGET_BYTES)),
+            animations: Rc::new(RefCell::new(AnimationBudget::default())),
         }
     }
 }
 
 impl Images {
-    /// Starts a frame: lets go of every image the previous frame did not draw.
-    pub fn next_frame(&self) {
+    /// Starts a frame: lets go of every image the previous frame did not draw. `active`
+    /// is whether the window has the focus (animations stop without it).
+    pub fn next_frame(&self, active: bool) {
         let frame = self.frame.get() + 1;
         self.frame.set(frame);
-        self.animations.borrow_mut().next_frame();
+        self.animations
+            .borrow_mut()
+            .next_frame(active, Instant::now());
         self.entries
             .borrow_mut()
             .retain(|_, e| e.used.saturating_add(1) >= frame);
@@ -142,6 +96,19 @@ impl Images {
 
     pub fn clear(&self) {
         self.entries.borrow_mut().clear();
+    }
+
+    /// How animations of `motion` are drawn this frame.
+    pub(crate) fn animator(&self, motion: Motion) -> Animator {
+        Animator {
+            motion,
+            budget: self.animations.clone(),
+        }
+    }
+
+    /// The shared animation budget (its settings, its counters).
+    pub(crate) fn animations(&self) -> &Rc<RefCell<AnimationBudget>> {
+        &self.animations
     }
 
     /// Lets go of one image now.
@@ -291,14 +258,19 @@ impl Inlet {
     }
 }
 
-/// Draws what [`Inlet::image`] gave.
+/// Draws what [`Inlet::image`] gave. An animation moves under the rules of `anim`'s
+/// budget (gpui's own `img` would only ever show its first frame here).
 pub(crate) fn picture_of(
     shown: Shown,
     (w, h): (f32, f32),
     radius: f32,
     fit: ObjectFit,
+    anim: &Animator,
 ) -> AnyElement {
     match shown {
+        Shown::Ready(image) if image.frame_count() > 1 => {
+            animated(image, (w, h), radius, fit, anim.motion, anim.budget.clone())
+        }
         Shown::Ready(image) => img(image)
             .w(px(w))
             .h(px(h))
@@ -340,33 +312,6 @@ mod tests {
     }
 
     #[test]
-    fn animations_share_one_budget_per_frame() {
-        const MIB: u64 = 1024 * 1024;
-        let mut budget = AnimationBudget::new(ANIMATION_BUDGET_BYTES);
-        // A capped animation (24 MiB) plays; a second one that does not fit shows its
-        // still; small ones fill what is left.
-        assert!(budget.admit(24 * MIB));
-        assert!(!budget.admit(24 * MIB));
-        assert!(budget.admit(6 * MIB));
-        assert!(budget.admit(2 * MIB));
-        assert!(!budget.admit(1));
-        assert!(budget.used() <= ANIMATION_BUDGET_BYTES);
-        // Many on screen: never more than the budget plays.
-        let mut budget = AnimationBudget::new(ANIMATION_BUDGET_BYTES);
-        let playing = (0..100).filter(|_| budget.admit(3 * MIB)).count();
-        assert_eq!(playing, 10);
-        assert!(budget.used() <= ANIMATION_BUDGET_BYTES);
-        // A new frame starts empty; sizes seen stay known, bounded.
-        budget.next_frame();
-        assert_eq!(budget.used(), 0);
-        for n in 0..(MAX_KNOWN_ANIMATIONS as u32 + 10) {
-            budget.remember(&req(n), 1);
-        }
-        assert!(budget.known.len() <= MAX_KNOWN_ANIMATIONS);
-        assert_eq!(budget.known(&req(MAX_KNOWN_ANIMATIONS as u32 + 9)), Some(1));
-    }
-
-    #[test]
     fn images_not_drawn_last_frame_are_let_go() {
         let images = Images::default();
         let limits = inlet_media::KindLimits::for_kind(MediaKind::Avatar);
@@ -378,20 +323,20 @@ mod tests {
         )
         .unwrap();
         let image = Arc::new(RenderImage::new(decoded.into_gpui_frames()));
-        images.next_frame();
+        images.next_frame(true);
         images.insert_ready(req(1), image.clone());
         images.insert_ready(req(2), image.clone());
         assert_eq!(Arc::strong_count(&image), 3);
         // Frame 2 draws only the first; both survive into it.
-        images.next_frame();
+        images.next_frame(true);
         images.touch(&req(1));
         assert_eq!(images.len(), 2);
         // Frame 3: the second was not drawn in frame 2 and goes.
-        images.next_frame();
+        images.next_frame(true);
         assert_eq!(images.len(), 1);
         assert_eq!(Arc::strong_count(&image), 2);
         // Nothing drawn for a frame: everything goes.
-        images.next_frame();
+        images.next_frame(true);
         assert_eq!(images.len(), 0);
         assert_eq!(Arc::strong_count(&image), 1);
     }

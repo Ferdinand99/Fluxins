@@ -12,6 +12,7 @@
 //! picks what to show.
 
 pub mod composer;
+mod emoji;
 mod guilds;
 mod markdown;
 pub mod media;

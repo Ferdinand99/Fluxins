@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! The desktop settings, kept under `"desktop"` in `settings.json` in Inlet's config
 //! folder: closing to the tray, starting hidden, the zoom level and where the window
-//! was. Other keys of the file are kept as they are, so other settings can live there
-//! too. Whether Inlet starts at login is not stored here: the operating system's own
-//! login item is the truth (`inlet_platform::autostart`).
+//! was. Other keys of the file are kept as they are, so other settings live there too
+//! ([`load_section`], [`save_section`]; the media settings under `"media"`). Whether
+//! Inlet starts at login is not stored here: the operating system's own login item is
+//! the truth (`inlet_platform::autostart`).
 
 use std::path::{Path, PathBuf};
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use super::window_state::WindowMemory;
@@ -77,33 +79,43 @@ pub fn settings_path() -> Option<PathBuf> {
 
 /// Reads the desktop settings from `path`; defaults for a missing or broken file.
 pub fn load(path: &Path) -> DesktopPrefs {
+    load_section::<DesktopPrefs>(path, "desktop").checked()
+}
+
+/// Writes the desktop settings into `path`, keeping the file's other keys.
+pub fn save(path: &Path, prefs: &DesktopPrefs) -> std::io::Result<()> {
+    save_section(path, "desktop", prefs)
+}
+
+/// Reads the settings under `key` from `path`; defaults for a missing or broken file
+/// or section.
+pub fn load_section<T: DeserializeOwned + Default>(path: &Path, key: &str) -> T {
     let Ok(text) = std::fs::read_to_string(path) else {
-        return DesktopPrefs::default();
+        return T::default();
     };
     let value: serde_json::Value = match serde_json::from_str(&text) {
         Ok(value) => value,
         Err(err) => {
             log::warn!("settings.json could not be read, using defaults: {err}");
-            return DesktopPrefs::default();
+            return T::default();
         }
     };
     value
-        .get("desktop")
+        .get(key)
         .cloned()
-        .and_then(|d| serde_json::from_value::<DesktopPrefs>(d).ok())
+        .and_then(|d| serde_json::from_value::<T>(d).ok())
         .unwrap_or_default()
-        .checked()
 }
 
-/// Writes the desktop settings into `path`, keeping the file's other keys, through a
+/// Writes `value` under `key` into `path`, keeping the file's other keys, through a
 /// temporary file so a crash never leaves half a file.
-pub fn save(path: &Path, prefs: &DesktopPrefs) -> std::io::Result<()> {
+pub fn save_section<T: Serialize>(path: &Path, key: &str, value: &T) -> std::io::Result<()> {
     let mut root = std::fs::read_to_string(path)
         .ok()
         .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
         .filter(|v| v.is_object())
         .unwrap_or_else(|| serde_json::json!({}));
-    root["desktop"] = serde_json::to_value(prefs).map_err(std::io::Error::other)?;
+    root[key] = serde_json::to_value(value).map_err(std::io::Error::other)?;
     let text = serde_json::to_string_pretty(&root).map_err(std::io::Error::other)?;
     let dir = path
         .parent()

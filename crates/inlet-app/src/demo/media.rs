@@ -220,6 +220,8 @@ fn serve(path: &str, query: &str) -> Option<Vec<u8>> {
             "sky" => png_of(800, 450, bands(800, 450, [60, 120, 230], [220, 240, 255])),
             _ => return None,
         },
+        "emojis" => super::emoji::emoji_picture(stem, animated)?,
+        "stickers" => super::emoji::sticker_picture(stem, animated)?,
         _ => return None,
     })
 }

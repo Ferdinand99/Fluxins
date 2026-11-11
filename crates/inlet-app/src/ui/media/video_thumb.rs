@@ -8,6 +8,7 @@
 
 use gpui::{div, prelude::*, px, AnyElement, Context, FontWeight, ObjectFit, SharedString};
 
+use super::animation_budget::Motion;
 use super::image::{picture_of, Shown};
 use super::{duration, requests, MediaIcon};
 use crate::app::Inlet;
@@ -144,7 +145,13 @@ impl Inlet {
             }
             None => Shown::Unavailable,
         };
-        let still = picture_of(shown, shown_size, 4., ObjectFit::Cover);
+        let still = picture_of(
+            shown,
+            shown_size,
+            4.,
+            ObjectFit::Cover,
+            &self.media.images.animator(Motion::Gif),
+        );
         let link = link.or_else(|| (!video.url.is_empty()).then(|| video.url.clone()));
         with_play(format!("evid-{key}"), still, None)
             .on_click(cx.listener(move |this, _, _, cx| {
