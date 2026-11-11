@@ -23,8 +23,10 @@ pub struct OverlayState {
     pub link_channel: Option<String>,
     /// The keyboard focus of the topmost layer over the chat (link prompt, settings).
     pub layer_focus: Option<FocusHandle>,
-    /// Whether a layer took the focus, so it goes back to the composer on close.
+    /// Whether a layer took the focus, so it is given back when the layers close.
     pub layer_had_focus: bool,
+    /// What had the focus before the first layer took it.
+    pub focus_before: Option<FocusHandle>,
 }
 
 impl Inlet {

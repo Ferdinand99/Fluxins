@@ -105,6 +105,11 @@ impl Inlet {
                     )
                     .child(cancel(t!("common-cancel")));
             }
+            Prompt::Unavailable => {
+                children.push(title(t!("link-prompt-unavailable-title")));
+                children.push(text(t!("link-prompt-unavailable-body")));
+                buttons = buttons.child(cancel(t!("link-prompt-dismiss")));
+            }
             Prompt::SignInFirst => {
                 children.push(title(t!("link-prompt-sign-in-title")));
                 children.push(text(t!("link-prompt-sign-in-body")));

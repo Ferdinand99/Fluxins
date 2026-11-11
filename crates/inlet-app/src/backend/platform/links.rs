@@ -81,6 +81,8 @@ pub enum Prompt {
     },
     /// Not signed in: there is nowhere to open a link yet.
     SignInFirst,
+    /// Inlet could not connect (its backend stopped); the link was not opened.
+    Unavailable,
 }
 
 /// What [`decide`] needs to know about the signed-in account.
@@ -180,6 +182,8 @@ pub enum Session {
     Connecting,
     /// Nobody is signed in.
     SignedOut,
+    /// The backend stopped; the session will not become ready.
+    Failed,
 }
 
 /// How long a link waits for the session before it is dropped.
@@ -192,6 +196,8 @@ pub enum Next {
     Ask(Incoming),
     /// Nobody is signed in: say so.
     SignInFirst,
+    /// The session failed: the link was dropped, say so.
+    Unavailable,
 }
 
 /// A link that came before the session was ready (Inlet started by the link, or a
@@ -222,6 +228,10 @@ impl LinkQueue {
             Session::SignedOut => {
                 self.waiting = None;
                 Some(Next::SignInFirst)
+            }
+            Session::Failed => {
+                self.waiting = None;
+                Some(Next::Unavailable)
             }
             Session::Connecting => None,
         }

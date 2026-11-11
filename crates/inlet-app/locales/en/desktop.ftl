@@ -21,6 +21,8 @@ link-prompt-invite-title = Open this invite?
 link-prompt-invite-other = This invite is on { $host }, a server Inlet is not signed in to.
 link-prompt-invite-body = The invite opens in your browser, on { $host }. Joining is a separate step there.
 link-prompt-invite-open = Open invite
+link-prompt-unavailable-title = Link not opened
+link-prompt-unavailable-body = Inlet could not connect, so the link was not opened. Restart Inlet, then open the link again.
 link-prompt-sign-in-title = Sign in first
 link-prompt-sign-in-body = A link was opened with Inlet. Sign in, then open the link again.
 

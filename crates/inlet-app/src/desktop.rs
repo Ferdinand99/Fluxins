@@ -866,6 +866,10 @@ impl Inlet {
                 self.overlays.link_prompt = Some(Prompt::SignInFirst);
                 cx.notify();
             }
+            Next::Unavailable => {
+                self.overlays.link_prompt = Some(Prompt::Unavailable);
+                cx.notify();
+            }
         }
     }
 
@@ -885,13 +889,29 @@ impl Inlet {
                 .get_or_insert_with(|| cx.focus_handle())
                 .clone();
             if !handle.is_focused(window) {
-                self.overlays.layer_had_focus = true;
+                if !self.overlays.layer_had_focus {
+                    // Where the keyboard was, to give it back when the layers close.
+                    self.overlays.focus_before = window.focused(cx);
+                    self.overlays.layer_had_focus = true;
+                }
                 cx.defer_in(window, move |_, window, cx| handle.focus(window, cx));
             }
         } else if self.overlays.layer_had_focus {
             self.overlays.layer_had_focus = false;
-            let composer = self.composer.view.focus_handle(cx);
-            cx.defer_in(window, move |_, window, cx| composer.focus(window, cx));
+            // Back where it was; if nothing had the keyboard, the field of the screen
+            // that is up: the sign-in field, or the composer in the chat.
+            let target = self
+                .overlays
+                .focus_before
+                .take()
+                .or_else(|| match self.screen {
+                    Screen::SignIn => Some(self.sign_in.instance_input.focus_handle(cx)),
+                    Screen::Main => Some(self.composer.view.focus_handle(cx)),
+                    _ => None,
+                });
+            if let Some(target) = target {
+                cx.defer_in(window, move |_, window, cx| target.focus(window, cx));
+            }
         }
     }
 
@@ -965,12 +985,13 @@ impl Inlet {
 fn session_of(screen: &Screen, has_account: bool) -> Session {
     match screen {
         Screen::Main if has_account => Session::Ready,
-        Screen::Main
-        | Screen::Starting { .. }
-        | Screen::Finishing
-        | Screen::Offline { .. }
-        | Screen::Fatal => Session::Connecting,
+        Screen::Main | Screen::Starting { .. } | Screen::Finishing | Screen::Offline { .. } => {
+            Session::Connecting
+        }
         Screen::SignIn | Screen::Confirm { .. } => Session::SignedOut,
+        // The backend stopped: nothing will become ready; a waiting link is dropped
+        // with a notice.
+        Screen::Fatal => Session::Failed,
     }
 }
 
@@ -1036,6 +1057,18 @@ mod tests {
             Some(Next::Ask(link))
         );
         assert_eq!(session_of(&Screen::SignIn, false), Session::SignedOut);
+        // The backend stopped: the link is dropped with a notice, not kept waiting.
+        let mut queue = LinkQueue::default();
+        queue.offer(
+            Incoming::Deep(start_link()),
+            session_of(&starting, false),
+            now,
+        );
+        assert_eq!(
+            queue.poll(session_of(&Screen::Fatal, false), now),
+            Some(Next::Unavailable)
+        );
+        assert_eq!(queue.poll(session_of(&Screen::Main, true), now), None);
     }
 
     fn start_link() -> DeepLink {
