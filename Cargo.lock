@@ -3025,6 +3025,7 @@ dependencies = [
  "image",
  "inlet-editor",
  "inlet-emoji",
+ "inlet-platform",
  "inlet-protocol",
  "inlet-state",
  "keyring",
