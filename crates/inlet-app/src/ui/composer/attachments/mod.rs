@@ -611,9 +611,14 @@ impl ComposerView {
                 .border_color(theme::ring())
                 .flex()
                 .flex_col()
+                // The tiles scroll sideways; they never widen the composer.
+                .min_w_0()
+                .overflow_hidden()
                 .child(
                     div()
                         .id("composer-attachments")
+                        .w_full()
+                        .min_w_0()
                         .overflow_x_scroll()
                         .flex()
                         .flex_row()
