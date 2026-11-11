@@ -48,6 +48,9 @@
 //! - `picker-emoji`, `picker-gif`: for `#general`, the composer's picker open on the
 //!   emoji tab (favourites, frequently used, the guild's custom emoji) or the GIF tab
 //!   (the featured search terms; see `pickers.rs`).
+//! - `media-errors`: the DM with Ada holds GIFs that cannot be shown (a proxy that does
+//!   not answer, a file that does not decode, a host Inlet does not load from), each as
+//!   a tile with its reason, and a GIF page that only has a video (see `media.rs`).
 //! - `members`, `profile-popout`: for `#general`, the member list with its groups,
 //!   statuses, custom statuses, the owner's crown and offline members (see
 //!   `members.rs`); or with the profile popout of a moderator open beside it.
@@ -55,9 +58,6 @@
 //!   the guild (see `search.rs`).
 //! - `quick-switcher`: for `#general`, the quick switcher open over the accounts of
 //!   `accounts` (their channels with mentions and unread messages).
-//! - `media-errors`: the DM with Ada holds GIFs that cannot be shown (a proxy that does
-//!   not answer, a file that does not decode, a host Inlet does not load from), each as
-//!   a tile with its reason, and a GIF page that only has a video (see `media.rs`).
 //!
 //! `INLET_DEMO_SCENE` may also name a scene file of the visual checks
 //! (`tests/visual/scenes/*.toml`, see `scene_file.rs`): it then sets the scene, the guild,
@@ -115,11 +115,11 @@ pub enum Scene {
     DmBlocked,
     PickerEmoji,
     PickerGif,
+    MediaErrors,
     Members,
     ProfilePopout,
     SearchResults,
     QuickSwitcher,
-    MediaErrors,
 }
 
 impl Scene {
@@ -159,11 +159,11 @@ impl Scene {
             "dm-blocked" => Scene::DmBlocked,
             "picker-emoji" => Scene::PickerEmoji,
             "picker-gif" => Scene::PickerGif,
+            "media-errors" => Scene::MediaErrors,
             "members" => Scene::Members,
             "profile-popout" => Scene::ProfilePopout,
             "search-results" => Scene::SearchResults,
             "quick-switcher" => Scene::QuickSwitcher,
-            "media-errors" => Scene::MediaErrors,
             _ => return None,
         })
     }
@@ -571,11 +571,11 @@ mod tests {
             "dm-blocked",
             "picker-emoji",
             "picker-gif",
+            "media-errors",
             "members",
             "profile-popout",
             "search-results",
             "quick-switcher",
-            "media-errors",
         ] {
             let scene = Scene::from_name(name).expect(name);
             let data = data(scene);
