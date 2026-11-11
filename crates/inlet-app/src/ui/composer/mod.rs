@@ -42,6 +42,8 @@ pub struct ComposerState {
     pub shared: Rc<RefCell<Shared>>,
     /// The signed-in account's ID, once the backend has told.
     pub user_id: Option<String>,
+    /// The account's upload limits, for the thread panel's composer too.
+    pub upload_limits: crate::backend::composer::Limits,
     session_asked: bool,
     /// Tags each request for the account ID; answers with an older tag are dropped, so
     /// a slow answer for an account that signed out cannot pick the drafts file.
@@ -70,6 +72,7 @@ impl ComposerState {
             view,
             shared,
             user_id: None,
+            upload_limits: Default::default(),
             session_asked: false,
             session_token: 0,
         }
@@ -287,6 +290,10 @@ impl Inlet {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // The thread panel's composer takes its share first.
+        let Some(event) = self.panel_composer_event(event, window, cx) else {
+            return;
+        };
         let view = self.composer.view.clone();
         match event {
             Ev::Session {
@@ -303,10 +310,15 @@ impl Inlet {
                 let file = dirs::data_local_dir()
                     .and_then(|dir| drafts::path_for(&dir, &self.instance, &user_id));
                 self.composer.user_id = Some(user_id);
+                self.composer.upload_limits = uploads;
                 view.update(cx, |v, cx| {
                     v.set_session(max_message_length, file, window, cx);
                     v.set_upload_limits(uploads);
                 });
+                self.panel_session(max_message_length, window, cx);
+                if let Some(panel) = self.threads.composer.clone() {
+                    panel.update(cx, |v, _| v.set_upload_limits(uploads));
+                }
             }
             Ev::SlowmodeWait { channel_id, secs } => {
                 view.update(cx, |v, cx| v.on_slowmode_wait(&channel_id, secs, cx))

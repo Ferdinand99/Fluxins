@@ -11,6 +11,7 @@ impl Render for Inlet {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.media_frame(window, cx);
         self.take_channel_jump(window, cx);
+        self.threads_frame(window, cx);
         self.focus_layer(window, cx);
         self.focus_message_overlay(window, cx);
         let root = div()
@@ -85,6 +86,6 @@ impl Inlet {
                     )
                     .child(self.render_user_panel(cx)),
             )
-            .child(self.render_chat(cx))
+            .child(self.render_center(cx))
     }
 }

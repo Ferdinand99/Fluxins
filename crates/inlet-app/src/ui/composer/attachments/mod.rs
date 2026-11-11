@@ -6,7 +6,7 @@
 //! Nothing is attached without the person: a file comes only from the dialog, a drop
 //! or a paste. Names are cleaned with the protocol's `safe_filename` when a file is
 //! attached. A pasted image stays in memory (at most [`MAX_PASTED_BYTES`] for all
-//! channels together) and is never written to disk. Files from disk are only looked at
+//! channels and every composer together) and is never written to disk. Files from disk are only looked at
 //! (size, and the bytes of a preview) until they are sent.
 //!
 //! Previews are decoded through `inlet-media`'s checks (encoded size, declared size and
@@ -29,7 +29,7 @@
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
@@ -343,6 +343,42 @@ pub fn decode_preview(source: &Source) -> Option<DecodedImage> {
     inspected.decode(PREVIEW_FIT, &limits, &control).ok()
 }
 
+/// Pasted bytes in every composer's tray together.
+static PASTED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+fn pasted_in<'a>(staged: impl IntoIterator<Item = &'a Staged>) -> u64 {
+    staged
+        .into_iter()
+        .filter_map(|s| match &s.file.source {
+            Source::Memory(b) => Some(b.len() as u64),
+            Source::Path(_) => None,
+        })
+        .sum()
+}
+
+/// Files leave a tray: their pasted bytes no longer count.
+fn release(staged: &[Staged]) {
+    forget_pasted(pasted_in(staged));
+}
+
+fn forget_pasted(n: u64) {
+    let mut now = PASTED_TOTAL.load(Ordering::SeqCst);
+    while let Err(seen) = PASTED_TOTAL.compare_exchange(
+        now,
+        now.saturating_sub(n),
+        Ordering::SeqCst,
+        Ordering::SeqCst,
+    ) {
+        now = seen;
+    }
+}
+
+impl Drop for Attachments {
+    fn drop(&mut self) {
+        forget_pasted(self.pasted_bytes());
+    }
+}
+
 impl Attachments {
     /// The files attached in `channel`.
     pub fn staged(&self, channel: &str) -> &[Staged] {
@@ -350,14 +386,7 @@ impl Attachments {
     }
 
     fn pasted_bytes(&self) -> u64 {
-        self.by_channel
-            .values()
-            .flatten()
-            .filter_map(|s| match &s.file.source {
-                Source::Memory(b) => Some(b.len() as u64),
-                Source::Path(_) => None,
-            })
-            .sum()
+        pasted_in(self.by_channel.values().flatten())
     }
 
     /// Adds files to `channel` if all of them fit the limits together with those there;
@@ -375,11 +404,14 @@ impl Attachments {
             .filter(|f| matches!(f.source, Source::Memory(_)))
             .map(|f| f.size)
             .sum();
-        if self.pasted_bytes().saturating_add(pasted) > MAX_PASTED_BYTES {
+        // One ceiling for every composer (the chat's and the thread panel's).
+        let all = PASTED_TOTAL.load(Ordering::SeqCst);
+        if all.saturating_add(pasted) > MAX_PASTED_BYTES {
             return Err(Refused::Total {
                 max: MAX_PASTED_BYTES,
             });
         }
+        PASTED_TOTAL.fetch_add(pasted, Ordering::SeqCst);
         let list = self.by_channel.entry(channel.to_owned()).or_default();
         let mut keys = Vec::with_capacity(files.len());
         for file in files {
@@ -410,6 +442,7 @@ impl Attachments {
         if list.is_empty() {
             self.by_channel.remove(channel);
         }
+        release(std::slice::from_ref(&staged));
         Some(staged)
     }
 
@@ -418,7 +451,9 @@ impl Attachments {
         if self.alt.as_ref().is_some_and(|a| a.channel == channel) {
             self.alt = None;
         }
-        self.by_channel.remove(channel).unwrap_or_default()
+        let taken = self.by_channel.remove(channel).unwrap_or_default();
+        release(&taken);
+        taken
     }
 
     /// Drops everything (sign-out).
@@ -426,7 +461,9 @@ impl Attachments {
         self.epoch += 1;
         self.alt = None;
         self.in_flight.clear();
-        self.by_channel.drain().flat_map(|(_, v)| v).collect()
+        let all: Vec<Staged> = self.by_channel.drain().flat_map(|(_, v)| v).collect();
+        release(&all);
+        all
     }
 
     /// The first file of `channel` that must not be sent as it is: its metadata

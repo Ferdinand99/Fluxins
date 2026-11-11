@@ -1274,6 +1274,7 @@ impl Backend {
             task.abort();
         }
         self.older = Default::default();
+        self.threads.stop();
     }
 
     /// Stops an account's gateway and its tasks.

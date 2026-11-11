@@ -36,6 +36,16 @@ impl Inlet {
             return div().into_any_element();
         };
         let compact = self.chat.view.compact;
+        self.render_row_of(row, compact, cx)
+    }
+
+    /// One row of a message list (the chat, or the thread panel's list).
+    pub(crate) fn render_row_of(
+        &mut self,
+        row: Row,
+        compact: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         match row {
             Row::Welcome(w) => welcome::render(&w),
             Row::Day { day, new } => divider::render_day(day, new),
@@ -144,6 +154,13 @@ impl Inlet {
         row: &MessageRow,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
+        // Deviation: the actions (reply, edit, the menu) act on the chat's channel and
+        // composer, so rows of the thread panel show none yet.
+        if self.open_channel_id().map(|c| c.to_string()).as_deref()
+            != Some(row.message.channel_id.as_str())
+        {
+            return None;
+        }
         self.render_action_bar(row, cx)
     }
 

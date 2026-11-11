@@ -10,7 +10,7 @@ use crate::ui::sidebar::channel_list::channel_icon;
 use crate::ui::HEADER_HEIGHT;
 
 impl Inlet {
-    pub(super) fn render_chat_header(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn render_chat_header(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let open = self
             .selected_channel
             .as_ref()
