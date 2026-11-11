@@ -24,6 +24,7 @@ mod messages;
 pub mod scene_file;
 pub mod scenes;
 mod social;
+pub mod threads;
 mod unread;
 
 use std::collections::HashMap;

@@ -133,10 +133,17 @@ cpu_scene() {
 cpu_scene 28-custom-emoji custom-emoji
 cpu_scene 29-emoji-100 emoji-100
 
-# 9. The scene files of the visual checks. Xvfb's pointer cannot be moved and sits in
-#    the middle of the screen; the demo puts a scene's window in the top left corner,
-#    and the screen is more than twice its size, so the pointer is never over it (no
-#    hover states). The app reads each file itself.
+# 9. Threads: the side panel with its own composer, the thread list, a forum and a
+#    media channel.
+scene 30-thread-panel thread-panel c-general
+scene 31-thread-list thread-list c-general
+scene 32-forum forum c-forum
+scene 33-media-channel media-channel c-gallery
+
+# 10. The scene files of the visual checks. Xvfb's pointer cannot be moved and sits in
+#     the middle of the screen; the demo puts a scene's window in the top left corner,
+#     and the screen is more than twice its size, so the pointer is never over it (no
+#     hover states). The app reads each file itself.
 mkdir -p "$out/visual"
 Xvfb :98 -screen 0 2600x1800x24 -dpi 96 >/dev/null 2>&1 &
 xvfb_scenes=$!

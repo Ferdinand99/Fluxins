@@ -155,6 +155,12 @@ Run-Demo "28-emoji-100" @{ INLET_DEMO = "1"; INLET_DEMO_LIVE_SECS = "3600"; INLE
 # The same with animated emoji switched off: every emoji shows its first frame.
 Run-Demo "29-emoji-100-still" @{ INLET_DEMO = "1"; INLET_DEMO_LIVE_SECS = "3600"; INLET_DEMO_SCENE = "emoji-100"; INLET_DEMO_GUILD = "g1"; INLET_DEMO_CHANNEL = "c-dev"; INLET_DEMO_ANIMATE_EMOJI = "0" } 10 10
 
+# Threads: the side panel with its own composer, the thread list, a forum and a media channel.
+Run-Demo "30-thread-panel" @{ INLET_DEMO = "1"; INLET_DEMO_LIVE_SECS = "3600"; INLET_DEMO_SCENE = "thread-panel"; INLET_DEMO_GUILD = "g1"; INLET_DEMO_CHANNEL = "c-general" } 10
+Run-Demo "31-thread-list" @{ INLET_DEMO = "1"; INLET_DEMO_LIVE_SECS = "3600"; INLET_DEMO_SCENE = "thread-list"; INLET_DEMO_GUILD = "g1"; INLET_DEMO_CHANNEL = "c-general" } 10
+Run-Demo "32-forum" @{ INLET_DEMO = "1"; INLET_DEMO_LIVE_SECS = "3600"; INLET_DEMO_SCENE = "forum"; INLET_DEMO_GUILD = "g1"; INLET_DEMO_CHANNEL = "c-forum" } 10
+Run-Demo "33-media-channel" @{ INLET_DEMO = "1"; INLET_DEMO_LIVE_SECS = "3600"; INLET_DEMO_SCENE = "media-channel"; INLET_DEMO_GUILD = "g1"; INLET_DEMO_CHANNEL = "c-gallery" } 10
+
 # One scene file: the app opens in the state the file names, at its window size, and
 # the inside of the window is saved as visual/<name>.png.
 function Run-Scene([System.IO.FileInfo]$File) {

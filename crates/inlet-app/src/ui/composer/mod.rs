@@ -261,6 +261,10 @@ impl Inlet {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // The thread panel's composer takes its share first.
+        let Some(event) = self.panel_composer_event(event, window, cx) else {
+            return;
+        };
         let view = self.composer.view.clone();
         match event {
             Ev::Session {
@@ -279,6 +283,7 @@ impl Inlet {
                 view.update(cx, |v, cx| {
                     v.set_session(max_message_length, file, window, cx)
                 });
+                self.panel_session(max_message_length, window, cx);
             }
             Ev::SlowmodeWait { channel_id, secs } => {
                 view.update(cx, |v, cx| v.on_slowmode_wait(&channel_id, secs, cx))

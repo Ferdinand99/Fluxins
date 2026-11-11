@@ -36,7 +36,8 @@ There are two kinds of screenshots:
   live demo messages off and holds animated emoji on their first frame
   (`INLET_DEMO_ANIMATE_EMOJI=0`), so a picture does not depend on when it was taken.
   Anything else that moves (a playing GIF or video, a running timer) cannot be gated
-  yet: keep it in the numbered demo runs, or freeze it with a demo switch first.
+  yet: keep it in the numbered demo runs, or freeze it with a demo switch first. The
+  emoji, sticker and thread screens (numbered runs 27-33) are not gated yet.
 
 When your change alters how a gated scene looks (for example a new header button),
 the screenshot jobs go red; that is expected:

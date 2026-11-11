@@ -31,6 +31,11 @@
 //!   quote, large) and stickers in PNG, APNG, GIF, WebP and animated WebP.
 //! - `emoji-100`: for `#development`, 100 different animated custom emoji at once (see
 //!   `emoji.rs`).
+//! - `thread-panel`, `thread-list`: for `#general`, with a thread, archived threads, a
+//!   forum and a media channel (see `threads.rs`); the thread open in the side panel, or
+//!   the thread list open.
+//! - `forum`, `media-channel`: the same data, for `c-forum` (posts with tags, unread
+//!   counts) and `c-gallery` (the grid).
 //!
 //! `INLET_DEMO_SCENE` may also name a scene file of the visual checks
 //! (`tests/visual/scenes/*.toml`, see `scene_file.rs`): it then sets the scene, the guild,
@@ -77,6 +82,10 @@ pub enum Scene {
     InboxMentions,
     CustomEmoji,
     Emoji100,
+    ThreadPanel,
+    ThreadList,
+    Forum,
+    MediaChannel,
 }
 
 impl Scene {
@@ -105,8 +114,22 @@ impl Scene {
             "inbox-mentions" => Scene::InboxMentions,
             "custom-emoji" => Scene::CustomEmoji,
             "emoji-100" => Scene::Emoji100,
+            "thread-panel" => Scene::ThreadPanel,
+            "thread-list" => Scene::ThreadList,
+            "forum" => Scene::Forum,
+            "media-channel" => Scene::MediaChannel,
             _ => return None,
         })
+    }
+}
+
+impl Scene {
+    /// The scenes with the demo's threads, forum and media channel.
+    pub fn has_threads(self) -> bool {
+        matches!(
+            self,
+            Scene::ThreadPanel | Scene::ThreadList | Scene::Forum | Scene::MediaChannel
+        )
     }
 }
 
@@ -193,6 +216,8 @@ fn channel_type(kind: ChannelKind) -> i64 {
         ChannelKind::GroupDm => 3,
         ChannelKind::Category => 4,
         ChannelKind::Announcement => 5,
+        ChannelKind::Forum => 15,
+        ChannelKind::Media => 16,
     }
 }
 
@@ -320,6 +345,10 @@ pub fn data(scene: Scene) -> Data {
         _ => {}
     }
     super::inbox::add(&mut by_name);
+    let threads = scene.has_threads();
+    if threads {
+        super::threads::add(&mut channels, &mut by_name);
+    }
 
     // Demo IDs become snowflakes everywhere.
     let guilds: Vec<Guild> = guilds::guilds()
@@ -390,7 +419,7 @@ pub fn data(scene: Scene) -> Data {
         read_states.extend(unread::read_states());
         guild_settings = unread::guild_settings();
     }
-    let ready = ready(
+    let mut ready = ready(
         &guilds,
         &channels,
         &messages,
@@ -398,6 +427,9 @@ pub fn data(scene: Scene) -> Data {
         guild_settings,
         unread_demo,
     );
+    if threads {
+        super::threads::decorate(&mut ready, &messages);
+    }
     Data {
         guilds,
         channels,
@@ -437,6 +469,10 @@ mod tests {
             "inbox-mentions",
             "custom-emoji",
             "emoji-100",
+            "thread-panel",
+            "thread-list",
+            "forum",
+            "media-channel",
         ] {
             let scene = Scene::from_name(name).expect(name);
             let data = data(scene);
