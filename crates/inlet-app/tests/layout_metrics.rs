@@ -81,6 +81,10 @@ fn channel_row_is_32_with_radius_6(cx: &mut TestAppContext) {
     assert_px(row.size.height, 32., "channel row height");
     // 8 px in from the list's left edge, as Fluxer's `margin-inline-start`.
     assert_px(row.origin.x - sidebar.origin.x, 8., "channel row inset");
+    // gpui's bounds carry no corner radius, so this reads the value the row is drawn
+    // with. The drawn corners are checked by the visual baselines: the selected row of
+    // `rail-channels` and `chat-groups` differs from the sidebar by more than the
+    // comparison's channel tolerance, so a different radius fails there.
     assert_eq!(CHANNEL_ROW_RADIUS, 6., "channel row corner radius");
 }
 
@@ -124,6 +128,18 @@ fn composer_min_height_is_58(cx: &mut TestAppContext) {
         px(WINDOW.1) - (composer.origin.y + composer.size.height),
         6.,
         "space under the composer",
+    );
+}
+
+/// Keeps `member_list_is_264` from staying ignored: it fails as soon as something
+/// carries the member list's selector. The task that builds the member list deletes
+/// this test and removes the `ignore` below.
+#[gpui::test]
+fn member_list_is_not_built_yet(cx: &mut TestAppContext) {
+    let cx = open(cx);
+    assert!(
+        cx.debug_bounds(selector::MEMBER_LIST).is_none(),
+        "the member list exists now: remove the ignore from member_list_is_264 and delete this test"
     );
 }
 

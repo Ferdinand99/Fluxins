@@ -19,6 +19,14 @@ sleep 2
 # A run whose app quit before its screenshot crashed: noted here, and the script fails
 # at the end (after handing back the pictures).
 failed=""
+# A panic or a RefCell borrow error (a frame gpui dropped) in log $1 fails run $2.
+bad_log() {
+  if grep -qE 'panicked|already (mutably )?borrowed' "$1"; then
+    echo "$2: a panic or borrow error in the log" >&2
+    grep -E -A3 'panicked|already (mutably )?borrowed' "$1" >&2
+    failed="$failed $2"
+  fi
+}
 shot() {
   kill -0 "$pid" 2>/dev/null || { echo "$1: the app exited early" >&2; failed="$failed $1"; }
   import -window root "$out/$1.png" 2>/dev/null
@@ -118,13 +126,14 @@ for file in "$scenes_dir"/*.toml; do
     tail -n 20 "$out/visual/$name.log" >&2
     failed="$failed scene-$name"
   fi
-  if grep -q 'panicked' "$out/visual/$name.log"; then
-    echo "scene $name: a panic in the log" >&2
-    grep -A3 'panicked' "$out/visual/$name.log" >&2
-    failed="$failed scene-$name"
-  fi
+  bad_log "$out/visual/$name.log" "scene-$name"
 done
 kill "$xvfb_scenes" 2>/dev/null
+
+# The numbered runs' logs: a panic on another thread, or a borrow error gpui logs when
+# it drops a frame, can leave the window up.
+bad_log "$out/signin.log" signin
+bad_log "$out/demo.log" demo
 
 tail -n 20 "$out/signin.log" "$out/demo.log" >&2
 cat "$out/memory.txt" >&2

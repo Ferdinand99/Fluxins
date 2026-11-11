@@ -16,17 +16,26 @@
 //!
 //! Optional too: `settings` (a settings tab to open), `deep_link` (an `inlet://` link to
 //! offer), `accent` (an instance accent such as `"#ff7e00"`), and `tolerance`
-//! (`{ channel = 24, pixels = 0.0001 }`: how far a colour channel may be off before a
-//! pixel counts as different, and the share of pixels that may differ).
+//! (`{ channel = 2, pixels = 0.0 }`: how far a colour channel may be off before a pixel
+//! counts as different, and the share of pixels that may differ). CI draws every scene
+//! pixel for pixel the same, so the defaults are strict; a scene may loosen them up to
+//! `channel = 16` and `pixels = 0.001`, and may leave out at most half of its window.
+//! Use `ignore` for an area that really changes from run to run.
 
 use std::path::Path;
 
 use serde::Deserialize;
 
-/// Per-channel difference (0–255) up to which a pixel counts as equal.
-pub const DEFAULT_CHANNEL_TOLERANCE: u8 = 24;
+/// Per-channel difference (0–255) up to which a pixel counts as equal. The selected
+/// channel row differs from the sidebar by 24 and the chat area by 5, so this must stay
+/// small for the check to see the palette.
+pub const DEFAULT_CHANNEL_TOLERANCE: u8 = 2;
 /// Share of compared pixels that may differ before a screenshot fails.
-pub const DEFAULT_PIXEL_TOLERANCE: f64 = 0.0001;
+pub const DEFAULT_PIXEL_TOLERANCE: f64 = 0.0;
+/// The loosest per-channel tolerance a scene may ask for.
+pub const MAX_CHANNEL_TOLERANCE: u8 = 16;
+/// The largest share of differing pixels a scene may allow.
+pub const MAX_PIXEL_TOLERANCE: f64 = 0.001;
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -114,14 +123,30 @@ impl SceneFile {
         if self.theme != "dark" {
             return Err(format!("theme {:?}: only \"dark\" exists", self.theme));
         }
+        let mut ignored = 0u64;
         for r in &self.ignore {
             let [x, y, rw, rh] = *r;
             if rw == 0 || rh == 0 || x.saturating_add(rw) > w || y.saturating_add(rh) > h {
                 return Err(format!("ignore {r:?} is empty or outside the window"));
             }
+            ignored += u64::from(rw) * u64::from(rh);
         }
-        if !(self.tolerance.pixels.is_finite() && (0.0..=1.0).contains(&self.tolerance.pixels)) {
-            return Err("tolerance.pixels is a share from 0 to 1".into());
+        // Overlapping boxes count twice: the limit errs on the strict side.
+        if ignored * 2 > u64::from(w) * u64::from(h) {
+            return Err("ignore leaves out more than half of the window".into());
+        }
+        if self.tolerance.channel > MAX_CHANNEL_TOLERANCE {
+            return Err(format!(
+                "tolerance.channel {} is above {MAX_CHANNEL_TOLERANCE}",
+                self.tolerance.channel
+            ));
+        }
+        if !(self.tolerance.pixels.is_finite()
+            && (0.0..=MAX_PIXEL_TOLERANCE).contains(&self.tolerance.pixels))
+        {
+            return Err(format!(
+                "tolerance.pixels is a share from 0 to {MAX_PIXEL_TOLERANCE}"
+            ));
         }
         if !self.demo
             && (self.scene.is_some()
@@ -171,6 +196,9 @@ mod tests {
             format!("{base}theme = \"dark\"\nignore = [[1200, 0, 100, 10]]"),
             format!("{base}theme = \"dark\"\ndemo = false\nguild = \"g1\""),
             format!("{base}theme = \"dark\"\nchannel = \"c-general\""),
+            format!("{base}theme = \"dark\"\ntolerance = {{ channel = 17 }}"),
+            format!("{base}theme = \"dark\"\ntolerance = {{ pixels = 0.01 }}"),
+            format!("{base}theme = \"dark\"\nignore = [[0, 0, 1280, 500]]"),
             "name = \"../x\"\nwindow = [1280, 860]\nscale = 1.0\ntheme = \"dark\"".into(),
         ] {
             assert!(SceneFile::parse(&bad).is_err(), "{bad}");

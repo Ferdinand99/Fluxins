@@ -10,7 +10,10 @@ blue) and `report.md`.
   with `INLET_DEMO_SCENE=<file>` (demo builds only). The keys are described in
   `crates/inlet-app/src/demo/scene_file.rs`: `name`, `window`, `scale`, `theme`,
   `ignore` (rectangles that are not compared), what to open (`demo`, `scene`, `guild`,
-  `channel`, …) and an optional `tolerance`.
+  `channel`, …) and an optional `tolerance`. CI draws every scene pixel for pixel the
+  same, so the comparison is strict: a colour channel may be off by 2 and no pixel may
+  differ beyond that. A scene can loosen this only a little and must compare at least
+  half of its window; the report says when a scene does.
 - `baseline/<os>/<name>.png`: what the scene looked like on that platform's CI runner.
   Fonts and DPI are pinned: the runner images are fixed, the screen is set to
   1920x1080 at one pixel per logical pixel, and macOS and Linux use the bundled fonts.
@@ -23,7 +26,9 @@ build tool in `crates/inlet-app/src/bin/visual.rs`) compares them.
 
 1. Push the change and let CI fail on the screenshots.
 2. Check the artifacts `visual-<os>` of that run: every difference must be wanted.
-3. Run `scripts/update-visual-baselines.sh <run id>` (GitHub CLI): it copies the run's
+3. Run `scripts/update-visual-baselines.sh <run id>` (GitHub CLI) on the branch the run
+   was made for: it shows the run's repository, branch and commit, refuses runs from
+   forks, other branches or other commits (unless `--other-run`), and copies the
    screenshots to `baseline/<os>/`. Look at them and commit them with the change.
 
 Baselines are never taken from a local machine and never updated automatically.

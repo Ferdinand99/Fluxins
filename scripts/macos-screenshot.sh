@@ -83,9 +83,10 @@ for file in "$scenes_dir"/*.toml; do
     tail -n 20 "$out/$name.log"
     failed="$failed $name"
   fi
-  if grep -q 'panicked' "$out/$name.log"; then
-    echo "scene $name: a panic in the log"
-    grep -A3 'panicked' "$out/$name.log"
+  # A panic, or a RefCell borrow error gpui logs when it drops a frame.
+  if grep -qE 'panicked|already (mutably )?borrowed' "$out/$name.log"; then
+    echo "scene $name: a panic or borrow error in the log"
+    grep -E -A3 'panicked|already (mutably )?borrowed' "$out/$name.log"
     failed="$failed $name"
   fi
 done
