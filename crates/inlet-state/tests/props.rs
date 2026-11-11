@@ -512,16 +512,19 @@ fn check_invariants(s: &AccountState, seed: u64, step: usize) {
                 "{at}: channel {c} in the wrong guild"
             );
         }
-        // The guild badge is the sum of its viewable text channels' mentions.
+        // The guild badge is the sum of its viewable text channels', forums' and
+        // threads' mentions.
         let gu = s.guild_unread(g.id);
         if !g.visiting {
             let sum: u32 = g
                 .channels
                 .iter()
                 .filter(|c| {
-                    s.channel(**c)
-                        .is_some_and(|ch| inlet_state::channels::is_guild_text_based(ch.kind))
-                        && s.permissions(g.id, **c).can_view()
+                    s.channel(**c).is_some_and(|ch| {
+                        inlet_state::channels::is_guild_text_based(ch.kind)
+                            || ch.is_thread()
+                            || ch.is_forum()
+                    }) && s.permissions(g.id, **c).can_view()
                 })
                 .map(|c| s.unread(*c).mentions)
                 .sum();

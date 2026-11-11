@@ -62,6 +62,10 @@ pub use ids::{ChannelId, GuildId, MessageId, RoleId, UserId};
 pub use messages::{MessageWindow, MessageWindows, MessagesPage};
 pub use permissions::Permissions;
 pub use read_state::{AckKind, Unread};
+pub use threads::{
+    forum_post_list, ForumPostList, ForumSort, ForumUnreadRequests, PageBy, PageRequest, TagMatch,
+    ThreadPages,
+};
 
 use smallvec::SmallVec;
 
@@ -92,8 +96,11 @@ pub mod limits {
     pub const MAX_REACTIONS_PER_MESSAGE: usize = 100;
     /// Guilds.
     pub const MAX_GUILDS: usize = 1_000;
-    /// Channels per guild (Fluxer allows 500).
+    /// Channels per guild (Fluxer allows 500), threads included.
     pub const MAX_CHANNELS_PER_GUILD: usize = 2_000;
+    /// Threads stored per guild (active ones from the gateway, and archived
+    /// ones the app opened); they count as channels too.
+    pub const MAX_THREADS_PER_GUILD: usize = 1_000;
     /// Direct and group direct message channels.
     pub const MAX_PRIVATE_CHANNELS: usize = 5_000;
     /// Roles per guild (Fluxer allows 250).
