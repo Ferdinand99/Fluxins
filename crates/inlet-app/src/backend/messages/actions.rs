@@ -305,9 +305,12 @@ impl Backend {
                             .collect(),
                         more: page.has_more,
                     }),
+                    // A session that ended signs out, which forgets the request; no
+                    // answer then, like every other action.
                     Err(err) => {
-                        let reason = fail(err).unwrap_or_default();
-                        send(Ev::ReactorsFailed { request, reason });
+                        if let Some(reason) = fail(err) {
+                            send(Ev::ReactorsFailed { request, reason });
+                        }
                     }
                 },
             }
