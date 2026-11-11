@@ -157,15 +157,19 @@ fn a_custom_status_is_trimmed_and_capped() {
 }
 
 /// A backend with a test store; the UI side is dropped.
-fn backend() -> (Backend, tokio::sync::mpsc::UnboundedReceiver<Internal>) {
+type UiEvents = futures::channel::mpsc::UnboundedReceiver<Event>;
+
+fn backend() -> (
+    Backend,
+    tokio::sync::mpsc::UnboundedReceiver<Internal>,
+    UiEvents,
+) {
     let (tx, rx) = futures::channel::mpsc::unbounded::<Event>();
-    // Events are not read here; keep the receiver alive so sends succeed.
-    std::mem::forget(rx);
     let store = Accounts::new(Arc::new(MemoryStore::default()), None, None);
     let mut b = Backend::with_store(Ui::new(tx), store);
     let (itx, irx) = tokio::sync::mpsc::unbounded_channel();
     b.internal = itx;
-    (b, irx)
+    (b, irx, rx)
 }
 
 /// Feeds the backend's internal messages back into it until `done` holds.
@@ -215,8 +219,9 @@ async fn active_account(
     AccountKey,
     Conn,
     Value,
+    UiEvents,
 ) {
-    let (mut b, mut irx) = backend();
+    let (mut b, mut irx, ui) = backend();
     let key = AccountKey::new(instance.origin(), "9").unwrap();
     b.start_background(
         Restored {
@@ -246,7 +251,7 @@ async fn active_account(
     .await;
     let mut conn = Conn::accept(listener).await;
     conn.identify("9").await;
-    (b, irx, key, conn, identify)
+    (b, irx, key, conn, identify, ui)
 }
 
 #[tokio::test]
@@ -254,7 +259,7 @@ async fn a_background_account_is_invisible_and_gets_no_more_presence() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let (_server, instance) = mock_instance(&format!("ws://127.0.0.1:{port}/gateway"), &[]).await;
-    let (mut b, _irx, key, mut conn, background_identify) =
+    let (mut b, _irx, key, mut conn, background_identify, _ui) =
         active_account(&listener, &instance).await;
     // Started in the background, it identified as invisible.
     assert_eq!(
@@ -305,7 +310,7 @@ async fn typing_is_sent_at_most_every_eight_seconds() {
         .respond_with(ResponseTemplate::new(204))
         .mount(&server)
         .await;
-    let (mut b, _irx, _key, _conn, _) = active_account(&listener, &instance).await;
+    let (mut b, _irx, _key, _conn, _, _ui) = active_account(&listener, &instance).await;
 
     async fn typing_posts(server: &MockServer) -> usize {
         requests(server)
@@ -342,4 +347,61 @@ async fn typing_is_sent_at_most_every_eight_seconds() {
     }
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(typing_posts(&server).await, 2, "the next one after 8 s");
+}
+
+#[tokio::test]
+async fn dnd_picked_in_inlet_reaches_the_notification_engine() {
+    use futures::StreamExt;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (server, instance) = mock_instance(&format!("ws://127.0.0.1:{port}/gateway"), &[]).await;
+    Mock::given(method("PATCH"))
+        .and(path("/api/v1/users/@me/settings"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"status": "dnd", "custom_status": null})),
+        )
+        .mount(&server)
+        .await;
+    let (mut b, _irx, key, _conn, _, mut ui) = active_account(&listener, &instance).await;
+    let mut engine = crate::backend::notifications::alerts::Engine::default();
+    assert!(!engine.is_dnd(Some(&key)));
+
+    // The pick goes out as one PATCH; the server's answer comes back tagged with the
+    // account, and the notification engine reads its status from it, as it reads the
+    // gateway's settings echo.
+    b.command(
+        Some(key.clone()),
+        social::Cmd::Presence(Cmd::SaveStatus {
+            status: "dnd".into(),
+        })
+        .into(),
+    );
+    let until = Instant::now() + Duration::from_secs(10);
+    loop {
+        let event = tokio::time::timeout_at(until, ui.next())
+            .await
+            .expect("the answer arrives")
+            .expect("events open");
+        let Event::Tagged { account, event } = event else {
+            continue;
+        };
+        engine.note_status_of(Some(&account), &event);
+        if matches!(*event, Event::Social(social::Ev::Presence(Ev::Saved(_)))) {
+            assert_eq!(account, key);
+            break;
+        }
+    }
+    assert!(
+        engine.is_dnd(Some(&key)),
+        "Do Not Disturb picked here is followed"
+    );
+    let patches = requests(&server)
+        .await
+        .into_iter()
+        .filter(|r| r.method.as_str() == "PATCH")
+        .collect::<Vec<_>>();
+    assert_eq!(patches.len(), 1);
+    let body: Value = serde_json::from_slice(&patches[0].body).unwrap();
+    assert_eq!(body["status"], "dnd");
 }
