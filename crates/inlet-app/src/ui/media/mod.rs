@@ -17,6 +17,7 @@ mod audio_file;
 mod avatar;
 pub(crate) mod embed;
 pub(crate) mod emoji;
+mod failed;
 mod image;
 pub mod requests;
 mod sticker;

@@ -18,8 +18,8 @@ use gpui::{div, prelude::*, px, AnyElement, Context, FontWeight, ObjectFit, Shar
 use inlet_media::{FetchError, MediaError};
 use url::Url;
 
-use super::animation_budget::Motion;
-use super::image::{picture_of, placeholder, Shown};
+use super::failed::{Origin, Trouble};
+use super::image::{placeholder, Shown};
 use super::{file_size, requests, MediaIcon};
 use crate::app::Inlet;
 use crate::backend::media::{self as backend_media, Cmd};
@@ -31,6 +31,9 @@ const MAX_TRACKED: usize = 500;
 /// At most this many refreshes start in [`REFRESH_WINDOW`]; the rest wait.
 const REFRESHES_PER_WINDOW: usize = 4;
 const REFRESH_WINDOW: Duration = Duration::from_secs(10);
+/// How long a preview waits for fresh URLs before it loads what it has: the answer
+/// redraws it sooner, this only bounds a refresh that never answers.
+const REFRESH_WAIT: Duration = Duration::from_secs(15);
 /// Width of a file card.
 pub const FILE_CARD_WIDTH: f32 = 432.;
 /// Height of a file card (32 px icon, 12 px padding, borders).
@@ -165,6 +168,37 @@ impl Inlet {
         ask
     }
 
+    /// Draws again after `wait`, so a placeholder that waits for an answer never waits
+    /// longer.
+    fn redraw_after(&self, wait: Duration, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(wait).await;
+            let _ = this.update(cx, |_, cx| cx.notify());
+        })
+        .detach();
+    }
+
+    /// The name and link of an attachment's tile: the file, opened from the media proxy
+    /// (or, when only a link elsewhere is known, through the link check).
+    fn attachment_origin(&self, a: &Attachment) -> Origin {
+        let proxied = self
+            .media
+            .setup
+            .as_ref()
+            .and_then(|s| requests::attachment_original(&s.proxy, a))
+            .map(|u| (String::from(u), false));
+        let elsewhere = || {
+            a.url
+                .clone()
+                .filter(|u| crate::ui::markdown::openable(u).is_some())
+                .map(|u| (u, true))
+        };
+        Origin {
+            name: a.filename.clone(),
+            link: proxied.or_else(elsewhere),
+        }
+    }
+
     /// Images and files under a message's text.
     pub(crate) fn render_attachments(
         &self,
@@ -218,21 +252,32 @@ impl Inlet {
     }
 
     /// The preview of an attachment that is an image or a video frame, with the
-    /// refresh of expired URLs. `None` while covered.
+    /// refresh of expired URLs. It ends as the picture or as a tile that says why not
+    /// (with retry and open in browser), never as an empty box. The flag is set for
+    /// the tile, which takes clicks of its own.
     pub(super) fn attachment_frame(
         &self,
         channel_id: &str,
         message_id: &str,
+        key: &str,
         a: &Attachment,
         size: (f32, f32),
         cx: &mut Context<Self>,
-    ) -> AnyElement {
+    ) -> (AnyElement, bool) {
+        let origin = self.attachment_origin(a);
+        let tile = |trouble, cx: &mut Context<Self>| {
+            (
+                self.failed_tile(key, size, 4., trouble, &origin, Vec::new(), cx),
+                true,
+            )
+        };
         let Some(setup) = &self.media.setup else {
-            return placeholder(size, 4., true);
+            return tile(Trouble::Unavailable, cx);
         };
         // Expired by its time: ask for fresh URLs before loading the old one.
         if self.maybe_refresh(channel_id, message_id, a, None) {
-            return placeholder(size, 4., false);
+            self.redraw_after(REFRESH_WAIT, cx);
+            return (placeholder(size, 4., false), false);
         }
         let scale = self.media.scale;
         let still = requests::attachment_preview(&setup.proxy, a, scale, false);
@@ -240,16 +285,19 @@ impl Inlet {
         let shown = self.moving(moving.as_ref(), still.as_ref(), cx);
         if let Shown::Failed(err) = &shown {
             if self.maybe_refresh(channel_id, message_id, a, Some(err)) {
-                return placeholder(size, 4., false);
+                self.redraw_after(REFRESH_WAIT, cx);
+                return (placeholder(size, 4., false), false);
             }
         }
-        picture_of(
-            shown,
-            size,
-            4.,
-            ObjectFit::Contain,
-            &self.media.images.animator(Motion::Gif),
-        )
+        // The server sends no link for a file whose time is up.
+        let no_link = a.url.is_none() && a.proxy_url.is_none();
+        if matches!(shown, Shown::Unavailable) && (a.expired || no_link) {
+            return tile(Trouble::Expired, cx);
+        }
+        let failed = matches!(shown, Shown::Failed(_) | Shown::Unavailable);
+        let retry = still.into_iter().chain(moving).collect();
+        let el = self.media_or_tile(key, shown, size, 4., ObjectFit::Contain, &origin, retry, cx);
+        (el, failed)
     }
 
     fn image_attachment(
@@ -267,7 +315,7 @@ impl Inlet {
         if let Some(cover) = self.cover(key, a.spoiler, a.explicit, size, cx) {
             return cover;
         }
-        let frame = self.attachment_frame(channel_id, message_id, a, size, cx);
+        let (frame, _) = self.attachment_frame(channel_id, message_id, key, a, size, cx);
         let viewer = super::Viewer::for_attachment(self, a);
         let group = SharedString::from(format!("att-{key}"));
         let save = self.save_button(&group, key, a, cx);

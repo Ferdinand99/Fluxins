@@ -111,6 +111,9 @@ pub struct EmbedMedia {
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub animated: bool,
+    /// A video (a GIF page's MP4 or WebM, a video file): the proxy gives its first
+    /// frame as an image when asked for an image format, never an animation.
+    pub video: bool,
     /// Marked as explicit by the server's media inspection.
     pub explicit: bool,
 }

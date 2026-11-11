@@ -1,21 +1,50 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! The media parts of embeds, for `ui/chat/embed.rs`: the large image, the thumbnail,
 //! and the author and footer icons. All of them load through the media proxy only; an
-//! embed whose media is not on the proxy shows a placeholder. A click on an image opens
-//! the viewer.
+//! embed whose media is not on the proxy, or does not load, shows a tile that names the
+//! site and opens the page in the browser. A click on an image opens the viewer.
 
 use gpui::{div, prelude::*, AnyElement, Context, ObjectFit, SharedString};
 
-use super::animation_budget::Motion;
-use super::image::{picture_of, Shown};
+use super::failed::{host_of, Origin};
+use super::image::Shown;
 use super::{requests, Viewer};
 use crate::app::Inlet;
-use crate::model::EmbedMedia;
+use crate::model::{Embed, EmbedMedia};
+use crate::ui::markdown::openable;
+
+/// The name and link of an embed's media tile: the provider (or the page's site) and
+/// the page, else the media's own link; both through the link check.
+pub(crate) fn embed_origin(e: &Embed) -> Origin {
+    let page = e.url.as_deref().filter(|u| openable(u).is_some());
+    Origin {
+        name: e
+            .provider
+            .clone()
+            .or_else(|| host_of(page))
+            .unwrap_or_default(),
+        link: page.map(|u| (u.to_string(), true)),
+    }
+}
+
+/// `origin` for one of the embed's media: its own link when the embed has none.
+fn media_origin(origin: &Origin, m: &EmbedMedia) -> Origin {
+    let own = (!m.url.is_empty() && openable(&m.url).is_some()).then(|| (m.url.clone(), true));
+    Origin {
+        name: if origin.name.is_empty() {
+            host_of(Some(&m.url)).unwrap_or_default()
+        } else {
+            origin.name.clone()
+        },
+        link: origin.link.clone().or(own),
+    }
+}
 
 impl Inlet {
     /// An embed image inside `max` logical pixels (the box of its kind), covered when
     /// explicit, opening the viewer on click. `chrome` is the width the card takes
-    /// around it, so a narrow window shrinks the image instead of clipping it.
+    /// around it, so a narrow window shrinks the image instead of clipping it. One that
+    /// cannot be shown is a tile named after `origin`.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn embed_image(
         &self,
@@ -25,33 +54,40 @@ impl Inlet {
         chrome: f32,
         nsfw: bool,
         name: String,
+        origin: &Origin,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let size = self.fit_column(requests::fit_inside(m.width, m.height, max), chrome);
         if let Some(cover) = self.cover(key, false, nsfw || m.explicit, size, cx) {
             return cover;
         }
-        let shown = match &self.media.setup {
+        let (shown, retry) = match &self.media.setup {
             Some(setup) => {
                 let scale = self.media.scale;
                 let still = requests::embed_image(&setup.proxy, m, max, scale, false);
                 let moving = requests::embed_image(&setup.proxy, m, max, scale, true);
-                self.moving(moving.as_ref(), still.as_ref(), cx)
+                let shown = self.moving(moving.as_ref(), still.as_ref(), cx);
+                (shown, still.into_iter().chain(moving).collect())
             }
-            None => Shown::Unavailable,
+            None => (Shown::Unavailable, Vec::new()),
         };
+        let origin = media_origin(origin, m);
+        let picture = self.media_or_tile(
+            &format!("embed-{key}"),
+            shown,
+            size,
+            4.,
+            ObjectFit::Contain,
+            &origin,
+            retry,
+            cx,
+        );
         let viewer = Viewer::for_embed(self, m, name);
         div()
             .id(SharedString::from(format!("embed-img-{key}")))
             .flex_none()
             .cursor_pointer()
-            .child(picture_of(
-                shown,
-                size,
-                4.,
-                ObjectFit::Contain,
-                &self.media.images.animator(Motion::Gif),
-            ))
+            .child(picture)
             .on_click(cx.listener(move |this, _, _, cx| {
                 if let Some(v) = viewer.clone() {
                     this.open_viewer(v, cx);

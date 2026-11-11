@@ -16,6 +16,7 @@ use crate::app::Inlet;
 use crate::model::{self, EmbedField, EmbedKind};
 use crate::theme;
 use crate::ui::markdown::{self, RenderCtx};
+use crate::ui::media::embed::embed_origin;
 use crate::ui::media::requests;
 
 /// Card width without media (`EMBED_TEXT_OUTER_WIDTH`).
@@ -116,6 +117,7 @@ pub(super) fn render_embed(
     if embed_spoilered(e, hidden) {
         return spoiler_card(this, id, e, ctx);
     }
+    let origin = embed_origin(e);
     let has_text = e.title.is_some()
         || e.author.is_some()
         || !e.description.is_empty()
@@ -137,6 +139,7 @@ pub(super) fn render_embed(
                     0.,
                     e.nsfw,
                     t!("embed-image"),
+                    &origin,
                     cx,
                 ))
                 .into_any_element();
@@ -261,6 +264,7 @@ pub(super) fn render_embed(
             0.,
             e.nsfw,
             e.title.clone().unwrap_or_else(|| t!("embed-thumbnail")),
+            &origin,
             cx,
         )));
     }
@@ -282,6 +286,7 @@ pub(super) fn render_embed(
             still,
             e.url.clone().filter(|u| markdown::openable(u).is_some()),
             e.nsfw,
+            &origin,
             cx,
         ));
     } else if let Some(i) = image {
@@ -292,6 +297,7 @@ pub(super) fn render_embed(
             crate::ui::media::EMBED_CHROME,
             e.nsfw,
             e.title.clone().unwrap_or_else(|| t!("embed-image")),
+            &origin,
             cx,
         ));
     }
