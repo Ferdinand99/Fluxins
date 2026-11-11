@@ -22,11 +22,20 @@ function Save-Screen([string]$Name) {
     Write-Host "saved $path ($($bounds.Width)x$($bounds.Height))"
 }
 
-function Run-Demo([string]$Name, [hashtable]$Env, [int]$Seconds) {
+function Run-Demo([string]$Name, [hashtable]$Env, [int]$Seconds, [int]$CpuSeconds = 0) {
     foreach ($k in $Env.Keys) { Set-Item -Path "Env:$k" -Value $Env[$k] }
     $log = Join-Path $OutDir "$Name.log"
     $p = Start-Process -FilePath $Exe -PassThru -RedirectStandardError $log
     Start-Sleep -Seconds $Seconds
+    # What the app costs while it shows the scene: CPU time over a few seconds, as a
+    # share of one core.
+    if ($CpuSeconds -gt 0 -and -not $p.HasExited) {
+        $p.Refresh(); $cpu0 = $p.TotalProcessorTime; $t0 = Get-Date
+        Start-Sleep -Seconds $CpuSeconds
+        $p.Refresh(); $cpu1 = $p.TotalProcessorTime; $t1 = Get-Date
+        $share = ($cpu1 - $cpu0).TotalMilliseconds / ($t1 - $t0).TotalMilliseconds * 100
+        Write-Host ("cpu {0}: {1:N1} % of one core over {2} s" -f $Name, $share, $CpuSeconds)
+    }
     if ($p.HasExited) {
         Write-Host "inlet.exe exited early with code $($p.ExitCode)"
         Get-Content $log | Select-Object -Last 40
@@ -90,9 +99,16 @@ Run-Demo "23-chat-pins" @{ INLET_DEMO = "1"; INLET_DEMO_LIVE_SECS = "3600"; INLE
 Run-Demo "24-inbox-unreads" @{ INLET_DEMO = "1"; INLET_DEMO_LIVE_SECS = "3600"; INLET_DEMO_SCENE = "inbox-unreads"; INLET_DEMO_GUILD = "g1"; INLET_DEMO_CHANNEL = "c-general" } 10
 Run-Demo "25-inbox-saved" @{ INLET_DEMO = "1"; INLET_DEMO_LIVE_SECS = "3600"; INLET_DEMO_SCENE = "inbox-saved"; INLET_DEMO_GUILD = "g1"; INLET_DEMO_CHANNEL = "c-general" } 10
 Run-Demo "26-inbox-mentions" @{ INLET_DEMO = "1"; INLET_DEMO_LIVE_SECS = "3600"; INLET_DEMO_SCENE = "inbox-mentions"; INLET_DEMO_GUILD = "g1"; INLET_DEMO_CHANNEL = "c-general" } 10
-# The Notifications settings tab, with a test notification (the toast shows at the
-# bottom right of the screen).
-Run-Demo "27-settings-notifications" @{ INLET_DEMO = "1"; INLET_DEMO_LIVE_SECS = "3600"; INLET_DEMO_GUILD = "g1"; INLET_DEMO_CHANNEL = "c-general"; INLET_DEMO_SETTINGS = "notifications"; INLET_DEMO_NOTIFY = "1" } 10
+
+# Custom emoji (still, animated, large) and stickers in every format; then 100 animated
+# custom emoji at once, with the CPU they cost (at most 32 move).
+Run-Demo "27-custom-emoji" @{ INLET_DEMO = "1"; INLET_DEMO_LIVE_SECS = "3600"; INLET_DEMO_SCENE = "custom-emoji"; INLET_DEMO_GUILD = "g1"; INLET_DEMO_CHANNEL = "c-dev" } 10 10
+Run-Demo "28-emoji-100" @{ INLET_DEMO = "1"; INLET_DEMO_LIVE_SECS = "3600"; INLET_DEMO_SCENE = "emoji-100"; INLET_DEMO_GUILD = "g1"; INLET_DEMO_CHANNEL = "c-dev" } 10 10
+# The same with animated emoji switched off: every emoji shows its first frame.
+Run-Demo "29-emoji-100-still" @{ INLET_DEMO = "1"; INLET_DEMO_LIVE_SECS = "3600"; INLET_DEMO_SCENE = "emoji-100"; INLET_DEMO_GUILD = "g1"; INLET_DEMO_CHANNEL = "c-dev"; INLET_DEMO_ANIMATE_EMOJI = "0" } 10 10
+# The Notifications settings tab. The demo also posts a test notification; the runner's
+# session does not show toasts, so the toast itself is checked by hand.
+Run-Demo "30-settings-notifications" @{ INLET_DEMO = "1"; INLET_DEMO_LIVE_SECS = "3600"; INLET_DEMO_GUILD = "g1"; INLET_DEMO_CHANNEL = "c-general"; INLET_DEMO_SETTINGS = "notifications"; INLET_DEMO_NOTIFY = "1" } 10
 
 # A demo that quit before its screenshot crashed: fail the job, the pictures are not
 # worth checking.

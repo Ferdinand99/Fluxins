@@ -27,6 +27,10 @@
 //! - `chat-pins`: for `#general`, the pinned messages panel open.
 //! - `inbox-unreads`, `inbox-saved`, `inbox-mentions`: for `#general`, the inbox open on
 //!   that tab (with the unread state of `default`; see `inbox.rs`).
+//! - `custom-emoji`: for `#development`, still and animated custom emoji (inline, in a
+//!   quote, large) and stickers in PNG, APNG, GIF, WebP and animated WebP.
+//! - `emoji-100`: for `#development`, 100 different animated custom emoji at once (see
+//!   `emoji.rs`).
 
 use std::collections::HashMap;
 
@@ -34,7 +38,7 @@ use inlet_protocol as p;
 use serde_json::{json, Value};
 
 use super::{
-    guilds, markdown, media, messages, snowflake, social, unread, user, user_id, ME,
+    emoji, guilds, markdown, media, messages, snowflake, social, unread, user, user_id, ME,
     ROLE_CONTRIBUTORS, ROLE_MODERATORS,
 };
 use crate::backend::messages::Pending;
@@ -64,6 +68,8 @@ pub enum Scene {
     InboxUnreads,
     InboxSaved,
     InboxMentions,
+    CustomEmoji,
+    Emoji100,
 }
 
 impl Scene {
@@ -90,6 +96,8 @@ impl Scene {
             "inbox-unreads" => Scene::InboxUnreads,
             "inbox-saved" => Scene::InboxSaved,
             "inbox-mentions" => Scene::InboxMentions,
+            "custom-emoji" => Scene::CustomEmoji,
+            "emoji-100" => Scene::Emoji100,
             _ => return None,
         })
     }
@@ -245,6 +253,12 @@ pub fn data(scene: Scene) -> Data {
         Scene::ChatReactions | Scene::ChatMenu | Scene::ChatDelete => {
             super::actions::add(&mut by_name);
         }
+        Scene::CustomEmoji => {
+            by_name.insert(markdown::SCENE_CHANNEL.into(), emoji::custom());
+        }
+        Scene::Emoji100 => {
+            by_name.insert(markdown::SCENE_CHANNEL.into(), emoji::hundred());
+        }
         _ => {}
     }
     super::inbox::add(&mut by_name);
@@ -363,6 +377,8 @@ mod tests {
             "inbox-unreads",
             "inbox-saved",
             "inbox-mentions",
+            "custom-emoji",
+            "emoji-100",
         ] {
             let scene = Scene::from_name(name).expect(name);
             let data = data(scene);

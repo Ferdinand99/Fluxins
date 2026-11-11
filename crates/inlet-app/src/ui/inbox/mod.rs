@@ -1102,6 +1102,7 @@ impl Inlet {
             revealed: false,
             names: self.mention_names(m, cx),
             jumbo: false,
+            emoji: self.emoji_pictures(markdown::custom_emoji(&m.blocks), cx),
             off_thread: Some(self.markdown_off_thread(cx)),
             on_link: Rc::new(move |url, masked, _window, cx| {
                 let url = url.to_string();

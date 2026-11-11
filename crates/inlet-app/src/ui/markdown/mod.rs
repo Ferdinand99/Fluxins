@@ -25,6 +25,7 @@ mod mention;
 mod table;
 mod timestamp;
 
+use std::collections::HashSet;
 use std::ops::Range;
 
 use fluxer_markdown_parser::ast::TimestampStyle;
@@ -210,12 +211,50 @@ pub enum LiveKind {
 pub enum Emoji {
     /// A Unicode emoji, drawn with Twemoji.
     Standard(String),
-    /// A guild emoji (`<:name:id>`). Its name shows until custom emoji images exist.
+    /// A guild emoji (`<:name:id>`, `<a:name:id>` when animated), drawn with its
+    /// picture from the media proxy.
     Custom {
         id: String,
+        /// Kept for the hover card and copying, which come with the message actions.
+        #[allow(dead_code)]
         name: String,
         animated: bool,
     },
+}
+
+/// The custom emoji `(id, animated)` in `blocks`, in order, each once. The views fetch
+/// their pictures before drawing the text.
+pub fn custom_emoji(blocks: &[Block]) -> Vec<(&str, bool)> {
+    fn inline<'a>(i: &'a Inline, seen: &mut HashSet<&'a str>, out: &mut Vec<(&'a str, bool)>) {
+        for (_, e) in &i.emoji {
+            if let Emoji::Custom { id, animated, .. } = e {
+                if seen.insert(id.as_str()) {
+                    out.push((id.as_str(), *animated));
+                }
+            }
+        }
+    }
+    fn walk<'a>(blocks: &'a [Block], seen: &mut HashSet<&'a str>, out: &mut Vec<(&'a str, bool)>) {
+        for b in blocks {
+            match b {
+                Block::Text(i) | Block::Heading(_, i) | Block::Subtext(i) => inline(i, seen, out),
+                Block::Quote(inner) | Block::Alert(_, inner) | Block::Spoiler(inner) => {
+                    walk(inner, seen, out)
+                }
+                Block::List(list) => list.items.iter().for_each(|item| walk(item, seen, out)),
+                Block::Table(t) => t
+                    .header
+                    .iter()
+                    .chain(t.rows.iter().flatten())
+                    .for_each(|i| inline(i, seen, out)),
+                Block::Code(_) => {}
+            }
+        }
+    }
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    walk(blocks, &mut seen, &mut out);
+    out
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -235,8 +274,6 @@ pub enum Style {
     LinkTarget,
     /// "(edited)" after the text.
     Edited,
-    /// Muted text, such as the name of a custom emoji.
-    Muted,
 }
 
 /// A URL that may be opened from a message: it parses and is http or https.
@@ -411,11 +448,49 @@ mod tests {
     }
 
     #[test]
-    fn custom_emoji_show_their_name() {
-        let blocks = parse("hi <:wave:123456789012345678>");
+    fn custom_emoji_take_an_emoji_placeholder() {
+        let blocks = parse("hi <:wave:123456789012345678> <a:party:223456789012345678>");
         let inline = first_inline(&blocks);
-        assert_eq!(inline.text, "hi :wave:");
-        assert!(matches!(&inline.emoji[0].1, Emoji::Custom { name, .. } if name == "wave"));
+        // The same room as a Unicode emoji; the picture is painted over it.
+        assert_eq!(
+            inline.text,
+            format!("hi {} {}", emoji::PLACEHOLDER, emoji::PLACEHOLDER)
+        );
+        assert!(
+            matches!(&inline.emoji[0].1, Emoji::Custom { name, animated: false, .. } if name == "wave")
+        );
+        assert!(matches!(
+            &inline.emoji[1].1,
+            Emoji::Custom { animated: true, .. }
+        ));
+        // Only custom emoji are listed for fetching, each once, also in quotes, lists,
+        // tables and spoilers; none from code.
+        let id = |n: u8| format!("10000000000000000{n}");
+        let blocks = parse(&format!(
+            "<:wave:{}> \u{1F600}\n> <:wave:{}> <a:party:{}>\n- ||<:x:{}>||\n\n| <:t:{}> |\n| - |\n| a |\n\n```\n<:code:{}>\n```",
+            id(1),
+            id(1),
+            id(2),
+            id(3),
+            id(4),
+            id(5)
+        ));
+        assert_eq!(
+            custom_emoji(&blocks),
+            vec![
+                ("100000000000000001", false),
+                ("100000000000000002", true),
+                ("100000000000000003", false),
+                ("100000000000000004", false)
+            ]
+        );
+        // An emoji-only message of custom emoji is drawn large.
+        assert!(
+            first_inline(&parse(
+                "<:wave:100000000000000001> <a:party:100000000000000002>"
+            ))
+            .jumbo
+        );
     }
 
     #[test]
