@@ -310,6 +310,8 @@ pub enum Problem {
     UnknownChannel(String),
     UnknownHas(String),
     BadDate(String),
+    /// `pinned:` takes `true` or `false` only.
+    BadPinned(String),
 }
 
 /// Turns the typed filters into IDs and days: `user` finds a user by name, mention or
@@ -356,7 +358,11 @@ pub fn resolve(
                 Some(day) => f.after = Some(day),
                 None => problems.push(Problem::BadDate(v.to_string())),
             },
-            Key::Pinned => f.pinned = matches!(v, "true" | "yes"),
+            Key::Pinned => match v {
+                "true" => f.pinned = true,
+                "false" => f.pinned = false,
+                _ => problems.push(Problem::BadPinned(v.to_string())),
+            },
         }
     }
     if problems.is_empty() {
@@ -531,6 +537,11 @@ mod tests {
         assert_eq!(typing_filter("hello"), None);
         assert_eq!(typing_filter("hello "), None);
         assert_eq!(day_of("2026-02-30"), None);
+        let maybe = parse("pinned:maybe");
+        assert_eq!(
+            resolve(&maybe, user, channel).unwrap_err(),
+            vec![Problem::BadPinned("maybe".into())]
+        );
         assert!(Filters::default().is_empty());
     }
 }

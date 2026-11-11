@@ -17,6 +17,7 @@ search-problem-user = No one called { $name } here.
 search-problem-channel = No channel called { $name } here.
 search-problem-has = "{ $name }" is not something a message can have.
 search-problem-date = "{ $name }" is not a date (year-month-day).
+search-problem-pinned = pinned: takes true or false, not "{ $name }".
 search-searching = Searching…
 search-results-count = Results: { $count }
 search-no-results = We searched far and wide, but nothing turned up.

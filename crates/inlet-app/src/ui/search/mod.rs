@@ -58,6 +58,10 @@ pub fn bind_keys(cx: &mut App) {
     ]);
 }
 
+fn field_focused(input: Option<&gpui::Entity<TextInput>>, window: &Window, cx: &App) -> bool {
+    input.is_some_and(|i| gpui::Focusable::focus_handle(i.read(cx), cx).is_focused(window))
+}
+
 /// This domain's view state.
 #[derive(Default)]
 pub struct State {
@@ -85,15 +89,14 @@ impl Inlet {
         self.search_panel_open() || self.quick_switcher_open()
     }
 
-    /// Whether the field of the topmost search layer has the keyboard. It is focused
-    /// when the layer opens, before the layer is first drawn, so the layer's own focus
-    /// rule cannot see it inside the layer during that first frame.
-    pub(crate) fn search_field_has_keyboard(&self, window: &Window, cx: &App) -> bool {
-        let focused = |input: Option<&gpui::Entity<TextInput>>| {
-            input.is_some_and(|i| gpui::Focusable::focus_handle(i.read(cx), cx).is_focused(window))
-        };
-        (self.is_top_layer(Layer::QuickSwitcher) && focused(self.search.switcher.input()))
-            || (self.is_top_layer(Layer::Search) && focused(self.search.bar.input()))
+    /// Whether the quick switcher's field has the keyboard now.
+    pub(crate) fn quick_switcher_field_focused(&self, window: &Window, cx: &App) -> bool {
+        field_focused(self.search.switcher.input(), window, cx)
+    }
+
+    /// Whether the search field has the keyboard now.
+    pub(crate) fn search_field_focused(&self, window: &Window, cx: &App) -> bool {
+        field_focused(self.search.bar.input(), window, cx)
     }
 
     /// Escape on a search layer.
@@ -191,8 +194,145 @@ impl Inlet {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
-    use gpui::{Keystroke, TestAppContext};
+    use crate::backend::accounts::{AccountInfo, AccountKey, Accounts};
+    use crate::token_store::MemoryStore;
+    use gpui::{AppContext, Entity, Keystroke, TestAppContext, VisualTestContext};
+    use inlet_state::{AccountState, ChannelId};
+
+    const GUILD: &str = "100";
+    const OPEN: &str = "303";
+
+    fn state() -> AccountState {
+        let ready: inlet_protocol::Ready = serde_json::from_value(serde_json::json!({
+            "session_id": "s",
+            "user": {"id": "10", "username": "me", "mfa_enabled": false},
+            "guilds": [{
+                "id": GUILD,
+                "properties": {"id": GUILD, "name": "g", "owner_id": "1"},
+                "roles": [{"id": GUILD, "name": "@everyone", "position": 0,
+                           "permissions": "274877975552"}],
+                "channels": [
+                    {"id": "301", "type": 0, "name": "chan-a", "position": 0},
+                    {"id": "302", "type": 0, "name": "chan-b", "position": 1},
+                    {"id": OPEN, "type": 0, "name": "general", "position": 2}
+                ],
+                "members": [{"user": {"id": "10", "username": "me"}, "roles": [],
+                             "joined_at": "2026-01-01T00:00:00Z"}]
+            }],
+            "private_channels": [], "users": [], "read_states": [], "user_guild_settings": []
+        }))
+        .unwrap();
+        AccountState::from_ready_at(&ready, 1_800_000_000_000)
+    }
+
+    /// A window with Inlet signed in (by hand) to one account, a guild with the
+    /// channels `chan-a`, `chan-b` and `general` (open), and the app's keys.
+    fn rig(cx: &mut TestAppContext) -> (Entity<Inlet>, &mut VisualTestContext) {
+        cx.executor().allow_parking();
+        cx.update(crate::bind_keys);
+        let (inlet, cx) = cx.add_window_view(|window, cx| {
+            Inlet::new_with(window, cx, |tx| {
+                crate::backend::start_with(tx, |ui| {
+                    Accounts::new(Arc::new(MemoryStore::default()), None, Some(ui))
+                })
+            })
+        });
+        // The backend answers that no account is stored; after that it is quiet.
+        for _ in 0..200 {
+            cx.run_until_parked();
+            if inlet.read_with(cx, |i, _| i.screen == Screen::SignIn) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        inlet.update(cx, |this, cx| {
+            let key = AccountKey::new("https://a.example", "10").unwrap();
+            this.switcher.accounts = vec![AccountInfo {
+                key: key.clone(),
+                name: "me".into(),
+                handle: "me".into(),
+            }];
+            this.switcher.active = Some(key);
+            this.account = Some(cx.new(|_| state()));
+            this.selected_guild = Some(GUILD.into());
+            this.selected_channel = Some(OPEN.into());
+            this.screen = Screen::Main;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        (inlet, cx)
+    }
+
+    fn chosen_channel(inlet: &Entity<Inlet>, cx: &mut VisualTestContext) -> Option<ChannelId> {
+        inlet.read_with(cx, |i, _| {
+            i.search.switcher.chosen.as_ref().and_then(|c| c.channel)
+        })
+    }
+
+    /// Up and Down move in the quick switcher's list, and Enter opens the row that is
+    /// highlighted: here the second one.
+    #[gpui::test]
+    fn down_then_enter_opens_the_second_row(cx: &mut TestAppContext) {
+        let (inlet, cx) = rig(cx);
+        cx.update(|window, cx| inlet.update(cx, |this, cx| this.toggle_quick_switcher(window, cx)));
+        cx.run_until_parked();
+        cx.simulate_input("chan");
+        cx.run_until_parked();
+        cx.simulate_keystrokes("down up down enter");
+        cx.run_until_parked();
+        assert_eq!(chosen_channel(&inlet, cx), ChannelId::parse("302"));
+        assert!(!inlet.read_with(cx, |i, _| i.search.switcher.open));
+    }
+
+    /// A deep-link prompt that opens over the quick switcher takes the keyboard in the
+    /// same frame: Enter then never picks a row of the switcher behind it.
+    #[gpui::test]
+    fn enter_under_a_link_prompt_picks_nothing(cx: &mut TestAppContext) {
+        let (inlet, cx) = rig(cx);
+        cx.update(|window, cx| inlet.update(cx, |this, cx| this.toggle_quick_switcher(window, cx)));
+        cx.run_until_parked();
+        cx.simulate_input("chan");
+        cx.run_until_parked();
+        inlet.update(cx, |this, cx| {
+            this.overlays.link_prompt = Some(crate::backend::platform::links::Prompt::Unavailable);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        assert_eq!(chosen_channel(&inlet, cx), None);
+        assert!(inlet.read_with(cx, |i, _| i.search.switcher.open));
+    }
+
+    /// The pins or the inbox opened over the search column take the keyboard at once:
+    /// what is typed next no longer lands in the search field.
+    #[gpui::test]
+    fn a_panel_over_the_search_takes_the_keyboard(cx: &mut TestAppContext) {
+        let (inlet, cx) = rig(cx);
+        cx.update(|window, cx| inlet.update(cx, |this, cx| this.open_search(window, cx)));
+        cx.run_until_parked();
+        cx.simulate_input("ab");
+        cx.run_until_parked();
+        let typed = |inlet: &Entity<Inlet>, cx: &mut VisualTestContext| {
+            inlet.read_with(cx, |i, cx| {
+                i.search.bar.input().map(|e| e.read(cx).text().to_string())
+            })
+        };
+        assert_eq!(typed(&inlet, cx).as_deref(), Some("ab"));
+        inlet.update(cx, |this, cx| {
+            this.inbox.open = Some(crate::ui::inbox::Panel::Inbox);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.simulate_input("cd");
+        cx.run_until_parked();
+        assert_eq!(typed(&inlet, cx).as_deref(), Some("ab"));
+        let focused = cx.update(|window, cx| inlet.read(cx).search_field_focused(window, cx));
+        assert!(!focused);
+    }
 
     /// Ctrl+K (Cmd+K) is bound once, to the quick switcher, with every domain's keys
     /// in place: nothing else takes it, in any context.

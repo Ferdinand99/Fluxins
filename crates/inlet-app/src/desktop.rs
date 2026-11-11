@@ -956,29 +956,24 @@ impl Inlet {
     /// behind it, and gives it back to the composer when the last layer closes. Called
     /// when the window is drawn.
     pub(crate) fn focus_layer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.layer_open() {
+        if let Some(top) = self.open_layers().topmost() {
             let layer = self
                 .overlays
                 .layer_focus
                 .get_or_insert_with(|| cx.focus_handle())
                 .clone();
-            // A layer with a field of its own (a picker's search) gives it the keyboard;
-            // the field lies inside the layer, so Escape still closes the layer.
-            let handle = match self.open_layers().topmost() {
-                Some(Layer::Picker) => self.composer.pickers.search_focus(cx).unwrap_or(layer),
+            // Where the keyboard goes when no field of the topmost layer has it: a
+            // picker's search field (it lies inside the layer, so Escape still closes
+            // the layer), else the layer itself.
+            let handle = match top {
+                Layer::Picker => self.composer.pickers.search_focus(cx).unwrap_or(layer),
                 _ => layer,
             };
-            // One rule for fields in layers: a field inside the topmost layer (the
-            // status picker's custom status, the search field) may keep the keyboard,
-            // because only the topmost layer carries this focus handle. Anything else
-            // gives it back to the layer; a layer that opens over another takes the
-            // handle, so a field under it loses the keyboard at once. A field focused
-            // as it appears is not in the drawn tree for one frame: the topmost layer's
-            // own fields are asked for that frame.
-            let field_keeps_it = (self.is_top_layer(Layer::StatusPicker)
-                && self.status_picker_field_focused(window, cx))
-                || self.search_field_has_keyboard(window, cx);
-            if !handle.contains_focused(window, cx) && !field_keeps_it {
+            // One rule, from this frame's state only: a text field keeps the keyboard
+            // while the layer it belongs to is the topmost one now. A layer that
+            // opens over it takes the keyboard in the same frame.
+            let field = self.focused_layer_field(window, cx);
+            if !handle.is_focused(window) && !field_keeps_keyboard(top, field) {
                 if !self.overlays.layer_had_focus {
                     // Where the keyboard was, to give it back when the layers close.
                     self.overlays.focus_before = window.focused(cx);
@@ -1094,6 +1089,40 @@ impl Inlet {
     }
 }
 
+/// Whether a text field of layer `field` (the layer whose field has the keyboard, if
+/// one has) keeps the keyboard while `top` is the topmost layer: only a field of the
+/// topmost layer does. Every window and dialog is its own layer, so a confirmation
+/// over a window takes the keyboard from the window's field.
+pub(crate) fn field_keeps_keyboard(top: Layer, field: Option<Layer>) -> bool {
+    field == Some(top)
+}
+
+impl Inlet {
+    /// The layer whose text field has the keyboard now, if one has: a picker's search,
+    /// the status picker's custom status, the quick switcher's field or the search
+    /// field.
+    fn focused_layer_field(&self, window: &Window, cx: &App) -> Option<Layer> {
+        if self
+            .composer
+            .pickers
+            .search_focus(cx)
+            .is_some_and(|h| h.is_focused(window))
+        {
+            return Some(Layer::Picker);
+        }
+        if self.status_picker_field_focused(window, cx) {
+            return Some(Layer::StatusPicker);
+        }
+        if self.quick_switcher_field_focused(window, cx) {
+            return Some(Layer::QuickSwitcher);
+        }
+        if self.search_field_focused(window, cx) {
+            return Some(Layer::Search);
+        }
+        None
+    }
+}
+
 /// A layer drawn over the chat that takes the keyboard.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Layer {
@@ -1115,7 +1144,7 @@ pub(crate) enum Layer {
     Search,
 }
 
-/// Which layers are open. They are drawn bottom first (the search panel, a panel, the
+/// Which layers are open. They are drawn bottom first (the search column, a panel, the
 /// image viewer, the picker, the settings view, the notification settings window, the
 /// account switcher, the status picker, the quick switcher, the link confirmation, the
 /// link prompt, see `ui/overlays`), and the topmost one has the keyboard: Escape closes
@@ -1368,6 +1397,54 @@ mod tests {
         assert_eq!(layers.topmost(), Some(Layer::NotificationSettings));
         layers = layers.after_escape();
         assert_eq!(layers.topmost(), Some(Layer::Settings));
+    }
+
+    /// A field keeps the keyboard only while its layer is the topmost one; a layer that
+    /// opens over it (the inbox over the search panel, a link prompt over the quick
+    /// switcher) takes the keyboard at once, in the same frame.
+    #[test]
+    fn a_field_keeps_the_keyboard_only_in_the_topmost_layer() {
+        let search = OpenLayers {
+            search: true,
+            ..OpenLayers::default()
+        };
+        assert!(field_keeps_keyboard(
+            search.topmost().unwrap(),
+            Some(Layer::Search)
+        ));
+        let inbox = OpenLayers {
+            panel: true,
+            ..search
+        };
+        assert!(!field_keeps_keyboard(
+            inbox.topmost().unwrap(),
+            Some(Layer::Search)
+        ));
+        let switcher = OpenLayers {
+            quick_switcher: true,
+            ..OpenLayers::default()
+        };
+        assert!(field_keeps_keyboard(
+            switcher.topmost().unwrap(),
+            Some(Layer::QuickSwitcher)
+        ));
+        let prompt = OpenLayers {
+            link_prompt: true,
+            ..switcher
+        };
+        assert!(!field_keeps_keyboard(
+            prompt.topmost().unwrap(),
+            Some(Layer::QuickSwitcher)
+        ));
+        let status = OpenLayers {
+            status_picker: true,
+            ..OpenLayers::default()
+        };
+        assert!(field_keeps_keyboard(
+            status.topmost().unwrap(),
+            Some(Layer::StatusPicker)
+        ));
+        assert!(!field_keeps_keyboard(status.topmost().unwrap(), None));
     }
 
     /// Every layer closes before the one under it, in the order they are drawn.

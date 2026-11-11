@@ -143,6 +143,15 @@ impl Results {
             ..Results::default()
         };
     }
+
+    /// The search is cleared (the cross in the header): the results go, but the pacing
+    /// stays, so a search still on its way keeps the next one waiting.
+    pub fn clear_keeping_pace(&mut self) {
+        let budget = std::mem::take(&mut self.budget);
+        self.clear();
+        self.budget = budget;
+        self.budget.waiting = None;
+    }
 }
 
 impl Inlet {
@@ -460,10 +469,14 @@ impl Inlet {
     }
 }
 
-/// Whether the account may see the channel of a result (fail closed: unknown channels
-/// are hidden).
+/// Whether the account may see the channel of a result: it must view the channel and
+/// read its history, as Fluxer's search requires (fail closed: unknown channels are
+/// hidden).
 fn can_view(state: &inlet_state::AccountState, channel_id: &str) -> bool {
-    ChannelId::parse(channel_id).is_some_and(|ch| state.channel_permissions(ch).can_view())
+    ChannelId::parse(channel_id).is_some_and(|ch| {
+        let p = state.channel_permissions(ch);
+        p.can_view() && p.has(inlet_protocol::permissions::READ_MESSAGE_HISTORY)
+    })
 }
 
 #[cfg(test)]
@@ -565,8 +578,13 @@ mod tests {
                         })
                     );
 
+                    // A result in a channel the account cannot read is refused with
+                    // the jump's notice, and no jump starts.
                     this.chat.pending_channel_jump = None;
+                    this.chat.notice = None;
+                    assert!(!this.inbox.jump.is_active(now));
                     this.open_result(&item(5_001, SECRET), window, cx);
+                    assert_eq!(this.chat.notice, Some(t!("inbox-jump-no-access")));
                     assert!(!this.inbox.jump.is_active(now));
                     assert_eq!(this.chat.pending_channel_jump, None);
                 })

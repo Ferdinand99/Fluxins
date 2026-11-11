@@ -39,8 +39,6 @@ impl Inlet {
         // The pins or the inbox, under the channel header, lie lowest; the viewer lies
         // under the settings view and the prompts (Escape closes the topmost layer
         // first, see `desktop::OpenLayers`).
-        // The search panel lies lowest: a popout (pins, inbox) opens over it.
-        out.extend(self.render_search_panel(cx));
         out.extend(self.render_panels(cx));
         out.extend(self.render_image_viewer(cx));
         // The emoji, GIF, sticker and meme picker: over the viewer, under the settings.

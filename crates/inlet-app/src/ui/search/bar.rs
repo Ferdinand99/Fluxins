@@ -2,15 +2,15 @@
 //! The search field in the channel header and the search panel it opens.
 //!
 //! The header shows Fluxer's search field (244 × 36, the magnifying glass on the right,
-//! the search typed last). A click opens the search panel, docked on the right under the
-//! header (Fluxer's results column is 420 px). Its top holds the field itself; under it
-//! are either the search options (the filter words, and suggestions for the one being
-//! typed: people, channels, kinds, a day) or the results (`results.rs`).
+//! the search typed last). A click opens the search column beside the chat, which
+//! narrows (Fluxer's results column is 420 px; less in a small window, see
+//! [`panel_width`]). Its top holds the field itself; under it are either the search
+//! options (the filter words, and suggestions for the one being typed: people,
+//! channels, kinds, a day) or the results (`results.rs`).
 //!
-//! Deviation: Fluxer types into the field in the header and opens its results beside the
-//! chat, which narrows. Inlet types in the panel's own field and lays the panel over the
-//! right of the chat, so the panel is one layer (`desktop::Layer::Search`) that takes the
-//! keyboard: nothing typed reaches the composer and nothing is read behind it.
+//! Deviation: Fluxer types into the field in the header. Inlet types in the column's own
+//! field, so the column is one layer (`desktop::Layer::Search`) that takes the keyboard:
+//! nothing typed reaches the composer and nothing is read behind it.
 //!
 //! A search covers the open guild, or the open direct message. It starts on Enter only.
 
@@ -36,6 +36,19 @@ pub const FIELD_WIDTH: f32 = 244.;
 pub const FIELD_HEIGHT: f32 = 36.;
 /// Fluxer's results column.
 pub const PANEL_WIDTH: f32 = 420.;
+/// The narrowest the column gets in a small window.
+const MIN_PANEL_WIDTH: f32 = 280.;
+
+/// The search column's width for a window `window_width` wide: Fluxer's 420 px when
+/// there is room, else half of the space beside the rail and the channel list, never
+/// under 280 px, so the chat beside it keeps its composer and its buttons.
+pub fn panel_width(window_width: f32) -> f32 {
+    if window_width <= 0. {
+        return PANEL_WIDTH;
+    }
+    let center = window_width - crate::ui::rail::RAIL_WIDTH - crate::ui::sidebar::SIDEBAR_WIDTH;
+    (center * 0.5).clamp(MIN_PANEL_WIDTH, PANEL_WIDTH)
+}
 /// Suggestions listed for the filter being typed.
 const SUGGESTIONS: usize = 8;
 
@@ -287,7 +300,7 @@ impl Inlet {
     /// Clears the search (the cross in the header field) and closes the panel.
     pub(crate) fn clear_search(&mut self, cx: &mut Context<Self>) {
         self.search.bar.clear();
-        self.search.results.clear();
+        self.search.results.clear_keeping_pace();
         cx.notify();
     }
 
@@ -376,7 +389,7 @@ impl Inlet {
         cx.notify();
     }
 
-    /// The search panel, docked under the header on the right, when it is open.
+    /// The search column beside the chat, when it is open (`render_center` places it).
     pub(crate) fn render_search_panel(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         if !self.search_panel_open() {
             return None;
@@ -393,15 +406,12 @@ impl Inlet {
                 cx.notify();
             },
         ));
+        let width = panel_width(self.media.viewport.width.as_f32());
         let frame = div()
             .id("search-panel")
-            .occlude()
-            .absolute()
-            .top(px(HEADER_HEIGHT))
-            .right_0()
-            .bottom_0()
-            .w(px(PANEL_WIDTH))
-            .max_w_full()
+            .flex_none()
+            .w(px(width))
+            .h_full()
             .flex()
             .flex_col()
             .bg(theme::bg_app())
@@ -410,11 +420,14 @@ impl Inlet {
             .child(
                 div()
                     .flex_none()
-                    .p(px(12.))
+                    .h(px(HEADER_HEIGHT))
+                    .px(px(12.))
                     .flex()
                     .flex_row()
                     .items_center()
                     .gap(px(8.))
+                    .border_b_1()
+                    .border_color(theme::divider())
                     .child(div().flex_1().min_w_0().child(input))
                     .child(close),
             )
@@ -449,6 +462,7 @@ impl Inlet {
                     }
                     Problem::UnknownHas(v) => t!("search-problem-has", name = v.as_str()),
                     Problem::BadDate(v) => t!("search-problem-date", name = v.as_str()),
+                    Problem::BadPinned(v) => t!("search-problem-pinned", name = v.as_str()),
                 };
                 div()
                     .px(px(8.))

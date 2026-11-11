@@ -458,6 +458,7 @@ impl Inlet {
         self.switcher.background.remove(key);
         self.switcher.summaries.remove(key);
         self.switcher.places.forget(key);
+        self.search.switcher.visits.forget(key);
         let path = dirs::data_local_dir().and_then(|dir| {
             crate::ui::composer::drafts::path_for(
                 &dir,

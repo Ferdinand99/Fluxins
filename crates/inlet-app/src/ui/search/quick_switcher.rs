@@ -34,8 +34,8 @@ use crate::ui::notifications::channel_badge;
 use crate::ui::overlays::account_switcher::Place;
 use crate::ui::sidebar::channel_list::channel_icon;
 
-/// Channels remembered as visited, over all accounts.
-const MAX_VISITS: usize = 50;
+/// Channels remembered as visited, per account (Fluxer keeps 20).
+const MAX_VISITS: usize = 20;
 /// Fluxer's history: the newest visits shown, fewer when other sections follow.
 const HISTORY_LIMIT: usize = 8;
 const PREVIOUS_WITH_SECTIONS: usize = 3;
@@ -93,6 +93,10 @@ pub enum Row {
 }
 
 /// The channels opened, newest first, per account.
+///
+/// Deviation: Fluxer stores the visits on disk; Inlet keeps them in memory for this run
+/// only, because a log of which channels were opened when is not among the data kept
+/// on disk.
 #[derive(Default)]
 pub struct Visits {
     list: VecDeque<(AccountKey, ChannelId, i64)>,
@@ -102,8 +106,21 @@ impl Visits {
     pub fn note(&mut self, account: AccountKey, channel: ChannelId, at: i64) {
         self.list
             .retain(|(a, c, _)| !(a == &account && *c == channel));
-        self.list.push_front((account, channel, at));
-        self.list.truncate(MAX_VISITS);
+        self.list.push_front((account.clone(), channel, at));
+        // At most MAX_VISITS per account: that account's oldest go.
+        let mut seen = 0;
+        self.list.retain(|(a, _, _)| {
+            if a != &account {
+                return true;
+            }
+            seen += 1;
+            seen <= MAX_VISITS
+        });
+    }
+
+    /// An account was signed out: its visits go.
+    pub fn forget(&mut self, account: &AccountKey) {
+        self.list.retain(|(a, _, _)| a != account);
     }
 
     pub fn last(&self, account: &AccountKey, channel: ChannelId) -> Option<i64> {
@@ -263,6 +280,9 @@ fn by_interest(a: &Candidate, b: &Candidate) -> std::cmp::Ordering {
 }
 
 /// The rows for `query` over the candidates of every account.
+///
+/// Deviation: Fluxer's `@` searches users (and opens a DM with them); here it narrows to
+/// the direct messages that exist, since starting a DM is the DM list's job.
 pub fn rank(candidates: &[Candidate], query: &str) -> Vec<Row> {
     let query = query.trim();
     let (mode, search) = match query.chars().next() {
@@ -298,8 +318,13 @@ pub fn rank(candidates: &[Candidate], query: &str) -> Vec<Row> {
 }
 
 /// Without a query: the channels visited last, then those with mentions, then the unread
-/// ones, across every account (Fluxer's `generateDefaultResults`, with the unread
-/// channels of every account instead of the open community's only).
+/// ones, across every account (Fluxer's `generateDefaultResults`).
+///
+/// Deviation: Fluxer lists other accounts in sections of their own, and its unread
+/// section holds the open community's text channels at the "all messages" level only.
+/// Inlet ranks every account in the same sections and lists every unread channel and
+/// direct message that is not muted, so one list shows where to go next across
+/// accounts.
 fn default_rows(candidates: &[Candidate]) -> Vec<Row> {
     let channels: Vec<&Candidate> = candidates
         .iter()
@@ -363,6 +388,9 @@ pub struct QuickSwitcher {
     /// The highlighted entry (an index among the entries, headings not counted).
     selected: usize,
     pub visits: Visits,
+    /// The last entry chosen (tests).
+    #[cfg(test)]
+    pub chosen: Option<Candidate>,
 }
 
 impl QuickSwitcher {
@@ -395,7 +423,8 @@ impl Inlet {
             cx.notify();
             return;
         }
-        if self.screen != crate::app::Screen::Main || self.account.is_none() {
+        // Not under the About view, which draws no layers.
+        if self.screen != crate::app::Screen::Main || self.account.is_none() || self.show_about {
             return;
         }
         let input = match self.search.switcher.input.clone() {
@@ -449,6 +478,10 @@ impl Inlet {
     }
 
     fn choose_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Enter counts only while the switcher is the topmost layer.
+        if !self.is_top_layer(crate::desktop::Layer::QuickSwitcher) {
+            return;
+        }
         let chosen = self
             .search
             .switcher
@@ -463,6 +496,15 @@ impl Inlet {
     /// Opens an entry: on the active account at once; on another account by switching
     /// to it, which then opens the entry as its place.
     fn choose(&mut self, c: Candidate, window: &mut Window, cx: &mut Context<Self>) {
+        // The rows are a snapshot: an account signed out since is not switched to.
+        if !self.switcher.accounts.iter().any(|a| a.key == c.account) {
+            self.rank_switcher(cx);
+            return;
+        }
+        #[cfg(test)]
+        {
+            self.search.switcher.chosen = Some(c.clone());
+        }
         self.search.switcher.open = false;
         let guild = c.guild.map(|g| g.to_string());
         let channel = c.channel.map(|ch| ch.to_string());
@@ -571,15 +613,6 @@ impl Inlet {
             .pt(px(120.))
             .px(px(16.))
             .bg(gpui::rgba(0x000000a0))
-            .key_context(super::SWITCHER_CONTEXT)
-            .on_action(cx.listener(|this, _: &super::SwitcherUp, _, cx| {
-                this.search.switcher.move_selection(-1);
-                cx.notify();
-            }))
-            .on_action(cx.listener(|this, _: &super::SwitcherDown, _, cx| {
-                this.search.switcher.move_selection(1);
-                cx.notify();
-            }))
             .on_mouse_down(
                 gpui::MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
@@ -588,7 +621,18 @@ impl Inlet {
                 }),
             )
             .child(
+                // The switcher's own key context sits inside the frame: the frame gets
+                // the layer's context (`layer_keys`), and an element has one context.
                 div()
+                    .key_context(super::SWITCHER_CONTEXT)
+                    .on_action(cx.listener(|this, _: &super::SwitcherUp, _, cx| {
+                        this.search.switcher.move_selection(-1);
+                        cx.notify();
+                    }))
+                    .on_action(cx.listener(|this, _: &super::SwitcherDown, _, cx| {
+                        this.search.switcher.move_selection(1);
+                        cx.notify();
+                    }))
                     .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .child(card),
             );
