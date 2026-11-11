@@ -219,6 +219,10 @@ mod output {
     use super::Pcm;
 
     const STREAM_PLAYBACK: c_int = 0;
+    /// `SND_PCM_NONBLOCK`: opening never waits for a device another program holds.
+    const OPEN_NONBLOCK: c_int = 1;
+    /// Writes in a row that move nothing before the sound is given up.
+    const MAX_STALLS: u32 = 3;
     const FORMAT_S16_LE: c_int = 2;
     const ACCESS_RW_INTERLEAVED: c_int = 3;
     /// Latency asked of ALSA, in microseconds.
@@ -230,6 +234,7 @@ mod output {
     type WriteI = unsafe extern "C" fn(*mut c_void, *const c_void, c_ulong) -> c_long;
     type Recover = unsafe extern "C" fn(*mut c_void, c_int, c_int) -> c_int;
     type Handle = unsafe extern "C" fn(*mut c_void) -> c_int;
+    type NonBlock = unsafe extern "C" fn(*mut c_void, c_int) -> c_int;
 
     /// The library, loaded on the first sound; a failure is kept and not retried.
     fn alsa() -> Result<&'static Library, String> {
@@ -272,9 +277,17 @@ mod output {
             let recover = sym::<Recover>(lib, "snd_pcm_recover")?;
             let drain = sym::<Handle>(lib, "snd_pcm_drain")?;
             let close = sym::<Handle>(lib, "snd_pcm_close")?;
+            let nonblock = sym::<NonBlock>(lib, "snd_pcm_nonblock")?;
 
             let mut handle: *mut c_void = std::ptr::null_mut();
-            let rc = open(&mut handle, c"default".as_ptr(), STREAM_PLAYBACK, 0);
+            // Non-blocking open: a busy device fails at once instead of holding the
+            // sound thread.
+            let rc = open(
+                &mut handle,
+                c"default".as_ptr(),
+                STREAM_PLAYBACK,
+                OPEN_NONBLOCK,
+            );
             if rc < 0 || handle.is_null() {
                 return Err(format!("no ALSA output device ({rc})"));
             }
@@ -291,13 +304,21 @@ mod output {
                 close(handle);
                 return Err(format!("ALSA refused the format ({rc})"));
             }
+            // Writing blocks again (for as long as the sound plays), so `drain` waits
+            // for the end of the sound.
+            nonblock(handle, 0);
             let mut at = 0usize;
-            while at < samples.len() {
+            let mut stalls = 0;
+            while at < samples.len() && stalls < MAX_STALLS {
                 let left = &samples[at..];
                 let n = writei(handle, left.as_ptr().cast(), left.len() as c_ulong);
                 if n > 0 {
                     at += n as usize;
-                } else if recover(handle, n as c_int, 1) < 0 {
+                    stalls = 0;
+                    continue;
+                }
+                stalls += 1;
+                if n < 0 && recover(handle, n as c_int, 1) < 0 {
                     break;
                 }
             }

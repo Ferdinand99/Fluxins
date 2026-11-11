@@ -191,9 +191,12 @@ pub fn why(state: &AccountState, probe: &Probe, m: &Message) -> Option<Why> {
             || m.mentions
                 .iter()
                 .any(|u| UserId::parse(&u.id) == Some(state.me_id())));
-    // As Fluxer, every message of an unmuted DM or group DM notifies, whatever level
-    // the direct messages have.
+    // As Fluxer, every message of an unmuted DM or group DM notifies at "all messages"
+    // and at "only mentions"; "nothing" still means nothing.
     if private {
+        if level(state, probe.channel) == NO_MESSAGES {
+            return None;
+        }
         return Some(if mention { Why::Mention } else { Why::Message });
     }
     match level(state, probe.channel) {
@@ -247,7 +250,10 @@ pub struct Target {
     pub account: Option<AccountKey>,
     /// The guild, `None` for a direct message.
     pub guild: Option<String>,
+    /// The channel to open: for a thread, the channel it belongs to.
     pub channel: String,
+    /// The thread to open in the side panel, for a message in a thread.
+    pub thread: Option<String>,
 }
 
 /// What to do for one message.
@@ -266,9 +272,9 @@ pub struct Input<'a> {
     pub state: &'a AccountState,
     pub probe: Probe,
     pub message: &'a Message,
-    /// The channel that is open and on screen while the window has focus (only for the
-    /// account on screen).
-    pub focused: Option<ChannelId>,
+    /// The channels on screen while the window has focus: the open channel and the
+    /// thread open in the side panel (only for the account on screen).
+    pub focused: &'a [ChannelId],
 }
 
 /// The settings, each account's Do Not Disturb, the rate limits and the clickable
@@ -333,7 +339,7 @@ impl Engine {
         let why = why(input.state, &input.probe, input.message)?;
         // Deviation: in the channel on screen Fluxer plays a softer sound of its own; Inlet
         // stays silent there.
-        if self.is_dnd(input.account) || input.focused == Some(input.probe.channel) {
+        if self.is_dnd(input.account) || input.focused.contains(&input.probe.channel) {
             return None;
         }
         let show = self.prefs.enabled && self.admit(now);
@@ -411,10 +417,15 @@ impl Engine {
                 return None;
             }
         };
+        let parent = state
+            .channel(ch)
+            .filter(|c| c.is_thread())
+            .and_then(|_| state.channels().parent_of(ch));
         let target = Target {
             account: input.account.cloned(),
             guild: state.channels().guild_of(ch).map(|g| g.to_string()),
-            channel: ch.to_string(),
+            channel: parent.unwrap_or(ch).to_string(),
+            thread: parent.map(|_| ch.to_string()),
         };
         self.targets.retain(|(t, _)| *t != tag);
         self.targets.push_back((tag, target));

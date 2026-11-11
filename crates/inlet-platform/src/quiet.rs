@@ -14,7 +14,9 @@
 //! - macOS: not detected. Focus has no public API for an ordinary app, so the sound
 //!   plays while a Focus is on (the notification itself follows Focus).
 //!
-//! The calls can block (D-Bus on Linux): call [`quiet_mode`] off the UI thread.
+//! Call [`quiet_mode`] off the UI thread. On Linux every D-Bus call has a 500 ms limit
+//! (a server that never answers counts as "not quiet"), and the answer is kept for one
+//! second, so a burst of sounds asks once.
 
 /// Whether a notification sound should stay silent because the system is in a quiet
 /// mode. Errors and unknown states count as not quiet.
@@ -25,7 +27,10 @@ pub fn quiet_mode() -> bool {
     }
     #[cfg(target_os = "linux")]
     {
-        linux_quiet()
+        static LAST: Answer = std::sync::Mutex::new(None);
+        cached(&LAST, std::time::Instant::now(), || {
+            quiet_bus().is_some_and(linux_quiet_on)
+        })
     }
     #[cfg(not(any(windows, target_os = "linux")))]
     {
@@ -55,11 +60,55 @@ fn windows_quiet() -> bool {
     }
 }
 
+/// How long a D-Bus call for the quiet state may take.
 #[cfg(target_os = "linux")]
-fn linux_quiet() -> bool {
-    let Some(bus) = crate::linux_bus::session() else {
-        return false;
-    };
+const CALL_LIMIT: std::time::Duration = std::time::Duration::from_millis(500);
+/// How long an answer is kept.
+#[cfg(target_os = "linux")]
+const CACHE_FOR: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The last answer and when it was taken.
+#[cfg(target_os = "linux")]
+type Answer = std::sync::Mutex<Option<(std::time::Instant, bool)>>;
+
+/// The answer in `last` while it is younger than [`CACHE_FOR`], else a fresh one from
+/// `ask`, kept in `last`.
+#[cfg(target_os = "linux")]
+fn cached(last: &Answer, now: std::time::Instant, ask: impl FnOnce() -> bool) -> bool {
+    let mut last = last.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((at, quiet)) = *last {
+        if now.saturating_duration_since(at) < CACHE_FOR {
+            return quiet;
+        }
+    }
+    let quiet = ask();
+    *last = Some((now, quiet));
+    quiet
+}
+
+/// A session-bus connection of its own whose calls give up after [`CALL_LIMIT`]
+/// (the shared one waits as long as the bus does). Made once; `None` without a bus.
+#[cfg(target_os = "linux")]
+fn quiet_bus() -> Option<&'static zbus::blocking::Connection> {
+    static BUS: std::sync::OnceLock<Option<zbus::blocking::Connection>> =
+        std::sync::OnceLock::new();
+    BUS.get_or_init(|| {
+        bounded_session()
+            .map_err(|e| log::info!("no D-Bus for the quiet state: {e}"))
+            .ok()
+    })
+    .as_ref()
+}
+
+#[cfg(target_os = "linux")]
+fn bounded_session() -> zbus::Result<zbus::blocking::Connection> {
+    zbus::blocking::connection::Builder::session()?
+        .method_timeout(CALL_LIMIT)
+        .build()
+}
+
+#[cfg(target_os = "linux")]
+fn linux_quiet_on(bus: &zbus::blocking::Connection) -> bool {
     let inhibited = bus
         .call_method(
             Some("org.freedesktop.Notifications"),
@@ -150,6 +199,85 @@ mod tests {
     fn asking_answers() {
         let started = std::time::Instant::now();
         let _ = quiet_mode();
-        assert!(started.elapsed() < std::time::Duration::from_secs(30));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_answer_is_kept_for_a_second() {
+        use std::time::{Duration, Instant};
+        let last: Answer = std::sync::Mutex::new(None);
+        let t0 = Instant::now();
+        assert!(cached(&last, t0, || true));
+        assert!(cached(&last, t0 + Duration::from_millis(900), || false));
+        assert!(!cached(&last, t0 + Duration::from_millis(1100), || false));
+    }
+
+    /// A stand-in notification server whose `Inhibited` answers after `delay`.
+    #[cfg(target_os = "linux")]
+    struct Server {
+        /// How long `Inhibited` takes to answer, in milliseconds.
+        delay_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    #[cfg(target_os = "linux")]
+    #[zbus::interface(name = "org.freedesktop.Notifications")]
+    impl Server {
+        #[zbus(property)]
+        fn inhibited(&self) -> bool {
+            let ms = self.delay_ms.load(std::sync::atomic::Ordering::Relaxed);
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+            true
+        }
+    }
+
+    /// Puts a stand-in server on the session bus; `None` (skipped) without a session
+    /// bus or when a real notification server holds the name.
+    #[cfg(target_os = "linux")]
+    fn serve(
+        delay_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ) -> Option<zbus::blocking::Connection> {
+        if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none() {
+            eprintln!("skipped: no D-Bus session bus (run under dbus-run-session)");
+            return None;
+        }
+        let conn = zbus::blocking::Connection::session().ok()?;
+        conn.object_server()
+            .at("/org/freedesktop/Notifications", Server { delay_ms })
+            .ok()?;
+        match conn.request_name("org.freedesktop.Notifications") {
+            Ok(_) => Some(conn),
+            Err(err) => {
+                eprintln!("skipped: the notification name is taken ({err})");
+                None
+            }
+        }
+    }
+
+    /// An inhibited server means quiet; the same server answering too late means "not
+    /// quiet", within the limit and not after the bus's own timeout.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_server_that_does_not_answer_is_not_quiet() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+        let delay = Arc::new(AtomicU64::new(0));
+        let Some(_server) = serve(delay.clone()) else {
+            return;
+        };
+        let client = bounded_session().expect("a bounded connection");
+        assert!(linux_quiet_on(&client));
+
+        delay.store(3_000, Ordering::Relaxed);
+        let started = Instant::now();
+        assert!(!linux_quiet_on(&client));
+        // The property call gives up after 500 ms; the portal calls fail at once (no
+        // portal on the test bus) or after 500 ms each.
+        assert!(
+            started.elapsed() < Duration::from_millis(2500),
+            "{:?}",
+            started.elapsed()
+        );
     }
 }

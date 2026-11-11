@@ -214,10 +214,13 @@ impl Inlet {
             Some(k) => self.switcher.is_active(k),
             None => true,
         };
-        // The open channel counts as watched only on screen, with the window in focus.
-        let focused = self
-            .open_channel_id()
-            .filter(|_| on_screen && self.chat_is_visible() && self.notifications.window_active);
+        // The open channel and the thread in the side panel count as watched only on
+        // screen, with the window in focus.
+        let mut focused = Vec::new();
+        if on_screen && self.chat_is_visible() && self.notifications.window_active {
+            focused.extend(self.open_channel_id());
+            focused.extend(self.threads.panel.as_ref().map(|p| p.thread));
+        }
         let label = account
             .as_ref()
             .filter(|_| self.switcher.accounts.len() > 1)
@@ -229,7 +232,7 @@ impl Inlet {
             label.as_deref(),
             probe,
             m,
-            focused,
+            &focused,
             state,
             cx,
         );
@@ -245,7 +248,7 @@ impl Inlet {
         label: Option<&str>,
         probe: Probe,
         m: &Message,
-        focused: Option<inlet_state::ChannelId>,
+        focused: &[inlet_state::ChannelId],
         state: &Entity<AccountState>,
         cx: &mut Context<Self>,
     ) -> Option<Delivery> {
@@ -331,6 +334,15 @@ impl Inlet {
                 self.switch_account(key, window, cx);
             }
             _ => self.follow_channel_link(target.guild, target.channel, window, cx),
+        }
+        // A message in a thread: its channel comes up with the thread in the side panel.
+        // The account's state is the one on screen by now, also after a switch.
+        if let Some(thread) = target
+            .thread
+            .as_deref()
+            .and_then(inlet_state::ChannelId::parse)
+        {
+            self.open_thread(thread, window, cx);
         }
         cx.notify();
     }

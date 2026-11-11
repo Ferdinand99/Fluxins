@@ -84,7 +84,7 @@ fn deliver(
             state,
             probe: p,
             message: m,
-            focused,
+            focused: focused.as_slice(),
         },
         now,
     )
@@ -326,6 +326,63 @@ fn silent_blocked_and_system_messages_do_not_notify() {
     );
     let mut dm = message(0, "300", "2", "no mention", false);
     assert!(send(&mut engine, &mut state, &mut dm));
+    // ... but "nothing" on the DM (or the direct messages) means nothing.
+    let mut state = state_with(
+        "online",
+        json!([{"guild_id": null,
+                "channel_overrides": [{"channel_id": "300", "message_notifications": 2}]}]),
+    );
+    let mut dm = message(0, "300", "2", "<@1> even a mention", true);
+    assert!(!send(&mut engine, &mut state, &mut dm));
+    let mut state = state_with(
+        "online",
+        json!([{"guild_id": null, "message_notifications": 2}]),
+    );
+    let mut dm = message(0, "300", "2", "hello", false);
+    assert!(!send(&mut engine, &mut state, &mut dm));
+}
+
+#[test]
+fn a_thread_open_in_the_panel_is_watched_and_its_click_opens_it() {
+    let mut engine = Engine::new(AlertPrefs::default());
+    let mut state = state_with("online", json!([]));
+    let thread: inlet_protocol::Channel = serde_json::from_value(json!({
+        "id": "400", "type": 11, "guild_id": "10", "parent_id": "100", "name": "plans",
+        "member": {"id": "400", "user_id": "1", "join_timestamp": "2026-01-01T00:00:00Z", "flags": 0},
+        "thread_metadata": {"archived": false, "locked": false, "auto_archive_duration": 1440}
+    }))
+    .unwrap();
+    state.apply(&Dispatch::ThreadCreate(Box::new(thread)));
+    let t0 = Instant::now();
+
+    // The thread is in the side panel next to #general, with focus: nothing.
+    let m = message(id(1), "400", "2", "in the thread", false);
+    let watched = [ChannelId(100), ChannelId(400)];
+    let p = {
+        let d = Dispatch::MessageCreate(Box::new(m.clone()));
+        let p = probe(&state, &d).unwrap();
+        state.apply(&d);
+        p
+    };
+    let input = Input {
+        account: None,
+        account_label: None,
+        state: &state,
+        probe: p,
+        message: &m,
+        focused: &watched,
+    };
+    assert!(engine.on_message(input, t0).is_none());
+
+    // Only #general on screen: the thread's message notifies, and its click leads to
+    // #general with the thread in the panel.
+    let m = message(id(2), "400", "2", "another", false);
+    let d = deliver(&mut engine, &mut state, None, &m, Some(ChannelId(100)), t0);
+    let n = shown(&d).expect("a notification");
+    let target = engine.target(n.tag()).unwrap();
+    assert_eq!(target.channel, "100");
+    assert_eq!(target.thread.as_deref(), Some("400"));
+    assert_eq!(target.guild.as_deref(), Some("10"));
 }
 
 #[test]
