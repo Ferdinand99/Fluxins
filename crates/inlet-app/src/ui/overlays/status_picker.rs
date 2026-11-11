@@ -283,6 +283,8 @@ impl Inlet {
             .child(body);
         let frame = div()
             .id("status-picker-frame")
+            // A click outside only closes the picker; it reaches nothing behind it.
+            .occlude()
             .absolute()
             .top_0()
             .left_0()
