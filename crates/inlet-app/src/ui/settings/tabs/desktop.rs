@@ -14,7 +14,7 @@ pub struct DesktopTab;
 
 /// A row with a check box. A row that cannot be changed right now is dimmed and does
 /// not react.
-fn toggle(id: &'static str, label: String, on: bool, enabled: bool) -> Stateful<Div> {
+pub(super) fn toggle(id: &'static str, label: String, on: bool, enabled: bool) -> Stateful<Div> {
     let mark = if on {
         Icon::CheckSquare
             .el(px(20.), theme::brand())
@@ -41,7 +41,7 @@ fn toggle(id: &'static str, label: String, on: bool, enabled: bool) -> Stateful<
         .child(div().text_color(theme::text_strong()).child(label))
 }
 
-fn note(text: String) -> Div {
+pub(super) fn note(text: String) -> Div {
     div()
         .pl(px(32.))
         .text_size(px(13.))
@@ -49,7 +49,7 @@ fn note(text: String) -> Div {
         .child(text)
 }
 
-fn heading(text: String) -> Div {
+pub(super) fn heading(text: String) -> Div {
     div()
         .pt_4()
         .pb_1()

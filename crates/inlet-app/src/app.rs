@@ -68,7 +68,6 @@ pub struct Inlet {
     pub media: ui::media::State,
     pub members: ui::members::State,
     pub profile: ui::profile::State,
-    #[allow(dead_code)] // filled by the task that builds the domain
     pub social: ui::social::State,
     #[allow(dead_code)] // filled by the task that builds the domain
     pub search: ui::search::State,
@@ -167,7 +166,7 @@ impl Inlet {
             media: ui::media::State::with_settings(),
             members: Default::default(),
             profile: Default::default(),
-            social: Default::default(),
+            social: ui::social::State::new(cx),
             search: Default::default(),
             inbox: Default::default(),
             threads: Default::default(),
@@ -290,6 +289,7 @@ impl Inlet {
         self.media.reset();
         self.notifications.clear();
         self.switcher.signed_out();
+        self.social.reset();
         self.backend.set_account(None);
         self.chat.status.clear();
         self.chat.error = None;

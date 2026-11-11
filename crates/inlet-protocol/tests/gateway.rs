@@ -376,6 +376,39 @@ async fn invalid_session_identifies_again() {
 }
 
 #[tokio::test]
+async fn identify_asks_for_the_initial_status_until_one_is_set() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let options = GatewayOptions {
+        initial_status: Some("invisible".into()),
+        ..fast_options(false)
+    };
+    let (handle, _events) = Gateway::connect(instance_for(port), Token::new("gw-pres"), options);
+    let mut c = Conn::accept(&listener).await;
+    c.hello(45_000).await;
+    let identify = c.recv(false).await;
+    assert_eq!(identify["op"], 2);
+    assert_eq!(
+        identify["d"]["presence"]["status"], "invisible",
+        "{identify}"
+    );
+    assert_eq!(identify["d"]["presence"]["afk"], false);
+    c.dispatch(1, "READY", ready("sess-pres")).await;
+
+    // A status set later goes out with `afk`, and the next Identify asks for it.
+    handle.set_presence("idle", true);
+    let update = c.recv(false).await;
+    assert_eq!(update["op"], 3, "{update}");
+    assert_eq!(update["d"]["status"], "idle");
+    assert_eq!(update["d"]["afk"], true);
+    c.send(json!({"op": 9, "d": false})).await;
+    let again = c.recv(false).await;
+    assert_eq!(again["op"], 2, "{again}");
+    assert_eq!(again["d"]["presence"]["status"], "idle", "{again}");
+    assert_eq!(again["d"]["presence"]["afk"], true);
+}
+
+#[tokio::test]
 async fn auth_failure_stops_for_good() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();

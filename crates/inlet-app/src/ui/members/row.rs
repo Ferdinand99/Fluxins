@@ -16,41 +16,10 @@ use super::{MemberIcon, ROW_HEIGHT};
 use crate::app::Inlet;
 use crate::theme;
 use crate::ui::profile::Opener;
+use crate::ui::social::presence::avatar_status;
 
 /// Size of the avatar in a row.
 pub const AVATAR: f32 = 32.;
-/// Size of the status dot (Fluxer's `StatusIndicator` default).
-pub const DOT: f32 = 12.;
-
-/// The colour of a status.
-pub fn status_color(status: &str) -> Hsla {
-    match status {
-        "online" => theme::status_online(),
-        "idle" => theme::status_idle(),
-        "dnd" => theme::status_dnd(),
-        _ => theme::status_offline(),
-    }
-}
-
-/// A status dot with a ring in `ring` (the surface it sits on), bottom right of an
-/// avatar.
-// Deviation: Fluxer draws idle as a moon and do-not-disturb with a bar; here every
-// status is a filled dot in its colour.
-pub fn status_badge(status: &str, size: f32, ring: Hsla) -> AnyElement {
-    let ring_w = (size / 4.).round();
-    div()
-        .absolute()
-        .right(px(-ring_w))
-        .bottom(px(-ring_w))
-        .size(px(size + ring_w * 2.))
-        .rounded_full()
-        .bg(ring)
-        .flex()
-        .items_center()
-        .justify_center()
-        .child(div().size(px(size)).rounded_full().bg(status_color(status)))
-        .into_any_element()
-}
 
 /// A row for a member that is not loaded yet.
 pub fn placeholder(ix: usize) -> AnyElement {
@@ -106,6 +75,10 @@ impl Inlet {
         fallback: &'static str,
         cx: &App,
     ) -> &'static str {
+        // The account itself: the status this session shows.
+        if self.account.as_ref().map(|a| a.read(cx).me_id()) == Some(user) {
+            return self.shown_status(cx);
+        }
         self.account
             .as_ref()
             .and_then(|a| {
@@ -219,7 +192,7 @@ impl Inlet {
                             .flex_none()
                             .size(px(AVATAR))
                             .child(avatar)
-                            .child(status_badge(status, DOT, theme::bg_chat())),
+                            .child(avatar_status(status, theme::bg_chat())),
                     )
                     .child(text)
                     .on_click(cx.listener(move |this, e: &ClickEvent, _, cx| {

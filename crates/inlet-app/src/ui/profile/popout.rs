@@ -30,6 +30,24 @@ const BANNER_PLAIN_HEIGHT: f32 = 60.;
 /// Avatar size in the popout.
 const AVATAR: f32 = 80.;
 
+/// The status dot of a large avatar (the presence domain's dot, `size` square), in a
+/// ring of `ring` on the avatar's bottom right.
+fn large_status(status: &str, size: f32, ring: Hsla) -> AnyElement {
+    let pad = (size / 4.).round();
+    div()
+        .absolute()
+        .right(px(-pad))
+        .bottom(px(-pad))
+        .size(px(size + 2. * pad))
+        .rounded_full()
+        .bg(ring)
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(crate::ui::social::presence::status_dot(status, size))
+        .into_any_element()
+}
+
 /// What is known of a person before (or without) the fetched profile.
 pub(super) struct Basics {
     pub name: String,
@@ -78,8 +96,8 @@ impl Inlet {
             return ("offline", None);
         };
         if state.me_id() == user {
-            // The account's own presence is not in the cache; show it online.
-            return ("online", None);
+            // The account itself: the status this session shows.
+            return (self.shown_status(cx), None);
         }
         let presence = state.presences().get(user);
         let status = normalize_status(presence.map_or("", |p| p.status.as_str()));
@@ -184,13 +202,13 @@ impl Inlet {
                         .p(px(ring))
                         .rounded_full()
                         .bg(surface)
-                        .child(div().relative().size(px(avatar)).child(avatar_el).child(
-                            crate::ui::members::status_badge(
-                                status,
-                                (avatar / 5.).round(),
-                                surface,
-                            ),
-                        )),
+                        .child(
+                            div()
+                                .relative()
+                                .size(px(avatar))
+                                .child(avatar_el)
+                                .child(large_status(status, (avatar / 5.).round(), surface)),
+                        ),
                 ),
             )
             .child(

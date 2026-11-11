@@ -19,7 +19,6 @@ mod group_header;
 pub mod list;
 mod row;
 
-pub use row::status_badge;
 mod search;
 
 use std::ops::Range;

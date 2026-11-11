@@ -571,6 +571,15 @@ pub fn show_main_window(cx: &mut App) {
     });
 }
 
+/// Flashes the taskbar button (bounces the dock icon) while the window has no focus,
+/// for a new notification.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn flash_main_window(cx: &mut App) {
+    with_main_window(cx, "flash the window", |window, _| {
+        gpui_glue::flash_window(window)
+    });
+}
+
 fn hide_main_window(cx: &mut App) {
     with_main_window(cx, "hide the window", |window, cx| {
         gpui_glue::hide_window(window, cx)
@@ -840,6 +849,9 @@ impl Inlet {
             }
             Ev::Os(PlatformEvent::DeepLink(link)) => self.offer_deep_link(link, cx),
             Ev::Os(PlatformEvent::TrayMenu(id)) if id == TRAY_QUIT => quit(cx),
+            Ev::Os(PlatformEvent::NotificationClicked(tag)) => {
+                self.open_notification(&tag, window, cx)
+            }
             Ev::Os(_) => {}
         }
     }
@@ -848,7 +860,7 @@ impl Inlet {
     /// with several accounts, this is the one place that sums them.
     /// Every signed-in account counts: the active one from its state, the others from
     /// their marks in the account switcher.
-    fn desktop_unread(&self, cx: &App) -> DesktopUnread {
+    pub(crate) fn desktop_unread(&self, cx: &App) -> DesktopUnread {
         let active = self
             .account
             .as_ref()
@@ -920,6 +932,7 @@ impl Inlet {
             profile_popout: self.profile.popout.is_some(),
             profile_modal: self.profile.full.is_some(),
             notification_settings: self.notifications.settings.is_some(),
+            status_picker: self.status_picker_open(),
             switcher: self.switcher_layer_open(),
             panel: self.inbox.open.is_some(),
             settings: self.settings.view.is_some(),
@@ -949,8 +962,11 @@ impl Inlet {
                 .layer_focus
                 .get_or_insert_with(|| cx.focus_handle())
                 .clone();
-            // A field inside the topmost layer (the note in a profile) may keep the
-            // keyboard; anything outside the layer gives it back to the layer.
+            // One rule for fields in layers: a field inside the topmost layer (the
+            // status picker's custom status, the note in a profile) may keep the
+            // keyboard, because only the topmost layer carries this focus handle.
+            // Anything else gives it back to the layer; a layer that opens over
+            // another takes the handle, so a field under it loses the keyboard at once.
             if !handle.contains_focused(window, cx) {
                 if !self.overlays.layer_had_focus {
                     // Where the keyboard was, to give it back when the layers close.
@@ -1002,6 +1018,7 @@ impl Inlet {
             Some(Layer::ProfilePopout) => self.profile.popout = None,
             Some(Layer::ProfileModal) => self.profile.full = None,
             Some(Layer::NotificationSettings) => self.notifications.settings = None,
+            Some(Layer::StatusPicker) => self.social.picker = None,
             Some(Layer::AccountSwitcher) => self.switcher.open = false,
             Some(Layer::Panel) => self.inbox.open = None,
             Some(Layer::Settings) => self.settings.view = None,
@@ -1064,6 +1081,8 @@ pub(crate) enum Layer {
     /// The full profile.
     ProfileModal,
     NotificationSettings,
+    /// The status picker over the user panel.
+    StatusPicker,
     AccountSwitcher,
     /// The pinned messages or the inbox, under the channel header.
     Panel,
@@ -1073,8 +1092,8 @@ pub(crate) enum Layer {
 
 /// Which layers are open. They are drawn bottom first (a panel, the image viewer, the
 /// settings view, the notification settings window, the account switcher, the full
-/// profile, the profile popout, the user menu, the link confirmation, the link prompt,
-/// see `ui/overlays`), and the topmost one has the
+/// profile, the profile popout, the user menu, the status picker, the link
+/// confirmation, the link prompt, see `ui/overlays`), and the topmost one has the
 /// keyboard: Escape closes it first.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct OpenLayers {
@@ -1084,6 +1103,7 @@ pub(crate) struct OpenLayers {
     pub profile_popout: bool,
     pub profile_modal: bool,
     pub notification_settings: bool,
+    pub status_picker: bool,
     pub switcher: bool,
     pub panel: bool,
     pub settings: bool,
@@ -1096,6 +1116,8 @@ impl OpenLayers {
             Some(Layer::LinkPrompt)
         } else if self.link_confirm {
             Some(Layer::LinkConfirm)
+        } else if self.status_picker {
+            Some(Layer::StatusPicker)
         } else if self.user_menu {
             Some(Layer::UserMenu)
         } else if self.profile_popout {
@@ -1127,6 +1149,7 @@ impl OpenLayers {
             Some(Layer::ProfilePopout) => self.profile_popout = false,
             Some(Layer::ProfileModal) => self.profile_modal = false,
             Some(Layer::NotificationSettings) => self.notification_settings = false,
+            Some(Layer::StatusPicker) => self.status_picker = false,
             Some(Layer::AccountSwitcher) => self.switcher = false,
             Some(Layer::Panel) => self.panel = false,
             Some(Layer::Settings) => self.settings = false,
@@ -1366,6 +1389,7 @@ mod tests {
             profile_popout: true,
             profile_modal: true,
             notification_settings: true,
+            status_picker: true,
             switcher: true,
             panel: true,
             settings: true,
@@ -1381,6 +1405,7 @@ mod tests {
             [
                 Layer::LinkPrompt,
                 Layer::LinkConfirm,
+                Layer::StatusPicker,
                 Layer::UserMenu,
                 Layer::ProfilePopout,
                 Layer::ProfileModal,

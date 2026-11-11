@@ -3,7 +3,7 @@
 //! these fill one submodule each.
 
 pub mod members;
-mod presence;
+pub mod presence;
 pub mod profile;
 mod relationships;
 
@@ -12,6 +12,8 @@ use super::Backend;
 /// Commands of this domain.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Cmd {
+    /// Presence and status (see [`presence`]).
+    Presence(presence::Cmd),
     /// The member list on screen and member searches (see [`members`]).
     Members(members::Cmd),
     /// Profiles and notes (see [`profile`]).
@@ -19,9 +21,18 @@ pub enum Cmd {
 }
 
 /// Events of this domain.
+#[derive(Clone, Debug)]
 pub enum Ev {
+    /// Presence and status (see [`presence`]).
+    Presence(presence::Ev),
     /// Profiles and notes (see [`profile`]).
     Profile(profile::Ev),
+}
+
+impl From<presence::Cmd> for super::Command {
+    fn from(cmd: presence::Cmd) -> Self {
+        super::Command::Social(Cmd::Presence(cmd))
+    }
 }
 
 impl From<members::Cmd> for super::Command {
@@ -54,6 +65,7 @@ impl State {
 
 pub(super) fn handle(backend: &mut Backend, cmd: Cmd) {
     match cmd {
+        Cmd::Presence(cmd) => presence::handle(backend, cmd),
         Cmd::Members(cmd) => members::handle(backend, cmd),
         Cmd::Profile(cmd) => profile::handle(backend, cmd),
     }

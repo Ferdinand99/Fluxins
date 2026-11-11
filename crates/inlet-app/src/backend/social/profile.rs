@@ -52,6 +52,7 @@ pub enum Cmd {
 }
 
 /// Profile events.
+#[derive(Clone, Debug)]
 pub enum Ev {
     Profile {
         request: u64,
