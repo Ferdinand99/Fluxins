@@ -6,8 +6,8 @@ Inlet is licensed under the GNU Affero General Public License, version 3 or late
 reproduced, followed by the crates that use that text. Fonts and icons built into
 the binary are listed at the end.
 
-- Apache License 2.0: 428 crate(s)
-- MIT License: 138 crate(s)
+- Apache License 2.0: 435 crate(s)
+- MIT License: 139 crate(s)
 - ISC License: 24 crate(s)
 - Unicode License v3: 23 crate(s)
 - BSD 3-Clause "New" or "Revised" License: 13 crate(s)
@@ -277,8 +277,10 @@ Used by:
   - accesskit_unix 0.22.1 (https://github.com/AccessKit/accesskit)
   - accesskit_windows 0.34.0 (https://github.com/AccessKit/accesskit)
   - allocator-api2 0.2.21 (https://github.com/zakarumych/allocator-api2)
+  - alsa 0.11.0 (https://github.com/diwic/alsa-rs)
   - anyhow 1.0.104 (https://github.com/dtolnay/anyhow)
   - async-trait 0.1.92 (https://github.com/dtolnay/async-trait)
+  - dasp_sample 0.11.0 (https://github.com/rustaudio/sample.git)
   - dirs 6.0.0 (https://github.com/soc/dirs-rs)
   - dirs-sys 0.5.0 (https://github.com/dirs-dev/dirs-sys-rs)
   - dispatch2 0.3.1 (https://github.com/madsmtm/objc2)
@@ -311,6 +313,9 @@ Used by:
   - naga-types 30.0.0 (https://github.com/gfx-rs/wgpu)
   - num-conv 0.2.2 (https://github.com/jhpratt/num-conv)
   - objc2-app-kit 0.3.2 (https://github.com/madsmtm/objc2)
+  - objc2-audio-toolbox 0.3.2 (https://github.com/madsmtm/objc2)
+  - objc2-core-audio 0.3.2 (https://github.com/madsmtm/objc2)
+  - objc2-core-audio-types 0.3.2 (https://github.com/madsmtm/objc2)
   - objc2-core-foundation 0.3.2 (https://github.com/madsmtm/objc2)
   - objc2-core-graphics 0.3.2 (https://github.com/madsmtm/objc2)
   - objc2-core-text 0.3.2 (https://github.com/madsmtm/objc2)
@@ -485,6 +490,7 @@ Used by:
   - core-graphics 0.24.0 (https://github.com/servo/core-foundation-rs)
   - core-graphics-types 0.2.0 (https://github.com/servo/core-foundation-rs)
   - core-text 21.0.0 (https://github.com/servo/core-foundation-rs)
+  - coreaudio-rs 0.14.2 (https://github.com/RustAudio/coreaudio-rs.git)
   - crossbeam-channel 0.5.17 (https://github.com/crossbeam-rs/crossbeam)
   - crossbeam-deque 0.8.8 (https://github.com/crossbeam-rs/crossbeam)
   - crossbeam-epoch 0.9.21 (https://github.com/crossbeam-rs/crossbeam)
@@ -3107,6 +3113,7 @@ limitations under the License.
 Apache License 2.0 (Apache-2.0)
 Used by:
   - codespan-reporting 0.13.1 (https://github.com/brendanzab/codespan)
+  - cpal 0.18.2 (https://github.com/RustAudio/cpal)
   - self_cell 1.3.0 (https://github.com/Voultapher/self_cell)
   - sys-locale 0.3.2 (https://github.com/1Password/sys-locale)
   - unicode-linebreak 0.1.5 (https://github.com/axelf4/unicode-linebreak)
@@ -13016,6 +13023,34 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
+
+
+================================================================================
+MIT License (MIT)
+Used by:
+  - alsa-sys 0.4.0 (https://github.com/diwic/alsa-sys)
+--------------------------------------------------------------------------------
+MIT License
+
+Copyright (c) 2018 diwic
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 
 
 ================================================================================

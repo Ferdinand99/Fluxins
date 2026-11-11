@@ -177,6 +177,11 @@ fn document(notification: &Notification) -> Result<XmlDocument> {
         element.SetInnerText(&HSTRING::from(text))?;
         binding.AppendChild(&element)?;
     }
+    // Silent: the app plays its own sound (or none, when the user turned sounds off or
+    // is in Do Not Disturb), never the system's default toast sound on top.
+    let audio = document.CreateElement(h!("audio"))?;
+    audio.SetAttribute(h!("silent"), h!("true"))?;
+    toast.AppendChild(&audio)?;
     Ok(document)
 }
 
@@ -192,6 +197,7 @@ mod tests {
         let xml = document(&n).unwrap().GetXml().unwrap().to_string();
         assert!(xml.contains("&lt;b&gt;Alice&lt;/b&gt;"), "{xml}");
         assert!(xml.contains("a &lt; b &amp;"), "{xml}");
+        assert!(xml.contains(r#"silent="true""#), "{xml}");
     }
 
     /// Shows and removes a real toast. The runner has a notification platform.

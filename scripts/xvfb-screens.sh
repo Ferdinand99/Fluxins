@@ -140,7 +140,14 @@ scene 31-thread-list thread-list c-general
 scene 32-forum forum c-forum
 scene 33-media-channel media-channel c-gallery
 
-# 10. The scene files of the visual checks. Xvfb's pointer cannot be moved and sits in
+# 10. The Notifications settings tab.
+INLET_DEMO=1 INLET_DEMO_LIVE_SECS=3600 INLET_DEMO_GUILD=g1 INLET_DEMO_CHANNEL=c-general INLET_DEMO_SETTINGS=notifications "$bin" >>"$out/demo.log" 2>&1 &
+pid=$!
+sleep 6
+shot 34-settings-notifications
+kill $pid; wait $pid 2>/dev/null
+
+# 11. The scene files of the visual checks. Xvfb's pointer cannot be moved and sits in
 #     the middle of the screen; the demo puts a scene's window in the top left corner,
 #     and the screen is more than twice its size, so the pointer is never over it (no
 #     hover states). The app reads each file itself.
