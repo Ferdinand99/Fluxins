@@ -93,7 +93,8 @@ pub fn sized_svg(svg: &[u8], px: u32) -> Vec<u8> {
         .iter()
         .position(|b| *b == b'>')
         .map_or(svg.len(), |p| p + at);
-    if svg[at..head_end].windows(5).any(|w| w == b"width") {
+    let head = &svg[at..head_end];
+    if head.windows(7).any(|w| w == b" width=") || head.windows(8).any(|w| w == b" height=") {
         return svg.to_vec();
     }
     let attrs = format!(" width=\"{px}\" height=\"{px}\"");
@@ -170,6 +171,13 @@ mod tests {
             "{sized}"
         );
         assert_eq!(sized_svg(&sized_svg(svg, 64), 64), sized_svg(svg, 64));
+        // Only a size of the root counts: a stroke width does not, a height alone does.
+        let stroke = br#"<svg stroke-width="2" viewBox="0 0 36 36"/>"#;
+        assert!(String::from_utf8(sized_svg(stroke, 64))
+            .unwrap()
+            .contains(r#" width="64""#));
+        let tall = br#"<svg height="10" viewBox="0 0 36 36"/>"#;
+        assert_eq!(sized_svg(tall, 64), tall.to_vec());
         assert_eq!(status_svg("busy"), status_svg("offline"));
     }
 }

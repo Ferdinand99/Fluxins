@@ -82,9 +82,10 @@ impl Presence {
         gateway.set_presence(BACKGROUND_STATUS, false);
     }
 
-    /// A new gateway of the active account: the status the UI asked for last, if any
-    /// (without one, Fluxer uses the account's saved status).
-    pub fn to_new_gateway(&self, gateway: &p::GatewayHandle) {
+    /// The account is in front again, or has a new gateway: the status the UI asked for
+    /// last, if any (a new gateway without one identifies with the account's saved
+    /// status; a gateway that was in the background leaves `invisible` this way).
+    pub fn to_front(&self, gateway: &p::GatewayHandle) {
         if let Some((status, afk)) = &self.wanted {
             gateway.set_presence(status, *afk);
         }
@@ -125,6 +126,8 @@ pub enum Next {
 pub struct Coalescer {
     wanted: Save,
     written: Save,
+    /// What counted as written before the write in flight (see [`Coalescer::failed`]).
+    before: Save,
     sent: VecDeque<Instant>,
 }
 
@@ -159,8 +162,15 @@ impl Coalescer {
             return Next::Wait(free_at.saturating_duration_since(now));
         }
         self.sent.push_back(now);
-        self.written = self.wanted.clone();
+        self.before = std::mem::replace(&mut self.written, self.wanted.clone());
         Next::Write(update)
+    }
+
+    /// The last write failed: what it carried does not count as written, so the next
+    /// wish writes it again, even when it asks for the same. It is not retried on its
+    /// own.
+    pub fn failed(&mut self) {
+        self.written = std::mem::take(&mut self.before);
     }
 }
 
@@ -178,6 +188,7 @@ async fn write_task(
         match c.next(Instant::now()) {
             Next::Write(update) => {
                 if let Err(err) = client.update_user_settings(&update).await {
+                    c.failed();
                     report(
                         &events,
                         &internal,
@@ -186,6 +197,10 @@ async fn write_task(
                         err,
                     );
                     let _ = events.unbounded_send(super::Ev::Presence(Ev::SaveFailed));
+                    // No retry of its own: wait for the next wish.
+                    if rx.changed().await.is_err() {
+                        return;
+                    }
                 }
             }
             Next::Wait(wait) => {

@@ -142,7 +142,7 @@ impl Backend {
             gateway.set_guild_active(guild, true);
         }
         if !background {
-            r.presence.to_new_gateway(&gateway);
+            r.presence.to_front(&gateway);
         }
         if let Some(r) = self.engine_mut(gen) {
             r.gateway = gateway;

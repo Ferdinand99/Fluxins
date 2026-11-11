@@ -1144,6 +1144,10 @@ impl Backend {
             Duration::ZERO
         };
         let guilds = r.guilds.lock().unwrap().clone();
+        if !restart {
+            // Its gateway stays: it shows the status asked for last, not `invisible`.
+            r.presence.to_front(&r.gateway);
+        }
         self.events = r.events.clone();
         self.session_activated(&r.session);
         self.active = Some(Active::Real(r));

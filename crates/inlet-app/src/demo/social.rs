@@ -85,10 +85,14 @@ pub fn start_typing(events: &Ui) {
                     "timestamp": chrono::Utc::now().timestamp(),
                 }))
                 .expect("a valid TYPING_START");
-                let _ = events.unbounded_send(msgs::Ev::Dispatch {
+                let sent = events.unbounded_send(msgs::Ev::Dispatch {
                     dispatch: Box::new(p::Dispatch::TypingStart(typing)),
                     rendered: Vec::new(),
                 });
+                if sent.is_err() {
+                    // The UI is gone.
+                    return;
+                }
             }
             tokio::time::sleep(Duration::from_secs(5)).await;
         }

@@ -85,9 +85,16 @@ fn status_updates_are_coalesced_five_per_twenty_seconds() {
     assert_eq!(c.next(now + SAVE_WINDOW), Next::Idle);
     // A new wish goes out at once while the window has a free slot.
     wish.merge(status("online"));
-    c.want(wish);
+    c.want(wish.clone());
     let at = now + Duration::from_secs(1);
     assert!(matches!(c.next(at), Next::Write(_)));
+    // That write failed: the same wish again writes it again.
+    c.failed();
+    c.want(wish);
+    match c.next(at + Duration::from_secs(1)) {
+        Next::Write(u) => assert_eq!(u.status.as_deref(), Some("online")),
+        other => panic!("the failed wish is written again: {other:?}"),
+    }
 }
 
 #[test]
@@ -228,8 +235,9 @@ async fn a_background_account_is_invisible_and_gets_no_more_presence() {
         Vec::<String>::new()
     );
 
-    // Active again (same gateway): a burst of picks sends at most 5 per 20 s in all on
-    // this connection; two went out already.
+    // Active again (same gateway): it leaves `invisible` for the status asked for last,
+    // and a burst of picks sends at most 5 per 20 s in all on this connection (two went
+    // out already).
     accounts::handle(&mut b, accounts::Cmd::SwitchAccount(key.clone()));
     for i in 0..12 {
         b.command(
@@ -239,6 +247,7 @@ async fn a_background_account_is_invisible_and_gets_no_more_presence() {
     }
     let burst = op3s(&mut conn, Duration::from_secs(2)).await;
     assert_eq!(burst.len(), 3, "5 per 20 s on the connection: {burst:?}");
+    assert_eq!(burst[0], "dnd", "back in front with its status: {burst:?}");
 }
 
 #[tokio::test]
