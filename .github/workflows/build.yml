@@ -387,7 +387,16 @@ jobs:
       # Package list follows Zed's script/linux.
       - name: Install system packages for gpui
         run: |
-          sudo apt-get update
+          # The runner's Azure mirror sometimes fails to resolve; fall back to the
+          # main Ubuntu archive and retry the index download a few times.
+          if ! getent hosts azure.archive.ubuntu.com >/dev/null; then
+            sudo sed -i 's#http://azure.archive.ubuntu.com#http://archive.ubuntu.com#g'               /etc/apt/sources.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true
+          fi
+          for attempt in 1 2 3; do
+            sudo apt-get update && break
+            echo "apt-get update failed (attempt $attempt), retrying"
+            sleep 15
+          done
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake clang lld pkg-config \
             libasound2-dev \
@@ -508,7 +517,16 @@ jobs:
 
       - name: Install Xvfb, software Vulkan and the capture tools
         run: |
-          sudo apt-get update
+          # The runner's Azure mirror sometimes fails to resolve; fall back to the
+          # main Ubuntu archive and retry the index download a few times.
+          if ! getent hosts azure.archive.ubuntu.com >/dev/null; then
+            sudo sed -i 's#http://azure.archive.ubuntu.com#http://archive.ubuntu.com#g'               /etc/apt/sources.list /etc/apt/sources.list.d/*.sources 2>/dev/null || true
+          fi
+          for attempt in 1 2 3; do
+            sudo apt-get update && break
+            echo "apt-get update failed (attempt $attempt), retrying"
+            sleep 15
+          done
           sudo apt-get install -y --no-install-recommends \
             xvfb x11-utils imagemagick xdotool \
             libvulkan1 mesa-vulkan-drivers libegl1 libgl1-mesa-dri \
