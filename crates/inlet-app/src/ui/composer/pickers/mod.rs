@@ -346,6 +346,7 @@ impl Inlet {
             let account = self.switcher.active.clone();
             self.composer.pickers.reset(account);
             self.set_picker_buttons(cx);
+            self.pickers_setup(cx);
         }
     }
 
@@ -450,22 +451,29 @@ impl Inlet {
     /// Asks once per account for what every tab needs: the instance's GIF setup and the
     /// preferences, when READY did not bring them.
     fn pickers_load(&mut self, cx: &mut Context<Self>) {
-        if !self.composer.pickers.setup_asked {
-            self.composer.pickers.setup_asked = true;
-            let traits = self
-                .account
-                .as_ref()
-                .map(|a| a.read(cx).me().traits())
-                .unwrap_or_default();
-            self.backend
-                .send(ComposerCmd::Pickers(Cmd::Setup { traits }));
-        }
+        self.pickers_setup(cx);
         let prefs = &mut self.composer.pickers.prefs;
         if !prefs.known() && !prefs.asked {
             prefs.asked = true;
             self.backend
                 .send(ComposerCmd::Pickers(Cmd::LoadPreferences));
         }
+    }
+
+    /// Asks once per account for the instance's GIF setup and whether the account may
+    /// use other communities' emoji (no request: the backend reads its discovery
+    /// document). The composer's GIF button shows once the answer says so.
+    fn pickers_setup(&mut self, cx: &mut Context<Self>) {
+        let Some(account) = self.account.as_ref() else {
+            return;
+        };
+        if self.composer.pickers.setup_asked {
+            return;
+        }
+        self.composer.pickers.setup_asked = true;
+        let traits = account.read(cx).me().traits();
+        self.backend
+            .send(ComposerCmd::Pickers(Cmd::Setup { traits }));
     }
 
     /// A tab became visible: a fresh search field with the tab's hint, and what the tab
@@ -577,7 +585,7 @@ impl Inlet {
                 if ready.extra.contains_key("favorite_memes") {
                     pickers.memes = Some(ready.favorite_memes());
                 }
-                self.set_picker_buttons(cx);
+                self.pickers_setup(cx);
             }
             p::Dispatch::UserSettingsUpdate(settings) => {
                 if let Some(Ok(prefs)) = settings.synced_preferences() {
