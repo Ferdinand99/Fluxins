@@ -956,24 +956,17 @@ impl Inlet {
     /// behind it, and gives it back to the composer when the last layer closes. Called
     /// when the window is drawn.
     pub(crate) fn focus_layer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let top = self.open_layers().topmost();
-        let same_top = std::mem::replace(&mut self.overlays.last_top, top) == top;
-        if self.layer_open() {
+        if let Some(top) = self.open_layers().topmost() {
             let handle = self
                 .overlays
                 .layer_focus
                 .get_or_insert_with(|| cx.focus_handle())
                 .clone();
-            // One rule for fields in layers: a field inside the topmost layer (the
-            // status picker's custom status, the note in a profile) may keep the
-            // keyboard. `contains_focused` reads the last frame's element tree, where
-            // the handle was on the layer that was topmost then; so a field keeps the
-            // keyboard only while the same layer stays topmost. A layer that opens
-            // over another takes the keyboard in that frame, and a field under it can
-            // never keep it.
-            let keeps =
-                handle.is_focused(window) || (same_top && handle.contains_focused(window, cx));
-            if !keeps {
+            // One rule, from this frame's state only: a text field keeps the keyboard
+            // while the layer it belongs to is the topmost one now. A layer that
+            // opens over it takes the keyboard in the same frame.
+            let field = self.focused_layer_field(window, cx);
+            if !handle.is_focused(window) && !field_keeps_keyboard(top, field) {
                 if !self.overlays.layer_had_focus {
                     // Where the keyboard was, to give it back when the layers close.
                     self.overlays.focus_before = window.focused(cx);
@@ -1072,6 +1065,32 @@ impl Inlet {
             self.chat.pending_channel_jump = Some(channel);
             self.take_channel_jump(window, cx);
         }
+    }
+}
+
+/// Whether a text field of layer `field` (the layer whose field has the keyboard, if
+/// one has) keeps the keyboard while `top` is the topmost layer: only a field of the
+/// topmost layer does. Every window and dialog is its own layer, so a confirmation
+/// over a window takes the keyboard from the window's field.
+pub(crate) fn field_keeps_keyboard(top: Layer, field: Option<Layer>) -> bool {
+    field == Some(top)
+}
+
+impl Inlet {
+    /// The layer whose text field has the keyboard now, if one has: the status
+    /// picker's custom status, or the note in the profile popout or the full profile.
+    fn focused_layer_field(&self, window: &Window, cx: &App) -> Option<Layer> {
+        if self.status_picker_field_focused(window, cx) {
+            return Some(Layer::StatusPicker);
+        }
+        if self.profile_note_focused(window, cx) {
+            return Some(if self.profile.full.is_some() {
+                Layer::ProfileModal
+            } else {
+                Layer::ProfilePopout
+            });
+        }
+        None
     }
 }
 
@@ -1349,6 +1368,49 @@ mod tests {
         assert_eq!(layers.topmost(), Some(Layer::NotificationSettings));
         layers = layers.after_escape();
         assert_eq!(layers.topmost(), Some(Layer::Settings));
+    }
+
+    /// A field keeps the keyboard only while its layer is the topmost one; a layer that
+    /// opens over it (a link prompt over the status picker, the link confirmation over
+    /// a profile's note) takes the keyboard at once, in the same frame.
+    #[test]
+    fn a_field_keeps_the_keyboard_only_in_the_topmost_layer() {
+        let picker = OpenLayers {
+            status_picker: true,
+            ..OpenLayers::default()
+        };
+        let top = picker.topmost().unwrap();
+        assert!(field_keeps_keyboard(top, Some(Layer::StatusPicker)));
+        assert!(!field_keeps_keyboard(top, None));
+        // A link prompt opens over the picker: its field gives up the keyboard now.
+        let prompt = OpenLayers {
+            link_prompt: true,
+            ..picker
+        };
+        assert!(!field_keeps_keyboard(
+            prompt.topmost().unwrap(),
+            Some(Layer::StatusPicker)
+        ));
+        // The note of a profile popout; the link confirmation over it takes the keyboard.
+        let popout = OpenLayers {
+            profile_popout: true,
+            ..OpenLayers::default()
+        };
+        assert!(field_keeps_keyboard(
+            popout.topmost().unwrap(),
+            Some(Layer::ProfilePopout)
+        ));
+        let confirm = OpenLayers {
+            link_confirm: true,
+            ..popout
+        };
+        assert!(!field_keeps_keyboard(
+            confirm.topmost().unwrap(),
+            Some(Layer::ProfilePopout)
+        ));
+        // When the confirmation closes, the popout is on top again and its field may
+        // take the keyboard back.
+        assert_eq!(confirm.after_escape(), popout);
     }
 
     /// The profile layers: the user menu closes before the popout and the full

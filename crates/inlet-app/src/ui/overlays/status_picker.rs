@@ -141,6 +141,15 @@ impl Inlet {
         self.social.picker.is_some() && self.screen == Screen::Main
     }
 
+    /// Whether the picker's text field has the keyboard now.
+    pub(crate) fn status_picker_field_focused(&self, window: &Window, cx: &gpui::App) -> bool {
+        self.social
+            .picker
+            .as_ref()
+            .and_then(|p| p.editor.as_ref())
+            .is_some_and(|e| e.input.focus_handle(cx).is_focused(window))
+    }
+
     pub(crate) fn open_status_picker(&mut self, cx: &mut Context<Self>) {
         self.social.picker = Some(Picker::default());
         cx.notify();

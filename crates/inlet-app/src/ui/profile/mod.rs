@@ -304,6 +304,15 @@ impl Inlet {
         cx.notify();
     }
 
+    /// Whether the note field of the profile on screen has the keyboard now.
+    pub(crate) fn profile_note_focused(&self, window: &Window, cx: &gpui::App) -> bool {
+        use gpui::Focusable;
+        self.profile
+            .note
+            .as_ref()
+            .is_some_and(|n| n.input.focus_handle(cx).is_focused(window))
+    }
+
     /// Once per frame: the note field follows the profile on screen, and a note
     /// that changed is saved when its profile closes. Also keeps the window width for
     /// placing a popout.
