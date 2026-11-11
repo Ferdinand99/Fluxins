@@ -12,6 +12,7 @@ impl Render for Inlet {
         self.media_frame(window, cx);
         self.take_channel_jump(window, cx);
         self.focus_layer(window, cx);
+        self.focus_message_overlay(window, cx);
         let root = div()
             .relative()
             .size_full()

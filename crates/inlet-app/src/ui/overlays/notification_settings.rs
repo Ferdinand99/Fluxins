@@ -8,6 +8,7 @@ use gpui::{div, prelude::*, px, AnyElement, Context, Div, FontWeight, SharedStri
 use super::modal::modal;
 use crate::app::Inlet;
 use crate::assets::Icon;
+use crate::desktop::Layer;
 use crate::model::ChannelKind;
 use crate::theme;
 use crate::ui::notifications::settings::{self, Change, Target};
@@ -294,76 +295,80 @@ impl Inlet {
         } else {
             t!("notifications-mark-channel-read")
         };
-        modal(
-            "notification-settings-window",
-            if columns.len() > 1 { 720. } else { 400. },
-            [
-                div()
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(theme::text_strong())
-                    .child(t!("notifications-title"))
-                    .into_any_element(),
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_start()
-                    .gap_6()
-                    .children(
-                        columns
-                            .into_iter()
-                            .map(|c| div().flex_1().min_w_0().child(c)),
-                    )
-                    .into_any_element(),
-                div()
-                    .flex()
-                    .flex_row()
-                    .flex_wrap()
-                    .gap_2()
-                    .when(has_channel, |d| {
-                        d.child(button("mark-channel-read", mark_channel, false).on_click(
-                            cx.listener(move |this, _, _, cx| {
-                                match &category {
-                                    Some(id) => this.mark_category_read(id.clone(), cx),
-                                    None => this.mark_channel_read(cx),
-                                }
+        let frame =
+            modal(
+                "notification-settings-window",
+                if columns.len() > 1 { 720. } else { 400. },
+                [
+                    div()
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(theme::text_strong())
+                        .child(t!("notifications-title"))
+                        .into_any_element(),
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_start()
+                        .gap_6()
+                        .children(
+                            columns
+                                .into_iter()
+                                .map(|c| div().flex_1().min_w_0().child(c)),
+                        )
+                        .into_any_element(),
+                    div()
+                        .flex()
+                        .flex_row()
+                        .flex_wrap()
+                        .gap_2()
+                        .when(has_channel, |d| {
+                            d.child(button("mark-channel-read", mark_channel, false).on_click(
+                                cx.listener(move |this, _, _, cx| {
+                                    match &category {
+                                        Some(id) => this.mark_category_read(id.clone(), cx),
+                                        None => this.mark_channel_read(cx),
+                                    }
+                                    cx.notify();
+                                }),
+                            ))
+                        })
+                        .child(button("mark-server-read", mark_server, false).on_click(
+                            cx.listener(|this, _, _, cx| {
+                                this.mark_guild_read(cx);
                                 cx.notify();
                             }),
                         ))
-                    })
-                    .child(
-                        button("mark-server-read", mark_server, false).on_click(cx.listener(
-                            |this, _, _, cx| {
-                                this.mark_guild_read(cx);
-                                cx.notify();
-                            },
-                        )),
-                    )
-                    .child(
-                        button("mark-all-read", t!("notifications-mark-all-read"), false).on_click(
-                            cx.listener(|this, _, _, cx| {
-                                this.mark_all_read(cx);
-                                cx.notify();
-                            }),
-                        ),
-                    )
-                    .into_any_element(),
-                div()
-                    .flex()
-                    .flex_row()
-                    .child(
-                        button(
-                            "notification-settings-close",
-                            t!("notifications-close"),
-                            true,
+                        .child(
+                            button("mark-all-read", t!("notifications-mark-all-read"), false)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.mark_all_read(cx);
+                                    cx.notify();
+                                })),
                         )
-                        .on_click(
-                            cx.listener(|this, _, _, cx| this.close_notification_settings(cx)),
-                        ),
-                    )
-                    .into_any_element(),
-            ],
-        )
-        .into_any_element()
+                        .into_any_element(),
+                    div()
+                        .flex()
+                        .flex_row()
+                        .child(
+                            button(
+                                "notification-settings-close",
+                                t!("notifications-close"),
+                                true,
+                            )
+                            .on_click(
+                                cx.listener(|this, _, _, cx| this.close_notification_settings(cx)),
+                            ),
+                        )
+                        .into_any_element(),
+                ],
+            );
+        // A layer: while it is the topmost one it has the keyboard (typing never reaches
+        // the composer behind it), and Escape closes it.
+        if self.is_top_layer(Layer::NotificationSettings) {
+            self.layer_keys(frame, cx).into_any_element()
+        } else {
+            frame.into_any_element()
+        }
     }
 
     fn settings_section(&self, s: Section, cx: &mut Context<Self>) -> AnyElement {

@@ -59,6 +59,7 @@ fn main() {
         text_input::bind_keys(cx);
         ui::notifications::bind_keys(cx);
         ui::composer::bind_keys(cx);
+        ui::chat::bind_keys(cx);
         assets::load_fonts(cx);
         desktop::init(cx);
         let options = desktop::window_options(&start, cx);

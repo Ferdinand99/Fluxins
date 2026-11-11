@@ -85,6 +85,12 @@ impl State {
         self.badges.refresh(state, changes);
     }
 
+    /// Drops the acknowledgement waiting for `ch`: "mark as unread" moved the read mark
+    /// back, and the waiting one would move it forward again.
+    pub fn drop_pending_ack(&mut self, ch: inlet_state::ChannelId) {
+        self.gate.clear(ch, std::time::Instant::now());
+    }
+
     /// Forgets everything (signed out). The settings writes start a new session, so a
     /// late answer to this one's writes is not taken for the next account's; whether
     /// the window has focus is not about the account and stays.
@@ -100,23 +106,32 @@ impl State {
 /// What Escape and Shift+Escape do.
 #[derive(Debug, PartialEq, Eq)]
 enum EscapeAction {
-    CloseSettings,
+    /// A layer is open (the link prompt or confirmation, the notification settings,
+    /// the settings view, the image viewer) but the key reached the window: the topmost
+    /// one closes.
+    CloseLayer,
+    /// A message menu or dialog is open (without the focus): it closes.
+    CloseMessageOverlay,
     MarkChannel,
     MarkGuild,
     Nothing,
 }
 
-/// A window over the app takes the key first (the settings window closes, a link
-/// confirmation is left alone); with the chat out of sight nothing is marked as read.
+/// What is over the chat takes the key first: the topmost layer (see
+/// `desktop::OpenLayers::topmost`), then a message menu or dialog. With the chat out of
+/// sight nothing is marked as read. Escape and Shift+Escape alike: neither marks
+/// anything read while a layer or a message overlay is open.
 fn escape_action(
-    settings_open: bool,
+    layer_open: bool,
+    message_overlay_open: bool,
     chat_visible: bool,
-    link_confirm_open: bool,
     shift: bool,
 ) -> EscapeAction {
-    if settings_open {
-        EscapeAction::CloseSettings
-    } else if !chat_visible || link_confirm_open {
+    if layer_open {
+        EscapeAction::CloseLayer
+    } else if message_overlay_open {
+        EscapeAction::CloseMessageOverlay
+    } else if !chat_visible {
         EscapeAction::Nothing
     } else if shift {
         EscapeAction::MarkGuild
@@ -166,15 +181,16 @@ impl Inlet {
     }
 
     /// Escape (`shift` false) or Shift+Escape.
-    fn on_escape(&mut self, shift: bool, cx: &mut Context<Self>) {
+    fn on_escape(&mut self, shift: bool, window: &mut gpui::Window, cx: &mut Context<Self>) {
         let action = escape_action(
-            self.notifications.settings.is_some(),
+            self.layer_open(),
+            self.chat.actions.overlay.is_some(),
             self.chat_is_visible(),
-            self.overlays.pending_link.is_some() || self.overlays.link_prompt.is_some(),
             shift,
         );
         match action {
-            EscapeAction::CloseSettings => self.close_notification_settings(cx),
+            EscapeAction::CloseLayer => self.close_top_layer(cx),
+            EscapeAction::CloseMessageOverlay => self.close_overlay(window, cx),
             EscapeAction::MarkChannel => self.mark_channel_read(cx),
             EscapeAction::MarkGuild => self.mark_guild_read(cx),
             EscapeAction::Nothing => {}
@@ -187,8 +203,12 @@ impl Inlet {
         el: E,
         cx: &mut Context<Self>,
     ) -> E {
-        el.on_action(cx.listener(|this, _: &MarkChannelRead, _, cx| this.on_escape(false, cx)))
-            .on_action(cx.listener(|this, _: &MarkGuildRead, _, cx| this.on_escape(true, cx)))
+        el.on_action(
+            cx.listener(|this, _: &MarkChannelRead, window, cx| this.on_escape(false, window, cx)),
+        )
+        .on_action(
+            cx.listener(|this, _: &MarkGuildRead, window, cx| this.on_escape(true, window, cx)),
+        )
     }
 
     /// Opens the settings window for the open channel and its server.
@@ -225,15 +245,29 @@ mod tests {
     #[test]
     fn escape_marks_read_only_where_the_chat_is_seen() {
         use EscapeAction::*;
-        assert_eq!(escape_action(false, true, false, false), MarkChannel);
-        assert_eq!(escape_action(false, true, false, true), MarkGuild);
+        // (layer open, message overlay open, chat visible, shift)
+        assert_eq!(escape_action(false, false, true, false), MarkChannel);
+        assert_eq!(escape_action(false, false, true, true), MarkGuild);
         // Under the About view: nothing, not the channel behind it.
         assert_eq!(escape_action(false, false, false, false), Nothing);
         assert_eq!(escape_action(false, false, false, true), Nothing);
-        // A link confirmation keeps the key for itself.
-        assert_eq!(escape_action(false, true, true, false), Nothing);
-        // The settings window closes first, with or without Shift.
-        assert_eq!(escape_action(true, true, false, false), CloseSettings);
-        assert_eq!(escape_action(true, true, false, true), CloseSettings);
+        // A message menu or dialog closes, with or without Shift; nothing is read.
+        assert_eq!(escape_action(false, true, true, false), CloseMessageOverlay);
+        assert_eq!(escape_action(false, true, true, true), CloseMessageOverlay);
+    }
+
+    /// Any open layer (the image viewer, the settings view, the notification settings,
+    /// a link prompt or confirmation) keeps Escape and Shift+Escape from marking
+    /// anything read, also over a message overlay: the topmost layer closes instead.
+    #[test]
+    fn no_escape_marks_anything_read_while_a_layer_is_open() {
+        use EscapeAction::*;
+        for shift in [false, true] {
+            for overlay in [false, true] {
+                for visible in [false, true] {
+                    assert_eq!(escape_action(true, overlay, visible, shift), CloseLayer);
+                }
+            }
+        }
     }
 }
