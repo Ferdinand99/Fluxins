@@ -30,6 +30,9 @@ env:
   CARGO_INCREMENTAL: 0
   CARGO_NET_RETRY: 10
   RUSTUP_MAX_RETRIES: 10
+  # The git dependencies (gpui's repository, Fluxer's) are large; the git command line
+  # fetches them much faster than cargo's built-in client.
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
   # The About view links to the exact commit the binary was built from.
   # Release builds never enable the `demo` feature of the app.
   INLET_SOURCE_REV: ${{ github.sha }}
@@ -43,10 +46,12 @@ env:
 #   and the default linkers, check them and package them: Windows and Linux on pushes
 #   to v0, all three on main, on tags (release.yml) and on manual runs that ask for it.
 #
-# Caches: one rust-cache entry per check job (shared-key), saved only by pushes to v0.
-# Pull requests restore the entry of v0 and save nothing, so the repository holds one
-# entry per job (a target folder without debug info) and stays within GitHub's 10 GB
-# limit. The release jobs use no cache.
+# Caches: one rust-cache entry per operating system (shared-key), saved only by the
+# build job on pushes to v0. The tests job of the same system and every pull request
+# restore it and save nothing. Each entry holds the git dependencies (about 2.2 GB),
+# the registry and the dependencies built with [profile.ci], so three entries and the
+# small fuzz one stay within GitHub's 10 GB per repository. The release jobs use no
+# cache.
 
 jobs:
   # Pull requests that only change documentation skip every other job. A skipped job
@@ -131,7 +136,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          shared-key: windows-ci-build
+          shared-key: windows-ci
           save-if: ${{ github.ref == 'refs/heads/v0' }}
 
       # Demo data only: never shipped.
@@ -184,8 +189,10 @@ jobs:
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          shared-key: windows-ci-test
-          save-if: ${{ github.ref == 'refs/heads/v0' }}
+          # The entry of the Windows job: the git and registry downloads and the
+          # dependencies both builds share.
+          shared-key: windows-ci
+          save-if: false
 
       - name: Test
         run: cargo test --workspace --profile ci --locked
@@ -596,8 +603,8 @@ jobs:
         # A mirror that does not answer fails the step instead of hanging the job.
         timeout-minutes: 10
         run: |
-          sudo apt-get -o Acquire::Retries=5 update
-          sudo apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
             build-essential cmake clang lld mold pkg-config \
             libasound2-dev \
             libfontconfig-dev \
@@ -619,7 +626,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          shared-key: linux-ci-build
+          shared-key: linux-ci
           save-if: ${{ github.ref == 'refs/heads/v0' }}
 
       # The extra test CA of inlet-protocol is for tests only. The crate also
@@ -683,8 +690,8 @@ jobs:
         # A mirror that does not answer fails the step instead of hanging the job.
         timeout-minutes: 10
         run: |
-          sudo apt-get -o Acquire::Retries=5 update
-          sudo apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
             build-essential cmake clang lld mold pkg-config \
             libasound2-dev \
             libfontconfig-dev \
@@ -706,8 +713,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          shared-key: linux-ci-test
-          save-if: ${{ github.ref == 'refs/heads/v0' }}
+          # The entry of the Linux job, as in windows-tests.
+          shared-key: linux-ci
+          save-if: false
 
       - name: Test
         run: cargo test --workspace --profile ci --locked
@@ -750,8 +758,8 @@ jobs:
         # A mirror that does not answer fails the step instead of hanging the job.
         timeout-minutes: 10
         run: |
-          sudo apt-get -o Acquire::Retries=5 update
-          sudo apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
             build-essential cmake clang lld pkg-config \
             libasound2-dev \
             libfontconfig-dev \
@@ -822,8 +830,8 @@ jobs:
         # A mirror that does not answer fails the step instead of hanging the job.
         timeout-minutes: 10
         run: |
-          sudo apt-get -o Acquire::Retries=5 update
-          sudo apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
             xvfb x11-utils imagemagick xdotool \
             libvulkan1 mesa-vulkan-drivers libegl1 libgl1-mesa-dri \
             libxkbcommon-x11-0 libxcb1 libx11-xcb1 libwayland-client0 libfontconfig1 \
