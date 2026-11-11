@@ -91,7 +91,7 @@ jobs:
           Get-Content platform-demo/windows.log
           if (-not (Select-String -Path platform-demo/windows.log -Pattern 'tray icon created' -Quiet)) { exit 1 }
           # The platform calls must never make gpui drop a frame.
-          if (Select-String -Path platform-demo/windows.log -Pattern 'RefCell already borrowed' -Quiet) { exit 1 }
+          if (Select-String -Path platform-demo/windows.log -Pattern 'already (mutably )?borrowed' -Quiet) { exit 1 }
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
@@ -158,7 +158,7 @@ jobs:
       - name: No COM or borrow errors in the demo logs
         shell: pwsh
         run: |
-          $patterns = @('CoInitialize has not been called', '0x800401F0', 'RefCell already borrowed', 'jump list')
+          $patterns = @('CoInitialize has not been called', '0x800401F0', 'RefCell already borrowed', 'already mutably borrowed', 'jump list')
           $bad = Select-String -Path screenshots/*.log -Pattern $patterns -SimpleMatch
           if ($bad) {
             $bad | ForEach-Object { Write-Host "::error::$($_.Filename): $($_.Line)" }

@@ -11,6 +11,7 @@ use gpui::{div, prelude::*, px, AnyElement, Context, Entity, FontWeight, SharedS
 
 use crate::app::Inlet;
 use crate::backend;
+use crate::desktop::Layer;
 use crate::theme;
 use crate::ui::widgets::button;
 
@@ -146,8 +147,8 @@ impl Inlet {
             return div().into_any_element();
         };
         let overlay = div().id("settings-overlay");
-        // Under an open link prompt, the prompt has the keyboard.
-        let overlay = if self.overlays.link_prompt.is_none() {
+        // Under an open link prompt or link confirmation, that layer has the keyboard.
+        let overlay = if self.is_top_layer(Layer::Settings) {
             self.layer_keys(overlay, cx)
         } else {
             overlay
